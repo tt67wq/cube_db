@@ -1,0 +1,17 @@
+.{
+    .name = .cube_db,
+    .version = "0.0.0",
+    .fingerprint = 0x561af1326a981d69,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .zio = .{
+            .path = "../zio",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tests",
+    },
+}
