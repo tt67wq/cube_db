@@ -1,5 +1,5 @@
 //! db.zig — DB 句柄：open/close/get/put/delete/select/compact，mailbox
-//! M4。D3 嵌入式库，zio async API，调用方拥有 runtime。
+//! M4。D3 嵌入式库，纯同步 API；D4 协程/异步写路径内部可切换。
 const std = @import("std");
 const zio = @import("zio");
 const f = @import("format.zig");
@@ -13,7 +13,6 @@ pub const Store = store_mod.Store;
 
 pub const Db = struct {
     allocator: std.mem.Allocator,
-    rt: *zio.Runtime,
     fs: file_store.FileStore,
     store: Store,
     state: writer.State,
@@ -27,12 +26,11 @@ pub const Db = struct {
     const Self = @This();
 
     /// 打开（或创建）数据库。
-    pub fn open(allocator: std.mem.Allocator, rt: *zio.Runtime, path: []const u8, opts: Options) !*Db {
+    pub fn open(allocator: std.mem.Allocator, path: []const u8, opts: Options) !*Db {
         const self = try allocator.create(Self);
         errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
-            .rt = rt,
             .fs = undefined,
             .store = undefined,
             .state = undefined,

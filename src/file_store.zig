@@ -170,29 +170,20 @@ pub fn appendHeaderRecord(self: *FileStore, header: f.Header) !u64 {
 const store = store_mod;
 
 test "file_store: open create + append + pread roundtrip" {
-    const rt = try zio.Runtime.init(std.testing.allocator, .{});
-    defer rt.deinit();
+    const path = "cube_db_filestore_test.db";
+    const cwd = zio.Dir.cwd();
+    cwd.deleteFile(path) catch {};
 
-    const Tmp = struct {
-        fn run() !void {
-            const path = "cube_db_filestore_test.db";
-            const cwd = zio.Dir.cwd();
-            cwd.deleteFile(path) catch {};
-
-            var fs = try FileStore.create(std.testing.allocator, path);
-            defer fs.close();
-            defer cwd.deleteFile(path) catch {};
-            const s = fs.store();
-            const data = "hello-file-store";
-            const off = try s.append(data);
-            try std.testing.expectEqual(@as(u64, 0), off);
-            var buf: [32]u8 = undefined;
-            const n = try s.read(&buf, off);
-            try std.testing.expectEqual(@as(usize, data.len), n);
-            try std.testing.expectEqualStrings(data, buf[0..n]);
-            try std.testing.expectEqual(@as(u64, data.len), try s.size());
-        }
-    };
-    var h = try rt.spawn(Tmp.run, .{});
-    h.join() catch {};
+    var fs = try FileStore.create(std.testing.allocator, path);
+    defer fs.close();
+    defer cwd.deleteFile(path) catch {};
+    const s = fs.store();
+    const data = "hello-file-store";
+    const off = try s.append(data);
+    try std.testing.expectEqual(@as(u64, 0), off);
+    var buf: [32]u8 = undefined;
+    const n = try s.read(&buf, off);
+    try std.testing.expectEqual(@as(usize, data.len), n);
+    try std.testing.expectEqualStrings(data, buf[0..n]);
+    try std.testing.expectEqual(@as(u64, data.len), try s.size());
 }

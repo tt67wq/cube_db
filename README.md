@@ -20,6 +20,26 @@
 zig build test
 ```
 
+## 使用示例
+
+```zig
+const cube = @import("cube_db");
+const Db = cube.Db;
+
+const db = try Db.open(allocator, "my.db", .{});
+defer db.close() catch {};
+
+try db.put("hello", "world");
+const v = try db.get("hello");
+if (v) |value| {
+    // value 由 allocator 分配，用完 free
+    allocator.free(value);
+}
+```
+
+`Db.open` 是**纯同步 API**，不需要调用方准备 `zio.Runtime`。
+内部文件 IO 通过 zio 的阻塞降级机制执行，未来启用 writer 协程（D4）时调用方也无感。
+
 ## 测试覆盖率
 
 Zig 0.16.0 没有内置覆盖率，这里用 [kcov](https://simonkagstrom.github.io/kcov/) 收集。

@@ -26,7 +26,7 @@
 | 层次 | 范围 | 文件 | 特点 |
 |------|------|------|------|
 | 单元测试 | 单个模块纯逻辑 | `src/*.zig` 里的 `test` 块 | 无 IO，毫秒级 |
-| 集成测试 | 全链路真文件 | `tests/db_test.zig` | 跑 zio runtime，用临时文件 |
+| 集成测试 | 全链路真文件 | `tests/db_test.zig` | 用临时文件，直接同步调用 |
 | 崩溃测试 | 故障注入 | `src/fault_store.zig` | 模拟断电、撕裂写 |
 | 模型测试 | 随机序列对比 | `src/btree.zig` 的模型测试 | 用 `StringHashMap` 当参考模型 |
 
@@ -66,31 +66,22 @@ test "store: append node + pread roundtrip" {
 
 ```zig
 fn withDb(comptime body: fn (db: *Db) anyerror!void) !void {
-    const rt = try zio.Runtime.init(std.testing.allocator, .{});
-    defer rt.deinit();
-    const cwd = zio.Dir.cwd();
     const path = "cube_db_itest.db";
-    cwd.deleteFile(path) catch {};
-    defer cwd.deleteFile(path) catch {};
+    zio.Dir.cwd().deleteFile(path) catch {};
+    defer zio.Dir.cwd().deleteFile(path) catch {};
 
-    const Runner = struct {
-        fn run(p: []const u8, r: *zio.Runtime) !void {
-            const db = try Db.open(std.testing.allocator, r, p, .{});
-            defer db.close() catch {};
-            try body(db);
-        }
-    };
-    var h = try rt.spawn(Runner.run, .{ path, rt });
-    h.join() catch {};
+    const db = try Db.open(std.testing.allocator, path, .{});
+    defer db.close() catch {};
+    try body(db);
 }
 ```
 
-所有 DB 操作必须在 zio runtime 的协程里执行，因为 `zio` 是异步 IO 库。
+所有 DB 操作通过同步 API 直接调用，不再需要在 zio runtime 协程里执行。
 
 集成测试验证：
 - open → put → get → close 全链路。
 - 重开后数据还在。
-- 并发 put 不丢失。
+- 并发 put 不丢失（多线程 std.Thread）。
 
 ---
 
@@ -194,14 +185,17 @@ test "my module: behavior description" {
 
 ```zig
 const std = @import("std");
-const zio = @import("zio");
 const cube = @import("cube_db");
 const Db = cube.Db;
 
 test "my integration test" {
-    const rt = try zio.Runtime.init(std.testing.allocator, .{});
-    defer rt.deinit();
-    // 创建 db，操作，断言
+    const path = "my_test.db";
+    zio.Dir.cwd().deleteFile(path) catch {};
+    defer zio.Dir.cwd().deleteFile(path) catch {};
+
+    const db = try Db.open(std.testing.allocator, path, .{});
+    defer db.close() catch {};
+    // 操作，断言
 }
 ```
 
@@ -213,7 +207,8 @@ test "my integration test" {
 
 - 测试分单元、集成、崩溃注入、模型测试四层。
 - `MemStore` 让单元测试快速无副作用。
-- 集成测试跑真文件和 zio runtime。
+- 集成测试跑真文件和同步 API。
+- 并发测试使用 `std.Thread` 多线程。
 - `FaultStore` 让崩溃场景可重复测试。
 - 模型测试用随机序列对比参考模型，是 B-tree 正确性的主力防线。
 
@@ -222,7 +217,7 @@ test "my integration test" {
 ## 11. 本章练习
 
 1. 给 `btree.zig` 加一条模型测试，用另一个 seed（比如 42）跑 5000 次操作。
-2. 在 `tests/db_test.zig` 加一条：并发 5 个协程，每个 put/delete 后立刻 get 验证。
+2. 在 `tests/db_test.zig` 加一条：并发 5 个线程，每个 put/delete 后立刻 get 验证。
 3. 写一条崩溃测试：先 put 一个 key，然后在 `Db.open` 模拟“header 没写就崩溃”，验证重开后数据丢失但不损坏。
 4. 统计 `src/` 里一共有多少个 `test` 块（提示：用 `grep -c 'test "'`）。
 5. 思考：为什么模型测试要用固定 seed？如果 seed 随机，失败后会带来什么麻烦？

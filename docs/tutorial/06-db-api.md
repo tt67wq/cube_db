@@ -17,7 +17,6 @@
 ```zig
 pub const Db = struct {
     allocator: std.mem.Allocator,
-    rt: *zio.Runtime,
     fs: file_store.FileStore,
     store: Store,
     state: writer.State,
@@ -44,7 +43,7 @@ pub const Db = struct {
 
 ```zig
 pub const Db = struct {
-    pub fn open(allocator, rt, path, opts) !*Db;
+    pub fn open(allocator, path, opts) !*Db;
     pub fn close(self: *Db) !void;
     pub fn get(self: *Db, key: []const u8) !?[]u8;
     pub fn put(self: *Db, key: []const u8, value: []const u8) !void;
@@ -55,14 +54,15 @@ pub const Db = struct {
 };
 ```
 
-所有方法都必须在 zio 协程中调用。它们会阻塞等待，但阻塞的是协程，不是线程。
+所有方法都是**同步 API**，可以在任意线程调用。内部通过 zio 的阻塞降级机制完成文件 IO，
+未来若启用 D4 协程写路径，调用方依然无需感知。
 
 ---
 
 ## 3. open：打开或创建数据库
 
 ```zig
-pub fn open(allocator, rt, path, opts) !*Db
+pub fn open(allocator, path, opts) !*Db
 ```
 
 流程：
@@ -245,7 +245,7 @@ pub fn close(self: *Self) !void {
 ## 8. 并发模型
 
 读：
-- 任意协程可以同时读。
+- 任意线程可以同时读。
 - 读只读 `state.root` 原子值，然后沿不可变树下行。
 - 不需要加锁。
 
@@ -270,7 +270,7 @@ pub fn close(self: *Self) !void {
 
 ## 10. 本章练习
 
-1. 在 `tests/db_test.zig` 里找到 `withDb` 函数，解释它为什么要在 zio runtime 里创建 `Db`。
+1. 在 `tests/db_test.zig` 里找到 `withDb` 函数，解释它为什么能直接用同步 API 创建 `Db`。
 2. 写一个测试：打开数据库，put 一个 key，close，重新 open，get 同一个 key，验证数据还在。
 3. 在 `db.zig` 里加 `getCopy` 方法：返回值由调用方 allocator 分配，而不是 `db.allocator`。
 4. 给 `select` 写一个测试：迭代期间同时 `put` 新 key，验证迭代器仍看到旧快照。

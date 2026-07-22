@@ -1,4 +1,4 @@
-//! db 集成测试：open→写→读→select→close 全链路，需 zio runtime
+//! db 集成测试：open→写→读→select→close 全链路，纯同步 API
 const std = @import("std");
 const zio = @import("zio");
 const cube = @import("cube_db");
@@ -6,22 +6,13 @@ const cube = @import("cube_db");
 const Db = cube.Db;
 
 fn withDb(comptime body: fn (db: *Db) anyerror!void) !void {
-    const rt = try zio.Runtime.init(std.testing.allocator, .{});
-    defer rt.deinit();
-    const cwd = zio.Dir.cwd();
     const path = "cube_db_itest.db";
-    cwd.deleteFile(path) catch {};
-    defer cwd.deleteFile(path) catch {};
+    zio.Dir.cwd().deleteFile(path) catch {};
+    defer zio.Dir.cwd().deleteFile(path) catch {};
 
-    const Runner = struct {
-        fn run(p: []const u8, r: *zio.Runtime) !void {
-            const db = try Db.open(std.testing.allocator, r, p, .{});
-            defer db.close() catch {};
-            try body(db);
-        }
-    };
-    var h = try rt.spawn(Runner.run, .{ path, rt });
-    h.join() catch {};
+    const db = try Db.open(std.testing.allocator, path, .{});
+    defer db.close() catch {};
+    try body(db);
 }
 
 test "db: put then get" {
@@ -63,34 +54,23 @@ test "db: delete" {
 }
 
 test "db: reopen reads persisted data" {
-    const rt = try zio.Runtime.init(std.testing.allocator, .{});
-    defer rt.deinit();
-    const cwd = zio.Dir.cwd();
     const path = "cube_db_reopen.db";
-    cwd.deleteFile(path) catch {};
-    defer cwd.deleteFile(path) catch {};
+    zio.Dir.cwd().deleteFile(path) catch {};
+    defer zio.Dir.cwd().deleteFile(path) catch {};
 
-    const Runner = struct {
-        fn run(p: []const u8, r: *zio.Runtime) !void {
-            // 第一次：写并关闭
-            {
-                const db = try Db.open(std.testing.allocator, r, p, .{});
-                defer db.close() catch {};
-                try db.put("persisted", "yes");
-            }
-            // 第二次：重开读
-            {
-                const db = try Db.open(std.testing.allocator, r, p, .{});
-                defer db.close() catch {};
-                const v = try db.get("persisted");
-                try std.testing.expect(v != null);
-                try std.testing.expectEqualStrings("yes", v.?);
-                std.testing.allocator.free(v.?);
-            }
-        }
-    };
-    var h = try rt.spawn(Runner.run, .{ path, rt });
-    h.join() catch {};
+    {
+        const db = try Db.open(std.testing.allocator, path, .{});
+        defer db.close() catch {};
+        try db.put("persisted", "yes");
+    }
+    {
+        const db = try Db.open(std.testing.allocator, path, .{});
+        defer db.close() catch {};
+        const v = try db.get("persisted");
+        try std.testing.expect(v != null);
+        try std.testing.expectEqualStrings("yes", v.?);
+        std.testing.allocator.free(v.?);
+    }
 }
 
 test "db: select range" {
@@ -115,58 +95,46 @@ test "db: select range" {
 }
 
 test "db: concurrent puts all visible" {
-    const rt = try zio.Runtime.init(std.testing.allocator, .{});
-    defer rt.deinit();
-    const cwd = zio.Dir.cwd();
     const path = "cube_db_concurrent.db";
-    cwd.deleteFile(path) catch {};
-    defer cwd.deleteFile(path) catch {};
+    zio.Dir.cwd().deleteFile(path) catch {};
+    defer zio.Dir.cwd().deleteFile(path) catch {};
+    zio.Dir.cwd().deleteFile(path ++ ".compact") catch {};
+    defer zio.Dir.cwd().deleteFile(path ++ ".compact") catch {};
 
-    const Setup = struct {
-        fn run(p: []const u8, r: *zio.Runtime) !void {
-            const db = try Db.open(std.testing.allocator, r, p, .{});
-            defer db.close() catch {};
-            var group: zio.Group = .init;
-            defer group.cancel();
-            for (0..10) |i| {
-                try group.spawn(putter, .{ db, @as(u32, @intCast(i)) });
-            }
-            try group.wait();
-        }
-        fn putter(db: *Db, base: u32) !void {
+    const db = try Db.open(std.testing.allocator, path, .{});
+    defer db.close() catch {};
+
+    const putter = struct {
+        fn run(pdb: *Db, base: u32) !void {
             var i: u32 = 0;
             while (i < 100) : (i += 1) {
                 var kbuf: [16]u8 = undefined;
                 const klen = (try std.fmt.bufPrint(&kbuf, "{d}", .{base * 1000 + i})).len;
-                try db.put(kbuf[0..klen], "v");
+                try pdb.put(kbuf[0..klen], "v");
             }
         }
-    };
-    var sh = try rt.spawn(Setup.run, .{ path, rt });
-    sh.join() catch {};
+    }.run;
+
+    var threads: [10]std.Thread = undefined;
+    for (0..10) |i| {
+        threads[i] = try std.Thread.spawn(.{}, putter, .{ db, @as(u32, @intCast(i)) });
+    }
+    for (threads) |t| t.join();
 
     // verify
-            const V = struct {
-        fn run(p: []const u8, r: *zio.Runtime) !void {
-            const db = try Db.open(std.testing.allocator, r, p, .{});
-            defer db.close() catch {};
-            var ok: u32 = 0;
-            var b: u32 = 0;
-            while (b < 10) : (b += 1) {
-                var i: u32 = 0;
-                while (i < 100) : (i += 1) {
-                    var kbuf: [16]u8 = undefined;
-                    const klen = (try std.fmt.bufPrint(&kbuf, "{d}", .{b * 1000 + i})).len;
-                    const v = try db.get(kbuf[0..klen]);
-                    if (v != null) {
-                        ok += 1;
-                        std.testing.allocator.free(v.?);
-                    }
-                }
+    var ok: u32 = 0;
+    var b: u32 = 0;
+    while (b < 10) : (b += 1) {
+        var i: u32 = 0;
+        while (i < 100) : (i += 1) {
+            var kbuf: [16]u8 = undefined;
+            const klen = (try std.fmt.bufPrint(&kbuf, "{d}", .{b * 1000 + i})).len;
+            const v = try db.get(kbuf[0..klen]);
+            if (v != null) {
+                ok += 1;
+                std.testing.allocator.free(v.?);
             }
-            try std.testing.expectEqual(@as(u32, 1000), ok);
         }
-    };
-    var vh = try rt.spawn(V.run, .{ path, rt });
-    vh.join() catch {};
+    }
+    try std.testing.expectEqual(@as(u32, 1000), ok);
 }
