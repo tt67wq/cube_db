@@ -21,9 +21,6 @@ pub const Db = struct {
     store: Store,
     state: writer.State,
     write_mutex: zio.Mutex,
-    mailbox: zio.Channel(writer.Request),
-    mailbox_buf: []writer.Request,
-    writer_handle: ?zio.JoinHandle(anyerror!void),
     path: []u8,
 };
 ```
@@ -34,7 +31,6 @@ pub const Db = struct {
 - `fs` / `store`：底层文件存储。
 - `state`：写状态（root、dirt、count 等）。
 - `write_mutex`：串行化写操作。
-- `mailbox` / `mailbox_buf`：保留给未来 writer 协程使用。
 - `path`：数据文件路径。
 
 ---
@@ -75,7 +71,7 @@ graph TD
     D -->|是| E[恢复 root/dirt/count/byte_size]
     E --> F[物理截断到 header 末尾]
     D -->|否| G[初始化为空]
-    G --> H[初始化 mailbox 与 mutex]
+    G --> H[初始化 mutex]
 ```
 
 ### 3.1 创建 FileStore
@@ -229,7 +225,6 @@ pub fn close(self: *Self) !void {
     self.state.closed.store(true, .release);
     self.store.sync() catch {};
     self.fs.close();
-    self.allocator.free(self.mailbox_buf);
     self.allocator.free(self.path);
     self.allocator.destroy(self);
 }

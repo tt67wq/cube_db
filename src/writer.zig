@@ -1,5 +1,5 @@
-//! writer.zig — writer 协程：batch 应用、COW、header 提交、垃圾统计、自动 compaction 触发
-//! M4。D4 单 writer + mailbox；D10 group commit 排空策略。
+//! writer.zig — batch 应用、COW、header 提交、垃圾统计、自动 compaction 触发
+//! M4。同步写路径；D4 协程/group commit 押注已关闭（压测验证同步写足够）。
 const std = @import("std");
 const zio = @import("zio");
 const f = @import("format.zig");
@@ -41,9 +41,6 @@ pub const State = struct {
     /// 自动 compaction 触发计数（测试用）
     compact_count: std.atomic.Value(u32),
 };
-
-pub const MAX_BATCH_OPS: usize = 64;
-pub const MAX_BATCH_BYTES: usize = 1024 * 1024;
 
 /// 应用一批写请求，COW 构建新 root，写 header，fsync，更新原子状态。
 /// 返回写入的 header 数（1）。
@@ -128,31 +125,3 @@ pub fn applyBatch(state: *State, batch: []Request) !void {
     }
 }
 
-/// writer 协程主循环。
-/// receive 首请求 → yield → tryReceive 排空至上限 → applyBatch → 循环。
-/// channel 关闭则退出。
-pub fn writerLoop(state: *State, mailbox: *zio.Channel(Request)) anyerror!void {
-    var batch_buf: [MAX_BATCH_OPS]Request = undefined;
-    while (true) {
-        const first = mailbox.receive() catch |err| switch (err) {
-            error.ChannelClosed => {
-                return;
-            },
-            else => return err,
-        };
-        // yield 一次让排队 sender 入队
-        try zio.yield();
-        // 排空至上限
-        var count: usize = 1;
-        batch_buf[0] = first;
-        var bytes: usize = first.key.len + first.value.len;
-        while (count < MAX_BATCH_OPS and bytes < MAX_BATCH_BYTES) {
-            const r = mailbox.tryReceive() catch break;
-            batch_buf[count] = r;
-            count += 1;
-            bytes += r.key.len + r.value.len;
-        }
-        applyBatch(state, batch_buf[0..count]) catch {};
-        if (state.closed.load(.acquire)) return;
-    }
-}

@@ -224,14 +224,14 @@ if (state.opts.auto_compact_dirt_ratio) |ratio| {
 
 ---
 
-## 6. MVP 同步写 vs 原设计的 writer 协程
+## 6. 同步写：压测验证后的最终选择
 
 原设计 D4 要求：
 - 一个专门的 writer 协程。
 - `put`/`delete` 把请求发到 mailbox channel。
 - writer 批量接收请求，合并成一次 batch，写一次 header。
 
-当前实现：
+当前实现（压测验证后定为最终形态）：
 - `db.sendRequest` 用 `zio.Mutex` 锁住 `applyBatch`。
 - 每次 `put` 直接同步应用 batch，然后返回。
 
@@ -239,7 +239,8 @@ if (state.opts.auto_compact_dirt_ratio) |ratio| {
 - 正确性一样：都是串行写，不会并发破坏数据。
 - 性能不同：协程版本可以合并多个请求，减少 fsync 次数；mutex 版本每次 `put` 都 fsync。
 
-代码里保留了 mailbox 结构，方便未来切回协程版本。
+压测结论（`bench/put_bench.zig`）：同步写 3335 ops/s，多线程因 mutex 串行不升反降。
+对嵌入式 KV 足够，D4 group commit 押注关闭，mailbox/writerLoop 死代码已移除。
 
 ```zig
 fn sendRequest(self: *Self, key, value, tombstone) !void {
@@ -260,7 +261,7 @@ fn sendRequest(self: *Self, key, value, tombstone) !void {
 - `writer.zig` 把写请求变成“COW → header → fsync → 更新状态”的完整流程。
 - `State` 是共享的写状态，所有字段都是原子的，读线程可以安全读 root。
 - DB 层用 `root = btree_offset + 1` 编码来区分空树和偏移 0。
-- 当前 MVP 用 mutex 串行写，原设计的 writer 协程暂时未启用。
+- 当前用 mutex 串行写，压测验证同步写足够后定为最终形态，D4 writer 协程押注已关闭。
 - 自动 compact 目前只计数，不自动执行。
 
 ---

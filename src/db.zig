@@ -1,5 +1,5 @@
-//! db.zig — DB 句柄：open/close/get/put/delete/select/compact，mailbox
-//! M4。D3 嵌入式库，纯同步 API；D4 协程/异步写路径内部可切换。
+//! db.zig — DB 句柄：open/close/get/put/delete/select/compact
+//! M4。D3 嵌入式库，纯同步 API。
 const std = @import("std");
 const zio = @import("zio");
 const f = @import("format.zig");
@@ -16,11 +16,8 @@ pub const Db = struct {
     fs: file_store.FileStore,
     store: Store,
     state: writer.State,
-    /// 写互斥锁（MVP 同步写替代 writer 协程的串行性）
+    /// 写互斥锁（串行化写操作）
     write_mutex: zio.Mutex,
-    mailbox: zio.Channel(writer.Request),
-    mailbox_buf: []writer.Request,
-    writer_handle: ?zio.JoinHandle(anyerror!void),
     path: []u8,
 
     const Self = @This();
@@ -35,9 +32,6 @@ pub const Db = struct {
             .store = undefined,
             .state = undefined,
             .write_mutex = .{},
-            .mailbox = undefined,
-            .mailbox_buf = undefined,
-            .writer_handle = null,
             .path = try allocator.dupe(u8, path),
         };
         errdefer allocator.free(self.path);
@@ -79,22 +73,13 @@ pub const Db = struct {
         };
         self.write_mutex = .{};
 
-        // mailbox buffer（保留供后续 writer 协程使用）
-        self.mailbox_buf = try allocator.alloc(writer.Request, 256);
-        self.mailbox = zio.Channel(writer.Request).init(self.mailbox_buf);
-
-        // ponytail: MVP 不 spawn writer 协程，写经 sendRequest 同步 applyBatch。
-        self.writer_handle = null;
-
         return self;
     }
 
     pub fn close(self: *Self) !void {
-        // ponytail: 无 writer 协程，sync + 关闭文件。即使 sync 失败也释放资源。
         self.state.closed.store(true, .release);
         self.store.sync() catch {};
         self.fs.close();
-        self.allocator.free(self.mailbox_buf);
         self.allocator.free(self.path);
         self.allocator.destroy(self);
     }

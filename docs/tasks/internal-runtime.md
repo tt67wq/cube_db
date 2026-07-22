@@ -37,26 +37,26 @@
 - [x] `tests/db_test.zig`：删 Runtime/spawn 骨架，直接同步调用；并发测试 `zio.Group` → `std.Thread` 多线程
 - [x] `tests/compact_test.zig`：同上
 
-### T4 隐藏 runtime 基建（D4 准备，可推迟）
+### T4 隐藏 runtime 基建 ❌ 关闭
 
-- [ ] `Db` 增加懒启动 runtime：仅 opts 显式启用 async writer 时创建
-- [ ] `Runtime.init(.{ .executors = .exact(1), .enable_main_executor = false })` + 后台线程 `run`
-- [ ] `close` 流程：关 mailbox → `writerLoop` 退出 → join 线程 → `runtime.deinit`
-- [ ] mailbox / `zio.Channel` 字段保留（已存在）
+压测结论：同步写 3335 ops/s 对嵌入式 KV 足够，多线程降速是 mutex 串行非真实瓶颈场景。
+D4 押注关闭，不建 runtime 基建。
 
-### T5 writer 协程激活（压测门控）
+### T5 writer 协程激活 ❌ 关闭
 
-- [ ] 压测脚本：N 并发线程 put，测同步写吞吐 / p99 延迟
-- [ ] 不达标 → spawn `writerLoop`，`sendRequest` 改走 mailbox + future
-- [ ] 达标 → 记录结论，关闭 D4 押注，评估移除 T4 基建
+- [x] 压测脚本：`bench/put_bench.zig`，测同步写吞吐
+- 结果：single 3335 ops/s，10-thread 2445 ops/s（不升反降）
+- [x] 达标 → 记录结论，关闭 D4 押注，移除死代码（mailbox/Channel/writerLoop）
 
-### T6 收尾（部分完成）
+### T6 收尾✅
 
 - [x] README 增加使用示例（同步 API）
 - [x] `docs/tutorial/06-db-api.md` 更新公开 API 描述
 - [x] `docs/tutorial/09-tests.md` 更新集成测试描述
 - [ ] 重跑 kcov 覆盖率（命令已固化在 README），确认无回归
 - [x] `zig build test` + `zig build -Doptimize=ReleaseSafe` 全绿
+- [x] `bench/put_bench.zig` 保留作回归基线
+- [x] 移除死代码：`Db.mailbox`/`mailbox_buf`/`writer_handle`、`writer.writerLoop`、`MAX_BATCH_*`
 
 ## 依赖图
 
