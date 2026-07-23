@@ -4,6 +4,7 @@ const std = @import("std");
 pub const format = @import("format.zig");
 pub const store = @import("store.zig");
 pub const btree = @import("btree.zig");
+pub const btree_batch = @import("btree_batch.zig");
 pub const file_store = @import("file_store.zig");
 pub const writer = @import("writer.zig");
 pub const db = @import("db.zig");

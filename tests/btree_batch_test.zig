@@ -4,6 +4,7 @@ const std = @import("std");
 const zio = @import("zio");
 const cube = @import("cube_db");
 const btree = cube.btree;
+const btree_batch = cube.btree_batch;
 const store_mod = cube.store;
 const CountStore = @import("count_store.zig").CountStore;
 
@@ -22,7 +23,7 @@ fn newStore() MemStore {
 test "BTreeBatch: 3 puts then get all" {
     var ms = newStore();
     defer ms.deinit();
-    var batch = btree.BTreeBatch.init(talloc, ms.store(), btree.NULL_ROOT);
+    var batch = btree_batch.BTreeBatch.init(talloc, ms.store(), btree.NULL_ROOT);
     defer batch.deinit();
     try batch.apply("a", "va", false);
     try batch.apply("b", "vb", false);
@@ -39,7 +40,7 @@ test "BTreeBatch: 3 puts then get all" {
 test "BTreeBatch: dedup same key last-write-wins" {
     var ms = newStore();
     defer ms.deinit();
-    var batch = btree.BTreeBatch.init(talloc, ms.store(), btree.NULL_ROOT);
+    var batch = btree_batch.BTreeBatch.init(talloc, ms.store(), btree.NULL_ROOT);
     defer batch.deinit();
     try batch.apply("k", "v1", false);
     try batch.apply("k", "v2", false);
@@ -55,7 +56,7 @@ test "BTreeBatch: cache amortizes store.append (100 puts << 100 appends)" {
     var ms = newStore();
     defer ms.deinit();
     var cs = CountStore.init(ms.store());
-    var batch = btree.BTreeBatch.init(talloc, cs.store(), btree.NULL_ROOT);
+    var batch = btree_batch.BTreeBatch.init(talloc, cs.store(), btree.NULL_ROOT);
     defer batch.deinit();
     var i: usize = 0;
     while (i < 100) : (i += 1) {
@@ -70,4 +71,38 @@ test "BTreeBatch: cache amortizes store.append (100 puts << 100 appends)" {
     const va = try btree.get(talloc, cs.store(), wr.new_root, "key0000000000");
     try std.testing.expect(va != null);
     talloc.free(va.?);
+}
+
+test "BTreeBatch: COW old root still readable after commit" {
+    var ms = newStore();
+    defer ms.deinit();
+    // 先 insert 一个 key 建 root
+    const r1 = try btree.insert(talloc, ms.store(), btree.NULL_ROOT, "k", "v1", false);
+    // batch 覆写 k=v2
+    var batch = btree_batch.BTreeBatch.init(talloc, ms.store(), r1.new_root);
+    defer batch.deinit();
+    try batch.apply("k", "v2", false);
+    const wr = try batch.commit();
+    // 旧 root 读 v1
+    const oldv = try btree.get(talloc, ms.store(), r1.new_root, "k");
+    try std.testing.expect(oldv != null);
+    try std.testing.expectEqualStrings("v1", oldv.?);
+    talloc.free(oldv.?);
+    // 新 root 读 v2
+    const newv = try btree.get(talloc, ms.store(), wr.new_root, "k");
+    try std.testing.expect(newv != null);
+    try std.testing.expectEqualStrings("v2", newv.?);
+    talloc.free(newv.?);
+}
+
+test "BTreeBatch: tombstone dedup (put then delete same key -> invisible)" {
+    var ms = newStore();
+    defer ms.deinit();
+    var batch = btree_batch.BTreeBatch.init(talloc, ms.store(), btree.NULL_ROOT);
+    defer batch.deinit();
+    try batch.apply("k", "v", false);
+    try batch.apply("k", "", true); // tombstone 同 key，last-wins
+    const wr = try batch.commit();
+    const v = try btree.get(talloc, ms.store(), wr.new_root, "k");
+    try std.testing.expectEqual(@as(?[]u8, null), v);
 }
