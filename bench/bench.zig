@@ -41,7 +41,7 @@ fn warmupCount(n: usize) usize {
 // ---- 矩阵 ----
 
 const Scale = enum { small, large };
-const Op = enum { put, get, delete, select, compact };
+const Op = enum { put, putbatch, get, delete, select, compact };
 const VSize = enum { b100, b10k };
 
 const Cell = struct { op: Op, scale: Scale, v: VSize };
@@ -92,6 +92,36 @@ fn runPut(allocator: std.mem.Allocator, path: []const u8, cell: Cell, n: usize, 
         const k = try fmtKey(&kbuf, i);
         try db.put(k, value);
     }
+    const ns = monoNs() - start;
+    return .{ .op = cell.op, .scale = cell.scale, .v = cell.v, .ops = n, .elapsed_ns = ns };
+}
+
+fn runPutBatch(allocator: std.mem.Allocator, path: []const u8, cell: Cell, n: usize, value: []const u8) !Result {
+    deleteIfExists(path);
+    try deleteCompact(allocator, path);
+    const db = try Db.open(allocator, path, .{ .fsync = true }); // 测量段带 fsync
+    defer db.close() catch {};
+    // 构造 N 个 Entry
+    const entries = try allocator.alloc(cube.Entry, n);
+    defer allocator.free(entries);
+    var kbuf: [12]u8 = undefined;
+    for (0..n) |i| {
+        const k = try fmtKey(&kbuf, i);
+        entries[i] = .{ .key = k, .value = value };
+    }
+    // warmup（小批 putBatch）
+    const wu = warmupCount(n);
+    if (wu > 0) {
+        const we = try allocator.alloc(cube.Entry, wu);
+        defer allocator.free(we);
+        for (0..wu) |i| {
+            const k = try fmtKey(&kbuf, i);
+            we[i] = .{ .key = k, .value = value };
+        }
+        try db.putBatch(we);
+    }
+    const start = monoNs();
+    try db.putBatch(entries);
     const ns = monoNs() - start;
     return .{ .op = cell.op, .scale = cell.scale, .v = cell.v, .ops = n, .elapsed_ns = ns };
 }
@@ -222,7 +252,7 @@ fn runCompact(allocator: std.mem.Allocator, path: []const u8, cell: Cell, n: usi
 // ---- 输出 ----
 
 fn opName(op: Op) []const u8 {
-    return switch (op) { .put => "put", .get => "get", .delete => "delete", .select => "select", .compact => "compact" };
+    return switch (op) { .put => "put", .putbatch => "putbatch", .get => "get", .delete => "delete", .select => "select", .compact => "compact" };
 }
 fn scaleName(s: Scale) []const u8 {
     return switch (s) { .small => "small", .large => "large" };
@@ -268,7 +298,7 @@ pub fn main(init: std.process.Init) !void {
     try w.writeAll("op      scale  value  ops          time_ms      ops/s        avg_us/op\n");
     try w.flush();
 
-    const ops = [_]Op{ .put, .get, .delete, .select, .compact };
+    const ops = [_]Op{ .put, .putbatch, .get, .delete, .select, .compact };
     const scales = [_]Scale{ .small, .large };
     const vsizes = [_]VSize{ .b100, .b10k };
 
@@ -289,6 +319,7 @@ pub fn main(init: std.process.Init) !void {
                 }
                 const result = switch (op) {
                     .put => runPut(allocator, path, cell, n, value) catch |e| { last_err = e; continue; },
+                    .putbatch => runPutBatch(allocator, path, cell, n, value) catch |e| { last_err = e; continue; },
                     .get => runGet(allocator, path, cell, n, value) catch |e| { last_err = e; continue; },
                     .delete => runDelete(allocator, path, cell, n, value) catch |e| { last_err = e; continue; },
                     .select => runSelect(allocator, path, cell, n, value) catch |e| { last_err = e; continue; },
