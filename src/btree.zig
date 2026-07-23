@@ -518,6 +518,88 @@ pub fn insert(
     };
 }
 
+// ===== BTreeBatch：批量树提交（lever 2）=====
+// 严格 TDD 驱动。先骨架（apply 累积 + commit 排序去重 + 逐 insert），再迭代缓存优化。
+
+pub const BatchEntry = struct {
+    key: []u8,
+    value: []u8,
+    tombstone: bool,
+};
+
+pub const BTreeBatch = struct {
+    allocator: std.mem.Allocator,
+    s: Store,
+    root: u64,
+    entries: std.ArrayList(BatchEntry),
+
+    pub fn init(allocator: std.mem.Allocator, s: Store, root: u64) BTreeBatch {
+        return .{ .allocator = allocator, .s = s, .root = root, .entries = .empty };
+    }
+
+    pub fn deinit(self: *BTreeBatch) void {
+        for (self.entries.items) |e| {
+            self.allocator.free(e.key);
+            self.allocator.free(e.value);
+        }
+        self.entries.deinit(self.allocator);
+    }
+
+    pub fn apply(self: *BTreeBatch, key: []const u8, value: []const u8, tombstone: bool) !void {
+        try self.entries.append(self.allocator, .{
+            .key = try self.allocator.dupe(u8, key),
+            .value = if (tombstone) try self.allocator.dupe(u8, "") else try self.allocator.dupe(u8, value),
+            .tombstone = tombstone,
+        });
+    }
+
+    /// 提交：排序去重（last-write-wins）后逐 insert 到 store。返回 WriteResult。
+    /// ponytail: 骨架版，未做缓存摊薄；后续加测试驱动缓存实现。
+    pub fn commit(self: *BTreeBatch) !WriteResult {
+        if (self.entries.items.len == 0) {
+            return .{ .new_root = self.root, .live_delta = 0, .dirt_delta = 0, .count_delta = 0 };
+        }
+        // 排序
+        std.mem.sort(BatchEntry, self.entries.items, {}, struct {
+            fn lt(_: void, a: BatchEntry, b: BatchEntry) bool {
+                return std.mem.order(u8, a.key, b.key) == .lt;
+            }
+        }.lt);
+        // 去重：同 key 保留最后出现（last-write-wins）
+        var dedup = std.ArrayList(BatchEntry).empty;
+        defer dedup.deinit(self.allocator);
+        var i: usize = 0;
+        while (i < self.entries.items.len) : (i += 1) {
+            if (i + 1 < self.entries.items.len and
+                std.mem.order(u8, self.entries.items[i].key, self.entries.items[i + 1].key) == .eq)
+            {
+                // 有后续同 key，释放当前，跳过（用最后一个）
+                self.allocator.free(self.entries.items[i].key);
+                self.allocator.free(self.entries.items[i].value);
+                continue;
+            }
+            try dedup.append(self.allocator, self.entries.items[i]);
+        }
+        // 清空 entries（所有权已转给 dedup）
+        self.entries.clearRetainingCapacity();
+
+        var bt_root = self.root;
+        var live_delta: i64 = 0;
+        var dirt_delta: u64 = 0;
+        var count_delta: i64 = 0;
+        for (dedup.items) |e| {
+            const wr = try insert(self.allocator, self.s, bt_root, e.key, e.value, e.tombstone);
+            bt_root = wr.new_root;
+            live_delta += wr.live_delta;
+            dirt_delta += wr.dirt_delta;
+            count_delta += wr.count_delta;
+            self.allocator.free(e.key);
+            self.allocator.free(e.value);
+        }
+        return .{ .new_root = bt_root, .live_delta = live_delta, .dirt_delta = dirt_delta, .count_delta = count_delta };
+    }
+};
+
 // ===== 删除（tombstone） =====
 pub fn remove(allocator: std.mem.Allocator, s: Store, root: u64, key: []const u8) !WriteResult {
     if (root == NULL_ROOT) {
