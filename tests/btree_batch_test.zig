@@ -106,3 +106,55 @@ test "BTreeBatch: tombstone dedup (put then delete same key -> invisible)" {
     const v = try btree.get(talloc, ms.store(), wr.new_root, "k");
     try std.testing.expectEqual(@as(?[]u8, null), v);
 }
+
+test "BTreeBatch: random batch vs model (seed 11, mixed put/delete)" {
+    const allocator = talloc;
+    var ms = newStore();
+    defer ms.deinit();
+    var batch = btree_batch.BTreeBatch.init(allocator, ms.store(), btree.NULL_ROOT);
+    defer batch.deinit();
+    // model：last-write-wins，tombstone = 删
+    var model = std.StringHashMap([]u8).init(allocator);
+    defer {
+        var it = model.iterator();
+        while (it.next()) |kv| { allocator.free(kv.key_ptr.*); allocator.free(kv.value_ptr.*); }
+        model.deinit();
+    }
+    var prng = std.Random.DefaultPrng.init(11);
+    const rnd = prng.random();
+    const ops = 2000;
+    var i: usize = 0;
+    while (i < ops) : (i += 1) {
+        var kbuf: [8]u8 = undefined;
+        const klen = 4 + rnd.uintLessThan(usize, 5);
+        for (0..klen) |j| kbuf[j] = 'a' + rnd.uintLessThan(u8, 8);
+        const key = kbuf[0..klen];
+        if (rnd.boolean()) {
+            try batch.apply(key, "V", false);
+            const gop = try model.getOrPut(key);
+            if (gop.found_existing) { allocator.free(gop.value_ptr.*); gop.value_ptr.* = try allocator.dupe(u8, "V"); }
+            else { gop.key_ptr.* = try allocator.dupe(u8, key); gop.value_ptr.* = try allocator.dupe(u8, "V"); }
+        } else {
+            try batch.apply(key, "", true);
+            if (model.fetchRemove(key)) |kv| { allocator.free(kv.key); allocator.free(kv.value); }
+        }
+    }
+    const wr = try batch.commit();
+    // 全量 get 验证
+    var mit = model.iterator();
+    var checked: usize = 0;
+    while (mit.next()) |kv| {
+        const bv = try btree.get(allocator, ms.store(), wr.new_root, kv.key_ptr.*);
+        try std.testing.expect(bv != null);
+        try std.testing.expectEqualStrings(kv.value_ptr.*, bv.?);
+        allocator.free(bv.?);
+        checked += 1;
+    }
+    // select 全量计数 = model.count
+    var sit = try btree.select(allocator, ms.store(), wr.new_root, null, null);
+    defer sit.deinit();
+    var bcount: usize = 0;
+    while (try sit.next()) |_| bcount += 1;
+    try std.testing.expectEqual(model.count(), bcount);
+    try std.testing.expect(checked == model.count());
+}
