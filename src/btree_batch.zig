@@ -349,14 +349,18 @@ pub const BTreeBatch = struct {
             },
             .branch => {
                 const branch = &cn.branch.?;
-                // 先 flush 所有子（递归）
+                // 先 flush 缓存中存在的子节点（被改过的）；未在缓存的子节点未改，其 ID 即真实 offset
                 for (branch.children.items) |child_id| {
-                    _ = try self.flushNode(child_id);
+                    if (self.cache.get(child_id)) |_| {
+                        _ = try self.flushNode(child_id);
+                    }
                 }
-                // 原地把 children 从缓存 ID 换成真实 offset（u64 原位覆盖，无所有权问题）
+                // 原地把 children 换成真实 offset：缓存中的取 real_off，未在缓存的取 ID 本身
                 for (branch.children.items) |*child_id| {
-                    const child_cn = self.cache.get(child_id.*) orelse return error.CorruptCrc;
-                    child_id.* = child_cn.real_off.?;
+                    if (self.cache.get(child_id.*)) |ccn| {
+                        child_id.* = ccn.real_off.?;
+                    }
+                    // else: child_id 已是真实 store offset（未改）
                 }
                 const off = try appendBranch(self.s, ca, branch);
                 cn.real_off = off;

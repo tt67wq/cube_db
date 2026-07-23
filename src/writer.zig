@@ -5,6 +5,7 @@ const zio = @import("zio");
 const f = @import("format.zig");
 const store_mod = @import("store.zig");
 const btree = @import("btree.zig");
+const btree_batch = @import("btree_batch.zig");
 const file_store = @import("file_store.zig");
 
 const Store = store_mod.Store;
@@ -47,47 +48,34 @@ pub const State = struct {
 pub fn applyBatch(state: *State, batch: []Request) !void {
     // 快照当前 root（DB 层：0=空，n>0=有效 btree off + 1）
     const cur_root = state.root.load(.acquire);
-    var bt_root: u64 = if (cur_root == 0) btree.NULL_ROOT else cur_root - 1;
-    var live_delta: i64 = 0;
-    var dirt_delta: u64 = 0;
-    var count_delta: i64 = 0;
-    var any_err: ?anyerror = null;
-    var err_req_index: ?usize = null;
+    const bt_root: u64 = if (cur_root == 0) btree.NULL_ROOT else cur_root - 1;
 
-    for (batch, 0..) |req, i| {
-        const wr = btree.insert(state.allocator, state.store, bt_root, req.key, req.value, req.tombstone) catch |err| {
-            any_err = err;
-            err_req_index = i;
-            break;
+    // BTreeBatch：所有 op 应用到缓存树，一次 flush（1 header + 1 fsync + COW 摊薄）
+    var bt = btree_batch.BTreeBatch.init(state.allocator, state.store, bt_root);
+    defer bt.deinit();
+
+    for (batch) |req| {
+        bt.apply(req.key, req.value, req.tombstone) catch |err| {
+            // apply 失败（如内存）：全批不提交，全部 future set err
+            for (batch) |r| r.future.set(err);
+            return;
         };
-        bt_root = wr.new_root;
-        live_delta += wr.live_delta;
-        dirt_delta += wr.dirt_delta;
-        count_delta += wr.count_delta;
     }
-
-    if (any_err) |err| {
-        // 失败：对已处理请求设成功，对失败请求设错误，后续未处理也设错误
-        for (batch, 0..) |req, i| {
-            if (i < err_req_index.?) {
-                req.future.set({});
-            } else {
-                req.future.set(err);
-            }
-        }
+    const wr = bt.commit() catch |err| {
+        for (batch) |r| r.future.set(err);
         return;
-    }
+    };
 
     // 提交：写 header（root、dirt、count、byte_size）
     // DB 层 root：0=空，n>0=btree off + 1
-    const new_db_root: u64 = if (bt_root == btree.NULL_ROOT) 0 else bt_root + 1;
+    const new_db_root: u64 = if (wr.new_root == btree.NULL_ROOT) 0 else wr.new_root + 1;
     const cur_dirt = state.dirt.load(.acquire);
     const cur_count = state.entry_count.load(.acquire);
     const cur_byte = state.byte_size.load(.acquire);
-    const new_dirt = cur_dirt + dirt_delta;
-    const new_count_signed: i64 = @as(i64, @intCast(cur_count)) + count_delta;
+    const new_dirt = cur_dirt + wr.dirt_delta;
+    const new_count_signed: i64 = @as(i64, @intCast(cur_count)) + wr.count_delta;
     const new_count: u64 = @intCast(@max(@as(i64, 0), new_count_signed));
-    const new_byte_signed: i64 = @as(i64, @intCast(cur_byte)) + live_delta;
+    const new_byte_signed: i64 = @as(i64, @intCast(cur_byte)) + wr.live_delta;
     const new_byte: u64 = @intCast(@max(@as(i64, 0), new_byte_signed));
 
     _ = try file_store.appendHeaderRecord(state.fs, .{

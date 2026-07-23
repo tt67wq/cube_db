@@ -6,6 +6,7 @@ const cube = @import("cube_db");
 const btree = cube.btree;
 const btree_batch = cube.btree_batch;
 const store_mod = cube.store;
+const writer = cube.writer;
 const CountStore = @import("count_store.zig").CountStore;
 
 // NOTE: import path resolved below — cube_db root re-exports modules.
@@ -158,3 +159,4 @@ test "BTreeBatch: random batch vs model (seed 11, mixed put/delete)" {
     try std.testing.expectEqual(model.count(), bcount);
     try std.testing.expect(checked == model.count());
 }
+
