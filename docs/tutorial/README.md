@@ -12,7 +12,7 @@
 
 ## cube_db 是什么？
 
-`cube_db` 是一个用 **Zig 0.16.0** 写的嵌入式键值存储，参考 Elixir 的 [CubDB](https://github.com/lucasavila00/cubdb) 架构：
+`cube_db` 是一个用 **Zig 0.16.0** 写的嵌入式键值存储，参考 Elixir 的 [CubDB](https://github.com/lucaong/cubdb) 架构：
 
 - **嵌入式**：不是一个独立服务器，而是一个库，你的程序里直接创建数据库对象。
 - **KV 数据库**：只提供 `get` / `put` / `delete` / `select` 这类基础操作。

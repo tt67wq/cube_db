@@ -1,20 +1,22 @@
 # cube_db
 
-用 Zig 0.16.0 写的嵌入式键值存储，参考 [CubDB](https://github.com/lucasavila00/cubdb) 架构：
+An embedded key-value store written in Zig 0.16.0, modeled after the [CubDB](https://github.com/lucaong/cubdb) architecture:
 
-- 嵌入式 KV 引擎：`get` / `put` / `delete` / `select`
-- append-only 数据文件
-- 不可变 B-tree（Copy-on-Write）
-- compaction 回收旧版本
+- Embedded KV engine: `get` / `put` / `delete` / `select`
+- Append-only data file
+- Immutable B-tree (Copy-on-Write)
+- Compaction to reclaim old versions
 
-完整实现说明见 [`docs/tutorial/`](docs/tutorial/)。
+Full implementation notes in [`docs/tutorial/`](docs/tutorial/).
 
-## 依赖
+> 中文版见 [README.zh.md](README.zh.md).
+
+## Dependencies
 
 - Zig 0.16.0
-- 本地 `../zio` 仓库（`build.zig.zon` 的 path 依赖）
+- Local `../zio` repo (`build.zig.zon` path dependency)
 
-## 构建与测试
+## Build & Test
 
 ```bash
 zig build test
@@ -22,40 +24,40 @@ zig build test
 
 ## Benchmark
 
-20 格矩阵（5 op × 2 规模 × 2 value 尺寸）。**必须 ReleaseFast**，Debug 数字无意义。
+20-cell matrix (5 ops × 2 scales × 2 value sizes). **Must use ReleaseFast** — Debug numbers are meaningless.
 
 ```bash
-zig build bench -Doptimize=ReleaseFast                  # 全量
-zig build bench -Dbench-scale=small -Doptimize=ReleaseFast  # smoke / 快跑
+zig build bench -Doptimize=ReleaseFast                     # full matrix
+zig build bench -Dbench-scale=small -Doptimize=ReleaseFast  # smoke / quick run
 ```
 
-`-Dbench-scale` 取 `all`|`small`|`large`（默认 `all`）。设计见 `docs/benchmark-design.md`。
+`-Dbench-scale` takes `all`|`small`|`large` (default `all`).
 
-### 结论（NVMe，ReleaseFast）
+### Findings (NVMe, ReleaseFast)
 
-基准矩阵主要数字与判读：
+Key numbers and interpretation from the benchmark matrix:
 
-| 维度 | small | large | 结论 |
+| Dimension | small | large | Conclusion |
 |---|---|---|---|
-| put 100B | 498 us/op | 706 us/op | small→large 变陡 ~1.4×，热在 fsync（~400us/op 固定成本），B-tree 深度次要 |
-| put 10KB | 3.9 ms/op | 3.8 ms/op | 几乎不随规模变，IO 带宽主导（~10KB/fsync） |
-| get 100B | 251 us/op | 494 us/op | large 翻倍 → B-tree 查找 / 随机读随深度变热；仍远快于 put（无 fsync） |
-| get 10KB | 786 us/op | 1.3 ms/op | IO + 查找双重成本 |
-| delete 100B | 416 us/op | — | 同 put 路径（墓碑 + fsync），成本接近 put |
+| put 100B | 498 us/op | 706 us/op | small→large steepens ~1.4×; fsync dominates (~400us/op fixed cost), B-tree depth secondary |
+| put 10KB | 3.9 ms/op | 3.8 ms/op | barely scales with size → I/O bandwidth dominates (~10KB/fsync) |
+| get 100B | 251 us/op | 494 us/op | doubles at large → B-tree lookup / random read heats up with depth; still far faster than put (no fsync) |
+| get 10KB | 786 us/op | 1.3 ms/op | double cost: I/O + lookup |
+| delete 100B | 416 us/op | — | same path as put (tombstone + fsync), cost ≈ put |
 
-要点：
+Key points:
 
-1. **fsync 是绝对热点**。put/delete 每 op 固定 ~400–700us，≈ fsync 延迟；putNoFsync 未测但引擎开销上限即此。
-2. **put 10KB vs 100B 差值 ≈ 写盘时间**：3.8ms − 0.7ms ≈ 3.1ms/10KB ≈ ~3.2 MB/s 落盘带宽，fsync 串行拖后腿。
-3. **get 远快于 put**（251us vs 498us，无 fsync），符合预期；large get 翻倍 → 查找 / page cache 未命中随规模上升，优化点在 B-tree 查找与读路径。
-4. **compact**：small 100B ~4s / 10KB ~35s，全量重写（seq read + write + sync），~100MB 耗 35s ≈ ~2.9 MB/s —— fsync 串行与单线程重写是瓶颈，多线程重写 / 流式 sync 是优化方向。
-5. **COW dirt 放大**：large×100B 预载（1M puts）产生 ~4.7GB 物理文件（live ~120MB，~33×），auto-compact 当前是 stub 未自动回收——手动 `compact()` 或后台 compactor 是必需。
+1. **fsync is the absolute hotspot.** put/delete run ~400–700us/op fixed, ≈ fsync latency; putNoFsync unmeasured but this is the engine-overhead ceiling.
+2. **put 10KB vs 100B delta ≈ write-to-disk time**: 3.8ms − 0.7ms ≈ 3.1ms/10KB ≈ ~3.2 MB/s flush bandwidth — serial fsync is the drag.
+3. **get is far faster than put** (251us vs 498us, no fsync), as expected; large get doubles → lookup / page-cache miss rises with scale — optimize B-tree lookup & read path.
+4. **compact**: small 100B ~4s / 10KB ~35s, full rewrite (seq read + write + sync), ~100MB in 35s ≈ ~2.9 MB/s — serial fsync + single-threaded rewrite is the bottleneck; multi-threaded rewrite / streaming sync is the fix.
+5. **COW dirt amplification**: large×100B preload (1M puts) yields ~4.7GB physical file (live ~120MB, ~33×); auto-compact is currently a stub and doesn't reclaim automatically — manual `compact()` or a background compactor is required.
 
-> **最高 ROI 优化**：开组提交 / 批量 fsync（`sendRequest` 现每 op 1 元素 batch + 1 fsync），put/delete 吞吐可提升 1–2 个量级；其次 get 查找路径与 compact 流式化。
+> **Highest-ROI optimization**: enable group commit / batched fsync (`sendRequest` currently builds a 1-element batch + 1 fsync per op); put/delete throughput could improve 1–2 orders of magnitude. Next: get lookup path and compact streaming.
 
-> 注：delete large / select large / compact large 单格耗时长（fsync 次数 × 1M 或全量重写 1GB+），未在 50min 内跑完；形态与 small 同构，按规模线性放。
+> Note: delete large / select large / compact large cells are long-running (1M fsyncs or full rewrite of 1GB+); not finished within 50min. Their shape mirrors small, scaling linearly with size.
 
-## 使用示例
+## Usage Example
 
 ```zig
 const cube = @import("cube_db");
@@ -67,27 +69,27 @@ defer db.close() catch {};
 try db.put("hello", "world");
 const v = try db.get("hello");
 if (v) |value| {
-    // value 由 allocator 分配，用完 free
+    // value is allocator-allocated; free when done
     allocator.free(value);
 }
 ```
 
-`Db.open` 是**纯同步 API**，不需要调用方准备 `zio.Runtime`。
-内部文件 IO 通过 zio 的阻塞降级机制执行，未来启用 writer 协程（D4）时调用方也无感。
+`Db.open` is a **purely synchronous API** — callers don't need to set up a `zio.Runtime`.
+Internal file I/O runs through zio's blocking-degradation mechanism; callers stay unaffected when the writer coroutine (D4) lands.
 
-## 测试覆盖率
+## Test Coverage
 
-Zig 0.16.0 没有内置覆盖率，这里用 [kcov](https://simonkagstrom.github.io/kcov/) 收集。
+Zig 0.16.0 has no built-in coverage; we use [kcov](https://simonkagstrom.github.io/kcov/).
 
-### 1. 安装 kcov
+### 1. Install kcov
 
 ```bash
 brew install kcov
 ```
 
-### 2. 临时 options 模块
+### 2. Temporary options module
 
-`zig test` 命令行不会生成 `build.zig` 里的 `zio_options` 模块，需要先写一份临时文件：
+The `zig test` CLI doesn't generate the `zio_options` module that `build.zig` does, so write a temp file:
 
 ```bash
 cat > /tmp/zio_options.zig <<'EOF'
@@ -99,7 +101,7 @@ pub const task_migration = true;
 EOF
 ```
 
-### 3. 收集 src 单测覆盖率
+### 3. Collect src unit-test coverage
 
 ```bash
 rm -rf /tmp/cov_src
@@ -111,7 +113,7 @@ zig test --test-cmd kcov \
   -Mzio_options=/tmp/zio_options.zig
 ```
 
-### 4. 收集集成测试覆盖率
+### 4. Collect integration-test coverage
 
 ```bash
 rm -rf /tmp/cov_db /tmp/cov_compact
@@ -133,7 +135,7 @@ zig test --test-cmd kcov \
   -Mzio_options=/tmp/zio_options.zig
 ```
 
-### 5. 合并并查看报告
+### 5. Merge and view the report
 
 ```bash
 rm -rf /tmp/cov_merged
@@ -141,11 +143,11 @@ kcov --merge /tmp/cov_merged /tmp/cov_src /tmp/cov_db /tmp/cov_compact
 open /tmp/cov_merged/kcov-merged/index.html
 ```
 
-### 当前覆盖率
+### Current Coverage
 
-42 个测试全部通过，项目代码覆盖率 **96.9%**（1436 / 1482 行）。
+All 42 tests pass; project code coverage is **96.9%** (1436 / 1482 lines).
 
-| 文件 | 覆盖率 |
+| File | Coverage |
 |------|--------|
 | `src/format.zig` | 100.0% |
 | `src/btree.zig` | 99.3% |
@@ -156,4 +158,4 @@ open /tmp/cov_merged/kcov-merged/index.html
 | `src/writer.zig` | 80.4% |
 | `src/root.zig` | 50.0% |
 
-主要未覆盖部分是 `src/root.zig` 的占位导出函数，以及 `src/writer.zig` 的部分错误分支。
+The main uncovered areas are the placeholder export functions in `src/root.zig` and some error branches in `src/writer.zig`.
