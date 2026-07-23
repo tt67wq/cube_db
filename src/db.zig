@@ -23,8 +23,14 @@ pub const Db = struct {
     fs: file_store.FileStore,
     store: Store,
     state: writer.State,
-    /// 写互斥锁（串行化写操作）
+    /// 写互斥锁（串行化 applyBatch：leader 与 putBatch/compact）
     write_mutex: zio.Mutex,
+    /// group commit 队列保护锁
+    queue_mutex: zio.Mutex,
+    /// 待合并的并发写请求（leader/follower）
+    write_queue: std.ArrayListUnmanaged(writer.Request),
+    /// 是否有 leader 正在服务
+    has_leader: bool,
     path: []u8,
 
     const Self = @This();
@@ -39,6 +45,9 @@ pub const Db = struct {
             .store = undefined,
             .state = undefined,
             .write_mutex = .{},
+            .queue_mutex = .{},
+            .write_queue = std.ArrayListUnmanaged(writer.Request).empty,
+            .has_leader = false,
             .path = try allocator.dupe(u8, path),
         };
         errdefer allocator.free(self.path);
@@ -87,6 +96,7 @@ pub const Db = struct {
         self.state.closed.store(true, .release);
         self.store.sync() catch {};
         self.fs.close();
+        self.write_queue.deinit(self.allocator);
         self.allocator.free(self.path);
         self.allocator.destroy(self);
     }
@@ -149,10 +159,14 @@ pub const Db = struct {
         return self.sendRequest(key, "", true);
     }
 
+    /// 错误路径让出 leader 身份（防 follower 死等）
+    fn leaderReset(self: *Self) void {
+        self.queue_mutex.lock() catch {};
+        self.has_leader = false;
+        self.queue_mutex.unlock();
+    }
+
     fn sendRequest(self: *Self, key: []const u8, value: []const u8, tombstone: bool) !void {
-        // ponytail: MVP 同步写——加写互斥锁保证串行（替代 D4 writer 协程）。
-        try self.write_mutex.lock();
-        defer self.write_mutex.unlock();
         var future: zio.Future(writer.OpResult) = .init;
         const req: writer.Request = .{
             .key = key,
@@ -160,8 +174,50 @@ pub const Db = struct {
             .tombstone = tombstone,
             .future = &future,
         };
-        var batch = [_]writer.Request{req};
-        try writer.applyBatch(&self.state, &batch);
+
+        // 入队 + leader 选举（queue_mutex 保护 has_leader + write_queue）
+        try self.queue_mutex.lock();
+        self.write_queue.append(self.allocator, req) catch |err| {
+            self.queue_mutex.unlock();
+            return err;
+        };
+        if (self.has_leader) {
+            // follower：req 已在队列，等 leader 处理后唤醒
+            self.queue_mutex.unlock();
+            const result = try future.wait();
+            return result.value;
+        }
+        self.has_leader = true; // 我是 leader
+        self.queue_mutex.unlock();
+
+        // leader：持 write_mutex，循环清空队列 + applyBatch，直到队列空
+        // 错误路径经 defer 让出 leader 身份；正常退出在 break 前已让出
+        try self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+        defer leaderReset(self);
+        while (true) {
+            try self.queue_mutex.lock();
+            const batch = self.write_queue.toOwnedSlice(self.allocator) catch |err| {
+                self.queue_mutex.unlock();
+                return err;
+            };
+            if (batch.len == 0) {
+                self.allocator.free(batch);
+                self.has_leader = false; // 让出 leader，允许新 leader 接手
+                self.queue_mutex.unlock();
+                break;
+            }
+            self.queue_mutex.unlock();
+
+            writer.applyBatch(&self.state, batch) catch |err| {
+                // applyBatch 已 set 全部 future=err；defer leaderReset 让出 leader
+                self.allocator.free(batch);
+                return err;
+            };
+            self.allocator.free(batch);
+        }
+
+        // leader 自己的 req 已被某批 applyBatch set
         const result = try future.wait();
         return result.value;
     }

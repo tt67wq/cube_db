@@ -186,7 +186,7 @@ pub fn applyBatch(state: *State, batch: []Request) !void {
 
 Option A = 按 key 排序 + 每 leaf 一次 decode→改→append（无缓存，leaf 级合并）。~3–5x，~150 LOC，无 offset 分配难题。作为 B 交付前的去风险台阶或 B flush 证伪时的降级。
 
-## 5. 杠杆 3：隐式 group commit（并发）
+## 5. 杠杆 3：隐式 group commit（并发）✅ 已实现
 
 （详细见前版 §3，此处摘要 + 与 1/2 的衔接）
 
@@ -194,6 +194,15 @@ Option A = 按 key 排序 + 每 leaf 一次 decode→改→append（无缓存，
 - 并发 put/delete/putBatch 自动合并到一次 applyBatch。
 - **与 BTreeBatch 衔接**：leader 收集到的 N 个 req（来自不同调用方）传给 applyBatch → BTreeBatch 一次 flush。并发乘数 × COW 摊薄叠加。
 - batch-of-1 零开销（零并发）。
+
+**实现落地**（`src/db.zig` `sendRequest`）：
+- 入队：`queue_mutex` 保护 `write_queue: ArrayListUnmanaged(Request)` `has_leader: bool`。
+- leader 选举：`queue_mutex` 下 enqueue；`has_leader` 已真 → follower，解锁、`future.wait`；否则置 `has_leader=true` 成为 leader。
+- leader：持 `write_mutex`，循环清空队列（`toOwnedSlice`）+ `applyBatch`，队列空则 `has_leader=false` 卸任、break；任何错误路径经 `defer leaderReset` 释 `has_leader` 防 follower 死等。
+- follower 的 future 由 `writer.applyBatch` 末尾 set；唤醒经内核 futex（无 runtime 亦可用）。
+- 锁序：leader write_mutex→queue_mutex；follower 与 putBatch/compact 仅各自一把锁，无反转。
+
+**验证**（`tests/group_commit_test.zig`，TDD red→green）：16 线程 × 50 put = 800 op 合并为 ~117 次 `applyBatch`（~6.8× 更少 fsync），800 key 全可读；并发 delete 合并测试同此。合并度经 `writer.State.apply_count`（`applyBatch` 顶部自增）观测。
 
 ## 6. 三杠杆如何叠加
 

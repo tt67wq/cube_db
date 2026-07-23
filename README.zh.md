@@ -57,7 +57,7 @@ zig build bench -Dbench-scale=small -Doptimize=ReleaseFast  # smoke / 快跑
 
 > **已实现（单线程）**：`putBatch` + `BTreeBatch` → put 吞吐 ~1000×（摊薄 fsync + COW）。批量节点内存由 arena 管理；节点缓存 + 自底向上 flush（子先父后分配 offset）。
 >
-> **未做（并发 group commit）**：隐式合并并发 put/delete 的 leader/follower。**已验证可行**：`zio.Future.wait()` 在原始线程上可用（无需 runtime）——无 task 上下文时走内核 futex（`NotifyFutex`），既有测试 `db: concurrent puts all visible` 已跑 10 线程 × 100 `put`（→ `future.wait`）全绿。设计 §5 用 `future.wait` 做 follower 唤醒的原样可实现。未做是优先级/工作量：杠杆 1+2 已交付用户指出的 fsync 瓶颈（~1000×）；杠杆 3 在其上叠并发乘数，留作后续。
+> **已实现（并发 group commit，杠杆 3）**：`sendRequest` 中隐式合并并发 put/delete 的 leader/follower。无活跃 leader 的线程负责清空请求队列合并一次 applyBatch（1 fsync）；follower 入队后阻塞在自己的 `zio.Future`（内核 futex，原始线程可用）。leader 在队列非空时持续服务，空则卸任。`writer.applyBatch` 本就 set 全部 future，无需额外管道。`tests/group_commit_test.zig` 验证：16 线程 × 50 put（800 op）合并为 ~117 次 applyBatch（~6.8× 更少 fsync），800 key 全可读；并发 delete 合并测试同此。合并度经 `writer.State.apply_count` 计数器观测。
 
 > 注：delete large / select large / compact large 单格耗时长（1M fsync 或全量重写 1GB+），未跑完；形态与 small 同构，按规模线性放。
 

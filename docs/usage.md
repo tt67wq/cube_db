@@ -266,8 +266,8 @@ db.put("k", "v") catch |err| switch (err) {
 ## 9. 并发
 
 - **多线程读**：安全。`get`/`select` 读原子 root 快照，无锁无 fsync，可与写并发。
-- **多线程写**：安全但串行。`put`/`putBatch`/`delete`/`compact` 共用写互斥锁，并发调用会排队。当前无 group commit（并发写不会自动合并 fsync——见 README benchmark 备注），每个写仍各自 fsync。
-- 想要高吞吐写：用 `putBatch` 把多条合并成一次提交（单线程即可拿 ~1000×），而非多线程并发 `put`。
+- **多线程写**：安全，且**自动合并**。`put`/`delete` 经 leader/follower group commit：并发调用者入共享队列，无 leader 的线程负责清空队列合并成一次 `applyBatch`（1 fsync），其余当 follower 阻塞在自己的 Future 等唤醒。16 线程 × 50 put 实测合并 ~6.8×（800 op → ~117 次 fsync）。`putBatch` 本身已是单次提交；`compact` 经写互斥锁与写串行。
+- 想要最高吞吐单线程写：用 `putBatch`（~1000×，1 fsync 摊到 N op + COW 摊薄）；并发写则 group commit 自动叠乘数。
 - **不要跨线程共享一个迭代器**；每个线程各开各的 `select`。
 
 ```zig

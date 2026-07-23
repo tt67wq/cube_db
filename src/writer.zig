@@ -41,11 +41,14 @@ pub const State = struct {
     closed: std.atomic.Value(bool),
     /// 自动 compaction 触发计数（测试用）
     compact_count: std.atomic.Value(u32),
+    /// applyBatch 调用次数（group commit 合并度观测）
+    apply_count: std.atomic.Value(u64) = .init(0),
 };
 
 /// 应用一批写请求，COW 构建新 root，写 header，fsync，更新原子状态。
 /// 返回写入的 header 数（1）。
 pub fn applyBatch(state: *State, batch: []Request) !void {
+    _ = state.apply_count.fetchAdd(1, .monotonic);
     // 快照当前 root（DB 层：0=空，n>0=有效 btree off + 1）
     const cur_root = state.root.load(.acquire);
     const bt_root: u64 = if (cur_root == 0) btree.NULL_ROOT else cur_root - 1;
