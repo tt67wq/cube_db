@@ -4,6 +4,9 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // ponytail: bench scale 过滤（smoke/small-only）；默认 all 跑全 20 格。
+    const bench_scale = b.option([]const u8, "bench-scale", "Bench scale filter: all|small|large") orelse "all";
+
     const zio_dep = b.dependency("zio", .{
         .target = target,
         .optimize = optimize,
@@ -37,6 +40,31 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
         run_cmd.addArgs(args);
+    }
+
+    // Benchmark 可执行 + step（zig build bench -Doptimize=ReleaseFast）
+    const bench_opts = b.addOptions();
+    bench_opts.addOption([]const u8, "scale_filter", bench_scale);
+    const bench_exe = b.addExecutable(.{
+        .name = "cube_bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    bench_exe.root_module.addOptions("bench_opts", bench_opts);
+    b.installArtifact(bench_exe);
+
+    const bench_step = b.step("bench", "Run benchmark matrix (20 cells)");
+    const bench_cmd = b.addRunArtifact(bench_exe);
+    bench_step.dependOn(&bench_cmd.step);
+    if (b.args) |args| {
+        bench_cmd.addArgs(args);
     }
 
     // Library unit tests (test blocks inside src/).
