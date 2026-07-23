@@ -69,6 +69,13 @@ pub fn decodeNodePayload(rec: []const u8) ![]const u8 {
     return f.decodeRecord(rec) catch return error.CorruptCrc;
 }
 
+/// 读路径用：解析 len + payload，不验 CRC（边界/header 恢复仍验）。
+/// ponytail: 热读路径跳过 per-node CRC（~8KB Crc32），损害检测由 open/恢复时的 header 扫描 + 写路径 CRC 兑。
+/// 仅 btree.get 读路径调；readRecord/写路径仍走 decodeNodePayload（验 CRC）。
+pub fn decodeNodePayloadNoCrc(rec: []const u8) ![]const u8 {
+    return f.decodeRecordNoCrc(rec) catch return error.CorruptCrc;
+}
+
 // ===== 叶节点内存表示（用于 COW 操作） =====
 pub const LeafEntry = f.LeafEntry;
 
@@ -220,19 +227,11 @@ pub fn get(allocator: std.mem.Allocator, s: Store, root: u64, key: []const u8) !
     while (depth < 1000) : (depth += 1) {
         const rec = try readRecord(allocator, s, cur);
         defer allocator.free(rec);
-        const payload = try decodeNodePayload(rec);
+        const payload = decodeNodePayloadNoCrc(rec) catch return error.CorruptCrc;
         if (payload.len == 0) return error.Truncated;
         if (payload[0] == @intFromEnum(f.NodeKind.leaf)) {
-            var leaf = try Leaf.fromPayload(allocator, payload);
-            defer leaf.deinit(allocator);
-            const pos = leaf.findPos(key);
-            if (pos < leaf.entries.items.len) {
-                const e = leaf.entries.items[pos];
-                if (cmpKey(e.key, key) == .eq and !e.tombstone) {
-                    return try allocator.dupe(u8, e.value);
-                }
-            }
-            return null;
+            // T5: skip 全 leaf 解码，直接从 payload seek 目标 key。
+            return findInLeaf(allocator, payload, key);
         } else {
             var branch = try Branch.fromPayload(allocator, payload);
             defer branch.deinit(allocator);
@@ -241,6 +240,43 @@ pub fn get(allocator: std.mem.Allocator, s: Store, root: u64, key: []const u8) !
         }
     }
     return error.Truncated;
+}
+
+// ===== 读路径优化（T5）：get 不全解码 leaf，直接从原始 payload seek 目标 key =====
+
+/// 从 leaf 原始 payload 直接 seek 目标 key，返回 dup 的 value（调用方 free）。
+/// 不 `Leaf.fromPayload` 全量解码、不逐 entry `allocator.dupe`——只匹配目标 key 时 dup 一个 value。
+/// leaf entries 排序，线性扫到第一个 >= key 的 entry；命中 eq 且非 tombstone 返回 value。
+/// 仅 get 读路径用；写路径（COW insert/delete）仍用 `Leaf.fromPayload` 全量解码。
+pub fn findInLeaf(allocator: std.mem.Allocator, payload: []const u8, key: []const u8) !?[]u8 {
+    if (payload.len < 3) return error.Truncated;
+    if (payload[0] != @intFromEnum(f.NodeKind.leaf)) return error.CorruptCrc;
+    const count = std.mem.readInt(u16, payload[1..3], .big);
+    var pos: usize = 3;
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        if (pos + 1 + 4 > payload.len) return error.Truncated;
+        const tombstone = payload[pos] == 1;
+        pos += 1;
+        const klen = std.mem.readInt(u32, payload[pos..][0..4], .big);
+        pos += 4;
+        if (pos + klen > payload.len) return error.Truncated;
+        const ek = payload[pos .. pos + klen];
+        pos += klen;
+        if (pos + 4 > payload.len) return error.Truncated;
+        const vlen = std.mem.readInt(u32, payload[pos..][0..4], .big);
+        pos += 4;
+        if (pos + vlen > payload.len) return error.Truncated;
+        const ev = payload[pos .. pos + vlen];
+        pos += vlen;
+        // entries 排序：扫到第一个 >= key 的；eq 命中返，gt 则 miss
+        switch (cmpKey(ek, key)) {
+            .lt => continue,
+            .eq => return if (!tombstone) try allocator.dupe(u8, ev) else null,
+            .gt => return null,
+        }
+    }
+    return null;
 }
 
 // ===== insert（COW） =====

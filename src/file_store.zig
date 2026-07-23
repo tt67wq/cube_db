@@ -5,8 +5,13 @@ const std = @import("std");
 const zio = @import("zio");
 const f = @import("format.zig");
 const store_mod = @import("store.zig");
+const mmap_mod = @import("mmap.zig");
 
 const Store = store_mod.Store;
+
+/// 预留 mmap 虚拟区大小（1 TB，sparse 几乎不占资源）。
+/// append-only COW 下 reader 沿 root 有效 offset ≤ backing，不越界。
+const MMAP_REGION: usize = 1 << 40;
 
 pub const FileStore = struct {
     allocator: std.mem.Allocator,
@@ -16,6 +21,10 @@ pub const FileStore = struct {
     /// 物理写入游标（含块标记）
     physical_len: u64,
     sync_count: u32 = 0,
+    /// mmap 预留区基指针（null = mmap 失败/未用，回退 pread）
+    mmap_base: ?[*]align(mmap_mod.PAGE_SIZE) u8 = null,
+    /// mmap 预留区长度
+    mmap_region_len: usize = 0,
 
     const Self = @This();
 
@@ -34,12 +43,20 @@ pub const FileStore = struct {
             // 末块至少 1 字节 marker；若 rem==1 仅 marker 无内容
             if (rem > 1) logical += rem - 1;
         }
-        return .{
+        var self: Self = .{
             .allocator = allocator,
             .file = file,
             .logical_len = logical,
             .physical_len = phys,
         };
+        // T2: mmap 预留大区只读 MAP_SHARED。失败则保持 mmap_base=null 回退 pread。
+        if (mmap_mod.mapReadOnly(@intCast(file.fd), MMAP_REGION)) |ptr| {
+            self.mmap_base = ptr;
+            self.mmap_region_len = MMAP_REGION;
+        } else |_| {
+            // 回退 pread 路径（功能不退化）
+        }
+        return self;
     }
 
     pub fn store(self: *Self) Store {
@@ -49,6 +66,11 @@ pub const FileStore = struct {
     fn vtRead(ptr: *anyopaque, buf: []u8, offset: u64) !usize {
         const self: *Self = @ptrCast(@alignCast(ptr));
         if (offset >= self.logical_len) return 0;
+        // T3: 走 mmap memcpy+跳 marker（零 syscall）；无 mmap 则回退 pread
+        if (self.mmap_base) |base| {
+            return self.mmapRead(base, buf, offset);
+        }
+        // 回退：旧 pread 循环
         var logical_pos = offset;
         var written: usize = 0;
         while (written < buf.len and logical_pos < self.logical_len) {
@@ -62,6 +84,26 @@ pub const FileStore = struct {
             written += n;
             logical_pos += n;
             if (n == 0) break;
+        }
+        return written;
+    }
+
+    /// mmap 读：memcpy from base + logical→physical 指针算 + 跨 marker 边界跳 1 字节。
+    /// bounds-check：调用方保证 offset < logical_len；此处再防 `offset+buf.len` 超 logical_len。
+    fn mmapRead(self: *Self, base: [*]align(mmap_mod.PAGE_SIZE) const u8, buf: []u8, offset: u64) usize {
+        const avail = self.logical_len - offset;
+        const want = @min(buf.len, avail);
+        var logical_pos = offset;
+        var written: usize = 0;
+        while (written < want) {
+            const phys = store_mod.logicalToPhysical(logical_pos);
+            const block_content_pos = logical_pos % (f.BLOCK_SIZE - 1);
+            const block_remaining = (f.BLOCK_SIZE - 1) - block_content_pos;
+            const take = @min(want - written, block_remaining);
+            const src = base + phys;
+            @memcpy(buf[written .. written + take], src[0..take]);
+            written += take;
+            logical_pos += take;
         }
         return written;
     }
@@ -124,10 +166,18 @@ pub const FileStore = struct {
 
     fn vtClose(ptr: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ptr));
+        if (self.mmap_base) |base| {
+            mmap_mod.unmap(base, self.mmap_region_len);
+            self.mmap_base = null;
+        }
         self.file.close();
     }
 
     pub fn close(self: *Self) void {
+        if (self.mmap_base) |base| {
+            mmap_mod.unmap(base, self.mmap_region_len);
+            self.mmap_base = null;
+        }
         self.file.close();
     }
 };

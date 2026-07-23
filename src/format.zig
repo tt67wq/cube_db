@@ -137,6 +137,15 @@ pub fn decodeRecord(buf: []const u8) Error![]const u8 {
     return payload;
 }
 
+/// 解析 len + payload，不验 CRC（热读路径用；边界恢复仍走 decodeRecord 验）。
+pub fn decodeRecordNoCrc(buf: []const u8) Error![]const u8 {
+    if (buf.len < REC_LEN_SIZE + REC_CRC_SIZE) return error.Truncated;
+    const len = std.mem.readInt(u32, buf[0..4], .big);
+    const need = REC_LEN_SIZE + @as(usize, len) + REC_CRC_SIZE;
+    if (buf.len < need) return error.Truncated;
+    return buf[REC_LEN_SIZE .. REC_LEN_SIZE + len];
+}
+
 // ---------- 节点 payload 编解码 ----------
 
 /// 计算 branch payload 字节数。

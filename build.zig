@@ -19,6 +19,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     mod.addImport("zio", zio_mod);
+    mod.link_libc = true; // T1: mmap wrapper 用 @cImport libc
 
     const exe = b.addExecutable(.{
         .name = "cube_db",
