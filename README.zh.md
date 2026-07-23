@@ -57,7 +57,7 @@ zig build bench -Dbench-scale=small -Doptimize=ReleaseFast  # smoke / 快跑
 
 > **已实现（单线程）**：`putBatch` + `BTreeBatch` → put 吞吐 ~1000×（摊薄 fsync + COW）。批量节点内存由 arena 管理；节点缓存 + 自底向上 flush（子先父后分配 offset）。
 >
-> **未做（并发 group commit）**：隐式合并并发 put/delete 的 leader/follower。`zio.Future.wait()` 不能阻塞原始线程（无 runtime），但 `zio.Condition` 可以（spike 验证）——待在 `sendRequest` 实现 Condition 版 leader/follower。在 `putBatch` 之上再叠加并发乘数。
+> **未做（并发 group commit）**：隐式合并并发 put/delete 的 leader/follower。**已验证可行**：`zio.Future.wait()` 在原始线程上可用（无需 runtime）——无 task 上下文时走内核 futex（`NotifyFutex`），既有测试 `db: concurrent puts all visible` 已跑 10 线程 × 100 `put`（→ `future.wait`）全绿。设计 §5 用 `future.wait` 做 follower 唤醒的原样可实现。未做是优先级/工作量：杠杆 1+2 已交付用户指出的 fsync 瓶颈（~1000×）；杠杆 3 在其上叠并发乘数，留作后续。
 
 > 注：delete large / select large / compact large 单格耗时长（1M fsync 或全量重写 1GB+），未跑完；形态与 small 同构，按规模线性放。
 

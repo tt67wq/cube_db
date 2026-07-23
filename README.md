@@ -57,7 +57,7 @@ Key points:
 
 > **Implemented (single-thread)**: `putBatch` + `BTreeBatch` → ~1000× put throughput by amortizing fsync + COW. Uses `arena` allocator for batch-node lifetime; node cache + bottom-up flush (children-first offset assignment).
 >
-> **Not yet done (concurrent group commit)**: implicit batching of *concurrent* `put`/`delete` callers via leader/follower on the write mutex. `zio.Future.wait()` does not block raw threads (no runtime), but `zio.Condition` does (spike-verified) — implementation pending a Condition-based leader/follower in `sendRequest`. Gives a concurrency multiplier on top of `putBatch`.
+> **Not yet done (concurrent group commit)**: implicit batching of *concurrent* `put`/`delete` callers via leader/follower on the write mutex. **Verified feasible**: `zio.Future.wait()` works on raw threads (no runtime needed) — the no-task path uses a kernel futex (`NotifyFutex`), and the existing `db: concurrent puts all visible` test already drives 10 threads × 100 `put` (→ `future.wait`) green. Design §5's leader/follower via `future.wait` is implementable as-is. Not done for priority/workload reasons: lever 1+2 already delivered the user-flagged fsync bottleneck (~1000×); lever 3 stacks a concurrency multiplier on top and remains a follow-up.
 
 > Note: delete large / select large / compact large cells are long-running (1M fsyncs or full rewrite of 1GB+); not run to completion. Their shape mirrors small, scaling linearly with size.
 
