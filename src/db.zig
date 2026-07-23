@@ -11,6 +11,13 @@ const writer = @import("writer.zig");
 pub const Options = writer.Options;
 pub const Store = store_mod.Store;
 
+/// 批量写条目（putBatch）。
+pub const Entry = struct {
+    key: []const u8,
+    value: []const u8,
+    tombstone: bool = false,
+};
+
 pub const Db = struct {
     allocator: std.mem.Allocator,
     fs: file_store.FileStore,
@@ -98,6 +105,38 @@ pub const Db = struct {
 
     pub fn put(self: *Self, key: []const u8, value: []const u8) !void {
         return self.sendRequest(key, value, false);
+    }
+
+    /// 批量写：一次 applyBatch + 一次 fsync，COW 摊薄（lever 1+2）。
+    /// entries 内同 key 后者胜；不保证调用方顺序语义。
+    pub fn putBatch(self: *Self, entries: []const Entry) !void {
+        if (entries.len == 0) return;
+        // 栈 future 受限，堆分配 future 数组（调用方释放责任轻；本函数内同生命周期）
+        const futures = try self.allocator.alloc(zio.Future(writer.OpResult), entries.len);
+        defer self.allocator.free(futures);
+        const reqs = try self.allocator.alloc(writer.Request, entries.len);
+        defer self.allocator.free(reqs);
+        for (entries, 0..) |e, i| {
+            futures[i] = .init;
+            reqs[i] = .{
+                .key = e.key,
+                .value = if (e.tombstone) "" else e.value,
+                .tombstone = e.tombstone,
+                .future = &futures[i],
+            };
+        }
+        try self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+        try writer.applyBatch(&self.state, reqs);
+        // 全部 future 已 set，收集结果
+        var first_err: ?anyerror = null;
+        for (futures) |*fut| {
+            const r = try fut.wait();
+            if (first_err == null) {
+                if (r.value) |_| {} else |err| first_err = err;
+            }
+        }
+        if (first_err) |err| return err;
     }
 
     pub fn putNoFsync(self: *Self, key: []const u8, value: []const u8) !void {

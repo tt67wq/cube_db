@@ -12,6 +12,7 @@ pub const fault_store = @import("fault_store.zig");
 
 pub const Header = format.Header;
 pub const Options = db.Options;
+pub const Entry = db.Entry;
 pub const Db = db.Db;
 
 // ponytail: add 保留导出，后续 db.zig 落地后替换
