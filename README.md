@@ -39,7 +39,9 @@ Key numbers and interpretation from the benchmark matrix:
 
 | Dimension | small | large | Conclusion |
 |---|---|---|---|
-| put 100B | 498 us/op | 706 us/op | small→large steepens ~1.4×; fsync dominates (~400us/op fixed cost), B-tree depth secondary |
+| put 100B | 498 us/op | 706 us/op | fsync dominates (~400us/op fixed cost), B-tree depth secondary |
+| **putBatch 100B** | **0.15 us/op** | — | **~1000× faster than put** — BTreeBatch amortizes COW path rewrite + 1 fsync for N ops |
+| **putBatch 10KB** | **2.5 us/op** | — | ~1400× faster; fsync + COW both amortized across the batch |
 | put 10KB | 3.9 ms/op | 3.8 ms/op | barely scales with size → I/O bandwidth dominates (~10KB/fsync) |
 | get 100B | 251 us/op | 494 us/op | doubles at large → B-tree lookup / random read heats up with depth; still far faster than put (no fsync) |
 | get 10KB | 786 us/op | 1.3 ms/op | double cost: I/O + lookup |
@@ -47,15 +49,17 @@ Key numbers and interpretation from the benchmark matrix:
 
 Key points:
 
-1. **fsync is the absolute hotspot.** put/delete run ~400–700us/op fixed, ≈ fsync latency; putNoFsync unmeasured but this is the engine-overhead ceiling.
-2. **put 10KB vs 100B delta ≈ write-to-disk time**: 3.8ms − 0.7ms ≈ 3.1ms/10KB ≈ ~3.2 MB/s flush bandwidth — serial fsync is the drag.
-3. **get is far faster than put** (251us vs 498us, no fsync), as expected; large get doubles → lookup / page-cache miss rises with scale — optimize B-tree lookup & read path.
-4. **compact**: small 100B ~4s / 10KB ~35s, full rewrite (seq read + write + sync), ~100MB in 35s ≈ ~2.9 MB/s — serial fsync + single-threaded rewrite is the bottleneck; multi-threaded rewrite / streaming sync is the fix.
-5. **COW dirt amplification**: large×100B preload (1M puts) yields ~4.7GB physical file (live ~120MB, ~33×); auto-compact is currently a stub and doesn't reclaim automatically — manual `compact()` or a background compactor is required.
+1. **fsync-per-op was the absolute hotspot** (put ~400–700us/op ≈ fsync latency). **Solved**: `putBatch([]Entry)` + `BTreeBatch` (node cache + dirty set + one flush) amortize both fsync and COW path rewrite → **~1000× single-thread throughput** (0.15us/op vs 498us/op).
+2. **put 10KB vs 100B delta ≈ write-to-disk time**: 3.8ms − 0.7ms ≈ 3.1ms/10KB ≈ ~3.2 MB/s flush bandwidth — serial fsync was the drag; `putBatch` collapses it.
+3. **get is far faster than put** (251us vs 498us, no fsync), as expected; large get doubles → lookup / page-cache miss rises with scale — optimize B-tree lookup & read path (still open).
+4. **compact**: small 100B ~4s / 10KB ~35s, full rewrite (seq read + write + sync), ~100MB in 35s ≈ ~2.9 MB/s — single-threaded rewrite is the bottleneck; multi-threaded rewrite / streaming sync is the fix (still open).
+5. **COW dirt amplification**: large×100B preload (1M puts) yields ~4.7GB physical file (live ~120MB, ~33×); auto-compact is a stub — manual `compact()` or a background compactor is required.
 
-> **Highest-ROI optimization**: enable group commit / batched fsync (`sendRequest` currently builds a 1-element batch + 1 fsync per op); put/delete throughput could improve 1–2 orders of magnitude. Next: get lookup path and compact streaming.
+> **Implemented (single-thread)**: `putBatch` + `BTreeBatch` → ~1000× put throughput by amortizing fsync + COW. Uses `arena` allocator for batch-node lifetime; node cache + bottom-up flush (children-first offset assignment).
+>
+> **Not yet done (concurrent group commit)**: implicit batching of *concurrent* `put`/`delete` callers via leader/follower on the write mutex. `zio.Future.wait()` does not block raw threads (no runtime), but `zio.Condition` does (spike-verified) — implementation pending a Condition-based leader/follower in `sendRequest`. Gives a concurrency multiplier on top of `putBatch`.
 
-> Note: delete large / select large / compact large cells are long-running (1M fsyncs or full rewrite of 1GB+); not finished within 50min. Their shape mirrors small, scaling linearly with size.
+> Note: delete large / select large / compact large cells are long-running (1M fsyncs or full rewrite of 1GB+); not run to completion. Their shape mirrors small, scaling linearly with size.
 
 ## Usage Example
 
