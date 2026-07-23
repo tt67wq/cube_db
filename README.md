@@ -7,7 +7,7 @@ An embedded key-value store written in Zig 0.16.0, modeled after the [CubDB](htt
 - Immutable B-tree (Copy-on-Write)
 - Compaction to reclaim old versions
 
-Full implementation notes in [`docs/tutorial/`](docs/tutorial/).
+Full implementation notes in [`docs/tutorial/`](docs/tutorial/). **Usage manual: [`docs/usage.md`](docs/usage.md).**
 
 > 中文版见 [README.zh.md](README.zh.md).
 
@@ -63,6 +63,8 @@ Key points:
 
 ## Usage Example
 
+A minimal open→put→get→close:
+
 ```zig
 const cube = @import("cube_db");
 const Db = cube.Db;
@@ -77,6 +79,8 @@ if (v) |value| {
     allocator.free(value);
 }
 ```
+
+For the full API (`putBatch`, `select` range queries, `compact`, `Options`, error handling, concurrency, recipes) see the **[usage manual](docs/usage.md)**.
 
 `Db.open` is a **purely synchronous API** — callers don't need to set up a `zio.Runtime`.
 Internal file I/O runs through zio's blocking-degradation mechanism; callers stay unaffected when the writer coroutine (D4) lands.

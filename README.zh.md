@@ -7,7 +7,7 @@
 - 不可变 B-tree（Copy-on-Write）
 - compaction 回收旧版本
 
-完整实现说明见 [`docs/tutorial/`](docs/tutorial/)。
+完整实现说明见 [`docs/tutorial/`](docs/tutorial/)。**使用手册：[`docs/usage.md`](docs/usage.md)。**
 
 > 英文版见 [README.md](README.md)。
 
@@ -63,6 +63,8 @@ zig build bench -Dbench-scale=small -Doptimize=ReleaseFast  # smoke / 快跑
 
 ## 使用示例
 
+最小 open→put→get→close：
+
 ```zig
 const cube = @import("cube_db");
 const Db = cube.Db;
@@ -77,6 +79,8 @@ if (v) |value| {
     allocator.free(value);
 }
 ```
+
+完整 API（`putBatch`、`select` 范围查询、`compact`、`Options`、错误处理、并发、常见配方）见 **[使用手册](docs/usage.md)**。
 
 `Db.open` 是**纯同步 API**，不需要调用方准备 `zio.Runtime`。
 内部文件 IO 通过 zio 的阻塞降级机制执行，未来启用 writer 协程（D4）时调用方也无感。
