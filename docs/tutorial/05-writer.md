@@ -4,9 +4,9 @@
 
 读完本章，你应该能：
 - 理解 `writer.zig` 在写路径中的作用。
-- 看懂 `applyBatch` 的完整流程。
+- 看懂 `applyBatch` 用 `BTreeBatch` 一次 flush 的流程。
 - 理解 `State` 里每个字段的含义。
-- 知道当前 MVP 和最初设计的区别。
+- 知道 group commit 怎么合并并发写。
 
 ---
 
@@ -22,7 +22,9 @@
 
 `writer.zig` 负责把这些步骤封装成 `applyBatch`。
 
-原设计里，writer 是一个独立的协程，通过 channel 接收写请求，批量处理。但当前 MVP 为了绕开一个 zio 的嵌套 join 限制，暂时用 `zio.Mutex` 串行化。我们后面会讲这个区别。
+原设计里，writer 是一个独立协程，通过 channel 接收写请求批量处理。现在改成了「group commit（leader/follower）」：并发 `put` 不各自 fsync，而是多个并发请求自动合并成一次 `applyBatch`（1 次 fsync）。这个机制在 `db.sendRequest` 里实现，见第 06 章。`writer.applyBatch` 本身只管「把一批请求应用到树 + 写 header + fsync」。
+
+另外，现代的 `applyBatch` 不再是逐个 `btree.insert`（那样每个 op 都要重读+重写整条路径，N 个 op 就 N×路径重写），而是用 **BTreeBatch**：把整批 op 先在内存里的「缓存树」上应用，最后**一次性 flush**（只重写真正变脏的节点）。这是单线程批量写快 1000× 的原因。
 
 ---
 
@@ -91,7 +93,7 @@ pub fn applyBatch(state: *State, batch: []Request) !void
 ```mermaid
 graph TD
     A[applyBatch] --> B[快照当前 root]
-    B --> C[逐个 insert 到 B-tree]
+    B --> C[BTreeBatch 应用整批]
     C --> D{出错?}
     D -->|是| E[已处理设成功 失败设错误]
     D -->|否| F[写 header]
@@ -111,19 +113,30 @@ var bt_root: u64 = if (cur_root == 0) btree.NULL_ROOT else cur_root - 1;
 
 `root` 在 DB 层是 `0 = 空树，n = btree 偏移 + 1`。传给 B-tree 时需要转换。
 
-### 3.2 逐个 insert
+### 3.2 BTreeBatch：缓存树 + 一次 flush
+
+旧实现是逐个 `btree.insert`（每个 op 独立走一遍 COW 路径）。现在用 `btree_batch.BTreeBatch`：
 
 ```zig
-for (batch, 0..) |req, i| {
-    const wr = try btree.insert(state.allocator, state.store, bt_root, req.key, req.value, req.tombstone);
-    bt_root = wr.new_root;
-    live_delta += wr.live_delta;
-    dirt_delta += wr.dirt_delta;
-    count_delta += wr.count_delta;
+var bt = btree_batch.BTreeBatch.init(state.allocator, state.store, bt_root);
+defer bt.deinit();
+for (batch) |req| {
+    bt.apply(req.key, req.value, req.tombstone) catch |err| {
+        // apply 失败：全批不提交，全部 future set err
+        for (batch) |r| r.future.set(err);
+        return;
+    };
 }
+const wr = try bt.commit(); // 一次 flush：只重写变脏的节点，算 offset，写 store
 ```
 
-每个请求调用一次 `btree.insert`。注意：如果某个请求失败，前面的请求已经生效了，但会尽量通知结果。
+BTreeBatch 关键点：
+- **节点缓存**：读过的节点放内存缓存，同一个节点被多个 op 命中只读一次、只写一次。
+- **脏集**：只有真正改了的节点才标记变脏，flush 时只重写这些。
+- **自底向上 flush**：先 flush 子节点拿到真实偏移，再 flush 父节点（父的 children 指向子的真实偏移），保证 offset 正确。
+- 这样 N 个 op 摊薄成 ~1 次 header + 1 次 fsync + 只重写变脏的少数节点。
+
+每个请求调用 `bt.apply`。注意：如果某个请求失败，整批回滚，不写 header。
 
 ### 3.3 写 header
 
@@ -224,52 +237,35 @@ if (state.opts.auto_compact_dirt_ratio) |ratio| {
 
 ---
 
-## 6. 同步写：压测验证后的最终选择
+## 6. Group commit：并发写的合并
 
-原设计 D4 要求：
-- 一个专门的 writer 协程。
-- `put`/`delete` 把请求发到 mailbox channel。
-- writer 批量接收请求，合并成一次 batch，写一次 header。
+并发场景下，多个线程同时 `put` 会怎样？如果各自 `fsync`，N 个线程 = N 次 fsync，很贵。`cube_db` 用 **leader/follower group commit** 合并：
 
-当前实现（压测验证后定为最终形态）：
-- `db.sendRequest` 用 `zio.Mutex` 锁住 `applyBatch`。
-- 每次 `put` 直接同步应用 batch，然后返回。
+- 每个并发写请求先进一个共享队列。
+- 第一个来的线程当 **leader**：它拿着写锁，把队列里所有请求（包括后来排队的）一次 `applyBatch`（1 次 fsync），然后继续清空队列直到空。
+- 后来排队的线程是 **follower**：它们只把自己的请求塞进队列，然后阻塞等 `Future`，leader 处理完会唤醒它们。
 
-区别：
-- 正确性一样：都是串行写，不会并发破坏数据。
-- 性能不同：协程版本可以合并多个请求，减少 fsync 次数；mutex 版本每次 `put` 都 fsync。
+结果：16 个线程 × 50 个 put（800 个写）实测只产生 ~117 次 fsync（合并 ~6.8×）。leader 的 `applyBatch` 一次性 set 所有请求的 future，follower 被唤醒拿到结果。
 
-压测结论（`bench/put_bench.zig`）：同步写 3335 ops/s，多线程因 mutex 串行不升反降。
-对嵌入式 KV 足够，D4 group commit 押注关闭，mailbox/writerLoop 死代码已移除。
+这套机制在 `db.sendRequest` 里实现（见第 06 章）。`writer.applyBatch` 本身不关心是单个还是合并——它就管「这批请求应用 + 写 header + fsync + set 全部 future」。
 
-```zig
-fn sendRequest(self: *Self, key, value, tombstone) !void {
-    try self.write_mutex.lock();
-    defer self.write_mutex.unlock();
-    var future: zio.Future(writer.OpResult) = .init;
-    var batch = [_]writer.Request{ .{ .key = key, .value = value, .tombstone = tombstone, .future = &future } };
-    try writer.applyBatch(&self.state, &batch);
-    const result = try future.wait();
-    return result.value;
-}
-```
+错误处理：leader 任何出错路径都经 `defer leaderReset` 让出 leader 身份，防 follower 死等。
 
 ---
 
 ## 7. 本章小结
 
-- `writer.zig` 把写请求变成“COW → header → fsync → 更新状态”的完整流程。
+- `writer.applyBatch` 用 `BTreeBatch`（缓存树 + 一次 flush）把一批 op 摊薄成 1 header + 1 fsync，单线程批量写快 ~1000×。
 - `State` 是共享的写状态，所有字段都是原子的，读线程可以安全读 root。
 - DB 层用 `root = btree_offset + 1` 编码来区分空树和偏移 0。
-- 当前用 mutex 串行写，压测验证同步写足够后定为最终形态，D4 writer 协程押注已关闭。
-- 自动 compact 目前只计数，不自动执行。
+- 并发写走 group commit（leader/follower），多个 put 合并成 1 次 fsync。
 
 ---
 
 ## 8. 本章练习
 
-1. 在 `writer.zig` 里找到 `applyBatch`，逐行注释每个步骤。
+1. 在 `writer.zig` 里找到 `applyBatch`，逐行注释每个步骤（快照 root → BTreeBatch.apply → commit flush → header → fsync → 更新状态 → set futures）。
 2. 解释为什么 `applyBatch` 要先写 header、再 fsync、最后才原子更新 root？顺序能不能反过来？
 3. 给 `applyBatch` 加一条测试：两个请求合并成一次 batch，验证 header 数只增加 1。
-4. 在 `db.zig` 里把 `putNoFsync` 真正做成 `fsync=false` 的路径（提示：在 `applyBatch` 里按 `opts.fsync` 或请求标志决定是否 sync）。
+4. 读 `btree_batch.zig` 的 `commit`/`flushNode`，理解「自底向上 flush」（子先写拿 offset，父再写）为什么能保证 children offset 正确。
 5. 解释：如果 `root` 是 `0`，为什么 B-tree 层要把它转成 `NULL_ROOT`？

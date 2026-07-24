@@ -157,13 +157,16 @@ const std = @import("std");
 pub const format = @import("format.zig");
 pub const store = @import("store.zig");
 pub const btree = @import("btree.zig");
+pub const btree_batch = @import("btree_batch.zig");
 pub const file_store = @import("file_store.zig");
+pub const mmap = @import("mmap.zig");
 pub const writer = @import("writer.zig");
 pub const db = @import("db.zig");
 pub const fault_store = @import("fault_store.zig");
 
 pub const Header = format.Header;
 pub const Options = db.Options;
+pub const Entry = db.Entry;
 pub const Db = db.Db;
 
 pub fn add(a: i32, b: i32) i32 {
@@ -192,13 +195,15 @@ const db = try cube.Db.open(...);
 | `src/main.zig` | 可执行入口 | 目前只打印 `build ok`，业务不在此 |
 | `src/root.zig` | 库入口 | 把内部模块整理后对外暴露 |
 | `src/format.zig` | 文件格式 | 定义 header、节点、记录、CRC 编解码 |
-| `src/store.zig` | Store 抽象 | 运行时接口 + 内存实现（MemStore） |
-| `src/file_store.zig` | 真实文件实现 | 基于 `zio.File` 的位置 IO |
+| `src/store.zig` | Store 抽象 | 运行时接口 + 内存实现（MemStore）+ header 正向扫描 |
+| `src/file_store.zig` | 真实文件实现 | 基于 `zio.File` 的位置 IO + **mmap 零拷贝读** |
+| `src/mmap.zig` | mmap wrapper | libc `mmap`/`munmap` 封装（跨平台，只读读路径用） |
 | `src/fault_store.zig` | 故障注入 | 包装 MemStore，模拟崩溃 |
-| `src/btree.zig` | B-tree 索引 | 查找、插入、删除、范围查询 |
-| `src/writer.zig` | 写状态 | batch 应用、header 提交、状态更新 |
-| `src/db.zig` | 公开 API | open/close/get/put/delete/select/compact |
-| `tests/*.zig` | 测试 | 集成测试和 compaction 测试 |
+| `src/btree.zig` | B-tree 索引 | 查找（`get`/`findInLeaf`/`findInBranchPayload` 零拷贝）、插入、删除、范围查询 |
+| `src/btree_batch.zig` | 批量树提交 | `BTreeBatch`：节点缓存 + 脏集 + 一次 flush，攤薄 COW 重写 |
+| `src/writer.zig` | 写状态 | `applyBatch`（走 BTreeBatch）、header 提交、状态更新 |
+| `src/db.zig` | 公开 API | open/close/get/put/delete/select/compact + group commit（leader/follower） |
+| `tests/*.zig` | 测试 | 集成测试、崩溃测试、group commit/零拷贝读测试等 |
 
 ---
 

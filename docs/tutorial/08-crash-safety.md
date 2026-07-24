@@ -5,7 +5,7 @@
 读完本章，你应该能：
 - 理解 `cube_db` 如何保证崩溃时数据不损坏。
 - 理解 header 作为提交点的作用。
-- 理解启动恢复时的反向扫描和 CRC 回退。
+- 理解启动恢复时的正向扫描和 CRC 回退。
 - 看懂 `fault_store.zig` 的测试。
 
 ---
@@ -59,53 +59,59 @@ graph TD
 
 ---
 
-## 4. 启动恢复：getLatestHeader
+## 4. 启动恢复：getLatestHeader（正向扫描）
 
 `src/store.zig` 的 `getLatestHeader` 负责启动时找到最新的有效 header。
 
-流程：
+流程：从文件头 offset=0 开始，按记录长度一条条往后走，记住最后一个有效的 header 记录，遇到坏记录就停。
 
 ```mermaid
 graph TD
-    A[从文件末尾开始] --> B{marker == HEADER?}
-    B -->|否| A
-    B -->|是| C[decodeRecord]
-    C --> D{OK?}
-    D -->|否| A
-    D -->|是| E[返回 header]
-    A --> F[没有更多块] --> G[返回 null]
+    A[从 offset=0 开始] --> B[读 len(4)]
+    B --> C[借整记录 readBorrow]
+    C --> D[decodeRecord CRC OK?]
+    D -->|否| G[停，返最后一个有效 header]
+    D -->|是| E{是 header?<br/>magic+version 对}
+    E -->|是| F[记住这个 header]
+    E -->|否| H[继续下一条]
+    F --> H
+    H --> B
+    G --> I{有记住的?}
+    I -->|是| J[返回 header]
+    I -->|否| K[返回 null 空库]
 ```
 
-### 4.1 反向扫描
-
-从文件最后一个块开始，向前扫描每个块首的 marker：
+### 4.1 正向扫描
 
 ```zig
-var block_index: u64 = num_blocks;
-while (block_index > 0) {
-    block_index -= 1;
-    const marker_phys = block_index * f.BLOCK_SIZE;
-    const n = try store.readPhysical(&marker_buf, marker_phys);
-    if (n != 1) continue;
-    if (marker_buf[0] != f.MARKER_HEADER) continue;
-    // 尝试读这个 header 记录
+var off: u64 = 0;
+while (off < total) {
+    const len_slice = store.readBorrow(off, 4) catch break;
+    if (len_slice.len < 4) break;
+    const payload_len = std.mem.readInt(u32, len_slice[0..4], .big);
+    const rec_total = f.REC_LEN_SIZE + payload_len + f.REC_CRC_SIZE;
+    if (off + rec_total > total) break; // 整记录越界 → crash 半写，停
+    const rec = store.readBorrow(off, rec_total) catch break;
+    const payload = f.decodeRecord(rec) catch break; // CRC 错则停
+    if (payload.len >= f.HEADER_PAYLOAD_SIZE) {
+        const h = f.decodeHeaderPayload(payload[0..f.HEADER_PAYLOAD_SIZE]);
+        if (h.magic == f.MAGIC and h.version == f.VERSION) {
+            last = .{ .record_logical_offset = off, .header = h }; // 记住
+        }
+    }
+    off += rec_total; // 下一条记录
 }
+return last;
 ```
+
+关键点：
+- 记录是连续的，靠 `len` 字段知道每条多长，一条接一条跳过去。
+- 中间混有 B-tree 节点记录（不是 header），扫到时 `decodeRecord` 能解出来，但它 magic/version 不是 header，跳过；只记住 header。
+- 遇到坏记录（CRC 错 / 长度越界，多半是崩溃时写了一半）就停，返回之前记住的最后一个 header。
 
 ### 4.2 校验
 
-找到 marker 后，读取 marker 后面的记录：
-
-```zig
-var rec_buf: [64]u8 = undefined;
-const rn = try store.readPhysical(&rec_buf, marker_phys + 1);
-const payload = f.decodeRecord(rec_buf[0..rn]) catch continue;
-const h = f.decodeHeaderPayload(payload[0..f.HEADER_PAYLOAD_SIZE]);
-if (h.magic != f.MAGIC) continue;
-if (h.version != f.VERSION) continue;
-```
-
-如果 CRC 失败、magic 不对、version 不对，都跳过这个 header，继续往前找。
+每条记录都走 `decodeRecord` 验 CRC。header 还额外检查 `magic == MAGIC` 和 `version == VERSION`，防止把别的记录误当 header。
 
 ### 4.3 物理截断
 
@@ -120,6 +126,8 @@ if (cur_size > header_end_logical) {
 ```
 
 这样下次 append 时，位置紧跟最新 header，不会写到旧垃圾上。
+
+> **历史**：以前有 marker 时，`getLatestHeader` 是从文件末尾「按块倒扫 marker」找 `MARKER_HEADER`。去 marker 后改成正向扫记录，代码反而更简单（不用管 marker 跳跃），且 crash 半写的尾部坏记录会被自动跳过。
 
 ---
 
@@ -169,7 +177,7 @@ pub const FaultConfig = struct {
 
 - header 是提交点，只有 header 成功写入并 fsync 后，写才可见。
 - append-only 保证旧 header 不被覆盖，崩溃时可以回退。
-- `getLatestHeader` 反向扫描 marker，CRC 失败就往前找。
+- `getLatestHeader` **正向扫记录**，记住最后一个有效 header；遇到坏记录（CRC 错/越界）就停，自动回退。
 - `fsync` 决定安全级别，默认开启。
 - `FaultStore` 让崩溃场景可以单元测试。
 
@@ -177,8 +185,8 @@ pub const FaultConfig = struct {
 
 ## 8. 本章练习
 
-1. 在 `src/store.zig` 里找到 `getLatestHeader`，逐行注释它的逻辑。
-2. 写一条测试：先写一个好 header，再追加一个 CRC 故意错误的“假 header”，验证 `getLatestHeader` 回退到第一个好 header。
-3. 在 `Db.open` 里，如果 `.compact` 文件存在，尝试删除它。
+1. 在 `src/store.zig` 里找到 `getLatestHeader`，逐行注释它的正向扫描逻辑。
+2. 写一条测试：先写一个好 header，再追加一些合法的 node 记录，再写第二个 header，验证 `getLatestHeader` 返回第二个（中间的 node 记录被跳过）。
+3. 写一条测试：写两个 header 后，破坏最后一个 header 的 payload 字节让 CRC 失败，验证 `getLatestHeader` 回退到第一个。
 4. 解释：如果 `fsync = false`，一次 `put` 成功后立即断电，可能丢失多少数据？是最近一次，还是所有未 fsync 的写？
-5. 思考：为什么 header 块必须从块首开始？如果 header 可以跨块会有什么麻烦？
+5. 思考：去 marker 后，`getLatestHeader` 为什么不需要「按块跳 marker」了？（提示：记录连续，靠 len 字段一条条跳，逻辑==物理。）

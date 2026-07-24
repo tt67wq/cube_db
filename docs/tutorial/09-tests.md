@@ -99,9 +99,10 @@ test "fault: header torn (crc bad) -> fall back to previous" {
     _ = try ms.appendHeaderRecord(.{ .btree_root = 1, ... });
     _ = try ms.appendHeaderRecord(.{ .btree_root = 2, ... });
 
-    // 破坏最后一个 header 的 payload
-    const found_phys = ...; // 找到最后一个 header 块
-    ms.data.items[found_phys + 6] ^= 0xff;
+    // 破坏最后一个 header 记录的 payload 区一字节（去 marker：记录 = len(4)+payload(38)+crc(4)，
+    //   翻倒数第 6 字节即 payload 区）→ CRC 失败
+    const total = ms.logical_len;
+    ms.data.items[@intCast(total - 6)] ^= 0xff;
 
     const r = try store_mod.getLatestHeader(std.testing.allocator, ms.store());
     try std.testing.expect(r != null);

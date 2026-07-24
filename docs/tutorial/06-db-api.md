@@ -4,9 +4,9 @@
 
 读完本章，你应该能：
 - 知道 `Db` 对外提供哪些方法。
-- 理解 `open` 时的恢复过程。
+- 理解 `open` 时的恢复过程（正向扫 header）。
 - 理解 `get`/`put`/`delete`/`select` 的内部流程。
-- 理解当前 MVP 的并发模型。
+- 理解 group commit（leader/follower）并发模型。
 
 ---
 
@@ -27,11 +27,14 @@ pub const Db = struct {
 
 `Db` 内部持有：
 - `allocator`：分配内存，调用方负责 `get` 返回值的 free。
-- `rt`：zio 运行时，所有协程操作都依赖它。
-- `fs` / `store`：底层文件存储。
+- `fs` / `store`：底层文件存储（FileStore 含 mmap，见第 03 章）。
 - `state`：写状态（root、dirt、count 等）。
-- `write_mutex`：串行化写操作。
+- `write_mutex`：leader 持有，串行化 `applyBatch`。
+- `queue_mutex`：保护 group commit 的 `write_queue` + `has_leader`。
+- `write_queue` / `has_leader`：group commit 的待合并队列 + leader 身份标志（见 §5）。
 - `path`：数据文件路径。
+
+> 上面结构字段略写了（部分未列出），重点是：除了原来的 `write_mutex`，还多了 group commit 用的 `queue_mutex`/`write_queue`/`has_leader`。
 
 ---
 
@@ -50,8 +53,10 @@ pub const Db = struct {
 };
 ```
 
-所有方法都是**同步 API**，可以在任意线程调用。内部通过 zio 的阻塞降级机制完成文件 IO，
-未来若启用 D4 协程写路径，调用方依然无需感知。
+所有方法都是**同步 API**，可以在任意线程调用。内部通过 zio 的阻塞降级机制完成文件 IO。
+
+- 读路径：mmap 零拷贝（见第 03/04 章）。
+- 写路径：group commit（leader/follower）合并并发写（见 §5）。
 
 ---
 
@@ -66,7 +71,7 @@ pub fn open(allocator, path, opts) !*Db
 ```mermaid
 graph TD
     A[open] --> B[创建 FileStore]
-    B --> C[反向扫描最新 header]
+    B --> C[正向扫找最新 header]
     C --> D{有 header?}
     D -->|是| E[恢复 root/dirt/count/byte_size]
     E --> F[物理截断到 header 末尾]
@@ -83,15 +88,15 @@ self.store = self.fs.store();
 
 如果文件不存在，`create` 会创建；如果存在，会打开。
 
-### 3.2 反向扫描 header
+### 3.2 正向扫描找最新 header
 
 ```zig
 const scan = try store_mod.getLatestHeader(allocator, self.store);
 ```
 
-`getLatestHeader` 从文件末尾开始，按块扫描 marker，找到最新的 `MARKER_HEADER`，然后读取 header 记录。
+`getLatestHeader` 从文件头 offset=0 开始，按记录长度一条条往后走，记住最后一个「magic + version 对、CRC 也对」的 header 记录。遇到坏记录（CRC 错或长度越界，多半是崩溃时写了一半）就停。所以拿到的是「最新有效提交点」。
 
-如果 CRC 失败或 magic/version 不对，就继续往前找。如果全找不到，说明是空数据库。
+如果文件空、或一条有效 header 都没有，返回 `null`，说明是空数据库。详见第 08 章。
 
 ### 3.3 恢复状态
 
@@ -154,7 +159,7 @@ pub fn get(self: *Self, key: []const u8) !?[]u8 {
 
 ---
 
-## 5. put / delete：写操作
+## 5. put / delete：写操作（group commit）
 
 ```zig
 pub fn put(self: *Db, key: []const u8, value: []const u8) !void {
@@ -166,30 +171,50 @@ pub fn delete(self: *Db, key: []const u8) !void {
 }
 ```
 
-内部统一走 `sendRequest`：
+内部统一走 `sendRequest`，**核心是 group commit（leader/follower）合并并发写**：
 
 ```zig
-fn sendRequest(self: *Self, key, value, tombstone) !void {
+fn sendRequest(self, key, value, tombstone) !void {
+    var future: zio.Future(writer.OpResult) = .init;
+    const req: writer.Request = .{ .key = key, .value = value, .tombstone = tombstone, .future = &future };
+
+    // 1. 入队 + leader 选举（queue_mutex 保护 has_leader + write_queue）
+    try self.queue_mutex.lock();
+    self.write_queue.append(self.allocator, req) catch ...;
+    if (self.has_leader) {
+        // 已经有 leader 了 → 我当 follower：req 已在队列，解锁、等 leader 唤醒
+        self.queue_mutex.unlock();
+        const result = try future.wait();  // 阻塞等 leader 处理完
+        return result.value;
+    }
+    self.has_leader = true; // 没有 leader → 我当 leader
+    self.queue_mutex.unlock();
+
+    // 2. leader：持 write_mutex，循环清空队列 + applyBatch，直到队列空
     try self.write_mutex.lock();
     defer self.write_mutex.unlock();
-
-    var future: zio.Future(writer.OpResult) = .init;
-    const req: writer.Request = .{
-        .key = key,
-        .value = value,
-        .tombstone = tombstone,
-        .future = &future,
-    };
-    var batch = [_]writer.Request{req};
-    try writer.applyBatch(&self.state, &batch);
+    defer leaderReset(self); // 错误路径让出 leader 身份，防 follower 死等
+    while (true) {
+        try self.queue_mutex.lock();
+        const batch = self.write_queue.toOwnedSlice(self.allocator) catch ...;
+        if (batch.len == 0) { self.has_leader = false; self.queue_mutex.unlock(); break; }
+        self.queue_mutex.unlock();
+        writer.applyBatch(&self.state, batch) catch ...; // 1 次 fsync 处理整批
+        self.allocator.free(batch);
+    }
+    // leader 自己的 req 已被某批 applyBatch set，等结果
     const result = try future.wait();
     return result.value;
 }
 ```
 
-MVP 每次只发一个请求，用 mutex 串行化。所以 `put` 和 `delete` 是原子的：一次只执行一个。
+机制要点：
+- **leader**：拿到写锁后，把队列里所有请求（包括 follower 刚塞进来的）一次 `applyBatch`（1 次 fsync），然后继续清空队列直到空才卸任。
+- **follower**：只入队 + 阻塞等 `Future`，leader 在 `applyBatch` 里会 set 所有请求的 future，follower 被唤醒。
+- **合并效果**：16 线程 × 50 put（800 个写）实测只产生 ~117 次 fsync（合并 ~6.8×）。
+- **错误路径**：leader 任何出错都经 `defer leaderReset` 让出 leader 身份，防 follower 死等。
 
-`putNoFsync` 当前行为与 `put` 一致（都 fsync），但代码里留了注释说明这是未来要补的优化。
+`putNoFsync` 当前行为与 `put` 一致（都走 group commit + fsync），代码里留了注释说明这是未来要补的优化。
 
 ---
 
@@ -241,24 +266,24 @@ pub fn close(self: *Self) !void {
 
 读：
 - 任意线程可以同时读。
-- 读只读 `state.root` 原子值，然后沿不可变树下行。
+- 读只读 `state.root` 原子值，然后沿不可变树下行（mmap 零拷贝）。
 - 不需要加锁。
 
 写：
-- 当前 MVP 通过 `write_mutex` 串行化。
-- 任意时刻只有一个写在进行。
+- 走 **group commit（leader/follower）**：多个并发 `put` 自动合并成一次 `applyBatch`（1 次 fsync）。第一个来的当 leader 持写锁清空队列，后来的当 follower 入队等唤醒。
+- leader 与 putBatch/compact 仍由 `write_mutex` 串行，任意时刻只有一个写。
 - 读和写互不阻塞。
 
-为什么读不会看到中间状态？因为 root 指针只在 header 落盘并 fsync 后才更新。写一半时，读线程仍然看到旧 root。
+为什么读不会看到中间状态？因为 root 指针只在 header 落盘并 fsync 后才更新。写一半时，读线程仍然看到旧 root，沿旧树下行看到一致快照（append-only 天然 MVCC）。
 
 ---
 
 ## 9. 本章小结
 
 - `Db` 是公开 API 入口，封装了 `Store`、`B-tree`、`Writer`。
-- `open` 从 header 恢复状态，并截断尾部垃圾。
-- `get`/`select` 是无锁读，基于不可变 B-tree。
-- `put`/`delete` 当前用 mutex 串行化，MVP 简单可靠但性能不是最优。
+- `open` 从 header 恢复状态（正向扫记录找最新 header），并截断尾部垃圾。
+- `get`/`select` 是无锁读，基于不可变 B-tree + mmap 零拷贝。
+- `put`/`delete` 走 group commit（leader/follower），多个并发写合并成 1 次 fsync。
 - `close` 负责释放所有资源，即使 sync 失败也不泄漏。
 
 ---

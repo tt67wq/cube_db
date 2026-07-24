@@ -27,12 +27,12 @@
 |------|------|----------|
 | 01 | 项目结构与构建 | `build.zig`, `build.zig.zon`, `src/root.zig` |
 | 02 | 文件格式与编解码 | `src/format.zig` |
-| 03 | Store 抽象与实现 | `src/store.zig`, `src/file_store.zig`, `src/fault_store.zig` |
-| 04 | 不可变 B-tree | `src/btree.zig` |
-| 05 | Writer 与状态管理 | `src/writer.zig`, `src/db.zig`（部分） |
-| 06 | DB 公开 API | `src/db.zig` |
+| 03 | Store 抽象与实现（含 mmap） | `src/store.zig`, `src/file_store.zig`, `src/mmap.zig`, `src/fault_store.zig` |
+| 04 | 不可变 B-tree（含零拷贝读） | `src/btree.zig` |
+| 05 | Writer 与状态管理（含 BTreeBatch） | `src/writer.zig`, `src/btree_batch.zig`, `src/db.zig`（部分） |
+| 06 | DB 公开 API（含 group commit） | `src/db.zig` |
 | 07 | Compaction | `src/db.zig` 的 `doCompact` |
-| 08 | 崩溃安全 | `src/fault_store.zig`, `src/store.zig` |
+| 08 | 崩溃安全（header 正向扫描） | `src/fault_store.zig`, `src/store.zig` |
 | 09 | 测试体系 | `tests/`, `src/*.zig` 里的测试块 |
 | 10 | 动手实验 | 基于本项目的练习 |
 
@@ -62,28 +62,31 @@ cube_db/
 ├── build.zig              # 构建脚本：告诉 Zig 怎么编译
 ├── build.zig.zon          # 包元信息：名字、版本、依赖
 ├── docs/
-│   ├── DESIGN.md          # 原始设计文档（决策很详细）
-│   ├── PROGRESS.md        # 实现进度与偏离设计的地方
+│   ├── usage.md           # 使用手册（API 用法）
+│   ├── *-design.md        # 各优化阶段设计文档（mmap 读、零拷贝读等）
 │   └── tutorial/          # 本教程
 ├── src/
 │   ├── root.zig           # 库入口
 │   ├── main.zig           # 可执行入口（占位）
 │   ├── format.zig         # 文件格式、编解码、CRC
-│   ├── store.zig          # Store 抽象 + 内存 Store
-│   ├── file_store.zig     # 真实文件 Store
+│   ├── store.zig          # Store 抽象 + 内存 Store + header 正向扫描
+│   ├── file_store.zig     # 真实文件 Store（含 mmap 零拷贝读）
+│   ├── mmap.zig           # libc mmap wrapper（跨平台）
 │   ├── fault_store.zig    # 故障注入 Store
-│   ├── btree.zig          # 不可变 B-tree
+│   ├── btree.zig          # 不可变 B-tree（读路径零拷贝）
+│   ├── btree_batch.zig    # BTreeBatch 批量树提交
 │   ├── writer.zig         # 写请求、状态、batch 应用
-│   └── db.zig             # DB 句柄与公开 API
+│   └── db.zig             # DB 句柄与公开 API（group commit）
 └── tests/
-    ├── db_test.zig        # 集成测试
-    └── compact_test.zig   # compaction 测试
+    └── 各类集成/崩溃/性能测试
 ```
 
 ## 读完本教程你能学到什么？
 
 - 一个真实嵌入式 KV 引擎的完整数据流。
 - append-only 文件、COW B-tree、compaction 的设计思路。
+- **读路径真零拷贝**：mmap + `readBorrow` 借用切片 + `findInLeaf`/`findInBranchPayload` 跳过解码，追平 LMDB。
+- **写路径 group commit**：leader/follower 把并发写合并成 1 次 fsync。
 - 怎么用 Zig 写模块化、可测试的系统代码。
 - 为什么测试要分层，怎么做模型测试、故障注入测试。
 

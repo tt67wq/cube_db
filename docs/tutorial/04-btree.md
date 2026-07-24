@@ -106,27 +106,72 @@ pub const Branch = struct {
 };
 ```
 
-注意：key 和 value 是 `[]u8` 切片，指向 `std.testing.allocator` 或 `db.allocator` 分配的内存。操作完成后需要 `free`。
+注意：key 和 value 是 `[]u8` 切片，指向 allocator 分配的内存。COW 写路径（insert/delete）用 `Leaf.fromPayload`/`Branch.fromPayload` 把节点**完整解码**成内存结构并复制 key/value，操作完后 `deinit` 释放。
+
+但**读路径（get）现在不全解码了**——见下一节，它直接在原始字节里找目标 key，不把整页拆成内存对象。这是读得快的关键。
 
 ---
 
-## 5. 查找 get
+## 5. 查找 get（读路径，零拷贝）
 
 ```zig
 pub fn get(allocator, s, root, key) !?[]u8
 ```
 
-流程：
+这是整个读路径，**走到 LMDB 级别的快**（~3 微秒）靠的就是这几步。流程：
 
 1. 如果 `root == NULL_ROOT`，返回 `null`（空树）。
-2. 从 root 开始读取节点记录。
-3. 如果是 Branch：用 `findChild(key)` 决定走哪个子节点。
-4. 如果是 Leaf：用 `findPos(key)` 二分查找。
-   - 命中且非 tombstone：返回 value 的拷贝。
-   - 命中但是 tombstone：返回 `null`（key 被删了）。
-   - 没命中：返回 `null`。
+2. 从 root 开始，逐层下钻到 Leaf。每层用 `readRecord` 读一条记录，用 `findInBranchPayload` 决定走哪个子节点。
+3. 到 Leaf 后，用 `findInLeaf` 直接在原始 payload 里找目标 key。
+4. 命中且非 tombstone：返回 value 的拷贝；命中 tombstone 或没命中：返回 `null`。
 
-### Branch 的 findChild
+### readRecord：返借用切片（不分配不复制）
+
+```zig
+pub fn readRecord(allocator, s, offset) ![]const u8 {
+    // 借用整记录（指向 mmap/MemStore，不 alloc 不 memcpy）
+    const len_slice = try s.readBorrow(offset, 4);  // 先读 len(4)
+    if (len_slice.len < 4) return error.Truncated;
+    const payload_len = std.mem.readInt(u32, len_slice[0..4], .big);
+    const total = f.REC_LEN_SIZE + payload_len + f.REC_CRC_SIZE;
+    const rec = try s.readBorrow(offset, total);  // 借用整记录
+    if (rec.len < total) return error.Truncated;
+    return rec; // 返回指向 mmap 的切片，调用方不 free
+}
+```
+
+关键：`readRecord` 返回的 `rec` 是**借用切片**（来自 `s.readBorrow`，FileStore 就是 mmap 指针）。读一个节点 = 读 mmap 里的一段字节，**零内存分配、零 memcpy**。这就是「真零拷贝」。
+
+### findInBranchPayload：跳过 branch 全解码
+
+旧实现读 branch 时要 `Branch.fromPayload` 把整页解码成内存结构、逐个 key 复制（dup）。这很贵。现在 `get` 不这么干了，而是直接在原始 payload 里扫：
+
+```zig
+pub fn findInBranchPayload(payload, key) !u64 {
+    // branch 格式：kind(1) + count(2) + [klen(4)+key]*(count-1) + [child(8)]*count
+    // 线性扫 keys，找第一个 > key 的 key → child index = 该位置
+    // → 读 8 字节 child offset，返回。不 dup 全 entry。
+}
+```
+
+逻辑跟下面 `Branch.findChild` 一样（找「第一个大于 key 的分隔 key」，取它左边的 child），但**不分配任何内存**——直接在 mmap 字节上读 len、跳 key、读 child offset。
+
+### findInLeaf：跳过 leaf 全解码
+
+同理，到 leaf 后不 `Leaf.fromPayload` 全量解码，而是 `findInLeaf` 直接在原始 payload 里顺序扫 entry（leaf 的 entry 是按 key 排好序的）：
+
+```zig
+pub fn findInLeaf(allocator, payload, key) !?[]u8 {
+    // leaf 格式：kind(1) + count(2) + [tombstone(1)+klen(4)+key+vlen(4)+value]*count
+    // 线性扫到第一个 >= key 的 entry；eq 且非 tombstone → dup 一个 value 返回。
+}
+```
+
+只匹配目标 key 时才 `allocator.dupe` 那**一个** value 返回给调用方，其余 entry 全不碰。
+
+### Branch 的 findChild（写路径仍用）
+
+写路径（insert/delete/split）还是要把 branch 完整解码成内存结构才能修改，所以 `Branch.findChild` 这个二分还在用：
 
 ```zig
 pub fn findChild(self: *const Branch, key: []const u8) usize {
@@ -143,31 +188,9 @@ pub fn findChild(self: *const Branch, key: []const u8) usize {
 }
 ```
 
-含义：
-- `keys[i]` 是 `children[i]` 和 `children[i+1]` 的分隔。
-- `children[i]` 里的 key 全部小于 `keys[i]`。
-- `children[i+1]` 里的 key 全部大于等于 `keys[i]`。
-- 所以 `findChild` 找“第一个大于 key 的 sep”，返回左边的 child index。
-- 相等 key 走右子。
+含义：`keys[i]` 是 `children[i]` 和 `children[i+1]` 的分隔；`findChild` 找「第一个大于 key 的 sep」，返回它左边的 child index；相等 key 走右子。`findInBranchPayload` 是它「不分配」的读路径版本。
 
-### Leaf 的 findPos
-
-```zig
-pub fn findPos(self: *const Leaf, key: []const u8) usize {
-    var lo: usize = 0;
-    var hi: usize = self.entries.items.len;
-    while (lo < hi) {
-        const mid = lo + (hi - lo) / 2;
-        switch (cmpKey(self.entries.items[mid].key, key)) {
-            .lt => lo = mid + 1,
-            .eq, .gt => hi = mid,
-        }
-    }
-    return lo;
-}
-```
-
-含义：找第一个大于等于 key 的 entry。相等会覆盖旧值。
+> **为什么 get 不用二分而用线性扫？** `findInBranchPayload`/`findInLeaf` 是线性扫 keys。因为节点最多 32 个 entry，线性扫 32 次和二分 5 次差不多，而且线性扫不用「跳到第 i 个 entry」（要在变长字段里数偏移，反而麻烦）。读 mmap 字节本身纳秒级，线性扫够快。
 
 ---
 
@@ -312,7 +335,7 @@ graph TD
 
     subgraph "Store 文件"
         Record["记录<br/>len:u32 | payload | crc:u32"]
-        Block["4096 字节块<br/>marker=0/1 | 内容"]
+        FileBytes["连续字节<br/>逻辑==物理"]
     end
 
     Root -->|root offset| Branch
@@ -321,7 +344,7 @@ graph TD
     BranchChild1 -->|下一层| BranchChild2
     BranchChild2 -->|最底层| Leaf
     Leaf -->|toRecord| Record
-    Record -->|append| Block
+    Record -->|append| FileBytes["文件连续字节"]
 ```
 
 ---
