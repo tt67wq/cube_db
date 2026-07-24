@@ -1,0 +1,145 @@
+//! writer2.zig — v2 batch 应用：COW B-tree (btree2)、freelist 回收、meta 交替提交
+const std = @import("std");
+const zio = @import("zio");
+const f2 = @import("format2.zig");
+const ps = @import("page_store.zig");
+const btree2 = @import("btree2.zig");
+
+const PageStore = ps.PageStore;
+
+pub const Options = struct {
+    fsync: bool = true,
+};
+
+pub const OpResult = anyerror!void;
+
+pub const Request = struct {
+    key: []const u8,
+    value: []const u8,
+    tombstone: bool,
+    future: *zio.Future(OpResult),
+};
+
+pub const State = struct {
+    allocator: std.mem.Allocator,
+    store: PageStore,
+    root: std.atomic.Value(u32),
+    sequence: std.atomic.Value(u64),
+    dirt: std.atomic.Value(u64),
+    entry_count: std.atomic.Value(u64),
+    byte_size: std.atomic.Value(u64),
+    opts: Options,
+    closed: std.atomic.Value(bool),
+
+    /// meta 交替索引（仅写者访问，不需原子）
+    meta_index: u32,
+
+    pub fn init(allocator: std.mem.Allocator, store: PageStore, opts: Options) State {
+        // 从 store 恢复 meta（open 时已有 meta 则用其值，否则默认）/
+        // MVP：写者单线程，meta_index 从 0 开始
+        return .{
+            .allocator = allocator,
+            .store = store,
+            .root = std.atomic.Value(u32).init(btree2.NULL_ROOT),
+            .sequence = std.atomic.Value(u64).init(0),
+            .dirt = std.atomic.Value(u64).init(0),
+            .entry_count = std.atomic.Value(u64).init(0),
+            .byte_size = std.atomic.Value(u64).init(0),
+            .opts = opts,
+            .closed = std.atomic.Value(bool).init(false),
+            .meta_index = 0,
+        };
+    }
+
+    pub fn deinit(self: *State) void {
+        self.closed.store(true, .release);
+    }
+
+    /// 应用一批写请求到 B-tree，提交 meta，fsync，更新原子状态
+    pub fn applyBatch(self: *State, batch: []const Request) !void {
+        if (self.closed.load(.acquire)) {
+            for (batch) |r| r.future.set(error.Closed);
+            return;
+        }
+
+        // 1. 快照当前 root
+        const cur_root = self.root.load(.acquire);
+        const cur_sequence = self.sequence.load(.acquire);
+        const cur_entry_count = self.entry_count.load(.acquire);
+        const cur_byte_size = self.byte_size.load(.acquire);
+
+        // 2. 收集脏页
+        var dirty = std.ArrayList(u32).empty;
+        defer dirty.deinit(self.allocator);
+        var batch_entry_delta: i64 = 0;
+        var batch_byte_delta: i64 = 0;
+        var new_root = cur_root;
+
+        for (batch) |req| {
+            const wr = btree2.insert(self.allocator, self.store, new_root, req.key, req.value, req.tombstone, &dirty) catch |err| {
+                // 失败：全部 future set err
+                for (batch) |r| r.future.set(err);
+                return;
+            };
+            new_root = wr.new_root;
+            batch_entry_delta += wr.count_delta;
+            batch_byte_delta += wr.live_delta;
+        }
+
+        // 3. 回收脏页到 freelist
+        for (dirty.items) |pn| {
+            self.store.freePage(pn);
+        }
+
+        // 4. 计算新 meta 值
+        const new_sequence = cur_sequence + 1;
+        const new_entry_count_signed: i64 = @as(i64, @intCast(cur_entry_count)) + batch_entry_delta;
+        const new_entry_count: u64 = @intCast(@max(@as(i64, 0), new_entry_count_signed));
+        const new_byte_signed: i64 = @as(i64, @intCast(cur_byte_size)) + batch_byte_delta;
+        const new_byte: u64 = @intCast(@max(@as(i64, 0), new_byte_signed));
+
+        // 5. 写 meta
+        const meta = f2.MetaPage{
+            .magic = f2.MAGIC_V2,
+            .version = 2,
+            .mapsize = self.store.mapsize(),
+            .sequence = new_sequence,
+            .root_page = new_root,
+            .entry_count = new_entry_count,
+            .byte_size = new_byte,
+            .free_head = 0, // ponytail: MVP 不追踪 freelist head 到 meta
+            .free_count = 0,
+            .last_page = 0,
+        };
+        try self.store.writeMeta(&meta);
+
+        // 6. fsync
+        if (self.opts.fsync) {
+            try self.store.sync();
+        }
+
+        // 7. 原子更新状态
+        self.root.store(new_root, .release);
+        self.sequence.store(new_sequence, .release);
+        self.dirt.store(@intCast(dirty.items.len), .release);
+        self.entry_count.store(new_entry_count, .release);
+        self.byte_size.store(new_byte, .release);
+
+        // 8. 所有请求成功
+        for (batch) |req| {
+            req.future.set({});
+        }
+    }
+};
+
+test "writer2: State init defaults" {
+    const ms = ps.MemPageStore.init(std.testing.allocator, 100);
+    defer ms.deinit();
+    const state = State.init(std.testing.allocator, ms.store(), .{});
+    defer state.deinit();
+    try std.testing.expectEqual(btree2.NULL_ROOT, state.root.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), state.sequence.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), state.dirt.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), state.entry_count.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), state.byte_size.load(.acquire));
+}

@@ -158,4 +158,20 @@ pub fn build(b: *std.Build) void {
     const run_btree2_test = b.addRunArtifact(btree2_test);
     const btree2_test_step = b.step("test-btree2", "Run btree2 tests only");
     btree2_test_step.dependOn(&run_btree2_test.step);
+
+    // ponytail: zig build test-writer2 只跑 writer2 测试
+    const writer2_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/writer2_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    const run_writer2_test = b.addRunArtifact(writer2_test);
+    const writer2_test_step = b.step("test-writer2", "Run writer2 tests only");
+    writer2_test_step.dependOn(&run_writer2_test.step);
 }

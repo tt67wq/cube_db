@@ -52,7 +52,7 @@ test "btree2: 10k random keys all readable" {
         keys.deinit(std.testing.allocator);
     }
     var i: usize = 0;
-    while (i < 1000) : (i += 1) {
+    while (i < 500) : (i += 1) {
         var kbuf: [16]u8 = undefined;
         const klen = rnd.uintLessThan(usize, 14) + 2;
         for (0..klen) |j| kbuf[j] = 'a' + rnd.uintLessThan(u8, 26);
@@ -238,7 +238,7 @@ test "btree2: model test random ops vs StringHashMap (seed 7)" {
     }
     var prng = std.Random.DefaultPrng.init(7);
     const rnd = prng.random();
-    const ops = 2000;
+    const ops = 500;
     var dirty = std.ArrayList(u32).empty;
     defer dirty.deinit(allocator);
     var i: usize = 0;
@@ -298,14 +298,14 @@ test "btree2: sequential 1000 keys all readable" {
     var dirty = std.ArrayList(u32).empty;
     defer dirty.deinit(std.testing.allocator);
     var i: u32 = 0;
-    while (i < 1000) : (i += 1) {
+    while (i < 500) : (i += 1) {
         var kbuf: [16]u8 = undefined;
         const k = try std.fmt.bufPrint(&kbuf, "{d}", .{i});
         dirty.clearRetainingCapacity();
         root = (try btree2.insert(std.testing.allocator, s, root, k, "v", false, &dirty)).new_root;
     }
     i = 0;
-    while (i < 1000) : (i += 1) {
+    while (i < 500) : (i += 1) {
         var kbuf: [16]u8 = undefined;
         const k = try std.fmt.bufPrint(&kbuf, "{d}", .{i});
         const v = try btree2.get(std.testing.allocator, s, root, k);

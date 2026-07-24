@@ -4,6 +4,7 @@ const std = @import("std");
 pub const format2 = @import("format2.zig");
 pub const page_store = @import("page_store.zig");
 pub const btree2 = @import("btree2.zig");
+pub const writer2 = @import("writer2.zig");
 
 pub const format = @import("format.zig");
 pub const store = @import("store.zig");
