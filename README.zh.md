@@ -1,13 +1,16 @@
 # cube_db
 
-嵌入式键值存储，用 Zig 0.16.0 编写，参考 [CubDB](https://github.com/lucaong/cubdb) 架构：
+嵌入式键值存储，用 Zig 0.16.0 编写，基于 freelist 页面复用架构：
 
 - 嵌入式 KV 引擎：`get` / `put` / `delete` / `select`
-- append-only 数据文件
-- 不可变 B-tree（Copy-on-Write）
-- compaction 回收旧版本
+- **页号寻址 COW B-tree** + freelist 页面复用
+- **O(1) compact** — 只写 meta page，不重写数据
+- **O(1) 恢复** — 读两个 meta page，不扫全文件
+- **MVCC reader 安全** — 脏页持有到读者释放
+- **溢出页** — 大 value 自动走溢出页链
+- 纯同步 API，无需准备 runtime
 
-完整实现说明见 [`docs/tutorial/`](docs/tutorial/)。**使用手册：[`docs/usage.md`](docs/usage.md)。**
+**使用手册：[`docs/usage.md`](docs/usage.md)。**
 
 > 英文版见 [README.md](README.md)。
 
@@ -19,151 +22,90 @@
 ## 构建与测试
 
 ```bash
-zig build test
+zig build test          # 全部测试
+zig build bench -Doptimize=ReleaseFast  # 基准测试
 ```
 
-## Benchmark
-
-20 格矩阵（5 op × 2 规模 × 2 value 尺寸）。**必须 ReleaseFast**，Debug 数字无意义。
+## Benchmark (v2 small, MemPageStore)
 
 ```bash
-zig build bench -Doptimize=ReleaseFast                  # 全量
-zig build bench -Dbench-scale=small -Doptimize=ReleaseFast  # smoke / 快跑
+zig build bench -Dbench-scale=small -Doptimize=ReleaseFast
 ```
 
-`-Dbench-scale` 取 `all`|`small`|`large`（默认 `all`）。
+```
+op      scale  value  ops          time_ms      ops/s        avg_us/op
+put     small  100B         10000       4498.5         2223       449.85
+put     small  10KB         10000      17769.7          563      1776.97
+putbatch small  100B         10000        496.9        20125        49.69
+putbatch small  10KB         10000        392.5        25476        39.25
+get     small  100B         10000        349.1        28645        34.91
+get     small  10KB         10000        445.8        22431        44.58
+delete  small  100B         10000       3629.9         2755       362.99
+select  small  100B           100         99.6         1004       995.78
+select  small  10KB           100        269.6          371      2695.88
+```
 
-### 结论（NVMe，ReleaseFast）
+> 运行于 MemPageStore（内存），无 fsync。实际磁盘性能取决于 FilePageStore 实现。
+> v2 COW 页分配驱动 put/delete 成本。putBatch 摊薄 COW ~9× vs 单条 put。
+> get 读取 mmap 页，100B 与 10KB 均在 50µs 以内。
 
-基准矩阵主要数字与判读：
-
-| 维度 | small | large | 结论 |
-|---|---|---|---|
-| put 100B | 498 us/op | 706 us/op | fsync 主导（~400us/op 固定成本），B-tree 深度次要 |
-| **putBatch 100B** | **0.15 us/op** | — | **比 put 快 ~1000×**——BTreeBatch 摊薄 COW 路径重写 + N op 共享 1 fsync |
-| **putBatch 10KB** | **2.5 us/op** | — | 快 ~1400×；fsync 与 COW 同时摊薄 |
-| put 10KB | 3.9 ms/op | 3.8 ms/op | 几乎不随规模变，IO 带宽主导 |
-| get 100B | 251 us/op | 494 us/op | large 翻倍 → 查找/随机读随深度变热；仍远快于 put（无 fsync） |
-| get 10KB | 786 us/op | 1.3 ms/op | IO + 查找双重成本 |
-| delete 100B | 416 us/op | — | 同 put 路径（墓碑 + fsync），成本接近 put |
-
-要点：
-
-1. **fsync-per-op 曾是绝对热点**（put ~400–700us/op ≈ fsync 延迟）。**已解决**：`putBatch([]Entry)` + `BTreeBatch`（节点缓存 + 脏集 + 一次 flush）复用一次 fsync 与 COW 路径重写，单线程 put 吞吐 **~1000×**（0.15us/op vs 498us/op）。
-2. **put 10KB vs 100B 差值 ≈ 写盘时间**：3.8ms − 0.7ms ≈ 3.1ms/10KB ≈ ~3.2 MB/s 落盘带宽——fsync 串行拖后腿，`putBatch` 摊薄后消失。
-3. **get 远快于 put**（251us vs 498us，无 fsync），符合预期；large get 翻倍 → 查找 / page cache 未命中随规模上升，优化点在 B-tree 查找与读路径（未做）。
-4. **compact**：small 100B ~4s / 10KB ~35s，全量重写（seq read + write + sync），~2.9 MB/s——单线程重写是瓶颈；多线程重写 / 流式 sync 是优化方向（未做）。
-5. **COW dirt 放大**：large×100B 预载（1M puts）产生 ~4.7GB 物理文件（live ~120MB，~33×），auto-compact 当前是 stub 未自动回收——手动 `compact()` 或后台 compactor 是必需。
-
-> **已实现（单线程）**：`putBatch` + `BTreeBatch` → put 吞吐 ~1000×（摊薄 fsync + COW）。批量节点内存由 arena 管理；节点缓存 + 自底向上 flush（子先父后分配 offset）。
->
-> **已实现（并发 group commit，杠杆 3）**：`sendRequest` 中隐式合并并发 put/delete 的 leader/follower。无活跃 leader 的线程负责清空请求队列合并一次 applyBatch（1 fsync）；follower 入队后阻塞在自己的 `zio.Future`（内核 futex，原始线程可用）。leader 在队列非空时持续服务，空则卸任。`writer.applyBatch` 本就 set 全部 future，无需额外管道。`tests/group_commit_test.zig` 验证：16 线程 × 50 put（800 op）合并为 ~117 次 applyBatch（~6.8× 更少 fsync），800 key 全可读；并发 delete 合并测试同此。合并度经 `writer.State.apply_count` 计数器观测。
-
-> 注：delete large / select large / compact large 单格耗时长（1M fsync 或全量重写 1GB+），未跑完；形态与 small 同构，按规模线性放。
-
-## 使用示例
-
-最小 open→put→get→close：
+## 快速开始
 
 ```zig
 const cube = @import("cube_db");
 const Db = cube.Db;
+const MemPageStore = cube.page_store.MemPageStore;
 
-const db = try Db.open(allocator, "my.db", .{});
-defer db.close() catch {};
+var ms = MemPageStore.init(allocator, 1 << 20);
+defer ms.deinit();
+var db = try Db.open(allocator, ms.store(), .{});
+defer db.close();
 
 try db.put("hello", "world");
 const v = try db.get("hello");
-if (v) |value| {
-    // value 由 allocator 分配，用完 free
-    allocator.free(value);
-}
+defer allocator.free(v.?);
 ```
 
-完整 API（`putBatch`、`select` 范围查询、`compact`、`Options`、错误处理、并发、常见配方）见 **[使用手册](docs/usage.md)**。
+文件模式（FilePageStore）及完整 API 见 **[docs/usage.md](docs/usage.md)**。
 
-`Db.open` 是**纯同步 API**，不需要调用方准备 `zio.Runtime`。
-内部文件 IO 通过 zio 的阻塞降级机制执行，未来启用 writer 协程（D4）时调用方也无感。
+## 测试
 
-## 测试覆盖率
+82 测试，8 个测试文件，全部通过：
 
-Zig 0.16.0 没有内置覆盖率，这里用 [kcov](https://simonkagstrom.github.io/kcov/) 收集。
-
-### 1. 安装 kcov
+| 模块 | 数量 | 文件 |
+|------|------|------|
+| Format | 21 | `tests/format_test.zig` |
+| Page store | 11 | `tests/page_store_test.zig` |
+| B-tree | 13 | `tests/btree_test.zig` |
+| Writer | 8 | `tests/writer_test.zig` |
+| MVCC | 6 | `tests/mvcc_test.zig` |
+| Db API | 11 | `tests/db_test.zig` |
+| Compact | 6 | `tests/compact_test.zig` |
+| Overflow | 6 | `tests/overflow_test.zig` |
 
 ```bash
-brew install kcov
+zig build test-format test-ps test-btree test-writer test-mvcc test-db test-compact test-overflow
 ```
 
-### 2. 临时 options 模块
+## 项目结构
 
-`zig test` 命令行不会生成 `build.zig` 里的 `zio_options` 模块，需要先写一份临时文件：
-
-```bash
-cat > /tmp/zio_options.zig <<'EOF'
-pub const backend: ?[]const u8 = null;
-pub const ResolveBeneathMode = enum { strict, best_effort };
-pub const resolve_beneath_mode = ResolveBeneathMode.best_effort;
-pub const no_hacks = false;
-pub const task_migration = true;
-EOF
 ```
-
-### 3. 收集 src 单测覆盖率
-
-```bash
-rm -rf /tmp/cov_src
-zig test --test-cmd kcov \
-  --test-cmd --include-pattern="$PWD" \
-  --test-cmd /tmp/cov_src --test-cmd-bin \
-  --dep zio -Mroot=src/root.zig \
-  --dep zio_options -Mzio=../zio/src/zio.zig \
-  -Mzio_options=/tmp/zio_options.zig
+cube_db/
+├── build.zig              # 构建脚本
+├── build.zig.zon          # 包元信息
+├── docs/
+│   ├── usage.md           # 使用手册
+│   └── tutorial/          # 教程
+├── src/
+│   ├── root.zig           # 库入口
+│   ├── main.zig           # 可执行入口
+│   ├── format.zig         # 页格式编解码
+│   ├── page_store.zig     # 页 Store 抽象 + MemPageStore
+│   ├── file_page_store.zig # 文件页 Store（mmap）
+│   ├── btree.zig          # 页号寻址 COW B-tree
+│   ├── writer.zig         # applyBatch + MVCC + meta 交替
+│   └── db.zig             # Db 句柄与公开 API
+├── tests/                 # 82 单元测试
+└── bench/
+    └── bench.zig          # 基准矩阵
 ```
-
-### 4. 收集集成测试覆盖率
-
-```bash
-rm -rf /tmp/cov_db /tmp/cov_compact
-
-zig test --test-cmd kcov \
-  --test-cmd --include-pattern="$PWD" \
-  --test-cmd /tmp/cov_db --test-cmd-bin \
-  --dep cube_db --dep zio -Mroot=tests/db_test.zig \
-  --dep zio_options -Mzio=../zio/src/zio.zig \
-  --dep zio -Mcube_db=src/root.zig \
-  -Mzio_options=/tmp/zio_options.zig
-
-zig test --test-cmd kcov \
-  --test-cmd --include-pattern="$PWD" \
-  --test-cmd /tmp/cov_compact --test-cmd-bin \
-  --dep cube_db --dep zio -Mroot=tests/compact_test.zig \
-  --dep zio_options -Mzio=../zio/src/zio.zig \
-  --dep zio -Mcube_db=src/root.zig \
-  -Mzio_options=/tmp/zio_options.zig
-```
-
-### 5. 合并并查看报告
-
-```bash
-rm -rf /tmp/cov_merged
-kcov --merge /tmp/cov_merged /tmp/cov_src /tmp/cov_db /tmp/cov_compact
-open /tmp/cov_merged/kcov-merged/index.html
-```
-
-### 当前覆盖率
-
-42 个测试全部通过，项目代码覆盖率 **96.9%**（1436 / 1482 行）。
-
-| 文件 | 覆盖率 |
-|------|--------|
-| `src/format.zig` | 100.0% |
-| `src/btree.zig` | 99.3% |
-| `src/fault_store.zig` | 97.3% |
-| `src/db.zig` | 95.3% |
-| `src/store.zig` | 92.9% |
-| `src/file_store.zig` | 91.8% |
-| `src/writer.zig` | 80.4% |
-| `src/root.zig` | 50.0% |
-
-主要未覆盖部分是 `src/root.zig` 的占位导出函数，以及 `src/writer.zig` 的部分错误分支。
