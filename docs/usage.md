@@ -1,29 +1,137 @@
 # cube_db 使用手册
 
-cube_db 是一个用 Zig 0.16.0 编写的嵌入式键值存储，参考 [CubDB](https://github.com/lucaong/cubdb) 架构：append-only 数据文件、不可变 B-tree（Copy-on-Write）、compaction 回收旧版本。纯同步 API，调用方无需准备 runtime。
+cube_db 是一个用 Zig 0.16.0 编写的嵌入式键值存储，提供两套引擎：
 
-本手册覆盖全部公开 API 与常见用法。
+- **v1（CubDB 架构）**：append-only 数据文件 + COW B-tree + 后台 auto-compact。成熟稳定。
+- **v2（freelist 架构）**：固定页 + freelist 复用 + O(1) compact + MVCC。新引擎，性能更好。
+
+纯同步 API，调用方无需准备 runtime。
+
+> **v2 当前状态**：核心功能已完成（页格式、B-tree、writer、MVCC、compact、溢出页），
+> 有 FilePageStore 磁盘实现。建议新项目使用 v2。
 
 ---
 
 ## 目录
 
-1. [安装与构建](#1-安装与构建)
-2. [打开与关闭](#2-打开与关闭)
-3. [读：get](#3-读get)
-4. [写：put / putBatch / delete](#4-写put--putbatch--delete)
-5. [范围查询：select](#5-范围查询select)
-6. [压缩：compact](#6-压缩compact)
-7. [选项：Options](#7-选项options)
-8. [错误处理](#8-错误处理)
-9. [并发](#9-并发)
-10. [持久化与崩溃恢复](#10-持久化与崩溃恢复)
-11. [常见配方](#11-常见配方)
-12. [API 速查](#12-api-速查)
+1. [v2 快速开始](#1-v2-快速开始)
+2. [v2 API](#2-v2-api)
+3. [v1 使用（legacy）](#3-v1-使用legacy)
+4. [常见配方](#4-常见配方)
+5. [API 速查](#5-api-速查)
 
 ---
 
-## 1. 安装与构建
+## 1. v2 快速开始
+
+v2（Db2）使用固定大小页（4KB）和 freelist 页面复用，无需全量 rewrite：
+- **O(1) compact**：只写 meta page，不重写数据
+- **~1× 写放大**：旧页进 freelist 原地复用（v1 约 33×）
+- **O(1) 恢复**：读两个 meta page（v1 需要扫全文件）
+- **MVCC reader 安全**：脏页持有到读者释放
+- **溢出页**：大 value 自动走溢出页链
+
+```zig
+const std = @import("std");
+const zio = @import("zio");
+const cube = @import("cube_db");
+const Db2 = cube.Db2;
+const V2 = cube.V2;
+
+pub fn main() !void {
+    const allocator = std.heap.page_allocator;
+
+    // 内存模式（测试/原型）
+    var ms = V2.page_store.MemPageStore.init(allocator, 1 << 20);
+    defer ms.deinit();
+    var db = try Db2.open(allocator, ms.store(), .{});
+    defer db.close();
+
+    try db.put("hello", "world");
+    const v = try db.get("hello");
+    defer allocator.free(v.?);
+    std.debug.print("got: {s}\n", .{v.?});
+
+    // 文件模式（持久化）
+    // var fps = try V2.file_page_store.create(allocator, "my_v2.db", 1 << 30);
+    // defer fps.deinit();
+    // var db2 = try Db2.open(allocator, fps.store(), .{});
+    // defer db2.close();
+}
+```
+
+---
+
+## 2. v2 API
+
+### 2.1 打开与关闭
+
+```zig
+// 内存模式（MemPageStore）
+var ms = V2.page_store.MemPageStore.init(allocator, mapsize_pages);
+defer ms.deinit();
+var db = try Db2.open(allocator, ms.store(), .{});
+defer db.close();
+
+// 文件模式（FilePageStore）
+var fps = try V2.file_page_store.create(allocator, "path.db", 1 << 30);  // 1GB mapsize
+defer fps.deinit();
+var db = try Db2.open(allocator, fps.store(), .{});
+defer db.close();
+```
+
+v2 的 `open` 从 meta page（page 1/2）恢复状态：root、sequence、entry_count、byte_size。
+恢复无需扫全文件，O(1)。
+
+### 2.2 读写操作
+
+v2 API 与 v1 相同：
+
+```zig
+try db.put("key", "value");
+const v = try db.get("key");       // !?[]u8，调用方 free
+try db.delete("key");
+
+try db.putBatch(&.{.{ .key = "a", .value = "1" }});
+
+var it = try db.select("a", "z");
+defer it.deinit();
+while (try it.next()) |e| { /* e.key, e.value 借用 */ }
+
+try db.compact();  // O(1)：只写 meta page
+```
+
+### 2.3 Options
+
+```zig
+var db = try Db2.open(allocator, store, .{
+    .fsync = true,   // 每次写入后 fsync
+});
+```
+
+v2 `Options` 比 v1 简洁：
+
+| 字段 | 类型 | 默认 | 含义 |
+|---|---|---|---|
+| `fsync` | `bool` | `true` | 写操作是否 fsync 落盘 |
+
+v2 的 compact 是 O(1) 的，无需 `auto_compact_*` 参数。
+
+### 2.4 MVCC 读者管理
+
+v2 支持多个并发读取器（reader），写入器在读者活跃时延迟回收脏页：
+
+```zig
+const reader_seq = db.beginRead();  // 开始读，返回当前序列号
+const v = try db.get("k");          // 读一致性快照
+db.endRead();                        // 结束读，释放脏页
+```
+
+没有活跃读者时，脏页在每次 commit 后自动回收。
+
+---
+
+## 3. v1 使用（legacy）
 
 依赖：
 - Zig 0.16.0

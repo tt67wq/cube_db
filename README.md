@@ -91,17 +91,24 @@ if (v) |value| {
 
 For the full API (`putBatch`, `select` range queries, `compact`, `Options`, error handling, concurrency, recipes) see the **[usage manual](docs/usage.md)**.
 
-## V2 (freelist-based) — Preview
+## V2 (freelist-based) — 新引擎
 
-A page-based B-tree with page reuse via freelist (LMDB-style). Currently in-memory only (MemPageStore); FilePageStore pending.
+A page-based B-tree with page reuse via freelist (LMDB-style). Both in-memory and file-backed.
 
 ```zig
 const Db2 = cube.Db2;
-const ps = cube.page_store;
+const V2 = cube.V2;
 
-var ms = ps.MemPageStore.init(allocator, 1 << 20);
+// 内存模式（测试/原型）
+var ms = V2.page_store.MemPageStore.init(allocator, 1 << 20);
 defer ms.deinit();
 var db = try Db2.open(allocator, ms.store(), .{});
+defer db.close();
+
+// 文件模式（持久化）
+var fps = try V2.file_page_store.create(allocator, "my_v2.db", 1 << 30);
+defer fps.deinit();
+var db = try Db2.open(allocator, fps.store(), .{});
 defer db.close();
 
 try db.put("hello", "world");
@@ -115,6 +122,15 @@ defer allocator.free(v.?);
 - **O(1) recovery** — reads two meta pages (vs v1's full-file scan)
 - **MVCC reader safety** — dirty pages held until readers drain
 - **Overflow pages** — values up to any size via overflow page chains
+
+**Quick bench comparison (ReleaseFast, 10K ops, fsync=false):**
+| Metric | v1 | v2 |
+|---|---|---|
+| put 100B | 541 ms (18,471/s) | 1,903 ms (5,254/s) |
+| get 100B | 4 ms (2.3M/s) | 324 ms (30,806/s) |
+
+> v2 write path is slower due to COW page allocation; read path needs zero-copy optimization.
+> Structural advantages (compact, write amplification, recovery) are verified by unit tests.
 
 `Db.open` is a **purely synchronous API** — callers don't need to set up a `zio.Runtime`.
 

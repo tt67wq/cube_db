@@ -55,7 +55,49 @@ zig build test                          # 跑全部测试
 zig build -Doptimize=ReleaseSafe         # 检查 ReleaseSafe 无警告
 ```
 
-## 项目目录速览
+## V2 (freelist 架构) — 新引擎
+
+v2 从 v1 的 append-only 改为固定页 + freelist 复用。核心差异：
+
+| 维度 | v1 (append-only) | v2 (freelist) |
+|---|---|---|
+| 文件格式 | 变长记录 + marker | 固定 4KB 页 + 页头 |
+| B-tree | 字节偏移寻址（u64） | 页号寻址（u32） |
+| 写放大 | ~33× | ~1×（页复用） |
+| compact | 全量重写（2.9 MB/s） | O(1) meta 切换 |
+| 恢复 | 扫全文件 | 读 2 meta 页 |
+| 大 value | 内联（受页大小限制） | 溢出页链 |
+
+v2 源文件（`src/`）：
+
+| 文件 | 对应 v1 | 说明 |
+|------|---------|------|
+| `format2.zig` | `format.zig` | v2 页格式：页头、meta page、freelist 页、CRC |
+| `page_store.zig` | `store.zig` | 页 Store 抽象（vtable）+ MemPageStore 实现 |
+| `btree2.zig` | `btree.zig` | 页号寻址 COW B-tree（u32 子指针） |
+| `writer2.zig` | `writer.zig` | applyBatch + MVCC pending_free + meta 交替 |
+| `db2.zig` | `db.zig` | Db2 句柄与公开 API |
+| `file_page_store.zig` | `file_store.zig` | 文件的页 Store（mmap 读写） |
+
+v2 测试文件（`tests/`）：
+
+| 文件 | 测试内容 |
+|------|----------|
+| `format2_test.zig` | 页头/meta/freelist 编解码（21 测试） |
+| `page_store_test.zig` | 页分配/回收/mmap 恢复（11 测试） |
+| `btree2_test.zig` | B-tree 全套（13 测试） |
+| `writer2_test.zig` | applyBatch/meta 交替（8 测试） |
+| `mvcc_test.zig` | MVCC reader 安全回收（6 测试） |
+| `db2_test.zig` | Db2 公开 API 集成（11 测试） |
+| `compact2_test.zig` | O(1) compact（6 测试） |
+| `overflow_test.zig` | 大 value 溢出页链（6 测试） |
+
+> 共 82 单测，全部通过。建议读完 v1 核心章节后对照 v2 代码，
+> 理解从 append-only 到 freelist 的架构演进。
+
+---
+
+## 项目目录速览（v2 补充）
 
 ```
 cube_db/
