@@ -24,6 +24,25 @@ zig build test          # all tests
 zig build bench -Doptimize=ReleaseFast  # benchmark
 ```
 
+## Benchmark (v2 small, MemPageStore)
+
+```
+op      scale  value  ops          time_ms      ops/s        avg_us/op
+put     small  100B         10000       4498.5         2223       449.85
+put     small  10KB         10000      17769.7          563      1776.97
+putbatch small  100B         10000        496.9        20125        49.69
+putbatch small  10KB         10000        392.5        25476        39.25
+get     small  100B         10000        349.1        28645        34.91
+get     small  10KB         10000        445.8        22431        44.58
+delete  small  100B         10000       3629.9         2755       362.99
+select  small  100B           100         99.6         1004       995.78
+select  small  10KB           100        269.6          371      2695.88
+```
+
+> `zig build bench -Dbench-scale=small -Doptimize=ReleaseFast` — in-memory (MemPageStore), no fsync.
+> v2 COW page allocation drives put/delete cost. putBatch amortizes COW ~9× vs single put.
+> get reads mmap-backed pages, sub-50µs for both 100B and 10KB values.
+
 ## Quick start
 
 ```zig
