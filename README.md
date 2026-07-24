@@ -35,7 +35,12 @@ zig build bench -Dbench-scale=small -Doptimize=ReleaseFast  # smoke / quick run
 
 ### Findings (NVMe, ReleaseFast)
 
-Key numbers and interpretation from the benchmark matrix:
+> **Note:** v2 benchmark requires FilePageStore (disk-backed) implementation.
+> Current v2 performance numbers are from MemPageStore (in-memory) — not comparable.
+> The structural advantages (O(1) compact, ~1× write amplification via freelist) are
+> verified by unit tests but full benchmark comparison is pending FilePageStore.
+
+Key numbers and interpretation from the v1 benchmark matrix:
 
 | Dimension | small | large | Conclusion |
 |---|---|---|---|

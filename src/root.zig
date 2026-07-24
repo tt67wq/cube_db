@@ -26,6 +26,15 @@ pub const Db = db.Db;
 // V2 (freelist-based page storage) — new default for new projects
 pub const Db2 = db2.Db2;
 
+pub const V2 = struct {
+    pub const format2 = @import("format2.zig");
+    pub const page_store = @import("page_store.zig");
+    pub const btree2 = @import("btree2.zig");
+    pub const writer2 = @import("writer2.zig");
+    pub const db2 = @import("db2.zig");
+    pub const file_page_store = @import("file_page_store.zig");
+};
+
 // ponytail: add 保留导出，后续 db.zig 落地后替换
 pub fn add(a: i32, b: i32) i32 {
     return a + b;

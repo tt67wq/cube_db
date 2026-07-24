@@ -223,6 +223,23 @@ pub fn build(b: *std.Build) void {
     const compact2_test_step = b.step("test-compact2", "Run compact2 tests only");
     compact2_test_step.dependOn(&run_compact2_test.step);
 
+    // ponytail: zig build bench-compare — 快速 v1 vs v2 对比
+    const bench_compare = b.addExecutable(.{
+        .name = "cube_bench_compare",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/bench_compare.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    const run_bench_compare = b.addRunArtifact(bench_compare);
+    const bench_compare_step = b.step("bench-compare", "Run v1 vs v2 quick benchmark");
+    bench_compare_step.dependOn(&run_bench_compare.step);
+
     // ponytail: zig build test-overflow 只跑 overflow 测试
     const overflow_test = b.addTest(.{
         .root_module = b.createModule(.{
