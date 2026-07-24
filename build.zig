@@ -222,4 +222,20 @@ pub fn build(b: *std.Build) void {
     const run_compact2_test = b.addRunArtifact(compact2_test);
     const compact2_test_step = b.step("test-compact2", "Run compact2 tests only");
     compact2_test_step.dependOn(&run_compact2_test.step);
+
+    // ponytail: zig build test-overflow 只跑 overflow 测试
+    const overflow_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/overflow_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    const run_overflow_test = b.addRunArtifact(overflow_test);
+    const overflow_test_step = b.step("test-overflow", "Run overflow tests only");
+    overflow_test_step.dependOn(&run_overflow_test.step);
 }

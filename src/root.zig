@@ -23,6 +23,9 @@ pub const Options = db.Options;
 pub const Entry = db.Entry;
 pub const Db = db.Db;
 
+// V2 (freelist-based page storage) — new default for new projects
+pub const Db2 = db2.Db2;
+
 // ponytail: add 保留导出，后续 db.zig 落地后替换
 pub fn add(a: i32, b: i32) i32 {
     return a + b;

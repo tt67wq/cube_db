@@ -3,10 +3,9 @@
 An embedded key-value store written in Zig 0.16.0, modeled after the [CubDB](https://github.com/lucaong/cubdb) architecture:
 
 - Embedded KV engine: `get` / `put` / `delete` / `select`
-- Append-only data file
+- **v2 (freelist)**: page-based COW B-tree with page reuse — O(1) compact, ~1× write amplification
+- **v1 (append-only)**: original format — append-only data file, auto-compaction in background thread
 - Immutable B-tree (Copy-on-Write)
-- Auto-compaction in background thread (threshold-based dirt reclamation)
-- Manual compaction to reclaim old versions
 
 Full implementation notes in [`docs/tutorial/`](docs/tutorial/). **Usage manual: [`docs/usage.md`](docs/usage.md).**
 
@@ -87,8 +86,32 @@ if (v) |value| {
 
 For the full API (`putBatch`, `select` range queries, `compact`, `Options`, error handling, concurrency, recipes) see the **[usage manual](docs/usage.md)**.
 
+## V2 (freelist-based) — Preview
+
+A page-based B-tree with page reuse via freelist (LMDB-style). Currently in-memory only (MemPageStore); FilePageStore pending.
+
+```zig
+const Db2 = cube.Db2;
+const ps = cube.page_store;
+
+var ms = ps.MemPageStore.init(allocator, 1 << 20);
+defer ms.deinit();
+var db = try Db2.open(allocator, ms.store(), .{});
+defer db.close();
+
+try db.put("hello", "world");
+const v = try db.get("hello");
+defer allocator.free(v.?);
+```
+
+**Key advantages over v1:**
+- **O(1) compact** — no full rewrite, just meta page switch (vs v1's 2.9 MB/s rewrite)
+- **~1× write amplification** — page reuse via freelist (vs v1's ~33×)
+- **O(1) recovery** — reads two meta pages (vs v1's full-file scan)
+- **MVCC reader safety** — dirty pages held until readers drain
+- **Overflow pages** — values up to any size via overflow page chains
+
 `Db.open` is a **purely synchronous API** — callers don't need to set up a `zio.Runtime`.
-Internal file I/O runs through zio's blocking-degradation mechanism; callers stay unaffected when the writer coroutine (D4) lands.
 
 ## Test Coverage
 

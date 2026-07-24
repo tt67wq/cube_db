@@ -63,15 +63,108 @@ pub fn writeNodePage(store: PageStore, page_no: u32, page_type: u8, nkeys: u16, 
 
 // ===== Leaf 节点编码 =====
 
+/// 最大内联值大小（留余量给页头和多个 entry）
+pub const MAX_INLINE_VALUE: usize = 3800;
+
+/// 溢出页最多可存 payload 字节数
+const OVERFLOW_PAYLOAD: usize = f2.PAGE_SIZE - f2.PAGE_HEADER_SIZE - 4;
+
+/// flags: 1 = 溢出页
+const LEAF_FLAG_OVERFLOW: u8 = 1;
+
+/// 写值到溢出页链，返首页号
+/// ponytail: MVP 无 nkeys 更新，链靠 free_next
+fn writeOverflowPages(store: PageStore, value: []const u8) !u32 {
+    var remaining = value.len;
+    var offset: usize = 0;
+    var first_page: u32 = 0;
+    var prev_page: u32 = 0;
+    
+    while (remaining > 0) {
+        const page_no = try store.allocPage();
+        const page = try store.writePage(page_no);
+        const arr: *[f2.PAGE_SIZE]u8 = @ptrCast(page.ptr);
+        const chunk = @min(remaining, OVERFLOW_PAYLOAD);
+        
+        const hdr = f2.PageHeader{
+            .page_no = page_no,
+            .page_type = f2.PAGE_TYPE_OVERFLOW,
+            .gen = 0,
+            .nkeys = 0,
+            .free_next = 0,
+        };
+        f2.encodePageHeader(page[0..f2.PAGE_HEADER_SIZE], &hdr);
+        @memcpy(page[f2.PAGE_HEADER_SIZE..][0..chunk], value[offset..offset+chunk]);
+        const rem = OVERFLOW_PAYLOAD - chunk;
+        if (rem > 0) @memset(page[f2.PAGE_HEADER_SIZE + chunk .. f2.PAGE_SIZE - 4], 0);
+        f2.setPageChecksum(arr, f2.computePageChecksum(arr));
+        
+        if (first_page == 0) {
+            first_page = page_no;
+        } else {
+            // 链接前页 → 本页
+            const prev = try store.writePage(prev_page);
+            const prev_arr: *[f2.PAGE_SIZE]u8 = @ptrCast(prev.ptr);
+            var prev_hdr = f2.decodePageHeader(prev[0..f2.PAGE_HEADER_SIZE]);
+            prev_hdr.free_next = page_no;
+            f2.encodePageHeader(prev[0..f2.PAGE_HEADER_SIZE], &prev_hdr);
+            f2.setPageChecksum(prev_arr, f2.computePageChecksum(prev_arr));
+        }
+        prev_page = page_no;
+        remaining -= chunk;
+        offset += chunk;
+    }
+    return first_page;
+}
+
+/// 读溢出页链，返回值（调用方 free）
+fn readOverflowValue(allocator: std.mem.Allocator, store: PageStore, first_page: u32, vlen: u32) ![]u8 {
+    const result = try allocator.alloc(u8, vlen);
+    errdefer allocator.free(result);
+    var offset: usize = 0;
+    var cur = first_page;
+    while (cur != 0 and offset < vlen) {
+        const payload = try readNodePayload(store, cur);
+        const chunk = @min(vlen - offset, payload.len);
+        @memcpy(result[offset..][0..chunk], payload[0..chunk]);
+        offset += chunk;
+        const page = try store.readPage(cur);
+        const hdr = f2.decodePageHeader(page[0..f2.PAGE_HEADER_SIZE]);
+        cur = hdr.free_next;
+    }
+    return result;
+}
+
+/// 回收溢出页链到 dirty list
+fn freeOverflowPages(store: PageStore, first_page: u32, dirty: *std.ArrayList(u32), allocator: std.mem.Allocator) void {
+    var cur = first_page;
+    while (cur != 0) {
+        const page = store.readPage(cur) catch return;
+        const hdr = f2.decodePageHeader(page[0..f2.PAGE_HEADER_SIZE]);
+        const next = hdr.free_next;
+        dirty.append(allocator, cur) catch {};
+        cur = next;
+    }
+}
+
+/// 判断 entry 需要溢出页
+fn needsOverflow(entry: LeafEntry) bool {
+    return entry.value.len > MAX_INLINE_VALUE;
+}
+
 pub fn leafPayloadSize(entries: []const LeafEntry) usize {
     var n: usize = 1 + 2;
     for (entries) |e| {
-        n += 1 + 4 + e.key.len + 4 + e.value.len;
+        // tombstone(1) + klen(4) + key + vlen(4) + flags(1) + value
+        // For overflow, value takes 4 bytes (page_no) instead of inline
+        const value_sz = if (e.value.len > MAX_INLINE_VALUE) @as(usize, 4) else e.value.len;
+        n += 1 + 4 + e.key.len + 4 + 1 + value_sz;
     }
     return n;
 }
 
-pub fn encodeLeafPayload(buf: []u8, entries: []const LeafEntry) usize {
+pub fn encodeLeafPayload(buf: []u8, entries: []const LeafEntry, store: PageStore, dirty: *std.ArrayList(u32)) !usize {
+    _ = dirty;
     const need = leafPayloadSize(entries);
     std.debug.assert(buf.len >= need);
     var pos: usize = 0;
@@ -80,6 +173,7 @@ pub fn encodeLeafPayload(buf: []u8, entries: []const LeafEntry) usize {
     std.mem.writeInt(u16, buf[pos..][0..2], @intCast(entries.len), .big);
     pos += 2;
     for (entries) |e| {
+        const is_ov = e.value.len > MAX_INLINE_VALUE;
         buf[pos] = if (e.tombstone) @as(u8, 1) else 0;
         pos += 1;
         std.mem.writeInt(u32, buf[pos..][0..4], @intCast(e.key.len), .big);
@@ -88,8 +182,18 @@ pub fn encodeLeafPayload(buf: []u8, entries: []const LeafEntry) usize {
         pos += e.key.len;
         std.mem.writeInt(u32, buf[pos..][0..4], @intCast(e.value.len), .big);
         pos += 4;
-        @memcpy(buf[pos..][0..e.value.len], e.value);
-        pos += e.value.len;
+        if (is_ov) {
+            buf[pos] = LEAF_FLAG_OVERFLOW;
+            pos += 1;
+            const ov_page = try writeOverflowPages(store, e.value);
+            std.mem.writeInt(u32, buf[pos..][0..4], ov_page, .little);
+            pos += 4;
+        } else {
+            buf[pos] = 0;
+            pos += 1;
+            @memcpy(buf[pos..][0..e.value.len], e.value);
+            pos += e.value.len;
+        }
     }
     return need;
 }
@@ -98,6 +202,8 @@ pub const DecodedLeafEntry = struct {
     tombstone: bool,
     key: []const u8,
     value: []const u8,
+    flags: u8,
+    vlen: u32,
 };
 
 pub fn decodeLeafPayload(payload: []const u8, entries_out: []DecodedLeafEntry) !void {
@@ -106,8 +212,8 @@ pub fn decodeLeafPayload(payload: []const u8, entries_out: []DecodedLeafEntry) !
     const count = std.mem.readInt(u16, payload[1..3], .big);
     if (entries_out.len < count) return error.Truncated;
     var pos: usize = 3;
-    var i: usize = 0;
-    while (i < count) : (i += 1) {
+    for (payload, 0..) |_, i| {
+        if (i >= count) break;
         if (pos + 1 + 4 > payload.len) return error.Truncated;
         const tombstone = payload[pos] == 1;
         pos += 1;
@@ -119,10 +225,21 @@ pub fn decodeLeafPayload(payload: []const u8, entries_out: []DecodedLeafEntry) !
         if (pos + 4 > payload.len) return error.Truncated;
         const vlen = std.mem.readInt(u32, payload[pos..][0..4], .big);
         pos += 4;
-        if (pos + vlen > payload.len) return error.Truncated;
-        const value = payload[pos .. pos + vlen];
-        pos += vlen;
-        entries_out[i] = .{ .tombstone = tombstone, .key = key, .value = value };
+        if (pos + 1 > payload.len) return error.Truncated;
+        const flags = payload[pos];
+        pos += 1;
+        if (flags & LEAF_FLAG_OVERFLOW != 0) {
+            // overflow: 4 bytes page_no
+            if (pos + 4 > payload.len) return error.Truncated;
+            const ov_page = payload[pos..pos+4];
+            pos += 4;
+            entries_out[i] = .{ .tombstone = tombstone, .key = key, .value = ov_page, .flags = flags, .vlen = vlen };
+        } else {
+            if (pos + vlen > payload.len) return error.Truncated;
+            const value = payload[pos .. pos + vlen];
+            pos += vlen;
+            entries_out[i] = .{ .tombstone = tombstone, .key = key, .value = value, .flags = flags, .vlen = vlen };
+        }
     }
 }
 
@@ -200,7 +317,7 @@ pub const Leaf = struct {
         self.allocator.free(self.entries);
     }
 
-    pub fn fromPayload(allocator: std.mem.Allocator, payload: []const u8) !Leaf {
+    pub fn fromPayload(allocator: std.mem.Allocator, store: PageStore, payload: []const u8, dirty: *std.ArrayList(u32)) !Leaf {
         const dec = try allocator.alloc(DecodedLeafEntry, LEAF_MAX_ENTRIES);
         defer allocator.free(dec);
         const count = blk: {
@@ -213,11 +330,23 @@ pub const Leaf = struct {
         try decodeLeafPayload(payload, dec_slice);
         const entries = try allocator.alloc(LeafEntry, count);
         for (dec_slice, 0..) |d, i| {
-            entries[i] = .{
-                .tombstone = d.tombstone,
-                .key = try allocator.dupe(u8, d.key),
-                .value = try allocator.dupe(u8, d.value),
-            };
+            if (d.flags & LEAF_FLAG_OVERFLOW != 0) {
+                // 读溢出页链，获完整值；并将旧溢出页加入 dirty
+                const ov_page = std.mem.readInt(u32, d.value[0..4], .little);
+                freeOverflowPages(store, ov_page, dirty, allocator);
+                const full_val = try readOverflowValue(allocator, store, ov_page, d.vlen);
+                entries[i] = .{
+                    .tombstone = d.tombstone,
+                    .key = try allocator.dupe(u8, d.key),
+                    .value = full_val,
+                };
+            } else {
+                entries[i] = .{
+                    .tombstone = d.tombstone,
+                    .key = try allocator.dupe(u8, d.key),
+                    .value = try allocator.dupe(u8, d.value),
+                };
+            }
         }
         return .{ .entries = entries, .allocator = allocator };
     }
@@ -296,7 +425,7 @@ pub fn get(allocator: std.mem.Allocator, store: PageStore, root: u32, key: []con
         const payload = try readNodePayload(store, cur);
         if (payload.len == 0) return error.Truncated;
         if (payload[0] == LEAF_KIND) {
-            return findInLeaf(allocator, payload, key);
+            return findInLeaf(allocator, store, payload, key);
         } else {
             cur = try findInBranchPayload(payload, key);
         }
@@ -304,7 +433,7 @@ pub fn get(allocator: std.mem.Allocator, store: PageStore, root: u32, key: []con
     return error.Truncated;
 }
 
-fn findInLeaf(allocator: std.mem.Allocator, payload: []const u8, key: []const u8) !?[]u8 {
+fn findInLeaf(allocator: std.mem.Allocator, store: PageStore, payload: []const u8, key: []const u8) !?[]u8 {
     if (payload.len < 3) return error.Truncated;
     if (payload[0] != LEAF_KIND) return error.CorruptCrc;
     const count = std.mem.readInt(u16, payload[1..3], .big);
@@ -322,12 +451,31 @@ fn findInLeaf(allocator: std.mem.Allocator, payload: []const u8, key: []const u8
         if (pos + 4 > payload.len) return error.Truncated;
         const vlen = std.mem.readInt(u32, payload[pos..][0..4], .big);
         pos += 4;
-        if (pos + vlen > payload.len) return error.Truncated;
-        const ev = payload[pos .. pos + vlen];
-        pos += vlen;
+        if (pos + 1 > payload.len) return error.Truncated;
+        const flags = payload[pos];
+        pos += 1;
         switch (cmpKey(ek, key)) {
-            .lt => continue,
-            .eq => return if (!tombstone) try allocator.dupe(u8, ev) else null,
+            .lt => {
+                // skip value for non-matching key
+                if (flags & LEAF_FLAG_OVERFLOW == 0) {
+                    if (pos + vlen > payload.len) return error.Truncated;
+                    pos += vlen;
+                } else {
+                    if (pos + 4 > payload.len) return error.Truncated;
+                    pos += 4;
+                }
+                continue;
+            },
+            .eq => {
+                if (tombstone) return null;
+                if (flags & LEAF_FLAG_OVERFLOW != 0) {
+                    const ov_page = std.mem.readInt(u32, payload[pos..][0..4], .little);
+                    return @as(?[]u8, try readOverflowValue(allocator, store, ov_page, @intCast(vlen)));
+                }
+                if (pos + vlen > payload.len) return error.Truncated;
+                const ev = payload[pos .. pos + vlen];
+                return try allocator.dupe(u8, ev);
+            },
             .gt => return null,
         }
     }
@@ -380,7 +528,7 @@ fn insertIntoLeaf(
     dirty: *std.ArrayList(u32),
 ) !InsertSub {
     const payload = try readNodePayload(store, page_no);
-    var leaf = try Leaf.fromPayload(allocator, payload);
+    var leaf = try Leaf.fromPayload(allocator, store, payload, dirty);
     defer leaf.deinit();
 
     var live_delta: i64 = 0;
@@ -429,7 +577,7 @@ fn insertIntoLeaf(
         const new_page = try store.allocPage();
         const pl = leafPayloadSize(leaf.entries);
         var payload_buf: [f2.PAGE_SIZE]u8 = undefined;
-        _ = encodeLeafPayload(payload_buf[0..pl], leaf.entries);
+        _ = try encodeLeafPayload(payload_buf[0..pl], leaf.entries, store, dirty);
         try writeNodePage(store, new_page, f2.PAGE_TYPE_LEAF, @intCast(leaf.entries.len), payload_buf[0..pl]);
         return .{
             .new_child = new_page,
@@ -444,12 +592,12 @@ fn insertIntoLeaf(
     const left_page = try store.allocPage();
     const left_pl = leafPayloadSize(left_entries);
     var left_buf: [f2.PAGE_SIZE]u8 = undefined;
-    _ = encodeLeafPayload(left_buf[0..left_pl], left_entries);
+    _ = try encodeLeafPayload(left_buf[0..left_pl], left_entries, store, dirty);
     try writeNodePage(store, left_page, f2.PAGE_TYPE_LEAF, @intCast(left_entries.len), left_buf[0..left_pl]);
     const right_page = try store.allocPage();
     const right_pl = leafPayloadSize(right_entries);
     var right_buf: [f2.PAGE_SIZE]u8 = undefined;
-    _ = encodeLeafPayload(right_buf[0..right_pl], right_entries);
+    _ = try encodeLeafPayload(right_buf[0..right_pl], right_entries, store, dirty);
     try writeNodePage(store, right_page, f2.PAGE_TYPE_LEAF, @intCast(right_entries.len), right_buf[0..right_pl]);
     const split_key = try allocator.dupe(u8, right_entries[0].key);
     return .{
@@ -598,7 +746,7 @@ pub fn insert(
         }
         const pl = leafPayloadSize(&entries);
         var buf: [f2.PAGE_SIZE]u8 = undefined;
-        _ = encodeLeafPayload(buf[0..pl], &entries);
+        _ = try encodeLeafPayload(buf[0..pl], &entries, store, dirty);
         try writeNodePage(store, new_page, f2.PAGE_TYPE_LEAF, 1, buf[0..pl]);
         return .{
             .new_root = new_page,
@@ -693,7 +841,9 @@ pub const Iterator = struct {
                 while (depth < 1000) : (depth += 1) {
                     const payload = try readNodePayload(self.store, cur);
                     if (payload[0] == LEAF_KIND) {
-                        self.cur_leaf = try Leaf.fromPayload(self.allocator, payload);
+                        var _leaf_dirty = std.ArrayList(u32).empty;
+                        defer _leaf_dirty.deinit(self.allocator);
+                        self.cur_leaf = try Leaf.fromPayload(self.allocator, self.store, payload, &_leaf_dirty);
                         self.cur_pos = 0;
                         return true;
                     } else {
@@ -728,10 +878,12 @@ pub fn select(allocator: std.mem.Allocator, store: PageStore, root: u32, min: ?[
     if (root == NULL_ROOT) return it;
     var cur = root;
     var depth: u32 = 0;
+    var _leaf_dirty = std.ArrayList(u32).empty;
+    defer _leaf_dirty.deinit(allocator);
     while (depth < 1000) : (depth += 1) {
         const payload = try readNodePayload(store, cur);
         if (payload[0] == LEAF_KIND) {
-            it.cur_leaf = try Leaf.fromPayload(allocator, payload);
+            it.cur_leaf = try Leaf.fromPayload(allocator, store, payload, &_leaf_dirty);
             it.cur_pos = 0;
             break;
         } else {
