@@ -43,15 +43,15 @@ Key numbers and interpretation from the benchmark matrix:
 | **putBatch 100B** | **0.15 us/op** | — | **~1000× faster than put** — BTreeBatch amortizes COW path rewrite + 1 fsync for N ops |
 | **putBatch 10KB** | **2.5 us/op** | — | ~1400× faster; fsync + COW both amortized across the batch |
 | put 10KB | 3.9 ms/op | 3.8 ms/op | barely scales with size → I/O bandwidth dominates (~10KB/fsync) |
-| get 100B | 251 → 133 us/op | 494 → ~360 us/op | mmap read path + skip-decode + read-no-CRC → ~1.9× small; still far faster than put (no fsync) |
-| get 10KB | 786 → 174 us/op | 1.3 ms → ~480 us/op | read-no-CRC skips ~80KB Crc32 per record → ~4.5× small |
+| get 100B | 251 → 133 → **2.96 us/op** | 494 → ~360 us/op | mmap zero-copy: remove marker + readRecord borrows mmap slice (no alloc/memcpy) + findInLeaf/findInBranchPayload skip full decode → ~85× small, **LMDB-level (~2us)** |
+| get 10KB | 786 → 174 → **5.77 us/op** | 1.3 ms → ~480 us/op | same zero-copy path, branch+leaf direct seek → ~136× small, LMDB-level (~5us) |
 | delete 100B | 416 us/op | — | same path as put (tombstone + fsync), cost ≈ put |
 
 Key points:
 
 1. **fsync-per-op was the absolute hotspot** (put ~400–700us/op ≈ fsync latency). **Solved**: `putBatch([]Entry)` + `BTreeBatch` (node cache + dirty set + one flush) amortize both fsync and COW path rewrite → **~1000× single-thread throughput** (0.15us/op vs 498us/op).
 2. **put 10KB vs 100B delta ≈ write-to-disk time**: 3.8ms − 0.7ms ≈ 3.1ms/10KB ≈ ~3.2 MB/s flush bandwidth — serial fsync was the drag; `putBatch` collapses it.
-3. **get is far faster than put** (251→133us vs 498us, no fsync), as expected; large get doubles → lookup / page-cache miss rises with scale — **read path optimized** (mmap + skip-decode + read-no-CRC, see `docs/mmap-read-design.md`); remaining 100B cost is `readRecord` per-node alloc+memcpy (~8KB × depth), fixable by direct-mmap zero-copy (beyond current scope).
+3. **get is far faster than put** (251→**2.96us**, no fsync) — **LMDB-level** (~2us). Zero-copy read path: remove marker (mmap bytes contiguous) + `Store.readBorrow` (borrowed mmap slice, no alloc/memcpy) + `readRecord` returns borrowed slice + `findInLeaf`/`findInBranchPayload` skip full leaf/branch decode + read-no-CRC on hot path. ~85× improvement; matches LMDB mmap reads.
 4. **compact**: small 100B ~4s / 10KB ~35s, full rewrite (seq read + write + sync), ~100MB in 35s ≈ ~2.9 MB/s — single-threaded rewrite is the bottleneck; multi-threaded rewrite / streaming sync is the fix (still open).
 5. **COW dirt amplification**: large×100B preload (1M puts) yields ~4.7GB physical file (live ~120MB, ~33×); auto-compact is a stub — manual `compact()` or a background compactor is required.
 
@@ -59,7 +59,7 @@ Key points:
 >
 > **Implemented (concurrent group commit, lever 3)**: implicit batching of *concurrent* `put`/`delete` via leader/follower in `sendRequest`. A thread that finds no active leader drains the request queue into one `applyBatch` (1 fsync); followers enqueue and block on their `zio.Future` (kernel futex, works on raw threads). Leader keeps serving while the queue is non-empty, then steps down. `writer.applyBatch` already set all futures, so no extra plumbing. Verified by `tests/group_commit_test.zig`: 16 threads × 50 puts (800 ops) merge to ~117 `applyBatch` calls (~6.8× fewer fsyncs) with all 800 keys readable; concurrent delete merge test too. Measured merge ratio via an `apply_count` counter on `writer.State`.
 
-> **Implemented (read path, lever — get)**: mmap整文件（预留大 sparse 区、append-only MVCC、永不 remap）+ get skip-decode（`btree.findInLeaf` 直接从 payload seek 目标 key，不全解码不逐 entry dup）+ 热读路径跳 CRC（`decodeRecordNoCrc`，仅 get 读路径；写/恢复仍验 CRC）。get 100B 252→133us（~1.9×），get 10KB 760→174us（~4.4×，跳 ~80KB Crc32）。见 `docs/mmap-read-design.md` + `docs/mmap-read-tasks.md`（TDD T0–T5）。余 100B 主成本是 `readRecord` 每节点 alloc+memcpy ~8KB，需直访 mmap 零拷贝（超方案 a 范围）。
+> **Implemented (read path, lever — get)**: two-phase。**Phase 1**（`docs/mmap-read-design.md`）：mmap整文件（预留大 sparse 区、append-only MVCC、永不 remap）+ get skip-decode（`findInLeaf`）+ 热读跳 CRC → 252→133us。**Phase 2**（`docs/zero-copy-read-design.md`，真零拷贝）：去 marker（mmap 字节天然连续）+ `Store.readBorrow`（返 mmap 借用切片，不 alloc 不 memcpy）+ `readRecord` 返借用 + ~8 调用点去 free + `getLatestHeader` 正向扫全文件记最后有效 header（去 marker 后替代扫 marker）+ `findInBranchPayload`（get 跳 branch 全解码）。结果：get 100B **2.96us**（~85×）、get 10KB **5.77us**（~136×），**追平 LMDB mmap 读**（~2–5us）。
 
 > Note: delete large / select large / compact large cells are long-running (1M fsyncs or full rewrite of 1GB+); not run to completion. Their shape mirrors small, scaling linearly with size.
 

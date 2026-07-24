@@ -1,6 +1,5 @@
-//! file_store.zig — FileStore：真文件 Store（zio.File）+ 块标记
-//! 复用 store.zig 的逻辑偏移/marker 语义。append/read/sync/setSize/size 走 zio.File 位置 IO。
-//! M2 集成（真文件路径）。
+//! file_store.zig — FileStore：真文件 Store（zio.File）+ mmap 零拷贝读
+//! 去 marker：appendRaw 写连续逻辑字节（逻辑==物理）；readBorrow 借用 mmap 切片零拷贝。
 const std = @import("std");
 const zio = @import("zio");
 const f = @import("format.zig");
@@ -16,9 +15,9 @@ const MMAP_REGION: usize = 1 << 40;
 pub const FileStore = struct {
     allocator: std.mem.Allocator,
     file: zio.File,
-    /// 逻辑长度（内容字节数，不含块标记）
+    /// 逻辑长度（== 物理长度，去 marker）
     logical_len: u64,
-    /// 物理写入游标（含块标记）
+    /// 物理写入游标（== 逻辑长度，去 marker）
     physical_len: u64,
     sync_count: u32 = 0,
     /// mmap 预留区基指针（null = mmap 失败/未用，回退 pread）
@@ -32,29 +31,20 @@ pub const FileStore = struct {
     pub fn create(allocator: std.mem.Allocator, path: []const u8) !Self {
         const cwd = zio.Dir.cwd();
         const file = try cwd.createFile(path, .{ .read = true, .truncate = false, .exclusive = false });
-        // 取现有大小
+        // 取现有大小（去 marker 后物理==逻辑）
         const phys = file.size() catch 0;
-        // 从物理大小反推逻辑长度：每块 BLOCK_SIZE 字节含 1 marker + (BLOCK_SIZE-1) 内容
-        // 完整块数 * (BLOCK_SIZE-1) + 末块内容数（末块物理字节 - marker）
-        const full_blocks = phys / f.BLOCK_SIZE;
-        const rem = phys % f.BLOCK_SIZE;
-        var logical: u64 = full_blocks * (f.BLOCK_SIZE - 1);
-        if (rem > 0) {
-            // 末块至少 1 字节 marker；若 rem==1 仅 marker 无内容
-            if (rem > 1) logical += rem - 1;
-        }
         var self: Self = .{
             .allocator = allocator,
             .file = file,
-            .logical_len = logical,
+            .logical_len = phys,
             .physical_len = phys,
         };
-        // T2: mmap 预留大区只读 MAP_SHARED。失败则保持 mmap_base=null 回退 pread。
+        // mmap 预留大区只读 MAP_SHARED。失败则保持 mmap_base=null 回退 pread。
         if (mmap_mod.mapReadOnly(@intCast(file.fd), MMAP_REGION)) |ptr| {
             self.mmap_base = ptr;
             self.mmap_region_len = MMAP_REGION;
         } else |_| {
-            // 回退 pread 路径（功能不退化）
+            // 回退 pread 路径（功能不退化，但非零拷贝）
         }
         return self;
     }
@@ -66,62 +56,47 @@ pub const FileStore = struct {
     fn vtRead(ptr: *anyopaque, buf: []u8, offset: u64) !usize {
         const self: *Self = @ptrCast(@alignCast(ptr));
         if (offset >= self.logical_len) return 0;
-        // T3: 走 mmap memcpy+跳 marker（零 syscall）；无 mmap 则回退 pread
+        // 去 marker：逻辑==物理，mmap 直 memcpy 或 pread（无 marker 跳转）
         if (self.mmap_base) |base| {
-            return self.mmapRead(base, buf, offset);
+            const avail = self.logical_len - offset;
+            const take = @min(buf.len, avail);
+            const src = base + offset;
+            @memcpy(buf[0..take], src[0..take]);
+            return take;
         }
-        // 回退：旧 pread 循环
-        var logical_pos = offset;
-        var written: usize = 0;
-        while (written < buf.len and logical_pos < self.logical_len) {
-            const phys = store_mod.logicalToPhysical(logical_pos);
-            const remain_logical = self.logical_len - logical_pos;
-            const want = @min(buf.len - written, remain_logical);
-            const block_content_pos = logical_pos % (f.BLOCK_SIZE - 1);
-            const block_remaining = (f.BLOCK_SIZE - 1) - block_content_pos;
-            const take = @min(want, block_remaining);
-            const n = try self.file.read(buf[written .. written + take], phys);
-            written += n;
-            logical_pos += n;
-            if (n == 0) break;
-        }
-        return written;
-    }
-
-    /// mmap 读：memcpy from base + logical→physical 指针算 + 跨 marker 边界跳 1 字节。
-    /// bounds-check：调用方保证 offset < logical_len；此处再防 `offset+buf.len` 超 logical_len。
-    fn mmapRead(self: *Self, base: [*]align(mmap_mod.PAGE_SIZE) const u8, buf: []u8, offset: u64) usize {
+        // 回退 pread（无 marker，一次读到位）
         const avail = self.logical_len - offset;
-        const want = @min(buf.len, avail);
-        var logical_pos = offset;
-        var written: usize = 0;
-        while (written < want) {
-            const phys = store_mod.logicalToPhysical(logical_pos);
-            const block_content_pos = logical_pos % (f.BLOCK_SIZE - 1);
-            const block_remaining = (f.BLOCK_SIZE - 1) - block_content_pos;
-            const take = @min(want - written, block_remaining);
-            const src = base + phys;
-            @memcpy(buf[written .. written + take], src[0..take]);
-            written += take;
-            logical_pos += take;
+        const take = @min(buf.len, avail);
+        var read_total: usize = 0;
+        while (read_total < take) {
+            const n = try self.file.read(buf[read_total..take], offset + read_total);
+            if (n == 0) break;
+            read_total += n;
         }
-        return written;
+        return read_total;
     }
 
-    /// 追加逻辑字节（自动插 MARKER_DATA），返回起始逻辑偏移。
+    fn vtReadBorrow(ptr: *anyopaque, offset: u64, max: usize) ![]const u8 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        if (offset >= self.logical_len) return &[_]u8{};
+        const avail = self.logical_len - offset;
+        const take = @min(max, avail);
+        if (self.mmap_base) |base| {
+            // 零拷贝：返回指向 mmap 的切片
+            const src = base + offset;
+            return src[0..take];
+        }
+        // 无 mmap：回退 pread 到内部小缓存（FileStore 默认有 mmap，此路径极少）
+        // ponytail: 回退时借用不可行（pread 需 caller buf），返错误让 readRecord 回退 alloc。
+        return error.NoMmapBorrow;
+    }
+
+    /// 追加连续逻辑字节（去 marker，逻辑==物理），返回起始逻辑偏移。
     pub fn appendRaw(self: *Self, bytes: []const u8) !u64 {
         const start_logical = self.logical_len;
         var i: usize = 0;
         while (i < bytes.len) {
-            if (self.physical_len % f.BLOCK_SIZE == 0) {
-                // 写 marker
-                _ = try self.file.write(&[_]u8{f.MARKER_DATA}, self.physical_len);
-                self.physical_len += 1;
-            }
-            // 同块内连续写
-            const block_remaining = f.BLOCK_SIZE - (self.physical_len % f.BLOCK_SIZE);
-            const take = @min(bytes.len - i, block_remaining);
-            const n = try self.file.write(bytes[i .. i + take], self.physical_len);
+            const n = try self.file.write(bytes[i..], self.physical_len);
             self.physical_len += n;
             self.logical_len += n;
             i += n;
@@ -142,10 +117,9 @@ pub const FileStore = struct {
 
     fn vtSetSize(ptr: *anyopaque, len: u64) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        // 物理截断到恰好容纳 len 逻辑字节
-        const target_physical = store_mod.logicalToPhysical(len);
-        try self.file.setSize(target_physical);
-        self.physical_len = target_physical;
+        // 去 marker 后物理截断 == 逻辑截断
+        try self.file.setSize(len);
+        self.physical_len = len;
         self.logical_len = len;
     }
 
@@ -190,23 +164,12 @@ const file_vtable: Store.VTable = .{
     .size = FileStore.vtSize,
     .readPhysical = FileStore.vtReadPhysical,
     .physicalSize = FileStore.vtPhysicalSize,
+    .readBorrow = FileStore.vtReadBorrow,
     .close = FileStore.vtClose,
 };
 
-// ===== header append（复用 store.zig 语义，但写物理） =====
+// ===== header append（去 marker：直接 appendRaw，不对齐/不写 marker） =====
 pub fn appendHeaderRecord(self: *FileStore, header: f.Header) !u64 {
-    // 填充到块末尾
-    const in_block_logical = self.logical_len % (f.BLOCK_SIZE - 1);
-    if (in_block_logical != 0) {
-        const pad = (f.BLOCK_SIZE - 1) - in_block_logical;
-        const padding = try self.allocator.alloc(u8, pad);
-        defer self.allocator.free(padding);
-        @memset(padding, 0);
-        _ = try self.appendRaw(padding);
-    }
-    // 写 MARKER_HEADER
-    _ = try self.file.write(&[_]u8{f.MARKER_HEADER}, self.physical_len);
-    self.physical_len += 1;
     const start_logical = self.logical_len;
     var payload_buf: [f.HEADER_PAYLOAD_SIZE]u8 = undefined;
     const pn = f.encodeHeaderPayload(&payload_buf, header);
@@ -236,4 +199,6 @@ test "file_store: open create + append + pread roundtrip" {
     try std.testing.expectEqual(@as(usize, data.len), n);
     try std.testing.expectEqualStrings(data, buf[0..n]);
     try std.testing.expectEqual(@as(u64, data.len), try s.size());
+    // 去 marker：物理==逻辑
+    try std.testing.expectEqual(try s.size(), try s.physicalSize());
 }

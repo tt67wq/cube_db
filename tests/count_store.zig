@@ -49,6 +49,10 @@ pub const CountStore = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
         return self.inner.physicalSize();
     }
+    fn vtReadBorrow(ptr: *anyopaque, offset: u64, max: usize) ![]const u8 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.inner.readBorrow(offset, max);
+    }
     fn vtClose(ptr: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         self.inner.close();
@@ -63,5 +67,6 @@ const vtable: Store.VTable = .{
     .size = CountStore.vtSize,
     .readPhysical = CountStore.vtReadPhysical,
     .physicalSize = CountStore.vtPhysicalSize,
+    .readBorrow = CountStore.vtReadBorrow,
     .close = CountStore.vtClose,
 };

@@ -47,22 +47,17 @@ pub fn cmpKey(a: []const u8, b: []const u8) std.math.Order {
 // ===== 临时节点解码辅助 =====
 // 从 store 读一个节点记录并解码。返回 payload 切片（allocator 分配的拷贝）。
 
-pub fn readRecord(allocator: std.mem.Allocator, s: Store, offset: u64) ![]u8 {
-    // 先读 len(4)，再读完整记录。
-    var len_buf: [4]u8 = undefined;
-    const n = try s.read(&len_buf, offset);
-    if (n < 4) return error.Truncated;
-    const payload_len = std.mem.readInt(u32, &len_buf, .big);
+pub fn readRecord(allocator: std.mem.Allocator, s: Store, offset: u64) ![]const u8 {
+    _ = allocator;
+    // T4 零拷贝：借用整记录（指向 mmap/MemStore，不 alloc 不 memcpy）。
+    // 先读 len(4)，再 readBorrow 整记录。
+    const len_slice = try s.readBorrow(offset, 4);
+    if (len_slice.len < 4) return error.Truncated;
+    const payload_len = std.mem.readInt(u32, len_slice[0..4], .big);
     const total = f.REC_LEN_SIZE + payload_len + f.REC_CRC_SIZE;
-    const buf = try allocator.alloc(u8, total);
-    errdefer allocator.free(buf);
-    var read_total: usize = 0;
-    while (read_total < total) {
-        const got = try s.read(buf[read_total..], offset + @as(u64, @intCast(read_total)));
-        if (got == 0) return error.Truncated;
-        read_total += got;
-    }
-    return buf;
+    const rec = try s.readBorrow(offset, total);
+    if (rec.len < total) return error.Truncated;
+    return rec;
 }
 
 pub fn decodeNodePayload(rec: []const u8) ![]const u8 {
@@ -74,6 +69,36 @@ pub fn decodeNodePayload(rec: []const u8) ![]const u8 {
 /// 仅 btree.get 读路径调；readRecord/写路径仍走 decodeNodePayload（验 CRC）。
 pub fn decodeNodePayloadNoCrc(rec: []const u8) ![]const u8 {
     return f.decodeRecordNoCrc(rec) catch return error.CorruptCrc;
+}
+
+/// T6：直接从 branch payload seek 目标 child offset，不 Branch.fromPayload 全解码、不逐 key dup。
+/// 线性扫 keys 找第一个 > key 的 index → child index = 该值 → 读 8 字节 child offset。
+/// 仅 get 读路径；写路径仍用 Branch.fromPayload 全量解码做 COW。
+pub fn findInBranchPayload(payload: []const u8, key: []const u8) !u64 {
+    if (payload.len < 3) return error.Truncated;
+    if (payload[0] != @intFromEnum(f.NodeKind.branch)) return error.CorruptCrc;
+    const count = std.mem.readInt(u16, payload[1..3], .big);
+    // keys 区：count-1 个 key（[klen4][key]），扫时累计 keys 区末偏移 + 找 child index
+    var pos: usize = 3;
+    var child_idx: usize = 0;
+    var found = false;
+    var i: usize = 0;
+    while (i + 1 < count) : (i += 1) {
+        if (pos + 4 > payload.len) return error.Truncated;
+        const klen = std.mem.readInt(u32, payload[pos..][0..4], .big);
+        pos += 4;
+        if (pos + klen > payload.len) return error.Truncated;
+        const ek = payload[pos .. pos + klen];
+        pos += klen;
+        if (!found and cmpKey(ek, key) == .gt) {
+            child_idx = i;
+            found = true;
+        }
+    }
+    if (!found) child_idx = count - 1; // 全 <= key → 最后一个 child
+    // children 区起点 = pos（keys 区末）
+    if (pos + 8 * count > payload.len) return error.Truncated;
+    return std.mem.readInt(u64, payload[pos + child_idx * 8 ..][0..8], .big);
 }
 
 // ===== 叶节点内存表示（用于 COW 操作） =====
@@ -226,17 +251,14 @@ pub fn get(allocator: std.mem.Allocator, s: Store, root: u64, key: []const u8) !
     var depth: u32 = 0;
     while (depth < 1000) : (depth += 1) {
         const rec = try readRecord(allocator, s, cur);
-        defer allocator.free(rec);
         const payload = decodeNodePayloadNoCrc(rec) catch return error.CorruptCrc;
         if (payload.len == 0) return error.Truncated;
         if (payload[0] == @intFromEnum(f.NodeKind.leaf)) {
             // T5: skip 全 leaf 解码，直接从 payload seek 目标 key。
             return findInLeaf(allocator, payload, key);
         } else {
-            var branch = try Branch.fromPayload(allocator, payload);
-            defer branch.deinit(allocator);
-            const ci = branch.findChild(key);
-            cur = branch.children.items[ci];
+            // T6: 跳过 branch 全解码，直接从 payload seek 目标 child offset
+            cur = try findInBranchPayload(payload, key);
         }
     }
     return error.Truncated;
@@ -307,7 +329,6 @@ fn insertIntoLeaf(
     tombstone: bool,
 ) !InsertSub {
     const rec = try readRecord(allocator, s, leaf_off);
-    defer allocator.free(rec);
     const payload = try decodeNodePayload(rec);
     var leaf = try Leaf.fromPayload(allocator, payload);
     defer leaf.deinit(allocator);
@@ -390,7 +411,6 @@ fn insertIntoBranch(
     tombstone: bool,
 ) !InsertSub {
     const rec = try readRecord(allocator, s, branch_off);
-    defer allocator.free(rec);
     const payload = try decodeNodePayload(rec);
     var branch = try Branch.fromPayload(allocator, payload);
     defer branch.deinit(allocator);
@@ -406,7 +426,6 @@ fn insertIntoBranch(
     // 递归插入子节点
     const child_is_leaf = blk: {
         const crec = try readRecord(allocator, s, child_off);
-        defer allocator.free(crec);
         const cpayload = try decodeNodePayload(crec);
         break :blk cpayload[0] == @intFromEnum(f.NodeKind.leaf);
     };
@@ -521,7 +540,6 @@ pub fn insert(
 
     // 判断 root 是叶还是 branch
     const rec = try readRecord(allocator, s, root);
-    defer allocator.free(rec);
     const payload = try decodeNodePayload(rec);
     const is_leaf = payload[0] == @intFromEnum(f.NodeKind.leaf);
 
@@ -627,11 +645,9 @@ pub const Iterator = struct {
                     if (payload[0] == @intFromEnum(f.NodeKind.leaf)) {
                         self.cur_leaf = try Leaf.fromPayload(self.allocator, payload);
                         self.cur_pos = 0;
-                        self.allocator.free(rec);
                         return true;
                     } else {
                         const br = try Branch.fromPayload(self.allocator, payload);
-                        self.allocator.free(rec);
                         const first_child = br.children.items[0];
                         try self.stack.append(self.allocator, .{ .branch = br, .child_idx = 0 });
                         cur = first_child;
@@ -671,11 +687,9 @@ pub fn select(allocator: std.mem.Allocator, s: Store, root: u64, min: ?[]const u
         if (payload[0] == @intFromEnum(f.NodeKind.leaf)) {
             it.cur_leaf = try Leaf.fromPayload(allocator, payload);
             it.cur_pos = 0;
-            allocator.free(rec);
             break;
         } else {
             var br = try Branch.fromPayload(allocator, payload);
-            allocator.free(rec);
             var ci: usize = 0;
             if (min) |m| ci = br.findChild(m);
             const next = br.children.items[ci];

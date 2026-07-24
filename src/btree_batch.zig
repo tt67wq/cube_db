@@ -201,7 +201,6 @@ pub const BTreeBatch = struct {
         const child_is_leaf = blk: {
             if (self.cache.get(child_id)) |ccn| break :blk ccn.kind == .leaf;
             const crec = try readRecord(ca, self.s, child_id);
-            defer ca.free(crec);
             const cp = try decodeNodePayload(crec);
             break :blk cp[0] == @intFromEnum(f.NodeKind.leaf);
         };

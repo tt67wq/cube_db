@@ -1,9 +1,9 @@
-//! store.zig — Store 抽象（D9 运行时 vtable）+ 内存实现 + 反向 header 扫描
-//! M2：先内存 store，块标记读写、append 节点/header、pread、getLatestHeader。
+//! store.zig — Store 抽象（运行时 vtable）+ 内存实现 + header 正向扫描
+//! 去 marker：appendRaw 写连续逻辑字节（逻辑==物理），readBorrow 借用切片零拷贝。
 const std = @import("std");
 const f = @import("format.zig");
 
-/// 运行时多态接口。所有偏移为「逻辑偏移」（剔除块标记字节后的内容偏移）。
+/// 运行时多态接口。所有偏移为「逻辑偏移」（去 marker 后逻辑==物理）。
 pub const Store = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -15,12 +15,15 @@ pub const Store = struct {
         append: *const fn (ptr: *anyopaque, bytes: []const u8) anyerror!u64,
         sync: *const fn (ptr: *anyopaque) anyerror!void,
         setSize: *const fn (ptr: *anyopaque, len: u64) anyerror!void,
-        /// 逻辑总长度（内容字节数，不含块标记）。
+        /// 逻辑总长度（内容字节数，== 物理长度，去 marker 后）。
         size: *const fn (ptr: *anyopaque) anyerror!u64,
-        /// 读物理字节（含块标记），用于 header 反向扫描。仅恢复路径调用。
+        /// 读物理字节（逻辑==物理，保留供兼容）。仅恢复路径调用。
         readPhysical: *const fn (ptr: *anyopaque, buf: []u8, phys_offset: u64) anyerror!usize,
-        /// 物理总长度（含块标记）。
+        /// 物理总长度（== 逻辑长度，去 marker 后）。
         physicalSize: *const fn (ptr: *anyopaque) anyerror!u64,
+        /// 借用切片：返指向 mmap/ArrayList 的只读切片（不 alloc 不 memcpy，零拷贝）。
+        /// bounds-check：offset <= logical_len；返 min(max, logical_len-offset) 字节。
+        readBorrow: *const fn (ptr: *anyopaque, offset: u64, max: usize) anyerror![]const u8,
         close: *const fn (ptr: *anyopaque) void,
     };
 
@@ -45,41 +48,35 @@ pub const Store = struct {
     pub fn physicalSize(self: Store) !u64 {
         return self.vtable.physicalSize(self.ptr);
     }
+    /// 借用只读切片（零拷贝）。
+    pub fn readBorrow(self: Store, offset: u64, max: usize) ![]const u8 {
+        return self.vtable.readBorrow(self.ptr, offset, max);
+    }
     pub fn close(self: Store) void {
         self.vtable.close(self.ptr);
     }
 };
 
-// ===== 块标记布局工具 =====
-// 物理文件：每 BLOCK_SIZE 字节一块，块首 1 字节 marker。
-// 逻辑内容 = 物理文件剔除每块首字节后的连续字节流。
-// logical_offset <-> physical_offset 转换：每块贡献 (BLOCK_SIZE-1) 逻辑字节。
+// ===== offset 转换（去 marker 后逻辑==物理，identity） =====
 
-/// 逻辑字节数 -> 所在物理块内偏移（块首 marker 之后）。
-/// 返回 physical_offset。
+/// 逻辑 offset -> 物理 offset（去 marker 后 identity）。
 pub fn logicalToPhysical(logical_offset: u64) u64 {
-    const block_index = logical_offset / (f.BLOCK_SIZE - 1);
-    const in_block = logical_offset % (f.BLOCK_SIZE - 1);
-    return block_index * f.BLOCK_SIZE + 1 + in_block; // +1 跳过 marker
+    return logical_offset;
 }
 
-/// 物理偏移 -> 逻辑偏移（仅对 marker 之后的内容字节有效）。
+/// 物理 offset -> 逻辑 offset（去 marker 后 identity）。
 pub fn physicalToLogical(physical_offset: u64) u64 {
-    const block_index = physical_offset / f.BLOCK_SIZE;
-    const in_block = physical_offset % f.BLOCK_SIZE;
-    // in_block==0 是 marker，不属于内容；此处只对 in_block>=1 调用
-    return block_index * (f.BLOCK_SIZE - 1) + (in_block - 1);
+    return physical_offset;
 }
 
 // ===== 内存 Store（TestStore） =====
-// 用 ArrayList(u8) 模拟物理文件字节数组，含块标记。
-// append 时自动在块边界插入 MARKER_DATA；header append 用 MARKER_HEADER。
+// 去 marker：appendRaw 写连续逻辑字节（逻辑==物理）。header append 不再对齐/写 marker。
 
 pub const MemStore = struct {
     allocator: std.mem.Allocator,
-    /// 物理字节（含块标记）
+    /// 字节（逻辑==物理，去 marker）
     data: std.ArrayList(u8),
-    /// 逻辑长度（内容字节数）
+    /// 逻辑长度（== 物理长度，去 marker）
     logical_len: u64 = 0,
     /// sync 调用计数（测试用）
     sync_count: u32 = 0,
@@ -111,16 +108,10 @@ pub const MemStore = struct {
     fn vtRead(ptr: *anyopaque, buf: []u8, offset: u64) !usize {
         const self: *Self = @ptrCast(@alignCast(ptr));
         if (offset >= self.logical_len) return 0;
-        var logical_pos = offset;
-        var written: usize = 0;
-        while (written < buf.len and logical_pos < self.logical_len) {
-            const phys = logicalToPhysical(logical_pos);
-            if (phys >= self.data.items.len) break;
-            buf[written] = self.data.items[phys];
-            written += 1;
-            logical_pos += 1;
-        }
-        return written;
+        const avail = self.logical_len - offset;
+        const take = @min(buf.len, avail);
+        @memcpy(buf[0..take], self.data.items[@intCast(offset)..][0..take]);
+        return take;
     }
 
     fn vtAppend(ptr: *anyopaque, bytes: []const u8) !u64 {
@@ -128,18 +119,11 @@ pub const MemStore = struct {
         return self.appendRaw(bytes);
     }
 
-    /// 追加逻辑字节（自动在物理块边界插 MARKER_DATA），返回起始逻辑偏移。
-    /// 不增加 logical_len 的开销只有 marker 字节本身（物理存在，逻辑不计）。
+    /// 追加连续逻辑字节（去 marker，逻辑==物理），返回起始逻辑偏移。
     pub fn appendRaw(self: *Self, bytes: []const u8) !u64 {
         const start_logical = self.logical_len;
-        for (bytes) |b| {
-            // 物理位于块首时需先写 marker（MARKER_DATA）
-            if (self.data.items.len % f.BLOCK_SIZE == 0) {
-                try self.data.append(self.allocator, f.MARKER_DATA);
-            }
-            try self.data.append(self.allocator, b);
-            self.logical_len += 1;
-        }
+        try self.data.appendSlice(self.allocator, bytes);
+        self.logical_len += bytes.len;
         return start_logical;
     }
 
@@ -150,10 +134,10 @@ pub const MemStore = struct {
 
     fn vtSetSize(ptr: *anyopaque, len: u64) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        // 物理截断到恰好容纳 len 逻辑字节
-        const target_physical = logicalToPhysical(len); // 下一内容字节物理位置 = 截断点
-        if (self.data.items.len > target_physical) {
-            self.data.shrinkRetainingCapacity(target_physical);
+        // 去 marker 后物理截断 == 逻辑截断
+        const target: usize = @intCast(len);
+        if (self.data.items.len > target) {
+            self.data.shrinkRetainingCapacity(target);
         }
         self.logical_len = len;
     }
@@ -177,29 +161,28 @@ pub const MemStore = struct {
         return self.data.items.len;
     }
 
+    fn vtReadBorrow(ptr: *anyopaque, offset: u64, max: usize) ![]const u8 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        if (offset >= self.logical_len) return &[_]u8{};
+        const start: usize = @intCast(offset);
+        const avail = self.logical_len - offset;
+        const take = @min(max, avail);
+        return self.data.items[start..][0..take];
+    }
+
     fn vtClose(ptr: *anyopaque) void {
         _ = ptr;
         // MemStore 由 owner 用 deinit 释放
     }
 
-    /// 写入一个 header 块：对齐到物理块边界，写 MARKER_HEADER + header 记录。
+    /// 写入 header 记录（去 marker：不再对齐/写 MARKER_HEADER，直接 appendRaw）。
     /// 返回 header 记录起始逻辑偏移。
     pub fn appendHeaderRecord(self: *Self, header: f.Header) !u64 {
-        // 填充逻辑到当前块末尾（下一块首）
-        const in_block_logical = self.logical_len % (f.BLOCK_SIZE - 1);
-        if (in_block_logical != 0) {
-            const pad = (f.BLOCK_SIZE - 1) - in_block_logical;
-            for (0..pad) |_| _ = try self.appendRaw(&[_]u8{0});
-        }
-        // 此时物理应恰在块首（data.len % BLOCK_SIZE == 0），写 MARKER_HEADER
-        try self.data.append(self.allocator, f.MARKER_HEADER);
-        // header 记录起始逻辑偏移 = 当前 logical_len（块首后首字节）
         const start_logical = self.logical_len;
         var payload_buf: [f.HEADER_PAYLOAD_SIZE]u8 = undefined;
         const pn = f.encodeHeaderPayload(&payload_buf, header);
         var rec_buf: [128]u8 = undefined;
         const rn = f.encodeRecord(&rec_buf, payload_buf[0..pn]);
-        // appendRaw 会检测到不在块首（data.len % BLOCK_SIZE != 0）因此不再插 marker
         _ = try self.appendRaw(rec_buf[0..rn]);
         return start_logical;
     }
@@ -213,12 +196,13 @@ const mem_vtable: Store.VTable = .{
     .size = MemStore.vtSize,
     .readPhysical = MemStore.vtReadPhysical,
     .physicalSize = MemStore.vtPhysicalSize,
+    .readBorrow = MemStore.vtReadBorrow,
     .close = MemStore.vtClose,
 };
 
-// ===== Header 反向扫描 =====
-// 从文件末尾反向按块扫描 marker 字节，定位最新 header 块。
-// header 块 marker==MARKER_HEADER，其后紧跟 header 记录（len+payload+crc）。
+// ===== Header 正向扫描（去 marker 后） =====
+// 从 offset 0 按记录长度一条条走，记最后一个有效 header（payload 有 magic+version）。
+// 文件尾写一半（crash，crc 不对或 len 超 EOF）→ 解析失败，停在最后一个有效 header。
 
 pub const HeaderScanResult = struct {
     /// header 记录起始逻辑偏移
@@ -226,38 +210,37 @@ pub const HeaderScanResult = struct {
     header: f.Header,
 };
 
-/// 在 store 中反向扫描，找最新有效 header。
-/// 找到 → 返回 result；CRC/解码失败则继续向前找；全找不到 → null。
+/// 在 store 中正向扫描，找最新有效 header。
+/// 按 [len(4)][payload(len)][crc(4)] 记录结构走；判别 header 靠 payload magic+version。
+/// 遇解析失败（truncated/crc 错）则停，返回最后一个有效 header；全找不到 → null。
 pub fn getLatestHeader(allocator: std.mem.Allocator, store: Store) !?HeaderScanResult {
-    const physical_total = try store.physicalSize();
-    if (physical_total == 0) return null;
-    const num_blocks = (physical_total + f.BLOCK_SIZE - 1) / f.BLOCK_SIZE;
-    if (num_blocks == 0) return null;
-
-    var marker_buf: [1]u8 = undefined;
-    var block_index: u64 = num_blocks;
-    while (block_index > 0) {
-        block_index -= 1;
-        const marker_phys = block_index * f.BLOCK_SIZE;
-        const n = try store.readPhysical(&marker_buf, marker_phys);
-        if (n != 1) continue;
-        if (marker_buf[0] != f.MARKER_HEADER) continue;
-        // marker 后紧跟 header 记录。物理读记录字节。
-        var rec_buf: [64]u8 = undefined;
-        const rn = try store.readPhysical(&rec_buf, marker_phys + 1);
-        if (rn < 4) continue;
-        const payload = f.decodeRecord(rec_buf[0..rn]) catch continue;
-        if (payload.len < f.HEADER_PAYLOAD_SIZE) continue;
-        const h = f.decodeHeaderPayload(payload[0..f.HEADER_PAYLOAD_SIZE]);
-        if (h.magic != f.MAGIC) continue;
-        if (h.version != f.VERSION) continue;
-        _ = allocator;
-        return HeaderScanResult{
-            .record_logical_offset = physicalToLogical(marker_phys + 1),
-            .header = h,
-        };
+    _ = allocator;
+    const total = try store.physicalSize();
+    if (total == 0) return null;
+    var last: ?HeaderScanResult = null;
+    var off: u64 = 0;
+    while (off < total) {
+        // 读 len(4)
+        const len_slice = store.readBorrow(off, 4) catch break;
+        if (len_slice.len < 4) break;
+        const payload_len = std.mem.readInt(u32, len_slice[0..4], .big);
+        const rec_total = f.REC_LEN_SIZE + payload_len + f.REC_CRC_SIZE;
+        // 整记录越界 → crash 半写，停
+        if (off + rec_total > total) break;
+        // 借用整记录
+        const rec = store.readBorrow(off, rec_total) catch break;
+        if (rec.len < rec_total) break;
+        const payload = f.decodeRecord(rec) catch break; // crc 错则停
+        // 判别 header：payload 长度 == HEADER_PAYLOAD_SIZE 且 magic/version 对
+        if (payload.len >= f.HEADER_PAYLOAD_SIZE) {
+            const h = f.decodeHeaderPayload(payload[0..f.HEADER_PAYLOAD_SIZE]);
+            if (h.magic == f.MAGIC and h.version == f.VERSION) {
+                last = .{ .record_logical_offset = off, .header = h };
+            }
+        }
+        off += rec_total;
     }
-    return null;
+    return last;
 }
 
 // ===== 测试 =====
@@ -309,7 +292,7 @@ test "store: trailing garbage -> still finds last good header" {
     var ms = MemStore.init(std.testing.allocator);
     defer ms.deinit();
     _ = try ms.appendHeaderRecord(.{ .btree_root = 7, .entry_count = 1, .byte_size = 1, .dirt = 0 });
-    // append 垃圾字节
+    // append 垃圾字节（不是合法记录结构）——正扫解析失败停在最后一个有效 header
     _ = try ms.store().append("garbage trailing bytes not a header");
     const r = try getLatestHeader(std.testing.allocator, ms.store());
     try std.testing.expect(r != null);
@@ -321,55 +304,52 @@ test "store: last header crc corrupt -> falls back to previous" {
     defer ms.deinit();
     _ = try ms.appendHeaderRecord(.{ .btree_root = 1, .entry_count = 1, .byte_size = 1, .dirt = 0 });
     _ = try ms.appendHeaderRecord(.{ .btree_root = 2, .entry_count = 2, .byte_size = 2, .dirt = 0 });
-    // 破坏最后一个 header 记录的某字节：找到最后 header 块的 marker 后第 6 字节（payload 区）
+    // 破坏最后 header 记录的 payload 区一字节（len 在前 4、payload 从第 5 起；翻第 6 字节）
     const total = ms.logical_len;
-    // 反向找最后一个 MARKER_HEADER 块的物理偏移
-    var found_phys: ?usize = null;
-    {
-        var b: usize = (ms.data.items.len + f.BLOCK_SIZE - 1) / f.BLOCK_SIZE;
-        while (b > 0) {
-            b -= 1;
-            const mp = b * f.BLOCK_SIZE;
-            if (mp < ms.data.items.len and ms.data.items[mp] == f.MARKER_HEADER) {
-                found_phys = mp;
-                break;
-            }
-        }
-    }
-    const fp = found_phys orelse return error.TestUnexpectedResult;
-    ms.data.items[fp + 6] ^= 0xff; // 翻转 payload 中一字节
+    ms.data.items[@intCast(total - 6)] ^= 0xff;
     const r = try getLatestHeader(std.testing.allocator, ms.store());
     try std.testing.expect(r != null);
     try std.testing.expectEqual(@as(u64, 1), r.?.header.btree_root);
-    _ = total;
 }
 
-test "store: record spanning block boundary roundtrip" {
+test "store: large append roundtrip (no marker, logical==physical)" {
     var ms = MemStore.init(std.testing.allocator);
     defer ms.deinit();
     const s = ms.store();
-    // 写接近块边界的数据，使其跨越
-    const fill_len = f.BLOCK_SIZE - 1 - 5; // 留 5 字节到块末
-    const fill = try std.testing.allocator.alloc(u8, fill_len);
-    defer std.testing.allocator.free(fill);
-    @memset(fill, 0x11);
-    _ = try s.append(fill);
-    // 这条记录将跨越块边界
-    const data = "across-the-boundary-payload-data";
-    const off = try s.append(data);
-    var buf: [64]u8 = undefined;
-    const n = try s.read(&buf, off);
-    try std.testing.expectEqual(@as(usize, data.len), n);
-    try std.testing.expectEqualStrings(data, buf[0..n]);
+    const N: usize = 8192;
+    const data = try std.testing.allocator.alloc(u8, N);
+    defer std.testing.allocator.free(data);
+    for (data, 0..) |*b, i| b.* = @intCast(i % 251);
+    _ = try s.append(data);
+    try std.testing.expectEqual(@as(u64, N), try s.size());
+    try std.testing.expectEqual(try s.size(), try s.physicalSize()); // logical==physical
+    const got = try std.testing.allocator.alloc(u8, N);
+    defer std.testing.allocator.free(got);
+    var rt: usize = 0;
+    while (rt < N) {
+        const n = try s.read(got[rt..], @intCast(rt));
+        try std.testing.expect(n > 0);
+        rt += n;
+    }
+    try std.testing.expectEqualSlices(u8, data, got);
 }
 
-test "store: logicalToPhysical / physicalToLogical roundtrip" {
-    // 块 0: marker(phys 0) + 4095 逻辑字节(phys 1..4095)；
-    // 块 1: marker(phys 4096) + 4095 逻辑字节(phys 4097..)
-    try std.testing.expectEqual(@as(u64, 1), logicalToPhysical(0));
-    try std.testing.expectEqual(@as(u64, f.BLOCK_SIZE - 1), logicalToPhysical(f.BLOCK_SIZE - 2));
-    try std.testing.expectEqual(@as(u64, f.BLOCK_SIZE + 1), logicalToPhysical(f.BLOCK_SIZE - 1));
-    try std.testing.expectEqual(@as(u64, 0), physicalToLogical(1));
-    try std.testing.expectEqual(@as(u64, f.BLOCK_SIZE - 2), physicalToLogical(f.BLOCK_SIZE - 1));
-    try std.testing.expectEqual(@as(u64, f.BLOCK_SIZE - 1), physicalToLogical(f.BLOCK_SIZE + 1));
+test "store: logicalToPhysical / physicalToLogical identity" {
+    // 去 marker 后逻辑==物理
+    try std.testing.expectEqual(@as(u64, 0), logicalToPhysical(0));
+    try std.testing.expectEqual(@as(u64, 4096), logicalToPhysical(4096));
+    try std.testing.expectEqual(@as(u64, 0), physicalToLogical(0));
+    try std.testing.expectEqual(@as(u64, 4096), physicalToLogical(4096));
+}
+
+test "store: readBorrow returns borrowed slice" {
+    var ms = MemStore.init(std.testing.allocator);
+    defer ms.deinit();
+    const s = ms.store();
+    const data = "borrowed-data";
+    const off = try s.append(data);
+    const got = try s.readBorrow(off, data.len);
+    try std.testing.expectEqualStrings(data, got);
+    const empty = try s.readBorrow(try s.size(), 10);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
 }

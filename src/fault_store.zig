@@ -68,6 +68,11 @@ pub const FaultStore = struct {
         return self.inner.store().physicalSize();
     }
 
+    fn vtReadBorrow(ptr: *anyopaque, offset: u64, max: usize) ![]const u8 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.inner.store().readBorrow(offset, max);
+    }
+
     fn vtClose(ptr: *anyopaque) void {
         _ = ptr;
     }
@@ -81,6 +86,7 @@ const fault_vtable: Store.VTable = .{
     .size = FaultStore.vtSize,
     .readPhysical = FaultStore.vtReadPhysical,
     .physicalSize = FaultStore.vtPhysicalSize,
+    .readBorrow = FaultStore.vtReadBorrow,
     .close = FaultStore.vtClose,
 };
 
@@ -109,17 +115,10 @@ test "fault: header torn (crc bad) -> fall back to previous" {
     defer ms.deinit();
     _ = try ms.appendHeaderRecord(.{ .btree_root = 1, .entry_count = 1, .byte_size = 1, .dirt = 0 });
     _ = try ms.appendHeaderRecord(.{ .btree_root = 2, .entry_count = 2, .byte_size = 2, .dirt = 0 });
-    // 破坏最后 header 的 payload
-    const found_phys = blk: {
-        var b: usize = (ms.data.items.len + f.BLOCK_SIZE - 1) / f.BLOCK_SIZE;
-        while (b > 0) {
-            b -= 1;
-            const mp = b * f.BLOCK_SIZE;
-            if (mp < ms.data.items.len and ms.data.items[mp] == f.MARKER_HEADER) break :blk mp;
-        }
-        break :blk @as(usize, 0);
-    };
-    ms.data.items[found_phys + 6] ^= 0xff;
+    // 破坏最后 header 记录的 payload 区一字节（去marker：header 是最后一条记录，
+    //   结构 [len4][payload38][crc4]，翻倒数第 6 字节即 payload 区）
+    const total = ms.logical_len;
+    ms.data.items[@intCast(total - 6)] ^= 0xff;
     const r = try store_mod.getLatestHeader(std.testing.allocator, ms.store());
     try std.testing.expect(r != null);
     try std.testing.expectEqual(@as(u64, 1), r.?.header.btree_root);
@@ -131,28 +130,15 @@ test "fault: fsync=false lost write (truncate tail) -> file opens, no corruption
     defer ms.deinit();
     _ = try ms.appendHeaderRecord(.{ .btree_root = 5, .entry_count = 5, .byte_size = 5, .dirt = 0 });
     _ = try ms.appendHeaderRecord(.{ .btree_root = 6, .entry_count = 6, .byte_size = 6, .dirt = 0 });
-    // 模拟断电：物理截断掉最后 header 块（未 sync 丢失）
-    // 找最后 header 块物理偏移并截到它之前
-    const last_header_phys = blk: {
-        var b: usize = (ms.data.items.len + f.BLOCK_SIZE - 1) / f.BLOCK_SIZE;
-        while (b > 0) {
-            b -= 1;
-            const mp = b * f.BLOCK_SIZE;
-            if (mp < ms.data.items.len and ms.data.items[mp] == f.MARKER_HEADER) break :blk mp;
-        }
-        break :blk @as(usize, 0);
-    };
-    // 截断到最后 header 块之前（丢弃最后 header）
-    if (last_header_phys > 0) {
-        ms.data.shrinkRetainingCapacity(last_header_phys);
-        // logical_len 重算：完整块数 * (BLOCK_SIZE-1) + 末块 content
-        const phys = ms.data.items.len;
-        const fb = phys / f.BLOCK_SIZE;
-        const rem = phys % f.BLOCK_SIZE;
-        ms.logical_len = fb * (f.BLOCK_SIZE - 1) + (if (rem > 1) rem - 1 else 0);
+    // 模拟断电：物理截断掉最后 header 记录（去marker：header 记录总长 = 4+38+4 = 46）
+    const total = ms.logical_len;
+    const last_rec_len: usize = f.REC_LEN_SIZE + f.HEADER_PAYLOAD_SIZE + f.REC_CRC_SIZE;
+    if (total >= last_rec_len) {
+        ms.data.shrinkRetainingCapacity(@intCast(total - last_rec_len));
+        ms.logical_len = total - last_rec_len;
     }
     const r = try store_mod.getLatestHeader(std.testing.allocator, ms.store());
-    // 截断后最近 header 不见，回退到前一个（root 5）或 null，都不损坏
+    // 截断后最近 header 丢失，回退到前一个（root 5）或 null，都不损坏
     if (r) |s| {
         try std.testing.expect(s.header.btree_root <= 6);
     }
