@@ -78,8 +78,8 @@ const MemPageStore = struct {
         const self: *MemPageStore = @ptrCast(@alignCast(ptr));
         if (page_no == f2.META_PAGE_0) return &self.meta0;
         if (page_no == f2.META_PAGE_1) return &self.meta1;
-        const entry = self.pages.get(page_no) orelse return error.PageNotFound;
-        return &entry;
+        const entry = self.pages.getPtr(page_no) orelse return error.PageNotFound;
+        return entry;
     }
 
     fn vtWritePage(ptr: *anyopaque, page_no: u32) ![]u8 {
