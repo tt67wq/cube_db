@@ -183,9 +183,9 @@ pub const State = struct {
 };
 
 test "writer2: State init defaults" {
-    const ms = ps.MemPageStore.init(std.testing.allocator, 100);
+    var ms = ps.MemPageStore.init(std.testing.allocator, 100);
     defer ms.deinit();
-    const state = State.init(std.testing.allocator, ms.store(), .{});
+    var state = State.init(std.testing.allocator, ms.store(), .{});
     defer state.deinit();
     try std.testing.expectEqual(btree2.NULL_ROOT, state.root.load(.acquire));
     try std.testing.expectEqual(@as(u64, 0), state.sequence.load(.acquire));
