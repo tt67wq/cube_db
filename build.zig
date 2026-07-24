@@ -174,4 +174,20 @@ pub fn build(b: *std.Build) void {
     const run_writer2_test = b.addRunArtifact(writer2_test);
     const writer2_test_step = b.step("test-writer2", "Run writer2 tests only");
     writer2_test_step.dependOn(&run_writer2_test.step);
+
+    // ponytail: zig build test-mvcc 只跑 MVCC 测试
+    const mvcc_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/mvcc_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    const run_mvcc_test = b.addRunArtifact(mvcc_test);
+    const mvcc_test_step = b.step("test-mvcc", "Run MVCC reader tests only");
+    mvcc_test_step.dependOn(&run_mvcc_test.step);
 }

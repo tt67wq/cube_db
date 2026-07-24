@@ -1,4 +1,4 @@
-//! writer2.zig — v2 batch 应用：COW B-tree (btree2)、freelist 回收、meta 交替提交
+//! writer2.zig — v2 batch 应用：COW B-tree (btree2)、freelist 回收（MVCC 安全）、meta 交替提交
 const std = @import("std");
 const zio = @import("zio");
 const f2 = @import("format2.zig");
@@ -31,12 +31,15 @@ pub const State = struct {
     opts: Options,
     closed: std.atomic.Value(bool),
 
-    /// meta 交替索引（仅写者访问，不需原子）
     meta_index: u32,
 
+    /// 活跃 reader 计数（0 = 无读者，可安全回收脏页）
+    reader_count: std.atomic.Value(u32),
+
+    /// 待回收的脏页（reader 活跃时积累，reader 归零后释放）
+    pending_free: std.ArrayList(u32),
+
     pub fn init(allocator: std.mem.Allocator, store: PageStore, opts: Options) State {
-        // 从 store 恢复 meta（open 时已有 meta 则用其值，否则默认）/
-        // MVP：写者单线程，meta_index 从 0 开始
         return .{
             .allocator = allocator,
             .store = store,
@@ -48,11 +51,54 @@ pub const State = struct {
             .opts = opts,
             .closed = std.atomic.Value(bool).init(false),
             .meta_index = 0,
+            .reader_count = std.atomic.Value(u32).init(0),
+            .pending_free = .empty,
         };
     }
 
     pub fn deinit(self: *State) void {
         self.closed.store(true, .release);
+        // 释放剩余的 pending_free（safe: 写者线程结束，无读者）
+        for (self.pending_free.items) |pn| self.store.freePage(pn);
+        self.pending_free.deinit(self.allocator);
+    }
+
+    // ---- MVCC 读者 API ----
+
+    /// 开始读事务。返回当前的 sequence（用于读一致性快照）。
+    pub fn beginRead(self: *State) u64 {
+        _ = self.reader_count.fetchAdd(1, .acquire);
+        return self.sequence.load(.acquire);
+    }
+
+    /// 结束读事务。若 reader_count 归零，释放所有 pending dirty 页。
+    pub fn endRead(self: *State) void {
+        const prev = self.reader_count.fetchSub(1, .release);
+        if (prev == 1) {
+            // 最后一个读者退出 → 回收所有等待释放的页
+            self.flushPendingFree();
+        }
+    }
+
+    /// 返回当前等待释放的脏页数
+    pub fn pendingFreeCount(self: *State) usize {
+        return self.pending_free.items.len;
+    }
+
+    /// 返回当前 root（测试用）
+    pub fn getRoot(self: *State) u32 {
+        return self.root.load(.acquire);
+    }
+
+    // ---- 内部 ----
+
+    /// 清理 pending_free：*不*检查 reader_count（由调用方保证安全）
+    fn flushPendingFree(self: *State) void {
+        for (self.pending_free.items) |pn| {
+            self.store.freePage(pn);
+        }
+        self.pending_free.clearRetainingCapacity();
+        self.dirt.store(0, .release);
     }
 
     /// 应用一批写请求到 B-tree，提交 meta，fsync，更新原子状态
@@ -69,15 +115,14 @@ pub const State = struct {
         const cur_byte_size = self.byte_size.load(.acquire);
 
         // 2. 收集脏页
-        var dirty = std.ArrayList(u32).empty;
-        defer dirty.deinit(self.allocator);
+        var batch_dirty = std.ArrayList(u32).empty;
+        defer batch_dirty.deinit(self.allocator);
         var batch_entry_delta: i64 = 0;
         var batch_byte_delta: i64 = 0;
         var new_root = cur_root;
 
         for (batch) |req| {
-            const wr = btree2.insert(self.allocator, self.store, new_root, req.key, req.value, req.tombstone, &dirty) catch |err| {
-                // 失败：全部 future set err
+            const wr = btree2.insert(self.allocator, self.store, new_root, req.key, req.value, req.tombstone, &batch_dirty) catch |err| {
                 for (batch) |r| r.future.set(err);
                 return;
             };
@@ -86,9 +131,9 @@ pub const State = struct {
             batch_byte_delta += wr.live_delta;
         }
 
-        // 3. 回收脏页到 freelist
-        for (dirty.items) |pn| {
-            self.store.freePage(pn);
+        // 3. 本批脏页进 pending_free（不立即回收，MVCC 安全）
+        for (batch_dirty.items) |pn| {
+            self.pending_free.append(self.allocator, pn) catch {};
         }
 
         // 4. 计算新 meta 值
@@ -107,7 +152,7 @@ pub const State = struct {
             .root_page = new_root,
             .entry_count = new_entry_count,
             .byte_size = new_byte,
-            .free_head = 0, // ponytail: MVP 不追踪 freelist head 到 meta
+            .free_head = 0,
             .free_count = 0,
             .last_page = 0,
         };
@@ -121,13 +166,18 @@ pub const State = struct {
         // 7. 原子更新状态
         self.root.store(new_root, .release);
         self.sequence.store(new_sequence, .release);
-        self.dirt.store(@intCast(dirty.items.len), .release);
+        self.dirt.store(@intCast(self.pending_free.items.len), .release);
         self.entry_count.store(new_entry_count, .release);
         self.byte_size.store(new_byte, .release);
 
         // 8. 所有请求成功
         for (batch) |req| {
             req.future.set({});
+        }
+
+        // 9. 若此时无读者，立即回收脏页
+        if (self.reader_count.load(.acquire) == 0) {
+            self.flushPendingFree();
         }
     }
 };

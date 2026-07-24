@@ -167,11 +167,17 @@ test "writer2: dirt count reflects pending free pages" {
     _ = try f1.wait();
     try std.testing.expectEqual(@as(u64, 0), state.dirt.load(.acquire));
 
-    // 第二次 overwrite：旧页被回收 → dirt > 0
+    // 第二次 overwrite：开始读事务，脏页不应立即回收
+    _ = state.beginRead();
     var f2: zio.Future(writer2.OpResult) = .{};
     try state.applyBatch(&.{.{ .key = "k", .value = "v2", .tombstone = false, .future = &f2 }});
     _ = try f2.wait();
-    try std.testing.expect(state.dirt.load(.acquire) > 0);
+    // 有读者 → pending_free > 0，dirt = pending_free
+    try std.testing.expect(state.pendingFreeCount() > 0);
+    try std.testing.expectEqual(state.pendingFreeCount(), state.dirt.load(.acquire));
+    // 结束读 → 脏页释放 → dirt = 0
+    state.endRead();
+    try std.testing.expectEqual(@as(u64, 0), state.dirt.load(.acquire));
 }
 
 test "writer2: entry_count and byte_size updated correctly" {
