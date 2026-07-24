@@ -108,11 +108,11 @@
 - 达 ~2–5us（追 LMDB）→ **停**（目标达成）。
 - 改善 < 预期 → profile 定位新瓶颈（可能：branch 全解码 `Branch.fromPayload`、或 btree 深度、或 findInLeaf 线性扫可改二分）。
 
-**结果（2025-07，macOS）**：✅ **追平 LMDB**。get 100B **2.96us/op**、get 10KB **5.77us/op**——LMDB mmap 读 ~2–5us 量级。
+**结果（2025-07，macOS）**：✅ **追平 LMDB**。get 100B **~3 us/op**（3.0–3.8 多次）、get 10KB **~5–13 us/op**（4.7–13 随 mmap 缺页波动）——LMDB mmap 读 ~2–5us 量级（10KB 随机 10000 次有缺页波动）。
 
-进程：T4 后 get 仍 ~128us（真零拷贝 readRecord 借用未提速——发现 readRecord alloc/memcpy 非主成本，主成本是 branch 全解码 `Branch.fromPayload`）。按决策点加 **T6 续**：`findInBranchPayload`（get 跳 branch 全解码，线性扫 keys 找目标 child offset，不 dup 全 entry）。落地后 get 100B 128→2.96us（~43×）、10KB 174→5.77us（~30×）。
+进程：T4 后 get 仍 ~128us（真零拷贝 readRecord 借用未提速——发现 readRecord alloc/memcpy 非主成本，主成本是 branch 全解码 `Branch.fromPayload`）。按决策点加 **T6 续**：`findInBranchPayload`（get 跳 branch 全解码，线性扫 keys 找目标 child offset，不 dup 全 entry）。落地后 get 100B 128→~3us、10KB 174→~5–13us。
 
-全量改进（两阶段累计）：get 100B 252→**2.96us**（~85×）、get 10KB 760→**5.77us**（~136×）。
+全量改进（两阶段累计）：get 100B 252→**~3us**（~85×）、get 10KB 760→**~5–13us**（~60–136×）。
 
 **结论**：目标达成，停。写路径 put（140us）仍 fsync 主导；get 已非短板。
 
