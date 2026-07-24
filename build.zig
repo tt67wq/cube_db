@@ -109,4 +109,37 @@ pub fn build(b: *std.Build) void {
         const run_t = b.addRunArtifact(t);
         test_step.dependOn(&run_t.step);
     }
+
+    // ponytail: per-test steps for faster iteration
+    // zig build test-format2 只跑 format2 测试
+    const format2_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/format2_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    const run_format2_test = b.addRunArtifact(format2_test);
+    const format2_test_step = b.step("test-format2", "Run format2 tests only");
+    format2_test_step.dependOn(&run_format2_test.step);
+
+    // ponytail: zig build test-ps 只跑 page_store 测试
+    const ps_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/page_store_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    const run_ps_test = b.addRunArtifact(ps_test);
+    const ps_test_step = b.step("test-ps", "Run page_store tests only");
+    ps_test_step.dependOn(&run_ps_test.step);
 }

@@ -1,6 +1,9 @@
 //! cube_db — 嵌入式 KV 引擎库入口
 const std = @import("std");
 
+pub const format2 = @import("format2.zig");
+pub const page_store = @import("page_store.zig");
+
 pub const format = @import("format.zig");
 pub const store = @import("store.zig");
 pub const btree = @import("btree.zig");
