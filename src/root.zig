@@ -8,6 +8,7 @@ pub const btree_batch = @import("btree_batch.zig");
 pub const file_store = @import("file_store.zig");
 pub const mmap = @import("mmap.zig");
 pub const writer = @import("writer.zig");
+pub const compactor = @import("compactor.zig");
 pub const db = @import("db.zig");
 pub const fault_store = @import("fault_store.zig");
 

@@ -202,19 +202,38 @@ while (try it.next()) |e| {
 
 append-only + COW 会产生垃圾（旧版本节点）。`compact` 做一次**全量重写**：遍历全部 live entry，写到临时文件，原子 rename 切换，dirt 归零。
 
+### 手动 compact
+
 ```zig
 try db.compact(); // 回收所有垃圾，物理文件缩到 live 大小
 ```
 
 - 持有写锁，与 put/delete 串行（compact 期间写会等待）。
 - 耗时 ≈ 顺序读 + 顺序写全部 live 数据（~2.9 MB/s，受单线程重写限制）。
-- **auto-compact 当前是 stub**（`Options.auto_compact_*` 只计数不触发）。**必须手动调用 `compact()`** 或自行安排后台压缩。
+
+### 自动 compact
+
+`Db.open` 传入 `Options` 可启用自动后台 compact。当文件 dirt 比例达到阈值时，自动在后台线程中执行压缩：
+
+```zig
+const db = try Db.open(allocator, "my.db", .{
+    .auto_compact_dirt_ratio = 0.30,    // dirt/(dirt+live) ≥ 30% 时触发
+    .auto_compact_min_bytes = 16 << 20, // 文件至少 16MB 才触发
+});
+```
+
+自动 compact 分两阶段：
+1. **阶段 1（无锁扫描）**：基于初始 `old_root` 快照遍历全部活 entry 写入临时文件。全程不持写锁，与在线写入并行。
+2. **阶段 2（持锁 diff + 切换）**：获取写锁后对比 `old_root` 与当前 `final_root`，用 merge diff 补齐阶段 1 期间的增量写入，然后原子切换。
+
+阶段 2 持锁时间 ≈ O(树全量) 只读 merge（无写入时 O(1) 捷径），典型毫秒级。
+
+失败处理：指数退避重试（默认 5 次，1s→2s→4s→8s→16s cap 60s），`null = 完全禁用自动 compact`。
 
 ### 何时 compact
 
-- 写放大明显（物理文件远大于 live 数据）时。
-- 大量 delete 后想回收空间。
-- 例：循环覆写同一批 key N 次后，`compact` 一次。
+- 自动 compact 在 dirt 超阈值时自动回收，无需手动干预。
+- 手动 `compact()` 仍适用：想在特定时机强制执行，或用于无 dirt 变化的精确 dirt 归零。
 
 ---
 
@@ -232,8 +251,12 @@ const db = try Db.open(allocator, "my.db", opts);
 | 字段 | 类型 | 默认 | 含义 |
 |---|---|---|---|
 | `fsync` | `bool` | `true` | 写操作是否 `fsync` 落盘。`false` = 只 append 不 sync（快但 crash 丢未 sync 数据，需自行 `db.close()` 或后续 sync） |
-| `auto_compact_dirt_ratio` | `?f32` | `0.30` | dirt/(live+dirt) 达到该值触发自动 compact。**当前 stub**，仅计数 |
-| `auto_compact_min_bytes` | `u64` | 16MB | 自动 compact 检查的 live+dirt 下限。**当前 stub** |
+| `auto_compact_dirt_ratio` | `?f32` | `0.30` | dirt/(live+dirt) 达到该值触发自动后台 compact。`null` = 禁用 |
+| `auto_compact_min_bytes` | `u64` | 16MB | 自动 compact 检查的 live+dirt 下限（避免小文件频繁触发） |
+| `compact_time_slice_ms` | `u64` | 10 | 阶段 1 单批扫描时间片（毫秒），越小限流越频繁 |
+| `compact_scan_sleep_ms` | `u64` | 0 | 阶段 1 批间 I/O 限流睡眠（毫秒）。0 = 只 yield（SSD 默认）；HDD 场景调大 |
+| `compact_max_retries` | `u32` | 5 | 失败重试次数，达到后放弃等下次触发 |
+| `compact_retry_base_ms` | `u64` | 1000 | 重试退避基数（毫秒），第 n 次退避 = base << (n-1)，cap 60s |
 
 > `putNoFsync` 当前是 stub（与 `put` 行为一致）。若要跳过 fsync，用 `Options{ .fsync = false }` 开库 + 普通 `put`。
 

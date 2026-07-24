@@ -7,6 +7,7 @@ const store_mod = @import("store.zig");
 const btree = @import("btree.zig");
 const file_store = @import("file_store.zig");
 const writer = @import("writer.zig");
+const compactor = @import("compactor.zig");
 
 pub const Options = writer.Options;
 pub const Store = store_mod.Store;
@@ -33,6 +34,9 @@ pub const Db = struct {
     has_leader: bool,
     path: []u8,
 
+    /// auto compact OS 线程句柄（close 时 join）
+    compact_thread: ?std.Thread = null,
+
     const Self = @This();
 
     /// 打开（或创建）数据库。
@@ -54,6 +58,9 @@ pub const Db = struct {
 
         self.fs = try file_store.FileStore.create(allocator, path);
         self.store = self.fs.store();
+
+        // 清除上次残留的 .compact（auto compact 半途崩溃）
+        deleteCompactResidue(allocator, path);
 
         // 恢复 header
         const scan = try store_mod.getLatestHeader(allocator, self.store);
@@ -94,6 +101,15 @@ pub const Db = struct {
 
     pub fn close(self: *Self) !void {
         self.state.closed.store(true, .release);
+        // 先 join auto compact 线程
+        if (self.compact_thread) |t| {
+            t.join();
+            self.compact_thread = null;
+        }
+        // 等可能正在进行的 manual compact（占 compacting 标志但无线程）
+        while (self.state.compacting.load(.acquire)) {
+            sleepMs(1);
+        }
         self.store.sync() catch {};
         self.fs.close();
         self.write_queue.deinit(self.allocator);
@@ -138,6 +154,8 @@ pub const Db = struct {
         try self.write_mutex.lock();
         defer self.write_mutex.unlock();
         try writer.applyBatch(&self.state, reqs);
+        // 自动 compact 触发
+        tryStartAutoCompact(self);
         // 全部 future 已 set，收集结果
         var first_err: ?anyerror = null;
         for (futures) |*fut| {
@@ -214,6 +232,8 @@ pub const Db = struct {
                 self.allocator.free(batch);
                 return err;
             };
+            // 自动 compact 触发
+            tryStartAutoCompact(self);
             self.allocator.free(batch);
         }
 
@@ -223,7 +243,12 @@ pub const Db = struct {
     }
 
     pub fn compact(self: *Self) !void {
-        // ponytail: MVP 全量 compact。写互斥锁保护（与 put 串行）。
+        // 对称 CAS 占用 compacting，与 auto compact 互斥
+        while (self.state.compacting.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) {
+            sleepMs(1);
+        }
+        defer self.state.compacting.store(false, .release);
+
         try self.write_mutex.lock();
         defer self.write_mutex.unlock();
         return self.doCompact();
@@ -286,7 +311,39 @@ pub const Db = struct {
         const bt_root = self.currentBtreeRoot();
         return btree.select(self.allocator, self.store, bt_root, min, max);
     }
+
+    /// 检查 dirt 阈值，触发 auto compact
+    fn tryStartAutoCompact(self: *Self) void {
+        if (self.state.opts.auto_compact_dirt_ratio) |ratio| {
+            const cur_dirt = self.state.dirt.load(.acquire);
+            const cur_byte = self.state.byte_size.load(.acquire);
+            const live = cur_byte;
+            const total = cur_dirt + live;
+            if (total >= self.state.opts.auto_compact_min_bytes and live > 0) {
+                const dirt_ratio = @as(f64, @floatFromInt(cur_dirt)) / @as(f64, @floatFromInt(total));
+                if (dirt_ratio >= @as(f64, @floatCast(ratio))) {
+                    compactor.tryStartCompact(self);
+                }
+            }
+        }
+    }
 };
 
-// ===== 测试 =====
-// db 集成测试需 zio runtime 驱动，见 tests/db_test.zig。
+fn sleepMs(ms: u64) void {
+    if (ms == 0) return;
+    var ts = std.posix.system.timespec{
+        .sec = @as(isize, @intCast(ms / 1000)),
+        .nsec = @as(isize, @intCast((ms % 1000) * 1_000_000)),
+    };
+    while (true) {
+        const rc = std.posix.system.nanosleep(&ts, &ts);
+        if (rc == 0) break;
+    }
+}
+
+/// 清除 .compact 残留文件（open 时调用）
+fn deleteCompactResidue(allocator: std.mem.Allocator, path: []const u8) void {
+    const compact_path = std.fmt.allocPrint(allocator, "{s}.compact", .{path}) catch return;
+    defer allocator.free(compact_path);
+    zio.Dir.cwd().deleteFile(compact_path) catch {};
+}

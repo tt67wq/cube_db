@@ -14,6 +14,15 @@ pub const Options = struct {
     auto_compact_dirt_ratio: ?f32 = 0.30,
     auto_compact_min_bytes: u64 = 16 * 1024 * 1024,
     fsync: bool = true,
+
+    /// 阶段1单批时间片（毫秒）。
+    compact_time_slice_ms: u64 = 10,
+    /// 阶段1批间 I/O 限流睡眠（毫秒）。0 = 只 yield。
+    compact_scan_sleep_ms: u64 = 0,
+    /// 失败最大重试次数。
+    compact_max_retries: u32 = 5,
+    /// 重试退避基数（毫秒）。
+    compact_retry_base_ms: u64 = 1000,
 };
 
 /// 写请求结果（Future 值类型）
@@ -43,6 +52,13 @@ pub const State = struct {
     compact_count: std.atomic.Value(u32),
     /// applyBatch 调用次数（group commit 合并度观测）
     apply_count: std.atomic.Value(u64) = .init(0),
+
+    /// auto compact 进行中（CAS 去重 + 手动 compact 互斥）
+    compacting: std.atomic.Value(bool) = .init(false),
+    /// 成功计数
+    compact_success_count: std.atomic.Value(u32) = .init(0),
+    /// 失败计数
+    compact_fail_count: std.atomic.Value(u32) = .init(0),
 };
 
 /// 应用一批写请求，COW 构建新 root，写 header，fsync，更新原子状态。

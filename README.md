@@ -5,7 +5,8 @@ An embedded key-value store written in Zig 0.16.0, modeled after the [CubDB](htt
 - Embedded KV engine: `get` / `put` / `delete` / `select`
 - Append-only data file
 - Immutable B-tree (Copy-on-Write)
-- Compaction to reclaim old versions
+- Auto-compaction in background thread (threshold-based dirt reclamation)
+- Manual compaction to reclaim old versions
 
 Full implementation notes in [`docs/tutorial/`](docs/tutorial/). **Usage manual: [`docs/usage.md`](docs/usage.md).**
 
@@ -53,13 +54,15 @@ Key points:
 2. **put 10KB vs 100B delta ≈ write-to-disk time**: 3.8ms − 0.7ms ≈ 3.1ms/10KB ≈ ~3.2 MB/s flush bandwidth — serial fsync was the drag; `putBatch` collapses it.
 3. **get is far faster than put** (251→**~3us**, no fsync) — **LMDB-level** (~2us). Zero-copy read path: remove marker (mmap bytes contiguous) + `Store.readBorrow` (borrowed mmap slice, no alloc/memcpy) + `readRecord` returns borrowed slice + `findInLeaf`/`findInBranchPayload` skip full leaf/branch decode + read-no-CRC on hot path. ~85× improvement; matches LMDB mmap reads.
 4. **compact**: small 100B ~4s / 10KB ~35s, full rewrite (seq read + write + sync), ~100MB in 35s ≈ ~2.9 MB/s — single-threaded rewrite is the bottleneck; multi-threaded rewrite / streaming sync is the fix (still open).
-5. **COW dirt amplification**: large×100B preload (1M puts) yields ~4.7GB physical file (live ~120MB, ~33×); auto-compact is a stub — manual `compact()` or a background compactor is required.
+5. **COW dirt amplification**: large×100B preload (1M puts) yields ~4.7GB physical file (live ~120MB, ~33×); **auto-compact** now reclaims upon threshold (`auto_compact_dirt_ratio` + `auto_compact_min_bytes`). Background thread does lock-free phase-1 scan + phase-2 tree diff merge under write mutex. See `docs/auto-compact-design.md`.
 
 > **Implemented (single-thread)**: `putBatch` + `BTreeBatch` → ~1000× put throughput by amortizing fsync + COW. Uses `arena` allocator for batch-node lifetime; node cache + bottom-up flush (children-first offset assignment).
 >
 > **Implemented (concurrent group commit, lever 3)**: implicit batching of *concurrent* `put`/`delete` via leader/follower in `sendRequest`. A thread that finds no active leader drains the request queue into one `applyBatch` (1 fsync); followers enqueue and block on their `zio.Future` (kernel futex, works on raw threads). Leader keeps serving while the queue is non-empty, then steps down. `writer.applyBatch` already set all futures, so no extra plumbing. Verified by `tests/group_commit_test.zig`: 16 threads × 50 puts (800 ops) merge to ~117 `applyBatch` calls (~6.8× fewer fsyncs) with all 800 keys readable; concurrent delete merge test too. Measured merge ratio via an `apply_count` counter on `writer.State`.
 
 > **Implemented (read path, lever — get)**: two-phase。**Phase 1**（`docs/mmap-read-design.md`）：mmap整文件（预留大 sparse 区、append-only MVCC、永不 remap）+ get skip-decode（`findInLeaf`）+ 热读跳 CRC → 252→133us。**Phase 2**（`docs/zero-copy-read-design.md`，真零拷贝）：去 marker（mmap 字节天然连续）+ `Store.readBorrow`（返 mmap 借用切片，不 alloc 不 memcpy）+ `readRecord` 返借用 + ~8 调用点去 free + `getLatestHeader` 正向扫全文件记最后有效 header（去 marker 后替代扫 marker）+ `findInBranchPayload`（get 跳 branch 全解码）。结果：get 100B **~3us**（~85×）、get 10KB **~5–13us**（~60–136×），**追平 LMDB mmap 读**（~2–5us）。
+
+> **Implemented (auto-compact)**: background thread with two-phase compaction — lock-free phase-1 scan of old-root snapshot, then phase-2 tree-diff merge under write mutex. Configurable dirt ratio threshold (`auto_compact_dirt_ratio`) and minimum file size (`auto_compact_min_bytes`). Retry with exponential backoff on failure. See [`docs/auto-compact-design.md`](docs/auto-compact-design.md).
 
 > Note: delete large / select large / compact large cells are long-running (1M fsyncs or full rewrite of 1GB+); not run to completion. Their shape mirrors small, scaling linearly with size.
 
