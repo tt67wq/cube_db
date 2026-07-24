@@ -206,4 +206,20 @@ pub fn build(b: *std.Build) void {
     const run_db2_test = b.addRunArtifact(db2_test);
     const db2_test_step = b.step("test-db2", "Run db2 tests only");
     db2_test_step.dependOn(&run_db2_test.step);
+
+    // ponytail: zig build test-compact2 只跑 compact2 测试
+    const compact2_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/compact2_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    const run_compact2_test = b.addRunArtifact(compact2_test);
+    const compact2_test_step = b.step("test-compact2", "Run compact2 tests only");
+    compact2_test_step.dependOn(&run_compact2_test.step);
 }

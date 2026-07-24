@@ -113,6 +113,22 @@ pub const Db2 = struct {
         const root = self.state.getRoot();
         return try btree2.select(self.allocator, self.store, root, min, max);
     }
+
+    pub fn compact(self: *Db2) !void {
+        try self.state.compact();
+    }
+
+    pub fn dirtCount(self: *Db2) u64 {
+        return self.state.dirtCount();
+    }
+
+    pub fn beginRead(self: *Db2) u64 {
+        return self.state.beginRead();
+    }
+
+    pub fn endRead(self: *Db2) void {
+        self.state.endRead();
+    }
 };
 
 test "db2: open default state" {

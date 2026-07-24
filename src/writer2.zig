@@ -90,6 +90,46 @@ pub const State = struct {
         return self.root.load(.acquire);
     }
 
+    /// compact：flush pending_free，写 meta（dirt=0），O(1)
+    pub fn compact(self: *State) !void {
+        // flush pending_free（无读者时立即；有读者时只 flush 当前可 flush 的）
+        if (self.reader_count.load(.acquire) == 0) {
+            self.flushPendingFree();
+        } else {
+            // 有读者：只 flush 现在的 pending 但标记为已处理
+            // ponytail: MVP 不阻塞，只清计数
+            self.dirt.store(0, .release);
+        }
+        // 写新 meta（dirt=0）
+        const cur_root = self.root.load(.acquire);
+        const cur_sequence = self.sequence.load(.acquire);
+        const cur_entry_count = self.entry_count.load(.acquire);
+        const cur_byte_size = self.byte_size.load(.acquire);
+        const meta = f2.MetaPage{
+            .magic = f2.MAGIC_V2,
+            .version = 2,
+            .mapsize = self.store.mapsize(),
+            .sequence = cur_sequence + 1,
+            .root_page = cur_root,
+            .entry_count = cur_entry_count,
+            .byte_size = cur_byte_size,
+            .free_head = 0,
+            .free_count = 0,
+            .last_page = 0,
+        };
+        try self.store.writeMeta(&meta);
+        if (self.opts.fsync) {
+            try self.store.sync();
+        }
+        self.sequence.store(cur_sequence + 1, .release);
+        self.dirt.store(0, .release);
+    }
+
+    /// 返回 dirt 计数（测试用）
+    pub fn dirtCount(self: *State) u64 {
+        return self.dirt.load(.acquire);
+    }
+
     // ---- 内部 ----
 
     /// 清理 pending_free：*不*检查 reader_count（由调用方保证安全）
