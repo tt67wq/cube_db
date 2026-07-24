@@ -6,7 +6,7 @@ const c = @cImport({
     @cInclude("sys/mman.h");
     @cInclude("unistd.h");
 });
-const f2 = @import("format2.zig");
+const f2 = @import("format.zig");
 
 const PAGE_SIZE = f2.PAGE_SIZE;
 

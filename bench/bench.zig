@@ -1,17 +1,17 @@
-//! bench.zig — cube_db 基准矩阵 runner
+//! bench.zig — cube_db v2 基准矩阵 runner
 //! 运行：zig build bench -Doptimize=ReleaseFast
-//! 设计：docs/benchmark-design.md。20 格 = 5 op × 2 scale × 2 value。
-//! 计时用 monoNs（clock_gettime MONOTONIC）。预载 fsync=false，测量段 fsync=true。
+//! 20 格 = 5 op × 2 scale × 2 value。计时 monoNs。
+//! 使用 MemPageStore（内存），测量算法吞吐。
 const std = @import("std");
 const Io = std.Io;
 const zio = @import("zio");
 const cube = @import("cube_db");
 const Db = cube.Db;
+const Entry = cube.Entry;
+const MemPageStore = cube.page_store.MemPageStore;
 
 const SEED: u64 = 0x42;
 const bopts = @import("bench_opts");
-
-// ---- 计时 / 清理（搬自 put_bench.zig）----
 
 fn monoNs() i64 {
     var ts: std.c.timespec = undefined;
@@ -19,17 +19,6 @@ fn monoNs() i64 {
     return @as(i64, @intCast(ts.sec)) * 1_000_000_000 + @as(i64, @intCast(ts.nsec));
 }
 
-fn deleteIfExists(path: []const u8) void {
-    zio.Dir.cwd().deleteFile(path) catch {};
-}
-
-fn deleteCompact(allocator: std.mem.Allocator, path: []const u8) !void {
-    const cp = try std.fmt.allocPrint(allocator, "{s}.compact", .{path});
-    defer allocator.free(cp);
-    deleteIfExists(cp);
-}
-
-// 零填充数字 key：字典序 = 数值序。
 fn fmtKey(buf: *[12]u8, i: usize) ![]const u8 {
     return std.fmt.bufPrint(buf, "{d:0>10}", .{i});
 }
@@ -37,8 +26,6 @@ fn fmtKey(buf: *[12]u8, i: usize) ![]const u8 {
 fn warmupCount(n: usize) usize {
     return @min(n / 100, 1000);
 }
-
-// ---- 矩阵 ----
 
 const Scale = enum { small, large };
 const Op = enum { put, putbatch, get, delete, select, compact };
@@ -61,26 +48,17 @@ fn keysFor(scale: Scale, v: VSize) usize {
     };
 }
 
-// 预载：开库（fsync 可选）顺序写 n 个 key，返回 db，调用方 close。
-fn openLoad(allocator: std.mem.Allocator, path: []const u8, n: usize, value: []const u8, fsync: bool) !*Db {
-    deleteIfExists(path);
-    try deleteCompact(allocator, path);
-    const db = try Db.open(allocator, path, .{ .fsync = fsync });
-    var kbuf: [12]u8 = undefined;
-    for (0..n) |i| {
-        const k = try fmtKey(&kbuf, i);
-        try db.put(k, value);
-    }
-    return db;
+fn mapsizeFor(scale: Scale, v: VSize) u32 {
+    // 足够容纳所有 key 的页数
+    const n = keysFor(scale, v);
+    return @as(u32, @intCast(cube.page_store.FIRST_DATA_PAGE + n + 1000));
 }
 
-// ---- 各操作 runner ----
-
-fn runPut(allocator: std.mem.Allocator, path: []const u8, cell: Cell, n: usize, value: []const u8) !Result {
-    deleteIfExists(path);
-    try deleteCompact(allocator, path);
-    const db = try Db.open(allocator, path, .{ .fsync = true }); // 测量段默认带 fsync
-    defer db.close() catch {};
+fn runPut(allocator: std.mem.Allocator, cell: Cell, n: usize, value: []const u8) !Result {
+    var ms = MemPageStore.init(allocator, mapsizeFor(cell.scale, cell.v));
+    defer ms.deinit();
+    var db = try Db.open(allocator, ms.store(), .{});
+    defer db.close();
     var kbuf: [12]u8 = undefined;
     const wu = warmupCount(n);
     for (0..wu) |i| {
@@ -96,23 +74,21 @@ fn runPut(allocator: std.mem.Allocator, path: []const u8, cell: Cell, n: usize, 
     return .{ .op = cell.op, .scale = cell.scale, .v = cell.v, .ops = n, .elapsed_ns = ns };
 }
 
-fn runPutBatch(allocator: std.mem.Allocator, path: []const u8, cell: Cell, n: usize, value: []const u8) !Result {
-    deleteIfExists(path);
-    try deleteCompact(allocator, path);
-    const db = try Db.open(allocator, path, .{ .fsync = true }); // 测量段带 fsync
-    defer db.close() catch {};
-    // 构造 N 个 Entry
-    const entries = try allocator.alloc(cube.Entry, n);
+fn runPutBatch(allocator: std.mem.Allocator, cell: Cell, n: usize, value: []const u8) !Result {
+    var ms = MemPageStore.init(allocator, mapsizeFor(cell.scale, cell.v));
+    defer ms.deinit();
+    var db = try Db.open(allocator, ms.store(), .{});
+    defer db.close();
+    const entries = try allocator.alloc(Entry, n);
     defer allocator.free(entries);
     var kbuf: [12]u8 = undefined;
     for (0..n) |i| {
         const k = try fmtKey(&kbuf, i);
         entries[i] = .{ .key = k, .value = value };
     }
-    // warmup（小批 putBatch）
     const wu = warmupCount(n);
     if (wu > 0) {
-        const we = try allocator.alloc(cube.Entry, wu);
+        const we = try allocator.alloc(Entry, wu);
         defer allocator.free(we);
         for (0..wu) |i| {
             const k = try fmtKey(&kbuf, i);
@@ -126,16 +102,19 @@ fn runPutBatch(allocator: std.mem.Allocator, path: []const u8, cell: Cell, n: us
     return .{ .op = cell.op, .scale = cell.scale, .v = cell.v, .ops = n, .elapsed_ns = ns };
 }
 
-fn runGet(allocator: std.mem.Allocator, path: []const u8, cell: Cell, n: usize, value: []const u8) !Result {
-    {
-        const db = try openLoad(allocator, path, n, value, false);
-        db.close() catch {}; // close syncs → 数据持久
+fn runGet(allocator: std.mem.Allocator, cell: Cell, n: usize, value: []const u8) !Result {
+    var ms = MemPageStore.init(allocator, mapsizeFor(cell.scale, cell.v));
+    defer ms.deinit();
+    var db = try Db.open(allocator, ms.store(), .{});
+    defer db.close();
+    // 预载
+    var kbuf: [12]u8 = undefined;
+    for (0..n) |i| {
+        const k = try fmtKey(&kbuf, i);
+        try db.put(k, value);
     }
-    const db = try Db.open(allocator, path, .{ .fsync = true });
-    defer db.close() catch {};
     var prng = std.Random.DefaultPrng.init(SEED);
     const rnd = prng.random();
-    var kbuf: [12]u8 = undefined;
     const wu = warmupCount(n);
     for (0..wu) |_| {
         const idx = rnd.uintLessThan(usize, n);
@@ -152,14 +131,16 @@ fn runGet(allocator: std.mem.Allocator, path: []const u8, cell: Cell, n: usize, 
     return .{ .op = cell.op, .scale = cell.scale, .v = cell.v, .ops = n, .elapsed_ns = ns };
 }
 
-fn runDelete(allocator: std.mem.Allocator, path: []const u8, cell: Cell, n: usize, value: []const u8) !Result {
-    {
-        const db = try openLoad(allocator, path, n, value, false);
-        db.close() catch {};
+fn runDelete(allocator: std.mem.Allocator, cell: Cell, n: usize, value: []const u8) !Result {
+    var ms = MemPageStore.init(allocator, mapsizeFor(cell.scale, cell.v));
+    defer ms.deinit();
+    var db = try Db.open(allocator, ms.store(), .{});
+    defer db.close();
+    var kbuf: [12]u8 = undefined;
+    for (0..n) |i| {
+        const k = try fmtKey(&kbuf, i);
+        try db.put(k, value);
     }
-    const db = try Db.open(allocator, path, .{ .fsync = true });
-    defer db.close() catch {};
-    // 随机序排列 0..n（Fisher-Yates）
     const perm = try allocator.alloc(u32, n);
     defer allocator.free(perm);
     for (perm, 0..) |*p, i| p.* = @intCast(i);
@@ -173,15 +154,12 @@ fn runDelete(allocator: std.mem.Allocator, path: []const u8, cell: Cell, n: usiz
         perm[i] = perm[j];
         perm[j] = t;
     }
-    var kbuf: [12]u8 = undefined;
-    // warmup 跳过：delete warmup 会改变 n，首删即隐式 warmup
     const start = monoNs();
     for (perm) |idx| {
         const k = try fmtKey(&kbuf, idx);
         try db.delete(k);
     }
     const ns = monoNs() - start;
-    // spot check：删后首 key 应 miss
     const k0 = try fmtKey(&kbuf, perm[0]);
     if (try db.get(k0)) |got| {
         allocator.free(got);
@@ -190,14 +168,17 @@ fn runDelete(allocator: std.mem.Allocator, path: []const u8, cell: Cell, n: usiz
     return .{ .op = cell.op, .scale = cell.scale, .v = cell.v, .ops = n, .elapsed_ns = ns };
 }
 
-fn runSelect(allocator: std.mem.Allocator, path: []const u8, cell: Cell, n: usize, value: []const u8) !Result {
-    {
-        const db = try openLoad(allocator, path, n, value, false);
-        db.close() catch {};
+fn runSelect(allocator: std.mem.Allocator, cell: Cell, n: usize, value: []const u8) !Result {
+    var ms = MemPageStore.init(allocator, mapsizeFor(cell.scale, cell.v));
+    defer ms.deinit();
+    var db = try Db.open(allocator, ms.store(), .{});
+    defer db.close();
+    var kbuf: [12]u8 = undefined;
+    for (0..n) |i| {
+        const k = try fmtKey(&kbuf, i);
+        try db.put(k, value);
     }
-    const db = try Db.open(allocator, path, .{ .fsync = true });
-    defer db.close() catch {};
-    const r = n / 100; // 范围 select 次数，每次消费 100 keys
+    const r = n / 100;
     var prng = std.Random.DefaultPrng.init(SEED);
     const rnd = prng.random();
     var kmin: [12]u8 = undefined;
@@ -224,11 +205,11 @@ fn runSelect(allocator: std.mem.Allocator, path: []const u8, cell: Cell, n: usiz
     return .{ .op = cell.op, .scale = cell.scale, .v = cell.v, .ops = r, .elapsed_ns = ns };
 }
 
-fn runCompact(allocator: std.mem.Allocator, path: []const u8, cell: Cell, n: usize, value: []const u8) !Result {
-    // 预载 + 同批 key 覆写 4 次（fsync=false 造 ~5× 垃圾）
-    deleteIfExists(path);
-    try deleteCompact(allocator, path);
-    const db = try Db.open(allocator, path, .{ .fsync = false });
+fn runCompact(allocator: std.mem.Allocator, cell: Cell, n: usize, value: []const u8) !Result {
+    var ms = MemPageStore.init(allocator, mapsizeFor(cell.scale, cell.v));
+    defer ms.deinit();
+    var db = try Db.open(allocator, ms.store(), .{});
+    defer db.close();
     var kbuf: [12]u8 = undefined;
     for (0..n) |i| {
         const k = try fmtKey(&kbuf, i);
@@ -239,17 +220,11 @@ fn runCompact(allocator: std.mem.Allocator, path: []const u8, cell: Cell, n: usi
         const k = try fmtKey(&kbuf, j % n);
         try db.put(k, value);
     }
-    db.close() catch {}; // syncs
-    const db2 = try Db.open(allocator, path, .{ .fsync = true });
-    defer db2.close() catch {};
-    // warmup 无意义（单次 compact）——直接测
     const start = monoNs();
-    try db2.compact();
+    try db.compact();
     const ns = monoNs() - start;
     return .{ .op = cell.op, .scale = cell.scale, .v = cell.v, .ops = 1, .elapsed_ns = ns };
 }
-
-// ---- 输出 ----
 
 fn opName(op: Op) []const u8 {
     return switch (op) { .put => "put", .putbatch => "putbatch", .get => "get", .delete => "delete", .select => "select", .compact => "compact" };
@@ -267,14 +242,13 @@ fn printRow(w: *Io.Writer, r: Result) !void {
     const ops_f = @as(f64, @floatFromInt(r.ops));
     var buf: [160]u8 = undefined;
     if (r.op == .compact) {
-        // ops/s 无意义打 -；avg = 总耗时（us）
         const line = try std.fmt.bufPrint(&buf, "{s:<7} {s:<6} {s:<5} {d:>12} {d:>12.1} {s:>12} {d:>12.2}\n", .{
             opName(r.op), scaleName(r.scale), vName(r.v), r.ops, elapsed_ms, @as([]const u8, "-"), elapsed_ms * 1000.0,
         });
         try w.writeAll(line);
     } else {
         const ops_s = ops_f / sec;
-        const avg_us = (@as(f64, @floatFromInt(r.elapsed_ns)) / 1000.0) / ops_f; // elapsed_us / ops
+        const avg_us = (@as(f64, @floatFromInt(r.elapsed_ns)) / 1000.0) / ops_f;
         const line = try std.fmt.bufPrint(&buf, "{s:<7} {s:<6} {s:<5} {d:>12} {d:>12.1} {d:>12.0} {d:>12.2}\n", .{
             opName(r.op), scaleName(r.scale), vName(r.v), r.ops, elapsed_ms, ops_s, avg_us,
         });
@@ -311,19 +285,13 @@ pub fn main(init: std.process.Init) !void {
                 const cell = Cell{ .op = op, .scale = scale, .v = v };
                 const n = keysFor(scale, v);
                 const value: []const u8 = if (v == .b100) &v100 else &v10k;
-                const path = try std.fmt.allocPrint(allocator, "bench_tmp_{s}_{s}_{s}.db", .{ opName(op), scaleName(scale), vName(v) });
-                defer allocator.free(path);
-                defer {
-                    deleteIfExists(path);
-                    deleteCompact(allocator, path) catch {};
-                }
                 const result = switch (op) {
-                    .put => runPut(allocator, path, cell, n, value) catch |e| { last_err = e; continue; },
-                    .putbatch => runPutBatch(allocator, path, cell, n, value) catch |e| { last_err = e; continue; },
-                    .get => runGet(allocator, path, cell, n, value) catch |e| { last_err = e; continue; },
-                    .delete => runDelete(allocator, path, cell, n, value) catch |e| { last_err = e; continue; },
-                    .select => runSelect(allocator, path, cell, n, value) catch |e| { last_err = e; continue; },
-                    .compact => runCompact(allocator, path, cell, n, value) catch |e| { last_err = e; continue; },
+                    .put => runPut(allocator, cell, n, value) catch |e| { last_err = e; continue; },
+                    .putbatch => runPutBatch(allocator, cell, n, value) catch |e| { last_err = e; continue; },
+                    .get => runGet(allocator, cell, n, value) catch |e| { last_err = e; continue; },
+                    .delete => runDelete(allocator, cell, n, value) catch |e| { last_err = e; continue; },
+                    .select => runSelect(allocator, cell, n, value) catch |e| { last_err = e; continue; },
+                    .compact => runCompact(allocator, cell, n, value) catch |e| { last_err = e; continue; },
                 };
                 try printRow(w, result);
             }

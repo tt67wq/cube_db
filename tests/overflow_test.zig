@@ -5,13 +5,13 @@ const std = @import("std");
 const zio = @import("zio");
 const cube = @import("cube_db");
 const ps = cube.page_store;
-const btree2 = cube.btree2;
-const db2 = cube.db2;
+const btree = cube.btree;
+const dbi = cube.db;
 
 test "overflow: put and get value larger than one page" {
     var ms = ps.MemPageStore.init(std.testing.allocator, 10000);
     defer ms.deinit();
-    var db = try db2.Db2.open(std.testing.allocator, ms.store(), .{});
+    var db = try dbi.Db.open(std.testing.allocator, ms.store(), .{});
     defer db.close();
 
     const big = try std.testing.allocator.alloc(u8, 5000);
@@ -29,7 +29,7 @@ test "overflow: put and get value larger than one page" {
 test "overflow: 10KB value roundtrip" {
     var ms = ps.MemPageStore.init(std.testing.allocator, 10000);
     defer ms.deinit();
-    var db = try db2.Db2.open(std.testing.allocator, ms.store(), .{});
+    var db = try dbi.Db.open(std.testing.allocator, ms.store(), .{});
     defer db.close();
 
     const big = try std.testing.allocator.alloc(u8, 10000);
@@ -47,7 +47,7 @@ test "overflow: 10KB value roundtrip" {
 test "overflow: overwrite with big value" {
     var ms = ps.MemPageStore.init(std.testing.allocator, 10000);
     defer ms.deinit();
-    var db = try db2.Db2.open(std.testing.allocator, ms.store(), .{});
+    var db = try dbi.Db.open(std.testing.allocator, ms.store(), .{});
     defer db.close();
 
     try db.put("k", "small");
@@ -66,7 +66,7 @@ test "overflow: overwrite with big value" {
 test "overflow: delete big value then get null" {
     var ms = ps.MemPageStore.init(std.testing.allocator, 10000);
     defer ms.deinit();
-    var db = try db2.Db2.open(std.testing.allocator, ms.store(), .{});
+    var db = try dbi.Db.open(std.testing.allocator, ms.store(), .{});
     defer db.close();
 
     const big = try std.testing.allocator.alloc(u8, 6000);
@@ -81,7 +81,7 @@ test "overflow: delete big value then get null" {
 test "overflow: multiple big values coexist" {
     var ms = ps.MemPageStore.init(std.testing.allocator, 10000);
     defer ms.deinit();
-    var db = try db2.Db2.open(std.testing.allocator, ms.store(), .{});
+    var db = try dbi.Db.open(std.testing.allocator, ms.store(), .{});
     defer db.close();
 
     const big1 = try std.testing.allocator.alloc(u8, 5000);
@@ -107,7 +107,7 @@ test "overflow: multiple big values coexist" {
 test "overflow: big value in select range" {
     var ms = ps.MemPageStore.init(std.testing.allocator, 10000);
     defer ms.deinit();
-    var db = try db2.Db2.open(std.testing.allocator, ms.store(), .{});
+    var db = try dbi.Db.open(std.testing.allocator, ms.store(), .{});
     defer db.close();
 
     const big = try std.testing.allocator.alloc(u8, 5000);

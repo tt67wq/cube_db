@@ -1,44 +1,16 @@
 //! cube_db — 嵌入式 KV 引擎库入口
 const std = @import("std");
 
-pub const format2 = @import("format2.zig");
-pub const page_store = @import("page_store.zig");
-pub const btree2 = @import("btree2.zig");
-pub const writer2 = @import("writer2.zig");
-pub const db2 = @import("db2.zig");
-
 pub const format = @import("format.zig");
-pub const store = @import("store.zig");
+pub const page_store = @import("page_store.zig");
 pub const btree = @import("btree.zig");
-pub const btree_batch = @import("btree_batch.zig");
-pub const file_store = @import("file_store.zig");
-pub const mmap = @import("mmap.zig");
 pub const writer = @import("writer.zig");
-pub const compactor = @import("compactor.zig");
 pub const db = @import("db.zig");
-pub const fault_store = @import("fault_store.zig");
+pub const file_page_store = @import("file_page_store.zig");
 
-pub const Header = format.Header;
-pub const Options = db.Options;
-pub const Entry = db.Entry;
 pub const Db = db.Db;
-
-// V2 (freelist-based page storage) — new default for new projects
-pub const Db2 = db2.Db2;
-
-pub const V2 = struct {
-    pub const format2 = @import("format2.zig");
-    pub const page_store = @import("page_store.zig");
-    pub const btree2 = @import("btree2.zig");
-    pub const writer2 = @import("writer2.zig");
-    pub const db2 = @import("db2.zig");
-    pub const file_page_store = @import("file_page_store.zig");
-};
-
-// ponytail: add 保留导出，后续 db.zig 落地后替换
-pub fn add(a: i32, b: i32) i32 {
-    return a + b;
-}
+pub const Entry = db.Entry;
+pub const Options = writer.Options;
 
 test {
     std.testing.refAllDecls(@This());

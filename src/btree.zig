@@ -1,41 +1,30 @@
-//! btree.zig — 不可变 B-tree（COW 插入/删除、查找、范围迭代）
-//! M3。全部对 Store（内存或文件）操作；节点存逻辑偏移。
-//! 排序按 key 字节序（memcmp）。
+//! btree.zig — 页号 COW B-tree（v2，page-based）
+//! 与 v1 btree.zig 相同算法，但节点寻址用 u32 页号，I/O 走 PageStore，
+//! 固定页大小，分支子指针为 u32。脏页收集到 caller 的 ArrayList。
 const std = @import("std");
-const f = @import("format.zig");
-const store_mod = @import("store.zig");
+const f2 = @import("format.zig");
+const ps = @import("page_store.zig");
 
-const Store = store_mod.Store;
+const PageStore = ps.PageStore;
 
-/// 叶节点目标最大条目数（payload ≤ ~8KB）。粗略：每条 entry ≈ 1+4+klen+4+vlen。
-/// 用条目数控制分裂，简化实现。
+pub const NULL_ROOT: u32 = 0;
 pub const LEAF_MAX_ENTRIES: usize = 32;
 pub const LEAF_MIN_ENTRIES: usize = LEAF_MAX_ENTRIES / 2;
-pub const BRANCH_MAX_CHILDREN: usize = 32;
+pub const BRANCH_MAX_CHILDREN: usize = 64;
 pub const BRANCH_MIN_CHILDREN: usize = BRANCH_MAX_CHILDREN / 2;
 
-/// 空树哨兵。不使用 0（0 是合法逻辑偏移——首条 append 返回 0）。
-pub const NULL_ROOT: u64 = std.math.maxInt(u64);
+const LEAF_KIND: u8 = 2;
+const BRANCH_KIND: u8 = 1;
 
-pub const Error = error{
-    OutOfMemory,
-    Truncated,
-    CorruptCrc,
-    BadMagic,
-    BadVersion,
-    IoError,
-    Empty,
-} || std.mem.Allocator.Error;
+pub const LeafEntry = struct {
+    tombstone: bool,
+    key: []const u8,
+    value: []const u8,
+};
 
-/// COW 插入/删除结果
 pub const WriteResult = struct {
-    /// 新 root 逻辑偏移（0 表示空树）
-    new_root: u64,
-    /// 本次写新增的 live 字节数（正）或减少的（负，用于 dirt 统计）
+    new_root: u32,
     live_delta: i64,
-    /// 本次写产生的垃圾字节数（旧路径节点大小之和）
-    dirt_delta: u64,
-    /// entry_count 变化（+1 / 0 / -1）
     count_delta: i64,
 };
 
@@ -44,41 +33,459 @@ pub fn cmpKey(a: []const u8, b: []const u8) std.math.Order {
     return std.mem.order(u8, a, b);
 }
 
-// ===== 临时节点解码辅助 =====
-// 从 store 读一个节点记录并解码。返回 payload 切片（allocator 分配的拷贝）。
+// ===== 页 I/O 辅助 =====
 
-pub fn readRecord(allocator: std.mem.Allocator, s: Store, offset: u64) ![]const u8 {
-    _ = allocator;
-    // T4 零拷贝：借用整记录（指向 mmap/MemStore，不 alloc 不 memcpy）。
-    // 先读 len(4)，再 readBorrow 整记录。
-    const len_slice = try s.readBorrow(offset, 4);
-    if (len_slice.len < 4) return error.Truncated;
-    const payload_len = std.mem.readInt(u32, len_slice[0..4], .big);
-    const total = f.REC_LEN_SIZE + payload_len + f.REC_CRC_SIZE;
-    const rec = try s.readBorrow(offset, total);
-    if (rec.len < total) return error.Truncated;
-    return rec;
+/// 从页读节点 payload（借用页缓冲，不拷贝）
+pub fn readNodePayload(store: PageStore, page_no: u32) ![]const u8 {
+    const page = try store.readPage(page_no);
+    const arr: *const [f2.PAGE_SIZE]u8 = @ptrCast(page.ptr);
+    if (!f2.verifyPageChecksum(arr)) return error.CorruptCrc;
+    return page[f2.PAGE_HEADER_SIZE .. f2.PAGE_SIZE - 4];
 }
 
-pub fn decodeNodePayload(rec: []const u8) ![]const u8 {
-    return f.decodeRecord(rec) catch return error.CorruptCrc;
+/// 写节点页（页头 + payload + CRC）
+pub fn writeNodePage(store: PageStore, page_no: u32, page_type: u8, nkeys: u16, payload: []const u8) !void {
+    const page = try store.writePage(page_no);
+    const arr: *[f2.PAGE_SIZE]u8 = @ptrCast(page.ptr);
+    const hdr = f2.PageHeader{
+        .page_no = page_no,
+        .page_type = page_type,
+        .gen = 0,
+        .nkeys = nkeys,
+        .free_next = 0,
+    };
+    f2.encodePageHeader(page[0..f2.PAGE_HEADER_SIZE], &hdr);
+    @memcpy(page[f2.PAGE_HEADER_SIZE ..][0..payload.len], payload);
+    const remaining = f2.PAGE_SIZE - f2.PAGE_HEADER_SIZE - 4 - payload.len;
+    if (remaining > 0) @memset(page[f2.PAGE_HEADER_SIZE + payload.len .. f2.PAGE_SIZE - 4], 0);
+    f2.setPageChecksum(arr, f2.computePageChecksum(arr));
 }
 
-/// 读路径用：解析 len + payload，不验 CRC（边界/header 恢复仍验）。
-/// ponytail: 热读路径跳过 per-node CRC（~8KB Crc32），损害检测由 open/恢复时的 header 扫描 + 写路径 CRC 兑。
-/// 仅 btree.get 读路径调；readRecord/写路径仍走 decodeNodePayload（验 CRC）。
-pub fn decodeNodePayloadNoCrc(rec: []const u8) ![]const u8 {
-    return f.decodeRecordNoCrc(rec) catch return error.CorruptCrc;
+// ===== Leaf 节点编码 =====
+
+/// 最大内联值大小（留余量给页头和多个 entry）
+pub const MAX_INLINE_VALUE: usize = 3800;
+
+/// 溢出页最多可存 payload 字节数
+const OVERFLOW_PAYLOAD: usize = f2.PAGE_SIZE - f2.PAGE_HEADER_SIZE - 4;
+
+/// flags: 1 = 溢出页
+const LEAF_FLAG_OVERFLOW: u8 = 1;
+
+/// 写值到溢出页链，返首页号
+/// ponytail: MVP 无 nkeys 更新，链靠 free_next
+fn writeOverflowPages(store: PageStore, value: []const u8) !u32 {
+    var remaining = value.len;
+    var offset: usize = 0;
+    var first_page: u32 = 0;
+    var prev_page: u32 = 0;
+    
+    while (remaining > 0) {
+        const page_no = try store.allocPage();
+        const page = try store.writePage(page_no);
+        const arr: *[f2.PAGE_SIZE]u8 = @ptrCast(page.ptr);
+        const chunk = @min(remaining, OVERFLOW_PAYLOAD);
+        
+        const hdr = f2.PageHeader{
+            .page_no = page_no,
+            .page_type = f2.PAGE_TYPE_OVERFLOW,
+            .gen = 0,
+            .nkeys = 0,
+            .free_next = 0,
+        };
+        f2.encodePageHeader(page[0..f2.PAGE_HEADER_SIZE], &hdr);
+        @memcpy(page[f2.PAGE_HEADER_SIZE..][0..chunk], value[offset..offset+chunk]);
+        const rem = OVERFLOW_PAYLOAD - chunk;
+        if (rem > 0) @memset(page[f2.PAGE_HEADER_SIZE + chunk .. f2.PAGE_SIZE - 4], 0);
+        f2.setPageChecksum(arr, f2.computePageChecksum(arr));
+        
+        if (first_page == 0) {
+            first_page = page_no;
+        } else {
+            // 链接前页 → 本页
+            const prev = try store.writePage(prev_page);
+            const prev_arr: *[f2.PAGE_SIZE]u8 = @ptrCast(prev.ptr);
+            var prev_hdr = f2.decodePageHeader(prev[0..f2.PAGE_HEADER_SIZE]);
+            prev_hdr.free_next = page_no;
+            f2.encodePageHeader(prev[0..f2.PAGE_HEADER_SIZE], &prev_hdr);
+            f2.setPageChecksum(prev_arr, f2.computePageChecksum(prev_arr));
+        }
+        prev_page = page_no;
+        remaining -= chunk;
+        offset += chunk;
+    }
+    return first_page;
 }
 
-/// T6：直接从 branch payload seek 目标 child offset，不 Branch.fromPayload 全解码、不逐 key dup。
-/// 线性扫 keys 找第一个 > key 的 index → child index = 该值 → 读 8 字节 child offset。
-/// 仅 get 读路径；写路径仍用 Branch.fromPayload 全量解码做 COW。
-pub fn findInBranchPayload(payload: []const u8, key: []const u8) !u64 {
+/// 读溢出页链，返回值（调用方 free）
+fn readOverflowValue(allocator: std.mem.Allocator, store: PageStore, first_page: u32, vlen: u32) ![]u8 {
+    const result = try allocator.alloc(u8, vlen);
+    errdefer allocator.free(result);
+    var offset: usize = 0;
+    var cur = first_page;
+    while (cur != 0 and offset < vlen) {
+        const payload = try readNodePayload(store, cur);
+        const chunk = @min(vlen - offset, payload.len);
+        @memcpy(result[offset..][0..chunk], payload[0..chunk]);
+        offset += chunk;
+        const page = try store.readPage(cur);
+        const hdr = f2.decodePageHeader(page[0..f2.PAGE_HEADER_SIZE]);
+        cur = hdr.free_next;
+    }
+    return result;
+}
+
+/// 回收溢出页链到 dirty list
+fn freeOverflowPages(store: PageStore, first_page: u32, dirty: *std.ArrayList(u32), allocator: std.mem.Allocator) void {
+    var cur = first_page;
+    while (cur != 0) {
+        const page = store.readPage(cur) catch return;
+        const hdr = f2.decodePageHeader(page[0..f2.PAGE_HEADER_SIZE]);
+        const next = hdr.free_next;
+        dirty.append(allocator, cur) catch {};
+        cur = next;
+    }
+}
+
+/// 判断 entry 需要溢出页
+fn needsOverflow(entry: LeafEntry) bool {
+    return entry.value.len > MAX_INLINE_VALUE;
+}
+
+pub fn leafPayloadSize(entries: []const LeafEntry) usize {
+    var n: usize = 1 + 2;
+    for (entries) |e| {
+        // tombstone(1) + klen(4) + key + vlen(4) + flags(1) + value
+        // For overflow, value takes 4 bytes (page_no) instead of inline
+        const value_sz = if (e.value.len > MAX_INLINE_VALUE) @as(usize, 4) else e.value.len;
+        n += 1 + 4 + e.key.len + 4 + 1 + value_sz;
+    }
+    return n;
+}
+
+pub fn encodeLeafPayload(buf: []u8, entries: []const LeafEntry, store: PageStore, dirty: *std.ArrayList(u32)) !usize {
+    _ = dirty;
+    const need = leafPayloadSize(entries);
+    std.debug.assert(buf.len >= need);
+    var pos: usize = 0;
+    buf[pos] = LEAF_KIND;
+    pos += 1;
+    std.mem.writeInt(u16, buf[pos..][0..2], @intCast(entries.len), .big);
+    pos += 2;
+    for (entries) |e| {
+        const is_ov = e.value.len > MAX_INLINE_VALUE;
+        buf[pos] = if (e.tombstone) @as(u8, 1) else 0;
+        pos += 1;
+        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(e.key.len), .big);
+        pos += 4;
+        @memcpy(buf[pos..][0..e.key.len], e.key);
+        pos += e.key.len;
+        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(e.value.len), .big);
+        pos += 4;
+        if (is_ov) {
+            buf[pos] = LEAF_FLAG_OVERFLOW;
+            pos += 1;
+            const ov_page = try writeOverflowPages(store, e.value);
+            std.mem.writeInt(u32, buf[pos..][0..4], ov_page, .little);
+            pos += 4;
+        } else {
+            buf[pos] = 0;
+            pos += 1;
+            @memcpy(buf[pos..][0..e.value.len], e.value);
+            pos += e.value.len;
+        }
+    }
+    return need;
+}
+
+pub const DecodedLeafEntry = struct {
+    tombstone: bool,
+    key: []const u8,
+    value: []const u8,
+    flags: u8,
+    vlen: u32,
+};
+
+pub fn decodeLeafPayload(payload: []const u8, entries_out: []DecodedLeafEntry) !void {
     if (payload.len < 3) return error.Truncated;
-    if (payload[0] != @intFromEnum(f.NodeKind.branch)) return error.CorruptCrc;
+    if (payload[0] != LEAF_KIND) return error.CorruptCrc;
     const count = std.mem.readInt(u16, payload[1..3], .big);
-    // keys 区：count-1 个 key（[klen4][key]），扫时累计 keys 区末偏移 + 找 child index
+    if (entries_out.len < count) return error.Truncated;
+    var pos: usize = 3;
+    for (payload, 0..) |_, i| {
+        if (i >= count) break;
+        if (pos + 1 + 4 > payload.len) return error.Truncated;
+        const tombstone = payload[pos] == 1;
+        pos += 1;
+        const klen = std.mem.readInt(u32, payload[pos..][0..4], .big);
+        pos += 4;
+        if (pos + klen > payload.len) return error.Truncated;
+        const key = payload[pos .. pos + klen];
+        pos += klen;
+        if (pos + 4 > payload.len) return error.Truncated;
+        const vlen = std.mem.readInt(u32, payload[pos..][0..4], .big);
+        pos += 4;
+        if (pos + 1 > payload.len) return error.Truncated;
+        const flags = payload[pos];
+        pos += 1;
+        if (flags & LEAF_FLAG_OVERFLOW != 0) {
+            // overflow: 4 bytes page_no
+            if (pos + 4 > payload.len) return error.Truncated;
+            const ov_page = payload[pos..pos+4];
+            pos += 4;
+            entries_out[i] = .{ .tombstone = tombstone, .key = key, .value = ov_page, .flags = flags, .vlen = vlen };
+        } else {
+            if (pos + vlen > payload.len) return error.Truncated;
+            const value = payload[pos .. pos + vlen];
+            pos += vlen;
+            entries_out[i] = .{ .tombstone = tombstone, .key = key, .value = value, .flags = flags, .vlen = vlen };
+        }
+    }
+}
+
+// ===== Branch 节点编码（u32 子指针） =====
+
+pub fn branchPayloadSize(keys: []const []const u8, children: []const u32) usize {
+    var n: usize = 1 + 2;
+    for (keys) |k| n += 4 + k.len;
+    n += 4 * children.len;
+    return n;
+}
+
+pub fn encodeBranchPayload(buf: []u8, keys: []const []const u8, children: []const u32) usize {
+    const need = branchPayloadSize(keys, children);
+    std.debug.assert(buf.len >= need);
+    std.debug.assert(children.len >= 2);
+    std.debug.assert(keys.len == children.len - 1);
+    var pos: usize = 0;
+    buf[pos] = BRANCH_KIND;
+    pos += 1;
+    std.mem.writeInt(u16, buf[pos..][0..2], @intCast(children.len), .big);
+    pos += 2;
+    for (keys) |k| {
+        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(k.len), .big);
+        pos += 4;
+        @memcpy(buf[pos..][0..k.len], k);
+        pos += k.len;
+    }
+    for (children) |c| {
+        std.mem.writeInt(u32, buf[pos..][0..4], c, .big);
+        pos += 4;
+    }
+    return need;
+}
+
+pub fn decodeBranchPayload(payload: []const u8, keys_out: [][]const u8, children_out: []u32) !void {
+    if (payload.len < 3) return error.Truncated;
+    if (payload[0] != BRANCH_KIND) return error.CorruptCrc;
+    const count = std.mem.readInt(u16, payload[1..3], .big);
+    if (keys_out.len < count - 1) return error.Truncated;
+    if (children_out.len < count) return error.Truncated;
+    var pos: usize = 3;
+    var i: usize = 0;
+    while (i < count - 1) : (i += 1) {
+        if (pos + 4 > payload.len) return error.Truncated;
+        const klen = std.mem.readInt(u32, payload[pos..][0..4], .big);
+        pos += 4;
+        if (pos + klen > payload.len) return error.Truncated;
+        keys_out[i] = payload[pos .. pos + klen];
+        pos += klen;
+    }
+    if (pos + 4 * count > payload.len) return error.Truncated;
+    var j: usize = 0;
+    while (j < count) : (j += 1) {
+        children_out[j] = std.mem.readInt(u32, payload[pos..][0..4], .big);
+        pos += 4;
+    }
+}
+
+// ===== Leaf 内存表示 =====
+
+pub const Leaf = struct {
+    entries: []LeafEntry,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) Leaf {
+        return .{ .entries = &.{}, .allocator = allocator };
+    }
+
+    pub fn deinit(self: *Leaf) void {
+        for (self.entries) |e| {
+            self.allocator.free(e.key);
+            self.allocator.free(e.value);
+        }
+        self.allocator.free(self.entries);
+    }
+
+    pub fn fromPayload(allocator: std.mem.Allocator, store: PageStore, payload: []const u8, dirty: *std.ArrayList(u32)) !Leaf {
+        const dec = try allocator.alloc(DecodedLeafEntry, LEAF_MAX_ENTRIES);
+        defer allocator.free(dec);
+        const count = blk: {
+            if (payload.len < 3) return error.Truncated;
+            if (payload[0] != LEAF_KIND) return error.CorruptCrc;
+            break :blk std.mem.readInt(u16, payload[1..3], .big);
+        };
+        const dec_slice = try allocator.alloc(DecodedLeafEntry, count);
+        defer allocator.free(dec_slice);
+        try decodeLeafPayload(payload, dec_slice);
+        const entries = try allocator.alloc(LeafEntry, count);
+        for (dec_slice, 0..) |d, i| {
+            if (d.flags & LEAF_FLAG_OVERFLOW != 0) {
+                // 读溢出页链，获完整值；并将旧溢出页加入 dirty
+                const ov_page = std.mem.readInt(u32, d.value[0..4], .little);
+                freeOverflowPages(store, ov_page, dirty, allocator);
+                const full_val = try readOverflowValue(allocator, store, ov_page, d.vlen);
+                entries[i] = .{
+                    .tombstone = d.tombstone,
+                    .key = try allocator.dupe(u8, d.key),
+                    .value = full_val,
+                };
+            } else {
+                entries[i] = .{
+                    .tombstone = d.tombstone,
+                    .key = try allocator.dupe(u8, d.key),
+                    .value = try allocator.dupe(u8, d.value),
+                };
+            }
+        }
+        return .{ .entries = entries, .allocator = allocator };
+    }
+
+    pub fn findPos(self: *const Leaf, key: []const u8) usize {
+        var lo: usize = 0;
+        var hi: usize = self.entries.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            switch (cmpKey(self.entries[mid].key, key)) {
+                .lt => lo = mid + 1,
+                .eq, .gt => hi = mid,
+            }
+        }
+        return lo;
+    }
+};
+
+// ===== Branch 内存表示 =====
+
+pub const Branch = struct {
+    keys: [][]u8,
+    children: []u32,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) Branch {
+        return .{ .keys = &.{}, .children = &.{}, .allocator = allocator };
+    }
+
+    pub fn deinit(self: *Branch) void {
+        for (self.keys) |k| self.allocator.free(k);
+        self.allocator.free(self.keys);
+        self.allocator.free(self.children);
+    }
+
+    pub fn fromPayload(allocator: std.mem.Allocator, payload: []const u8) !Branch {
+        const count = blk: {
+            if (payload.len < 3) return error.Truncated;
+            if (payload[0] != BRANCH_KIND) return error.CorruptCrc;
+            break :blk std.mem.readInt(u16, payload[1..3], .big);
+        };
+        const keys_tmp = try allocator.alloc([]const u8, count - 1);
+        defer allocator.free(keys_tmp);
+        const children_tmp = try allocator.alloc(u32, count);
+        defer allocator.free(children_tmp);
+        try decodeBranchPayload(payload, keys_tmp, children_tmp);
+        const keys = try allocator.alloc([]u8, count - 1);
+        const children = try allocator.alloc(u32, count);
+        for (keys_tmp, 0..) |k, i| keys[i] = try allocator.dupe(u8, k);
+        @memcpy(children, children_tmp);
+        return .{ .keys = keys, .children = children, .allocator = allocator };
+    }
+
+    /// 找 key 应走哪个子节点（返回 child index 0..count-1）
+    pub fn findChild(self: *const Branch, key: []const u8) usize {
+        var lo: usize = 0;
+        var hi: usize = self.keys.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            switch (cmpKey(self.keys[mid], key)) {
+                .lt, .eq => lo = mid + 1,
+                .gt => hi = mid,
+            }
+        }
+        return lo;
+    }
+};
+
+// ===== get =====
+
+pub fn get(allocator: std.mem.Allocator, store: PageStore, root: u32, key: []const u8) !?[]u8 {
+    if (root == NULL_ROOT) return null;
+    var cur = root;
+    var depth: u32 = 0;
+    while (depth < 1000) : (depth += 1) {
+        const payload = try readNodePayload(store, cur);
+        if (payload.len == 0) return error.Truncated;
+        if (payload[0] == LEAF_KIND) {
+            return findInLeaf(allocator, store, payload, key);
+        } else {
+            cur = try findInBranchPayload(payload, key);
+        }
+    }
+    return error.Truncated;
+}
+
+fn findInLeaf(allocator: std.mem.Allocator, store: PageStore, payload: []const u8, key: []const u8) !?[]u8 {
+    if (payload.len < 3) return error.Truncated;
+    if (payload[0] != LEAF_KIND) return error.CorruptCrc;
+    const count = std.mem.readInt(u16, payload[1..3], .big);
+    var pos: usize = 3;
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        if (pos + 1 + 4 > payload.len) return error.Truncated;
+        const tombstone = payload[pos] == 1;
+        pos += 1;
+        const klen = std.mem.readInt(u32, payload[pos..][0..4], .big);
+        pos += 4;
+        if (pos + klen > payload.len) return error.Truncated;
+        const ek = payload[pos .. pos + klen];
+        pos += klen;
+        if (pos + 4 > payload.len) return error.Truncated;
+        const vlen = std.mem.readInt(u32, payload[pos..][0..4], .big);
+        pos += 4;
+        if (pos + 1 > payload.len) return error.Truncated;
+        const flags = payload[pos];
+        pos += 1;
+        switch (cmpKey(ek, key)) {
+            .lt => {
+                // skip value for non-matching key
+                if (flags & LEAF_FLAG_OVERFLOW == 0) {
+                    if (pos + vlen > payload.len) return error.Truncated;
+                    pos += vlen;
+                } else {
+                    if (pos + 4 > payload.len) return error.Truncated;
+                    pos += 4;
+                }
+                continue;
+            },
+            .eq => {
+                if (tombstone) return null;
+                if (flags & LEAF_FLAG_OVERFLOW != 0) {
+                    const ov_page = std.mem.readInt(u32, payload[pos..][0..4], .little);
+                    return @as(?[]u8, try readOverflowValue(allocator, store, ov_page, @intCast(vlen)));
+                }
+                if (pos + vlen > payload.len) return error.Truncated;
+                const ev = payload[pos .. pos + vlen];
+                return try allocator.dupe(u8, ev);
+            },
+            .gt => return null,
+        }
+    }
+    return null;
+}
+
+fn findInBranchPayload(payload: []const u8, key: []const u8) !u32 {
+    if (payload.len < 3) return error.Truncated;
+    if (payload[0] != BRANCH_KIND) return error.CorruptCrc;
+    const count = std.mem.readInt(u16, payload[1..3], .big);
     var pos: usize = 3;
     var child_idx: usize = 0;
     var found = false;
@@ -95,418 +502,227 @@ pub fn findInBranchPayload(payload: []const u8, key: []const u8) !u64 {
             found = true;
         }
     }
-    if (!found) child_idx = count - 1; // 全 <= key → 最后一个 child
-    // children 区起点 = pos（keys 区末）
-    if (pos + 8 * count > payload.len) return error.Truncated;
-    return std.mem.readInt(u64, payload[pos + child_idx * 8 ..][0..8], .big);
-}
-
-// ===== 叶节点内存表示（用于 COW 操作） =====
-pub const LeafEntry = f.LeafEntry;
-
-pub const Leaf = struct {
-    entries: std.ArrayList(LeafEntry),
-
-    pub fn init(allocator: std.mem.Allocator) Leaf {
-        _ = allocator;
-        return .{ .entries = .empty };
-    }
-    pub fn deinit(self: *Leaf, allocator: std.mem.Allocator) void {
-        for (self.entries.items) |e| {
-            allocator.free(e.key);
-            allocator.free(e.value);
-        }
-        self.entries.deinit(allocator);
-    }
-
-    pub fn fromPayload(allocator: std.mem.Allocator, payload: []const u8) !Leaf {
-        if (payload.len < 3) return error.Truncated;
-        if (payload[0] != @intFromEnum(f.NodeKind.leaf)) return error.CorruptCrc;
-        const count = std.mem.readInt(u16, payload[1..3], .big);
-        const dec = try allocator.alloc(f.DecodedLeafEntry, count);
-        defer allocator.free(dec);
-        f.decodeLeafPayload(payload, dec) catch return error.CorruptCrc;
-        var leaf = Leaf.init(allocator);
-        try leaf.entries.ensureTotalCapacity(allocator, count);
-        for (dec) |e| {
-            try leaf.entries.append(allocator, .{
-                .tombstone = e.tombstone,
-                .key = try allocator.dupe(u8, e.key),
-                .value = try allocator.dupe(u8, e.value),
-            });
-        }
-        return leaf;
-    }
-
-    pub fn toRecord(self: *const Leaf, allocator: std.mem.Allocator) ![]u8 {
-        const payload_size = f.leafPayloadSize(.{ .entries = self.entries.items });
-        const total = f.recordTotalSize(payload_size);
-        const buf = try allocator.alloc(u8, total);
-        errdefer allocator.free(buf);
-        // 直接写 len + payload + crc，避免 encodeRecord 别名
-        std.mem.writeInt(u32, buf[0..4], @intCast(payload_size), .big);
-        _ = f.encodeLeafPayload(buf[f.REC_LEN_SIZE..][0..payload_size], .{ .entries = self.entries.items });
-        var crc = f.Crc32.init();
-        crc.update(buf[0 .. f.REC_LEN_SIZE + payload_size]);
-        std.mem.writeInt(u32, buf[f.REC_LEN_SIZE + payload_size ..][0..4], crc.final(), .big);
-        return buf;
-    }
-
-    /// 二分查找 key 应插入位置（返回第一个 >= key 的 index）。
-    pub fn findPos(self: *const Leaf, key: []const u8) usize {
-        var lo: usize = 0;
-        var hi: usize = self.entries.items.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            switch (cmpKey(self.entries.items[mid].key, key)) {
-                .lt => lo = mid + 1,
-                .eq, .gt => hi = mid,
-            }
-        }
-        return lo;
-    }
-};
-
-// ===== 内部节点内存表示 =====
-pub const Branch = struct {
-    keys: std.ArrayList([]u8),
-    children: std.ArrayList(u64),
-
-    pub fn init(allocator: std.mem.Allocator) Branch {
-        _ = allocator;
-        return .{ .keys = .empty, .children = .empty };
-    }
-    pub fn deinit(self: *Branch, allocator: std.mem.Allocator) void {
-        for (self.keys.items) |k| allocator.free(k);
-        self.keys.deinit(allocator);
-        self.children.deinit(allocator);
-    }
-
-    pub fn fromPayload(allocator: std.mem.Allocator, payload: []const u8) !Branch {
-        if (payload.len < 3) return error.Truncated;
-        if (payload[0] != @intFromEnum(f.NodeKind.branch)) return error.CorruptCrc;
-        const count = std.mem.readInt(u16, payload[1..3], .big);
-        const keys_tmp = try allocator.alloc([]const u8, count - 1);
-        defer allocator.free(keys_tmp);
-        const children_tmp = try allocator.alloc(u64, count);
-        defer allocator.free(children_tmp);
-        f.decodeBranchPayload(payload, keys_tmp, children_tmp) catch return error.CorruptCrc;
-        var b = Branch.init(allocator);
-        try b.keys.ensureTotalCapacity(allocator, count - 1);
-        try b.children.ensureTotalCapacity(allocator, count);
-        for (keys_tmp) |k| try b.keys.append(allocator, try allocator.dupe(u8, k));
-        for (children_tmp) |c| try b.children.append(allocator, c);
-        return b;
-    }
-
-    pub fn toRecord(self: *const Branch, allocator: std.mem.Allocator) ![]u8 {
-        const keys_slice = try allocator.alloc([]const u8, self.keys.items.len);
-        defer allocator.free(keys_slice);
-        for (self.keys.items, 0..) |k, i| keys_slice[i] = k;
-        const payload_size = f.branchPayloadSize(.{ .keys = keys_slice, .children = self.children.items });
-        const total = f.recordTotalSize(payload_size);
-        const buf = try allocator.alloc(u8, total);
-        errdefer allocator.free(buf);
-        std.mem.writeInt(u32, buf[0..4], @intCast(payload_size), .big);
-        _ = f.encodeBranchPayload(buf[f.REC_LEN_SIZE..][0..payload_size], .{ .keys = keys_slice, .children = self.children.items });
-        var crc = f.Crc32.init();
-        crc.update(buf[0 .. f.REC_LEN_SIZE + payload_size]);
-        std.mem.writeInt(u32, buf[f.REC_LEN_SIZE + payload_size ..][0..4], crc.final(), .big);
-        return buf;
-    }
-
-    /// 找 key 应走哪个子节点（返回 child index 0..count-1）。
-    pub fn findChild(self: *const Branch, key: []const u8) usize {
-        var lo: usize = 0;
-        var hi: usize = self.keys.items.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            switch (cmpKey(self.keys.items[mid], key)) {
-                // keys[mid] <= key → key 属于右子，上界在右
-                .lt, .eq => lo = mid + 1,
-                .gt => hi = mid,
-            }
-        }
-        return lo;
-    }
-};
-
-// ===== 写入 store 辅助 =====
-pub fn appendLeaf(s: Store, allocator: std.mem.Allocator, leaf: *const Leaf) !u64 {
-    const rec = try leaf.toRecord(allocator);
-    defer allocator.free(rec);
-    return s.append(rec);
-}
-
-pub fn appendBranch(s: Store, allocator: std.mem.Allocator, branch: *const Branch) !u64 {
-    const rec = try branch.toRecord(allocator);
-    defer allocator.free(rec);
-    return s.append(rec);
-}
-
-// ===== get =====
-pub fn get(allocator: std.mem.Allocator, s: Store, root: u64, key: []const u8) !?[]u8 {
-    if (root == NULL_ROOT) return null;
-    var cur = root;
-    var depth: u32 = 0;
-    while (depth < 1000) : (depth += 1) {
-        const rec = try readRecord(allocator, s, cur);
-        const payload = decodeNodePayloadNoCrc(rec) catch return error.CorruptCrc;
-        if (payload.len == 0) return error.Truncated;
-        if (payload[0] == @intFromEnum(f.NodeKind.leaf)) {
-            // T5: skip 全 leaf 解码，直接从 payload seek 目标 key。
-            return findInLeaf(allocator, payload, key);
-        } else {
-            // T6: 跳过 branch 全解码，直接从 payload seek 目标 child offset
-            cur = try findInBranchPayload(payload, key);
-        }
-    }
-    return error.Truncated;
-}
-
-// ===== 读路径优化（T5）：get 不全解码 leaf，直接从原始 payload seek 目标 key =====
-
-/// 从 leaf 原始 payload 直接 seek 目标 key，返回 dup 的 value（调用方 free）。
-/// 不 `Leaf.fromPayload` 全量解码、不逐 entry `allocator.dupe`——只匹配目标 key 时 dup 一个 value。
-/// leaf entries 排序，线性扫到第一个 >= key 的 entry；命中 eq 且非 tombstone 返回 value。
-/// 仅 get 读路径用；写路径（COW insert/delete）仍用 `Leaf.fromPayload` 全量解码。
-pub fn findInLeaf(allocator: std.mem.Allocator, payload: []const u8, key: []const u8) !?[]u8 {
-    if (payload.len < 3) return error.Truncated;
-    if (payload[0] != @intFromEnum(f.NodeKind.leaf)) return error.CorruptCrc;
-    const count = std.mem.readInt(u16, payload[1..3], .big);
-    var pos: usize = 3;
-    var i: usize = 0;
-    while (i < count) : (i += 1) {
-        if (pos + 1 + 4 > payload.len) return error.Truncated;
-        const tombstone = payload[pos] == 1;
-        pos += 1;
-        const klen = std.mem.readInt(u32, payload[pos..][0..4], .big);
-        pos += 4;
-        if (pos + klen > payload.len) return error.Truncated;
-        const ek = payload[pos .. pos + klen];
-        pos += klen;
-        if (pos + 4 > payload.len) return error.Truncated;
-        const vlen = std.mem.readInt(u32, payload[pos..][0..4], .big);
-        pos += 4;
-        if (pos + vlen > payload.len) return error.Truncated;
-        const ev = payload[pos .. pos + vlen];
-        pos += vlen;
-        // entries 排序：扫到第一个 >= key 的；eq 命中返，gt 则 miss
-        switch (cmpKey(ek, key)) {
-            .lt => continue,
-            .eq => return if (!tombstone) try allocator.dupe(u8, ev) else null,
-            .gt => return null,
-        }
-    }
-    return null;
+    if (!found) child_idx = count - 1;
+    // children 区：keys 区结束后
+    if (pos + 4 * count > payload.len) return error.Truncated;
+    return std.mem.readInt(u32, payload[pos + child_idx * 4 ..][0..4], .big);
 }
 
 // ===== insert（COW） =====
-// 返回新 root 偏移与 dirt/live 统计。tombstone=true 表示删除。
 
-pub const InsertOutcome = struct {
-    /// 新子树根偏移（替换旧 root/旧 child）
-    new_child: u64,
-    /// 若子树发生分裂，分隔 key（向上传播）+ 右子偏移；否则 null
-    split_key: ?[]u8 = null,
-    split_right: u64 = 0,
-};
-
-/// 子树插入/删除递归返回
 const InsertSub = struct {
-    outcome: InsertOutcome,
-    dirt_delta: u64,
-    live_delta: i64,
-    count_delta: i64,
+    new_child: u32,
+    split_key: ?[]u8 = null,
+    split_right: u32 = 0,
+    live_delta: i64 = 0,
+    count_delta: i64 = 0,
 };
 
 fn insertIntoLeaf(
-    s: Store,
+    store: PageStore,
     allocator: std.mem.Allocator,
-    leaf_off: u64,
+    page_no: u32,
     key: []const u8,
     value: []const u8,
     tombstone: bool,
+    dirty: *std.ArrayList(u32),
 ) !InsertSub {
-    const rec = try readRecord(allocator, s, leaf_off);
-    const payload = try decodeNodePayload(rec);
-    var leaf = try Leaf.fromPayload(allocator, payload);
-    defer leaf.deinit(allocator);
+    const payload = try readNodePayload(store, page_no);
+    var leaf = try Leaf.fromPayload(allocator, store, payload, dirty);
+    defer leaf.deinit();
 
-    const old_rec_size = rec.len;
-    const dirt_delta: u64 = old_rec_size;
     var live_delta: i64 = 0;
     var count_delta: i64 = 0;
 
     const pos = leaf.findPos(key);
-    if (pos < leaf.entries.items.len and cmpKey(leaf.entries.items[pos].key, key) == .eq) {
-        // 覆盖/tombstone 已有 key
-        const old = leaf.entries.items[pos];
+    if (pos < leaf.entries.len and cmpKey(leaf.entries[pos].key, key) == .eq) {
+        // 覆盖
+        const old = leaf.entries[pos];
         live_delta -= @as(i64, @intCast(old.key.len + old.value.len + 9));
         allocator.free(old.key);
         allocator.free(old.value);
-        leaf.entries.items[pos] = .{
-            .tombstone = tombstone,
-            .key = try allocator.dupe(u8, key),
-            .value = if (tombstone) try allocator.dupe(u8, "") else try allocator.dupe(u8, value),
-        };
-        live_delta += @as(i64, @intCast(key.len + (if (tombstone) 0 else value.len) + 9));
-        // count 不变（覆盖）
-    } else {
-        // 新增：在 pos 插入
-        const new_entry = LeafEntry{
-            .tombstone = tombstone,
-            .key = try allocator.dupe(u8, key),
-            .value = if (tombstone) try allocator.dupe(u8, "") else try allocator.dupe(u8, value),
-        };
-        _ = try leaf.entries.addOne(allocator);
-        // 把 [pos..len-2] 后移一位（len-2 是 addOne 前的末尾）
-        var i: usize = leaf.entries.items.len - 1;
-        while (i > pos) : (i -= 1) {
-            leaf.entries.items[i] = leaf.entries.items[i - 1];
+        if (!old.tombstone and tombstone) {
+            count_delta = -1;
+        } else if (old.tombstone and !tombstone) {
+            count_delta = 1;
         }
-        leaf.entries.items[pos] = new_entry;
-        live_delta += @as(i64, @intCast(key.len + (if (tombstone) 0 else value.len) + 9));
+        leaf.entries[pos] = .{
+            .tombstone = tombstone,
+            .key = try allocator.dupe(u8, key),
+            .value = if (tombstone) try allocator.dupe(u8, "") else try allocator.dupe(u8, value),
+        };
+        live_delta += @as(i64, @intCast(key.len + (if (tombstone) @as(usize, 0) else value.len) + 9));
+    } else {
+        // 新增
+        const new_entries = try allocator.alloc(LeafEntry, leaf.entries.len + 1);
+        @memcpy(new_entries[0..pos], leaf.entries[0..pos]);
+        new_entries[pos] = .{
+            .tombstone = tombstone,
+            .key = try allocator.dupe(u8, key),
+            .value = if (tombstone) try allocator.dupe(u8, "") else try allocator.dupe(u8, value),
+        };
+        @memcpy(new_entries[pos + 1 ..], leaf.entries[pos..]);
+        // 旧 entries 的 key/value 指针已拷贝到 new_entries（转移所有权），只释放数组
+        allocator.free(leaf.entries);
+        leaf.entries = new_entries;
+        live_delta += @as(i64, @intCast(key.len + (if (tombstone) @as(usize, 0) else value.len) + 9));
         if (!tombstone) count_delta = 1;
     }
 
+    // 记录旧页为脏
+    dirty.append(allocator, page_no) catch {};
+
     // 分裂判定
-    if (leaf.entries.items.len <= LEAF_MAX_ENTRIES) {
-        const new_off = try appendLeaf(s, allocator, &leaf);
+    if (leaf.entries.len <= LEAF_MAX_ENTRIES) {
+        const new_page = try store.allocPage();
+        const pl = leafPayloadSize(leaf.entries);
+        var payload_buf: [f2.PAGE_SIZE]u8 = undefined;
+        _ = try encodeLeafPayload(payload_buf[0..pl], leaf.entries, store, dirty);
+        try writeNodePage(store, new_page, f2.PAGE_TYPE_LEAF, @intCast(leaf.entries.len), payload_buf[0..pl]);
         return .{
-            .outcome = .{ .new_child = new_off },
-            .dirt_delta = dirt_delta,
+            .new_child = new_page,
             .live_delta = live_delta,
             .count_delta = count_delta,
         };
     }
-    // 分裂：取中点。转移 entries 所有权到 left/right（避免 double free）。
-    const mid = leaf.entries.items.len / 2;
-    var right = Leaf.init(allocator);
-    try right.entries.appendSlice(allocator, leaf.entries.items[mid..]);
-    var left = Leaf.init(allocator);
-    try left.entries.appendSlice(allocator, leaf.entries.items[0..mid]);
-    // 清空原 leaf.entries 所有权（指针已转给 left/right），但不要 free 它们。
-    leaf.entries.shrinkRetainingCapacity(0);
-    defer right.deinit(allocator);
-    defer left.deinit(allocator);
-
-    const left_off = try appendLeaf(s, allocator, &left);
-    const right_off = try appendLeaf(s, allocator, &right);
-    const split_key = try allocator.dupe(u8, right.entries.items[0].key);
+    // 分裂
+    const mid = leaf.entries.len / 2;
+    const right_entries = leaf.entries[mid..];
+    const left_entries = leaf.entries[0..mid];
+    const left_page = try store.allocPage();
+    const left_pl = leafPayloadSize(left_entries);
+    var left_buf: [f2.PAGE_SIZE]u8 = undefined;
+    _ = try encodeLeafPayload(left_buf[0..left_pl], left_entries, store, dirty);
+    try writeNodePage(store, left_page, f2.PAGE_TYPE_LEAF, @intCast(left_entries.len), left_buf[0..left_pl]);
+    const right_page = try store.allocPage();
+    const right_pl = leafPayloadSize(right_entries);
+    var right_buf: [f2.PAGE_SIZE]u8 = undefined;
+    _ = try encodeLeafPayload(right_buf[0..right_pl], right_entries, store, dirty);
+    try writeNodePage(store, right_page, f2.PAGE_TYPE_LEAF, @intCast(right_entries.len), right_buf[0..right_pl]);
+    const split_key = try allocator.dupe(u8, right_entries[0].key);
     return .{
-        .outcome = .{ .new_child = left_off, .split_key = split_key, .split_right = right_off },
-        .dirt_delta = dirt_delta,
+        .new_child = left_page,
+        .split_key = split_key,
+        .split_right = right_page,
         .live_delta = live_delta,
         .count_delta = count_delta,
     };
 }
 
 fn insertIntoBranch(
-    s: Store,
+    store: PageStore,
     allocator: std.mem.Allocator,
-    branch_off: u64,
+    page_no: u32,
     key: []const u8,
     value: []const u8,
     tombstone: bool,
+    dirty: *std.ArrayList(u32),
 ) !InsertSub {
-    const rec = try readRecord(allocator, s, branch_off);
-    const payload = try decodeNodePayload(rec);
+    const payload = try readNodePayload(store, page_no);
     var branch = try Branch.fromPayload(allocator, payload);
-    defer branch.deinit(allocator);
+    defer branch.deinit();
 
-    const old_rec_size = rec.len;
-    var dirt_delta: u64 = old_rec_size;
     var live_delta: i64 = 0;
     var count_delta: i64 = 0;
 
     const ci = branch.findChild(key);
-    const child_off = branch.children.items[ci];
+    const child_off = branch.children[ci];
 
     // 递归插入子节点
     const child_is_leaf = blk: {
-        const crec = try readRecord(allocator, s, child_off);
-        const cpayload = try decodeNodePayload(crec);
-        break :blk cpayload[0] == @intFromEnum(f.NodeKind.leaf);
+        const cpayload = try readNodePayload(store, child_off);
+        break :blk cpayload[0] == LEAF_KIND;
     };
-
-    var sub: InsertSub = undefined;
-    if (child_is_leaf) {
-        sub = try insertIntoLeaf(s, allocator, child_off, key, value, tombstone);
-    } else {
-        sub = try insertIntoBranch(s, allocator, child_off, key, value, tombstone);
-    }
-    dirt_delta += sub.dirt_delta;
+    const sub = if (child_is_leaf)
+        try insertIntoLeaf(store, allocator, child_off, key, value, tombstone, dirty)
+    else
+        try insertIntoBranch(store, allocator, child_off, key, value, tombstone, dirty);
     live_delta += sub.live_delta;
     count_delta += sub.count_delta;
 
-    // 替换子指针
-    branch.children.items[ci] = sub.outcome.new_child;
+    // 记录旧页为脏
+    dirty.append(allocator, page_no) catch {};
 
-    if (sub.outcome.split_key) |sk| {
-        // 子分裂，需在 branch 插入新 key + 右子
-        var new_keys = try allocator.alloc([]u8, branch.keys.items.len + 1);
-        defer allocator.free(new_keys);
-        var new_children = try allocator.alloc(u64, branch.children.items.len + 1);
-        defer allocator.free(new_children);
-        // copy [0..ci] keys, insert sk, copy [ci..]
-        @memcpy(new_keys[0..ci], branch.keys.items[0..ci]);
+    // 替换子指针
+    branch.children[ci] = sub.new_child;
+
+    if (sub.split_key) |sk| {
+        // 子分裂，在 branch 插入新 key + 右子
+        const new_keys = try allocator.alloc([]u8, branch.keys.len + 1);
+        const new_children = try allocator.alloc(u32, branch.children.len + 1);
+        @memcpy(new_keys[0..ci], branch.keys[0..ci]);
         new_keys[ci] = sk;
-        @memcpy(new_keys[ci + 1 ..], branch.keys.items[ci..]);
-        @memcpy(new_children[0..ci + 1], branch.children.items[0..ci + 1]);
-        new_children[ci + 1] = sub.outcome.split_right;
-        @memcpy(new_children[ci + 2 ..], branch.children.items[ci + 1 ..]);
-        // 转移所有权：旧 keys 指针已拷进 new_keys，不能 free。
-        branch.keys.clearRetainingCapacity();
-        branch.children.clearRetainingCapacity();
-        try branch.keys.appendSlice(allocator, new_keys);
-        try branch.children.appendSlice(allocator, new_children);
-        // sk（sub.outcome.split_key）所有权已转给 branch.keys，InsertSub 不再持有。
+        @memcpy(new_keys[ci + 1 ..], branch.keys[ci..]);
+        @memcpy(new_children[0 .. ci + 1], branch.children[0 .. ci + 1]);
+        new_children[ci + 1] = sub.split_right;
+        @memcpy(new_children[ci + 2 ..], branch.children[ci + 1 ..]);
+        // 旧 keys/children 数组指针已转移（key 元素指针在 new_keys 中），只释放数组
+        allocator.free(branch.keys);
+        allocator.free(branch.children);
+        branch.keys = new_keys;
+        branch.children = new_children;
 
         // 分裂判定
-        if (branch.children.items.len <= BRANCH_MAX_CHILDREN) {
-            const new_off = try appendBranch(s, allocator, &branch);
-            // 注意：sk 被 branch.keys 持有，不能在此 free。但 branch.deinit 会 free。
-            // 但 appendBranch 已序列化，branch 即将 deinit。OK。
+        if (branch.children.len <= BRANCH_MAX_CHILDREN) {
+            const new_page = try store.allocPage();
+            const keys_slice = try allocator.alloc([]const u8, branch.keys.len);
+            defer allocator.free(keys_slice);
+            for (branch.keys, 0..) |k, i| keys_slice[i] = k;
+            const pl = branchPayloadSize(keys_slice, branch.children);
+            var buf: [f2.PAGE_SIZE]u8 = undefined;
+            _ = encodeBranchPayload(buf[0..pl], keys_slice, branch.children);
+            try writeNodePage(store, new_page, f2.PAGE_TYPE_BRANCH, @intCast(branch.children.len), buf[0..pl]);
             return .{
-                .outcome = .{ .new_child = new_off },
-                .dirt_delta = dirt_delta,
+                .new_child = new_page,
                 .live_delta = live_delta,
                 .count_delta = count_delta,
             };
         }
         // 分裂 branch
-        const mid = branch.keys.items.len / 2;
-        var right = Branch.init(allocator);
-        const up_key = try allocator.dupe(u8, branch.keys.items[mid]);
-        try right.keys.appendSlice(allocator, branch.keys.items[mid + 1 ..]);
-        try right.children.appendSlice(allocator, branch.children.items[mid + 1 ..]);
-        // 左 branch 缩到 mid（转移所有权）
-        var left = Branch.init(allocator);
-        try left.keys.appendSlice(allocator, branch.keys.items[0..mid]);
-        try left.children.appendSlice(allocator, branch.children.items[0..mid + 1]);
-        // mid key 被 up_key 复制，所有权转给父（up_key）；原 mid key 需释放。
-        allocator.free(branch.keys.items[mid]);
-        // 清空原 branch 所有权（指针已转给 left/right），不 free。
-        branch.keys.shrinkRetainingCapacity(0);
-        branch.children.shrinkRetainingCapacity(0);
-        defer left.deinit(allocator);
-        defer right.deinit(allocator);
-
-        const left_off = try appendBranch(s, allocator, &left);
-        const right_off = try appendBranch(s, allocator, &right);
+        const mid = branch.keys.len / 2;
+        const up_key = try allocator.dupe(u8, branch.keys[mid]);
+        // 右半
+        const right_keys = branch.keys[mid + 1 ..];
+        const right_children = branch.children[mid + 1 ..];
+        const right_page = try store.allocPage();
+        const rkeys_slice = try allocator.alloc([]const u8, right_keys.len);
+        defer allocator.free(rkeys_slice);
+        for (right_keys, 0..) |k, i| rkeys_slice[i] = k;
+        var rbuf: [f2.PAGE_SIZE]u8 = undefined;
+        const rpl = branchPayloadSize(rkeys_slice, right_children);
+        _ = encodeBranchPayload(rbuf[0..rpl], rkeys_slice, right_children);
+        try writeNodePage(store, right_page, f2.PAGE_TYPE_BRANCH, @intCast(right_children.len), rbuf[0..rpl]);
+        // 左半
+        const left_keys = branch.keys[0..mid];
+        const left_children = branch.children[0 .. mid + 1];
+        const left_page = try store.allocPage();
+        const lkeys_slice = try allocator.alloc([]const u8, left_keys.len);
+        defer allocator.free(lkeys_slice);
+        for (left_keys, 0..) |k, i| lkeys_slice[i] = k;
+        var lbuf: [f2.PAGE_SIZE]u8 = undefined;
+        const lpl = branchPayloadSize(lkeys_slice, left_children);
+        _ = encodeBranchPayload(lbuf[0..lpl], lkeys_slice, left_children);
+        try writeNodePage(store, left_page, f2.PAGE_TYPE_BRANCH, @intCast(left_children.len), lbuf[0..lpl]);
+        // branch.deinit() 处理释放，不手动 free
         return .{
-            .outcome = .{ .new_child = left_off, .split_key = up_key, .split_right = right_off },
-            .dirt_delta = dirt_delta,
+            .new_child = left_page,
+            .split_key = up_key,
+            .split_right = right_page,
             .live_delta = live_delta,
             .count_delta = count_delta,
         };
     }
-    // 无分裂：重写 branch
-    const new_off = try appendBranch(s, allocator, &branch);
+    // 无分裂：写新 branch
+    const new_page = try store.allocPage();
+    const keys_slice = try allocator.alloc([]const u8, branch.keys.len);
+    defer allocator.free(keys_slice);
+    for (branch.keys, 0..) |k, i| keys_slice[i] = k;
+    const pl = branchPayloadSize(keys_slice, branch.children);
+    var buf: [f2.PAGE_SIZE]u8 = undefined;
+    _ = encodeBranchPayload(buf[0..pl], keys_slice, branch.children);
+    try writeNodePage(store, new_page, f2.PAGE_TYPE_BRANCH, @intCast(branch.children.len), buf[0..pl]);
     return .{
-        .outcome = .{ .new_child = new_off },
-        .dirt_delta = dirt_delta,
+        .new_child = new_page,
         .live_delta = live_delta,
         .count_delta = count_delta,
     };
@@ -514,82 +730,70 @@ fn insertIntoBranch(
 
 pub fn insert(
     allocator: std.mem.Allocator,
-    s: Store,
-    root: u64,
+    store: PageStore,
+    root: u32,
     key: []const u8,
     value: []const u8,
     tombstone: bool,
+    dirty: *std.ArrayList(u32),
 ) !WriteResult {
     if (root == NULL_ROOT) {
-        // 空树：写一个叶
-        var leaf = Leaf.init(allocator);
-        defer leaf.deinit(allocator);
-        try leaf.entries.append(allocator, .{
-            .tombstone = tombstone,
-            .key = try allocator.dupe(u8, key),
-            .value = if (tombstone) try allocator.dupe(u8, "") else try allocator.dupe(u8, value),
-        });
-        const off = try appendLeaf(s, allocator, &leaf);
+        const new_page = try store.allocPage();
+        var entries: [1]LeafEntry = .{.{ .tombstone = tombstone, .key = try allocator.dupe(u8, key), .value = try allocator.dupe(u8, if (tombstone) "" else value) }};
+        defer {
+            allocator.free(entries[0].key);
+            allocator.free(entries[0].value);
+        }
+        const pl = leafPayloadSize(&entries);
+        var buf: [f2.PAGE_SIZE]u8 = undefined;
+        _ = try encodeLeafPayload(buf[0..pl], &entries, store, dirty);
+        try writeNodePage(store, new_page, f2.PAGE_TYPE_LEAF, 1, buf[0..pl]);
         return .{
-            .new_root = off,
-            .live_delta = @intCast(key.len + (if (tombstone) 0 else value.len) + 9),
-            .dirt_delta = 0,
+            .new_root = new_page,
+            .live_delta = @intCast(key.len + (if (tombstone) @as(usize, 0) else value.len) + 9),
             .count_delta = if (tombstone) 0 else 1,
         };
     }
 
-    // 判断 root 是叶还是 branch
-    const rec = try readRecord(allocator, s, root);
-    const payload = try decodeNodePayload(rec);
-    const is_leaf = payload[0] == @intFromEnum(f.NodeKind.leaf);
+    const payload = try readNodePayload(store, root);
+    const is_leaf = payload[0] == LEAF_KIND;
 
     const sub = if (is_leaf)
-        try insertIntoLeaf(s, allocator, root, key, value, tombstone)
+        try insertIntoLeaf(store, allocator, root, key, value, tombstone, dirty)
     else
-        try insertIntoBranch(s, allocator, root, key, value, tombstone);
+        try insertIntoBranch(store, allocator, root, key, value, tombstone, dirty);
 
-    if (sub.outcome.split_key) |sk| {
+    if (sub.split_key) |sk| {
         // root 分裂：建新 root branch
-        var new_root = Branch.init(allocator);
-        defer new_root.deinit(allocator);
-        try new_root.keys.append(allocator, sk);
-        try new_root.children.append(allocator, sub.outcome.new_child);
-        try new_root.children.append(allocator, sub.outcome.split_right);
-        const off = try appendBranch(s, allocator, &new_root);
-        // sk 所有权已转给 new_root.keys（append 拷贝指针），new_root.deinit 释放之。不再 free。
+        var keys: [1][]const u8 = .{sk};
+        var children: [2]u32 = .{ sub.new_child, sub.split_right };
+        const new_page = try store.allocPage();
+        const pl = branchPayloadSize(&keys, &children);
+        var buf: [f2.PAGE_SIZE]u8 = undefined;
+        _ = encodeBranchPayload(buf[0..pl], &keys, &children);
+        try writeNodePage(store, new_page, f2.PAGE_TYPE_BRANCH, 2, buf[0..pl]);
+        allocator.free(sk);
         return .{
-            .new_root = off,
+            .new_root = new_page,
             .live_delta = sub.live_delta,
-            .dirt_delta = sub.dirt_delta,
             .count_delta = sub.count_delta,
         };
     }
     return .{
-        .new_root = sub.outcome.new_child,
+        .new_root = sub.new_child,
         .live_delta = sub.live_delta,
-        .dirt_delta = sub.dirt_delta,
         .count_delta = sub.count_delta,
     };
 }
 
-// ===== 删除（tombstone） =====
-pub fn remove(allocator: std.mem.Allocator, s: Store, root: u64, key: []const u8) !WriteResult {
-    if (root == NULL_ROOT) {
-        // 空树删：无操作
-        return .{ .new_root = NULL_ROOT, .live_delta = 0, .dirt_delta = 0, .count_delta = 0 };
-    }
-    return insert(allocator, s, root, key, "", true);
-}
-
 // ===== 范围迭代器 =====
+
 pub const Iterator = struct {
     allocator: std.mem.Allocator,
-    s: Store,
+    store: PageStore,
     min: ?[]const u8,
     max: ?[]const u8,
-    // 叶子栈：从 root 到当前叶的 (branch, child_index) 序列
     stack: std.ArrayList(StackFrame),
-    // 当前叶的 entries 与位置
     cur_leaf: ?Leaf,
     cur_pos: usize,
 
@@ -599,66 +803,61 @@ pub const Iterator = struct {
     };
 
     pub fn deinit(self: *Iterator) void {
-        for (self.stack.items) |*fr| fr.branch.deinit(self.allocator);
+        for (self.stack.items) |*fr| fr.branch.deinit();
         self.stack.deinit(self.allocator);
-        if (self.cur_leaf) |*l| l.deinit(self.allocator);
-        // min/max 是外部借用，不释放
+        if (self.cur_leaf) |*l| l.deinit();
     }
 
     pub fn next(self: *Iterator) !?LeafEntry {
         while (true) {
             if (self.cur_leaf) |*leaf| {
-                while (self.cur_pos < leaf.entries.items.len) : (self.cur_pos += 1) {
-                    const e = leaf.entries.items[self.cur_pos];
+                while (self.cur_pos < leaf.entries.len) : (self.cur_pos += 1) {
+                    const e = leaf.entries[self.cur_pos];
                     if (e.tombstone) continue;
                     if (self.min) |m| {
                         if (cmpKey(e.key, m) == .lt) continue;
                     }
                     if (self.max) |mx| {
-                        if (cmpKey(e.key, mx) != .lt) return null; // >= max
+                        if (cmpKey(e.key, mx) != .lt) return null;
                     }
                     self.cur_pos += 1;
                     return e;
                 }
-                // 当前叶耗尽，回溯到下一个叶
-                leaf.deinit(self.allocator);
+                leaf.deinit();
                 self.cur_leaf = null;
             }
-            // 找下一个叶
             if (!try self.descendToNextLeaf()) return null;
         }
     }
 
     fn descendToNextLeaf(self: *Iterator) !bool {
-        // 若栈顶 branch 还有下一个 child，下钻；否则弹出
         while (self.stack.items.len > 0) {
             const top_i = self.stack.items.len - 1;
             self.stack.items[top_i].child_idx += 1;
             const ci = self.stack.items[top_i].child_idx;
-            if (ci < self.stack.items[top_i].branch.children.items.len) {
-                // 下钻
-                var cur = self.stack.items[top_i].branch.children.items[ci];
+            if (ci < self.stack.items[top_i].branch.children.len) {
+                var cur = self.stack.items[top_i].branch.children[ci];
                 var depth: u32 = 0;
                 while (depth < 1000) : (depth += 1) {
-                    const rec = try readRecord(self.allocator, self.s, cur);
-                    const payload = try decodeNodePayload(rec);
-                    if (payload[0] == @intFromEnum(f.NodeKind.leaf)) {
-                        self.cur_leaf = try Leaf.fromPayload(self.allocator, payload);
+                    const payload = try readNodePayload(self.store, cur);
+                    if (payload[0] == LEAF_KIND) {
+                        var _leaf_dirty = std.ArrayList(u32).empty;
+                        defer _leaf_dirty.deinit(self.allocator);
+                        self.cur_leaf = try Leaf.fromPayload(self.allocator, self.store, payload, &_leaf_dirty);
                         self.cur_pos = 0;
                         return true;
                     } else {
                         const br = try Branch.fromPayload(self.allocator, payload);
-                        const first_child = br.children.items[0];
+                        const first_child = br.children[0];
                         try self.stack.append(self.allocator, .{ .branch = br, .child_idx = 0 });
                         cur = first_child;
                     }
                 }
                 return false;
             } else {
-                // 弹出
-                if (self.stack.pop()) |fr_val| {
-                    var fr = fr_val;
-                    fr.branch.deinit(self.allocator);
+                if (self.stack.pop()) |fr| {
+                    var f = fr;
+                    f.branch.deinit();
                 }
             }
         }
@@ -666,11 +865,10 @@ pub const Iterator = struct {
     }
 };
 
-/// 创建范围迭代器。min/max 为 null 表示无界；[min, max)。
-pub fn select(allocator: std.mem.Allocator, s: Store, root: u64, min: ?[]const u8, max: ?[]const u8) !Iterator {
+pub fn select(allocator: std.mem.Allocator, store: PageStore, root: u32, min: ?[]const u8, max: ?[]const u8) !Iterator {
     var it: Iterator = .{
         .allocator = allocator,
-        .s = s,
+        .store = store,
         .min = min,
         .max = max,
         .stack = .empty,
@@ -678,21 +876,21 @@ pub fn select(allocator: std.mem.Allocator, s: Store, root: u64, min: ?[]const u
         .cur_pos = 0,
     };
     if (root == NULL_ROOT) return it;
-    // 下钻到第一个 >= min 的叶
     var cur = root;
     var depth: u32 = 0;
+    var _leaf_dirty = std.ArrayList(u32).empty;
+    defer _leaf_dirty.deinit(allocator);
     while (depth < 1000) : (depth += 1) {
-        const rec = try readRecord(allocator, s, cur);
-        const payload = try decodeNodePayload(rec);
-        if (payload[0] == @intFromEnum(f.NodeKind.leaf)) {
-            it.cur_leaf = try Leaf.fromPayload(allocator, payload);
+        const payload = try readNodePayload(store, cur);
+        if (payload[0] == LEAF_KIND) {
+            it.cur_leaf = try Leaf.fromPayload(allocator, store, payload, &_leaf_dirty);
             it.cur_pos = 0;
             break;
         } else {
             var br = try Branch.fromPayload(allocator, payload);
             var ci: usize = 0;
             if (min) |m| ci = br.findChild(m);
-            const next = br.children.items[ci];
+            const next = br.children[ci];
             try it.stack.append(allocator, .{ .branch = br, .child_idx = ci });
             cur = next;
         }
@@ -700,264 +898,12 @@ pub fn select(allocator: std.mem.Allocator, s: Store, root: u64, min: ?[]const u
     return it;
 }
 
-// ===== 测试 =====
-
-const MemStore = store_mod.MemStore;
-
-fn newStore() MemStore {
-    return MemStore.init(std.testing.allocator);
-}
-
-test "btree: empty tree get -> null" {
-    var ms = newStore();
-    defer ms.deinit();
-    const v = try get(std.testing.allocator, ms.store(), NULL_ROOT, "k");
-    try std.testing.expectEqual(@as(?[]u8, null), v);
-}
-
-test "btree: single put/get roundtrip" {
-    var ms = newStore();
-    defer ms.deinit();
-    const r = try insert(std.testing.allocator, ms.store(), NULL_ROOT, "k", "v", false);
-    const v = try get(std.testing.allocator, ms.store(), r.new_root, "k");
-    try std.testing.expect(v != null);
-    try std.testing.expectEqualStrings("v", v.?);
-    std.testing.allocator.free(v.?);
-}
-
-test "btree: insert 10k random keys all readable" {
-    var ms = newStore();
-    defer ms.deinit();
-    var root: u64 = NULL_ROOT;
-    var prng = std.Random.DefaultPrng.init(42);
-    const rnd = prng.random();
-    var keys = std.ArrayList([]u8).empty;
-    defer {
-        for (keys.items) |k| std.testing.allocator.free(k);
-        keys.deinit(std.testing.allocator);
-    }
-    var i: usize = 0;
-    while (i < 1000) : (i += 1) {
-        var kbuf: [16]u8 = undefined;
-        const klen = rnd.uintLessThan(usize, 14) + 2;
-        for (0..klen) |j| kbuf[j] = 'a' + rnd.uintLessThan(u8, 26);
-        const k = try std.testing.allocator.dupe(u8, kbuf[0..klen]);
-        try keys.append(std.testing.allocator, k);
-    }
-    // 排序去重后插入
-    std.mem.sort([]u8, keys.items, {}, struct {
-        fn lt(_: void, a: []u8, b: []u8) bool {
-            return std.mem.order(u8, a, b) == .lt;
-        }
-    }.lt);
-    var unique = std.ArrayList([]u8).empty;
-    defer unique.deinit(std.testing.allocator);
-    for (keys.items) |k| {
-        if (unique.items.len == 0 or std.mem.order(u8, unique.items[unique.items.len - 1], k) != .eq) {
-            try unique.append(std.testing.allocator, k);
-        }
-    }
-    for (unique.items) |k| {
-        root = (try insert(std.testing.allocator, ms.store(), root, k, "val", false)).new_root;
-    }
-    // 验证全部可读
-    for (unique.items) |k| {
-        const v = try get(std.testing.allocator, ms.store(), root, k);
-        try std.testing.expect(v != null);
-        try std.testing.expectEqualStrings("val", v.?);
-        std.testing.allocator.free(v.?);
-    }
-}
-
-test "btree: overwrite key -> new value" {
-    var ms = newStore();
-    defer ms.deinit();
-    var root = (try insert(std.testing.allocator, ms.store(), NULL_ROOT, "k", "v1", false)).new_root;
-    root = (try insert(std.testing.allocator, ms.store(), root, "k", "v2", false)).new_root;
-    const v = try get(std.testing.allocator, ms.store(), root, "k");
-    try std.testing.expectEqualStrings("v2", v.?);
-    std.testing.allocator.free(v.?);
-}
-
-test "btree: delete key -> get null" {
-    var ms = newStore();
-    defer ms.deinit();
-    var root = (try insert(std.testing.allocator, ms.store(), NULL_ROOT, "k", "v", false)).new_root;
-    root = (try remove(std.testing.allocator, ms.store(), root, "k")).new_root;
-    const v = try get(std.testing.allocator, ms.store(), root, "k");
-    try std.testing.expectEqual(@as(?[]u8, null), v);
-}
-
-test "btree: COW old root still points to old version" {
-    var ms = newStore();
-    defer ms.deinit();
-    const r1 = try insert(std.testing.allocator, ms.store(), NULL_ROOT, "k", "v1", false);
-    const r2 = try insert(std.testing.allocator, ms.store(), r1.new_root, "k", "v2", false);
-    // 用旧 root 读到旧值
-    const oldv = try get(std.testing.allocator, ms.store(), r1.new_root, "k");
-    try std.testing.expectEqualStrings("v1", oldv.?);
-    std.testing.allocator.free(oldv.?);
-    // 用新 root 读到新值
-    const newv = try get(std.testing.allocator, ms.store(), r2.new_root, "k");
-    try std.testing.expectEqualStrings("v2", newv.?);
-    std.testing.allocator.free(newv.?);
-}
-
-test "btree: select null,null full ordered output" {
-    var ms = newStore();
-    defer ms.deinit();
-    var root: u64 = NULL_ROOT;
-    const keys = [_][]const u8{ "banana", "apple", "cherry" };
-    for (keys) |k| {
-        root = (try insert(std.testing.allocator, ms.store(), root, k, "v", false)).new_root;
-    }
-    var it = try select(std.testing.allocator, ms.store(), root, null, null);
-    defer it.deinit();
-    var got = std.ArrayList([]const u8).empty;
-    defer got.deinit(std.testing.allocator);
-    while (try it.next()) |e| {
-        try got.append(std.testing.allocator, try std.testing.allocator.dupe(u8, e.key));
-    }
-    try std.testing.expectEqual(@as(usize, 3), got.items.len);
-    try std.testing.expectEqualStrings("apple", got.items[0]);
-    try std.testing.expectEqualStrings("banana", got.items[1]);
-    try std.testing.expectEqualStrings("cherry", got.items[2]);
-    for (got.items) |g| std.testing.allocator.free(g);
-}
-
-test "btree: select min,max inclusive min exclusive max" {
-    var ms = newStore();
-    defer ms.deinit();
-    var root: u64 = NULL_ROOT;
-    const keys = [_][]const u8{ "a", "b", "c", "d", "e" };
-    for (keys) |k| {
-        root = (try insert(std.testing.allocator, ms.store(), root, k, "v", false)).new_root;
-    }
-    var it = try select(std.testing.allocator, ms.store(), root, "b", "d");
-    defer it.deinit();
-    var got = std.ArrayList([]const u8).empty;
-    defer got.deinit(std.testing.allocator);
-    while (try it.next()) |e| {
-        try got.append(std.testing.allocator, try std.testing.allocator.dupe(u8, e.key));
-    }
-    try std.testing.expectEqual(@as(usize, 2), got.items.len);
-    try std.testing.expectEqualStrings("b", got.items[0]);
-    try std.testing.expectEqualStrings("c", got.items[1]);
-    for (got.items) |g| std.testing.allocator.free(g);
-}
-
-test "btree: select empty range min>max -> empty" {
-    var ms = newStore();
-    defer ms.deinit();
-    var root: u64 = NULL_ROOT;
-    root = (try insert(std.testing.allocator, ms.store(), NULL_ROOT, "a", "v", false)).new_root;
-    var it = try select(std.testing.allocator, ms.store(), root, "z", "a");
-    defer it.deinit();
-    var count: usize = 0;
-    while (try it.next()) |_| count += 1;
-    try std.testing.expectEqual(@as(usize, 0), count);
-}
-
-test "btree: select skips tombstones" {
-    var ms = newStore();
-    defer ms.deinit();
-    var root: u64 = NULL_ROOT;
-    root = (try insert(std.testing.allocator, ms.store(), NULL_ROOT, "a", "va", false)).new_root;
-    root = (try insert(std.testing.allocator, ms.store(), root, "b", "vb", false)).new_root;
-    root = (try remove(std.testing.allocator, ms.store(), root, "a")).new_root;
-    var it = try select(std.testing.allocator, ms.store(), root, null, null);
-    defer it.deinit();
-    var got = std.ArrayList([]const u8).empty;
-    defer got.deinit(std.testing.allocator);
-    while (try it.next()) |e| {
-        try got.append(std.testing.allocator, try std.testing.allocator.dupe(u8, e.key));
-    }
-    try std.testing.expectEqual(@as(usize, 1), got.items.len);
-    try std.testing.expectEqualStrings("b", got.items[0]);
-    for (got.items) |g| std.testing.allocator.free(g);
-}
-
-test "btree: model test random ops vs StringHashMap (seed 7)" {
-    const allocator = std.testing.allocator;
-    var ms = newStore();
-    defer ms.deinit();
-    var root: u64 = NULL_ROOT;
-    var model = std.StringHashMap([]u8).init(allocator);
-    defer {
-        var it = model.iterator();
-        while (it.next()) |kv| {
-            allocator.free(kv.key_ptr.*);
-            allocator.free(kv.value_ptr.*);
-        }
-        model.deinit();
-    }
-    var prng = std.Random.DefaultPrng.init(7);
-    const rnd = prng.random();
-    const ops = 2000;
-    var i: usize = 0;
-    while (i < ops) : (i += 1) {
-        var kbuf: [8]u8 = undefined;
-        const klen = 4 + rnd.uintLessThan(usize, 5);
-        for (0..klen) |j| kbuf[j] = 'a' + rnd.uintLessThan(u8, 8);
-        const key = kbuf[0..klen];
-        if (rnd.boolean()) {
-            // put
-            const val = try allocator.dupe(u8, "V");
-            const r = try insert(allocator, ms.store(), root, key, val, false);
-            root = r.new_root;
-            allocator.free(val);
-            const gop = try model.getOrPut(key);
-            if (gop.found_existing) {
-                allocator.free(gop.value_ptr.*);
-                gop.value_ptr.* = try allocator.dupe(u8, "V");
-            } else {
-                gop.key_ptr.* = try allocator.dupe(u8, key);
-                gop.value_ptr.* = try allocator.dupe(u8, "V");
-            }
-        } else {
-            // delete
-            const r = try remove(allocator, ms.store(), root, key);
-            root = r.new_root;
-            if (model.fetchRemove(key)) |kv| {
-                allocator.free(kv.key);
-                allocator.free(kv.value);
-            }
-        }
-        // 验证该 key
-        const mv = model.get(key);
-        const bv = try get(allocator, ms.store(), root, key);
-        if (mv == null) {
-            try std.testing.expect(bv == null);
-        } else {
-            try std.testing.expect(bv != null);
-            try std.testing.expectEqualStrings(mv.?, bv.?);
-            allocator.free(bv.?);
-        }
-    }
-    // 全量比对
-    var it = try select(allocator, ms.store(), root, null, null);
-    defer it.deinit();
-    var bcount: usize = 0;
-    while (try it.next()) |_| bcount += 1;
-    try std.testing.expectEqual(model.count(), bcount);
-}
-
-test "btree: sequential 1000 keys all readable" {
-    var ms = newStore();
-    defer ms.deinit();
-    var root: u64 = NULL_ROOT;
-    var i: u32 = 0;
-    while (i < 1000) : (i += 1) {
-        var kbuf: [16]u8 = undefined;
-        const k = try std.fmt.bufPrint(&kbuf, "{d}", .{i});
-        root = (try insert(std.testing.allocator, ms.store(), root, k, "v", false)).new_root;
-    }
-    i = 0;
-    while (i < 1000) : (i += 1) {
-        var kbuf: [16]u8 = undefined;
-        const k = try std.fmt.bufPrint(&kbuf, "{d}", .{i});
-        const v = try get(std.testing.allocator, ms.store(), root, k);
-        if (v == null) return error.TestUnexpectedResult;
-        std.testing.allocator.free(v.?);
-    }
-}
+// ===== 错误 =====
+pub const Error = error{
+    OutOfMemory,
+    Truncated,
+    CorruptCrc,
+    IoError,
+    MapFull,
+    PageNotFound,
+} || std.mem.Allocator.Error;

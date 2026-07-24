@@ -5,26 +5,26 @@ const std = @import("std");
 const zio = @import("zio");
 const cube = @import("cube_db");
 const ps = cube.page_store;
-const btree2 = cube.btree2;
-const writer2 = cube.writer2;
+const btree = cube.btree;
+const wrt = cube.writer;
 
 test "mvcc: no active readers — dirty pages freed immediately" {
     var ms = ps.MemPageStore.init(std.testing.allocator, 1000);
     defer ms.deinit();
     const s = ms.store();
 
-    var state = writer2.State.init(std.testing.allocator, s, .{});
+    var state = wrt.State.init(std.testing.allocator, s, .{});
     defer state.deinit();
 
     // 写入一个 key（新建 leaf，无脏页）
-    var f1: zio.Future(writer2.OpResult) = .{};
+    var f1: zio.Future(wrt.OpResult) = .{};
     try state.applyBatch(&.{.{ .key = "k", .value = "v1", .tombstone = false, .future = &f1 }});
     _ = try f1.wait();
     const dirt1 = state.dirt.load(.acquire);
     try std.testing.expectEqual(@as(u64, 0), dirt1); // 首次插入无脏页
 
     // 覆写 key（旧页进 pending_free，无读者应立即释放）
-    var f2: zio.Future(writer2.OpResult) = .{};
+    var f2: zio.Future(wrt.OpResult) = .{};
     try state.applyBatch(&.{.{ .key = "k", .value = "v2", .tombstone = false, .future = &f2 }});
     _ = try f2.wait();
     // 无读者 → pending_free 被 flush → dirt = 0（已回收）
@@ -40,11 +40,11 @@ test "mvcc: active reader prevents dirty page recycling" {
     defer ms.deinit();
     const s = ms.store();
 
-    var state = writer2.State.init(std.testing.allocator, s, .{});
+    var state = wrt.State.init(std.testing.allocator, s, .{});
     defer state.deinit();
 
     // 写入一个 key，建立初始页
-    var f1: zio.Future(writer2.OpResult) = .{};
+    var f1: zio.Future(wrt.OpResult) = .{};
     try state.applyBatch(&.{.{ .key = "k", .value = "v1", .tombstone = false, .future = &f1 }});
     _ = try f1.wait();
 
@@ -56,7 +56,7 @@ test "mvcc: active reader prevents dirty page recycling" {
     try std.testing.expect(reader_seq > 0);
 
     // 覆写 key（COW 创建新 leaf 2，释放旧 leaf 1）
-    var f2: zio.Future(writer2.OpResult) = .{};
+    var f2: zio.Future(wrt.OpResult) = .{};
     try state.applyBatch(&.{.{ .key = "k", .value = "v2", .tombstone = false, .future = &f2 }});
     _ = try f2.wait();
 
@@ -75,10 +75,10 @@ test "mvcc: multiple readers all release before pages freed" {
     defer ms.deinit();
     const s = ms.store();
 
-    var state = writer2.State.init(std.testing.allocator, s, .{});
+    var state = wrt.State.init(std.testing.allocator, s, .{});
     defer state.deinit();
 
-    var f1: zio.Future(writer2.OpResult) = .{};
+    var f1: zio.Future(wrt.OpResult) = .{};
     try state.applyBatch(&.{.{ .key = "k", .value = "v1", .tombstone = false, .future = &f1 }});
     _ = try f1.wait();
 
@@ -89,7 +89,7 @@ test "mvcc: multiple readers all release before pages freed" {
     _ = r2;
 
     // 覆写
-    var f2: zio.Future(writer2.OpResult) = .{};
+    var f2: zio.Future(wrt.OpResult) = .{};
     try state.applyBatch(&.{.{ .key = "k", .value = "v2", .tombstone = false, .future = &f2 }});
     _ = try f2.wait();
     try std.testing.expect(state.pendingFreeCount() > 0);
@@ -108,16 +108,16 @@ test "mvcc: dirt counter reflects pending pages" {
     defer ms.deinit();
     const s = ms.store();
 
-    var state = writer2.State.init(std.testing.allocator, s, .{});
+    var state = wrt.State.init(std.testing.allocator, s, .{});
     defer state.deinit();
 
-    var f1: zio.Future(writer2.OpResult) = .{};
+    var f1: zio.Future(wrt.OpResult) = .{};
     try state.applyBatch(&.{.{ .key = "k", .value = "v1", .tombstone = false, .future = &f1 }});
     _ = try f1.wait();
 
     _ = state.beginRead();
 
-    var f2: zio.Future(writer2.OpResult) = .{};
+    var f2: zio.Future(wrt.OpResult) = .{};
     try state.applyBatch(&.{.{ .key = "k", .value = "v2", .tombstone = false, .future = &f2 }});
     _ = try f2.wait();
 
@@ -134,11 +134,11 @@ test "mvcc: old root still readable during concurrent write" {
     defer ms.deinit();
     const s = ms.store();
 
-    var state = writer2.State.init(std.testing.allocator, s, .{});
+    var state = wrt.State.init(std.testing.allocator, s, .{});
     defer state.deinit();
 
     // 写入 key="k"="v1"
-    var f1: zio.Future(writer2.OpResult) = .{};
+    var f1: zio.Future(wrt.OpResult) = .{};
     try state.applyBatch(&.{.{ .key = "k", .value = "v1", .tombstone = false, .future = &f1 }});
     _ = try f1.wait();
     const root_v1 = state.getRoot();
@@ -147,19 +147,19 @@ test "mvcc: old root still readable during concurrent write" {
     _ = state.beginRead();
 
     // 写入 key="k"="v2"（COW 产生新 root，旧 root 的页不应被回收）
-    var f2: zio.Future(writer2.OpResult) = .{};
+    var f2: zio.Future(wrt.OpResult) = .{};
     try state.applyBatch(&.{.{ .key = "k", .value = "v2", .tombstone = false, .future = &f2 }});
     _ = try f2.wait();
 
     // 旧 root 应仍可读（页未被回收）
-    const oldv = try btree2.get(std.testing.allocator, s, root_v1, "k");
+    const oldv = try btree.get(std.testing.allocator, s, root_v1, "k");
     try std.testing.expectEqualStrings("v1", oldv.?);
     std.testing.allocator.free(oldv.?);
 
     // 新 root 读到新值
     const root_v2 = state.getRoot();
     try std.testing.expect(root_v2 != root_v1);
-    const newv = try btree2.get(std.testing.allocator, s, root_v2, "k");
+    const newv = try btree.get(std.testing.allocator, s, root_v2, "k");
     try std.testing.expectEqualStrings("v2", newv.?);
     std.testing.allocator.free(newv.?);
 
@@ -171,12 +171,12 @@ test "mvcc: beginRead/endRead nesting" {
     defer ms.deinit();
     const s = ms.store();
 
-    var state = writer2.State.init(std.testing.allocator, s, .{});
+    var state = wrt.State.init(std.testing.allocator, s, .{});
     defer state.deinit();
 
     // 嵌套 beginRead/endRead 应正确计数
     // 先写入一个 key，后续覆写产生脏页
-    var f0: zio.Future(writer2.OpResult) = .{};
+    var f0: zio.Future(wrt.OpResult) = .{};
     try state.applyBatch(&.{.{ .key = "k", .value = "initial", .tombstone = false, .future = &f0 }});
     _ = try f0.wait();
 
@@ -185,7 +185,7 @@ test "mvcc: beginRead/endRead nesting" {
     _ = r1;
     _ = r2;
     state.endRead(); // 释放第二个
-    var f1: zio.Future(writer2.OpResult) = .{};
+    var f1: zio.Future(wrt.OpResult) = .{};
     try state.applyBatch(&.{.{ .key = "k", .value = "v", .tombstone = false, .future = &f1 }});
     _ = try f1.wait();
     // 仍有活跃 reader（第一个），页不应释放

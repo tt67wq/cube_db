@@ -5,7 +5,7 @@
 //! MemPageStore 是 page_store.PageStore 接口的内存实现（测试用）。
 const std = @import("std");
 const cube = @import("cube_db");
-const f2 = cube.format2;
+const f2 = cube.format;
 const ps = cube.page_store;
 
 // ===== 内存 PageStore 实现 =====

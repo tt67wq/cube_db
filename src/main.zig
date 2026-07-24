@@ -14,5 +14,5 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test "main: sanity" {
-    try std.testing.expect(cube_db.add(2, 2) == 4);
+    _ = cube_db;
 }

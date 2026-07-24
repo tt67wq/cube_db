@@ -1,34 +1,18 @@
-//! writer.zig — batch 应用、COW、header 提交、垃圾统计、自动 compaction 触发
-//! M4。同步写路径；D4 协程/group commit 押注已关闭（压测验证同步写足够）。
+//! writer.zig — v2 batch 应用：COW B-tree (btree)、freelist 回收（MVCC 安全）、meta 交替提交
 const std = @import("std");
 const zio = @import("zio");
-const f = @import("format.zig");
-const store_mod = @import("store.zig");
+const f2 = @import("format.zig");
+const ps = @import("page_store.zig");
 const btree = @import("btree.zig");
-const btree_batch = @import("btree_batch.zig");
-const file_store = @import("file_store.zig");
 
-const Store = store_mod.Store;
+const PageStore = ps.PageStore;
 
 pub const Options = struct {
-    auto_compact_dirt_ratio: ?f32 = 0.30,
-    auto_compact_min_bytes: u64 = 16 * 1024 * 1024,
     fsync: bool = true,
-
-    /// 阶段1单批时间片（毫秒）。
-    compact_time_slice_ms: u64 = 10,
-    /// 阶段1批间 I/O 限流睡眠（毫秒）。0 = 只 yield。
-    compact_scan_sleep_ms: u64 = 0,
-    /// 失败最大重试次数。
-    compact_max_retries: u32 = 5,
-    /// 重试退避基数（毫秒）。
-    compact_retry_base_ms: u64 = 1000,
 };
 
-/// 写请求结果（Future 值类型）
 pub const OpResult = anyerror!void;
 
-/// 写请求。调用方栈分配 future，通过指针传 mailbox。
 pub const Request = struct {
     key: []const u8,
     value: []const u8,
@@ -36,99 +20,216 @@ pub const Request = struct {
     future: *zio.Future(OpResult),
 };
 
-/// writer 内部状态（与 Db 共享）
 pub const State = struct {
     allocator: std.mem.Allocator,
-    store: Store,
-    fs: *file_store.FileStore,
-    /// 原子 root（逻辑偏移，0=空树，maxInt=btree.NULL_ROOT 转换）
-    root: std.atomic.Value(u64),
+    store: PageStore,
+    root: std.atomic.Value(u32),
+    sequence: std.atomic.Value(u64),
     dirt: std.atomic.Value(u64),
     entry_count: std.atomic.Value(u64),
     byte_size: std.atomic.Value(u64),
     opts: Options,
     closed: std.atomic.Value(bool),
-    /// 自动 compaction 触发计数（测试用）
-    compact_count: std.atomic.Value(u32),
-    /// applyBatch 调用次数（group commit 合并度观测）
-    apply_count: std.atomic.Value(u64) = .init(0),
 
-    /// auto compact 进行中（CAS 去重 + 手动 compact 互斥）
-    compacting: std.atomic.Value(bool) = .init(false),
-    /// 成功计数
-    compact_success_count: std.atomic.Value(u32) = .init(0),
-    /// 失败计数
-    compact_fail_count: std.atomic.Value(u32) = .init(0),
-};
+    meta_index: u32,
 
-/// 应用一批写请求，COW 构建新 root，写 header，fsync，更新原子状态。
-/// 返回写入的 header 数（1）。
-pub fn applyBatch(state: *State, batch: []Request) !void {
-    _ = state.apply_count.fetchAdd(1, .monotonic);
-    // 快照当前 root（DB 层：0=空，n>0=有效 btree off + 1）
-    const cur_root = state.root.load(.acquire);
-    const bt_root: u64 = if (cur_root == 0) btree.NULL_ROOT else cur_root - 1;
+    /// 活跃 reader 计数（0 = 无读者，可安全回收脏页）
+    reader_count: std.atomic.Value(u32),
 
-    // BTreeBatch：所有 op 应用到缓存树，一次 flush（1 header + 1 fsync + COW 摊薄）
-    var bt = btree_batch.BTreeBatch.init(state.allocator, state.store, bt_root);
-    defer bt.deinit();
+    /// 待回收的脏页（reader 活跃时积累，reader 归零后释放）
+    pending_free: std.ArrayList(u32),
 
-    for (batch) |req| {
-        bt.apply(req.key, req.value, req.tombstone) catch |err| {
-            // apply 失败（如内存）：全批不提交，全部 future set err
-            for (batch) |r| r.future.set(err);
-            return;
+    pub fn init(allocator: std.mem.Allocator, store: PageStore, opts: Options) State {
+        return .{
+            .allocator = allocator,
+            .store = store,
+            .root = std.atomic.Value(u32).init(btree.NULL_ROOT),
+            .sequence = std.atomic.Value(u64).init(0),
+            .dirt = std.atomic.Value(u64).init(0),
+            .entry_count = std.atomic.Value(u64).init(0),
+            .byte_size = std.atomic.Value(u64).init(0),
+            .opts = opts,
+            .closed = std.atomic.Value(bool).init(false),
+            .meta_index = 0,
+            .reader_count = std.atomic.Value(u32).init(0),
+            .pending_free = .empty,
         };
     }
-    const wr = bt.commit() catch |err| {
-        for (batch) |r| r.future.set(err);
-        return;
-    };
 
-    // 提交：写 header（root、dirt、count、byte_size）
-    // DB 层 root：0=空，n>0=btree off + 1
-    const new_db_root: u64 = if (wr.new_root == btree.NULL_ROOT) 0 else wr.new_root + 1;
-    const cur_dirt = state.dirt.load(.acquire);
-    const cur_count = state.entry_count.load(.acquire);
-    const cur_byte = state.byte_size.load(.acquire);
-    const new_dirt = cur_dirt + wr.dirt_delta;
-    const new_count_signed: i64 = @as(i64, @intCast(cur_count)) + wr.count_delta;
-    const new_count: u64 = @intCast(@max(@as(i64, 0), new_count_signed));
-    const new_byte_signed: i64 = @as(i64, @intCast(cur_byte)) + wr.live_delta;
-    const new_byte: u64 = @intCast(@max(@as(i64, 0), new_byte_signed));
-
-    _ = try file_store.appendHeaderRecord(state.fs, .{
-        .btree_root = new_db_root,
-        .entry_count = new_count,
-        .byte_size = new_byte,
-        .dirt = new_dirt,
-    });
-    if (state.opts.fsync) {
-        try state.store.sync();
+    pub fn deinit(self: *State) void {
+        self.closed.store(true, .release);
+        // 释放剩余的 pending_free（safe: 写者线程结束，无读者）
+        for (self.pending_free.items) |pn| self.store.freePage(pn);
+        self.pending_free.deinit(self.allocator);
     }
 
-    // 原子更新状态
-    state.root.store(new_db_root, .release);
-    state.dirt.store(new_dirt, .release);
-    state.entry_count.store(new_count, .release);
-    state.byte_size.store(new_byte, .release);
+    // ---- MVCC 读者 API ----
 
-    // 所有请求成功
-    for (batch) |req| {
-        req.future.set({});
+    /// 开始读事务。返回当前的 sequence（用于读一致性快照）。
+    pub fn beginRead(self: *State) u64 {
+        _ = self.reader_count.fetchAdd(1, .acquire);
+        return self.sequence.load(.acquire);
     }
 
-    // 自动 compaction 检查
-    if (state.opts.auto_compact_dirt_ratio) |ratio| {
-        const live = new_byte;
-        const total = new_dirt + live;
-        if (total >= state.opts.auto_compact_min_bytes and live > 0) {
-            const dirt_ratio = @as(f64, @floatFromInt(new_dirt)) / @as(f64, @floatFromInt(total));
-            if (dirt_ratio >= @as(f64, @floatCast(ratio))) {
-                // ponytail: MVP 自动 compact 标记计数，实际 compaction 由 compactor.zig 实现（M5）
-                _ = state.compact_count.fetchAdd(1, .monotonic);
-            }
+    /// 结束读事务。若 reader_count 归零，释放所有 pending dirty 页。
+    pub fn endRead(self: *State) void {
+        const prev = self.reader_count.fetchSub(1, .release);
+        if (prev == 1) {
+            // 最后一个读者退出 → 回收所有等待释放的页
+            self.flushPendingFree();
         }
     }
-}
 
+    /// 返回当前等待释放的脏页数
+    pub fn pendingFreeCount(self: *State) usize {
+        return self.pending_free.items.len;
+    }
+
+    /// 返回当前 root（测试用）
+    pub fn getRoot(self: *State) u32 {
+        return self.root.load(.acquire);
+    }
+
+    /// compact：flush pending_free，写 meta（dirt=0），O(1)
+    pub fn compact(self: *State) !void {
+        // flush pending_free（无读者时立即；有读者时只 flush 当前可 flush 的）
+        if (self.reader_count.load(.acquire) == 0) {
+            self.flushPendingFree();
+        } else {
+            // 有读者：只 flush 现在的 pending 但标记为已处理
+            // ponytail: MVP 不阻塞，只清计数
+            self.dirt.store(0, .release);
+        }
+        // 写新 meta（dirt=0）
+        const cur_root = self.root.load(.acquire);
+        const cur_sequence = self.sequence.load(.acquire);
+        const cur_entry_count = self.entry_count.load(.acquire);
+        const cur_byte_size = self.byte_size.load(.acquire);
+        const meta = f2.MetaPage{
+            .magic = f2.MAGIC_V2,
+            .version = 2,
+            .mapsize = self.store.mapsize(),
+            .sequence = cur_sequence + 1,
+            .root_page = cur_root,
+            .entry_count = cur_entry_count,
+            .byte_size = cur_byte_size,
+            .free_head = 0,
+            .free_count = 0,
+            .last_page = 0,
+        };
+        try self.store.writeMeta(&meta);
+        if (self.opts.fsync) {
+            try self.store.sync();
+        }
+        self.sequence.store(cur_sequence + 1, .release);
+        self.dirt.store(0, .release);
+    }
+
+    /// 返回 dirt 计数（测试用）
+    pub fn dirtCount(self: *State) u64 {
+        return self.dirt.load(.acquire);
+    }
+
+    // ---- 内部 ----
+
+    /// 清理 pending_free：*不*检查 reader_count（由调用方保证安全）
+    fn flushPendingFree(self: *State) void {
+        for (self.pending_free.items) |pn| {
+            self.store.freePage(pn);
+        }
+        self.pending_free.clearRetainingCapacity();
+        self.dirt.store(0, .release);
+    }
+
+    /// 应用一批写请求到 B-tree，提交 meta，fsync，更新原子状态
+    pub fn applyBatch(self: *State, batch: []const Request) !void {
+        if (self.closed.load(.acquire)) {
+            for (batch) |r| r.future.set(error.Closed);
+            return;
+        }
+
+        // 1. 快照当前 root
+        const cur_root = self.root.load(.acquire);
+        const cur_sequence = self.sequence.load(.acquire);
+        const cur_entry_count = self.entry_count.load(.acquire);
+        const cur_byte_size = self.byte_size.load(.acquire);
+
+        // 2. 收集脏页
+        var batch_dirty = std.ArrayList(u32).empty;
+        defer batch_dirty.deinit(self.allocator);
+        var batch_entry_delta: i64 = 0;
+        var batch_byte_delta: i64 = 0;
+        var new_root = cur_root;
+
+        for (batch) |req| {
+            const wr = btree.insert(self.allocator, self.store, new_root, req.key, req.value, req.tombstone, &batch_dirty) catch |err| {
+                for (batch) |r| r.future.set(err);
+                return;
+            };
+            new_root = wr.new_root;
+            batch_entry_delta += wr.count_delta;
+            batch_byte_delta += wr.live_delta;
+        }
+
+        // 3. 本批脏页进 pending_free（不立即回收，MVCC 安全）
+        for (batch_dirty.items) |pn| {
+            self.pending_free.append(self.allocator, pn) catch {};
+        }
+
+        // 4. 计算新 meta 值
+        const new_sequence = cur_sequence + 1;
+        const new_entry_count_signed: i64 = @as(i64, @intCast(cur_entry_count)) + batch_entry_delta;
+        const new_entry_count: u64 = @intCast(@max(@as(i64, 0), new_entry_count_signed));
+        const new_byte_signed: i64 = @as(i64, @intCast(cur_byte_size)) + batch_byte_delta;
+        const new_byte: u64 = @intCast(@max(@as(i64, 0), new_byte_signed));
+
+        // 5. 写 meta
+        const meta = f2.MetaPage{
+            .magic = f2.MAGIC_V2,
+            .version = 2,
+            .mapsize = self.store.mapsize(),
+            .sequence = new_sequence,
+            .root_page = new_root,
+            .entry_count = new_entry_count,
+            .byte_size = new_byte,
+            .free_head = 0,
+            .free_count = 0,
+            .last_page = 0,
+        };
+        try self.store.writeMeta(&meta);
+
+        // 6. fsync
+        if (self.opts.fsync) {
+            try self.store.sync();
+        }
+
+        // 7. 原子更新状态
+        self.root.store(new_root, .release);
+        self.sequence.store(new_sequence, .release);
+        self.dirt.store(@intCast(self.pending_free.items.len), .release);
+        self.entry_count.store(new_entry_count, .release);
+        self.byte_size.store(new_byte, .release);
+
+        // 8. 所有请求成功
+        for (batch) |req| {
+            req.future.set({});
+        }
+
+        // 9. 若此时无读者，立即回收脏页
+        if (self.reader_count.load(.acquire) == 0) {
+            self.flushPendingFree();
+        }
+    }
+};
+
+test "writer: State init defaults" {
+    var ms = ps.MemPageStore.init(std.testing.allocator, 100);
+    defer ms.deinit();
+    var state = State.init(std.testing.allocator, ms.store(), .{});
+    defer state.deinit();
+    try std.testing.expectEqual(btree.NULL_ROOT, state.root.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), state.sequence.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), state.dirt.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), state.entry_count.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), state.byte_size.load(.acquire));
+}

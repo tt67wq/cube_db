@@ -1,16 +1,16 @@
-//! format2_test.zig — 页格式 v2 编解码测试（TDD RED）
+//! format_test.zig — 页格式 v2 编解码测试（TDD RED）
 //! 覆盖：PageHeader roundtrip、MetaPage roundtrip + 交替恢复、CRC 校验 + 损坏回退、freelist 页编码。
 //! 先 fail（format2.zig 尚不存在），实现后全绿。
 const std = @import("std");
 const cube = @import("cube_db");
-const f2 = cube.format2;
+const f2 = cube.format;
 
-test "format2: PAGE_SIZE and PAGE_HEADER_SIZE constants" {
+test "format: PAGE_SIZE and PAGE_HEADER_SIZE constants" {
     try std.testing.expectEqual(@as(usize, 4096), f2.PAGE_SIZE);
     try std.testing.expectEqual(@as(usize, 24), f2.PAGE_HEADER_SIZE);
 }
 
-test "format2: page type constants" {
+test "format: page type constants" {
     try std.testing.expectEqual(@as(u8, 0), f2.PAGE_TYPE_FREE);
     try std.testing.expectEqual(@as(u8, 1), f2.PAGE_TYPE_META);
     try std.testing.expectEqual(@as(u8, 2), f2.PAGE_TYPE_BRANCH);
@@ -18,13 +18,13 @@ test "format2: page type constants" {
     try std.testing.expectEqual(@as(u8, 4), f2.PAGE_TYPE_OVERFLOW);
 }
 
-test "format2: null page constants" {
+test "format: null page constants" {
     try std.testing.expectEqual(@as(u32, 0), f2.NULL_PAGE);
     try std.testing.expectEqual(@as(u32, 1), f2.META_PAGE_0);
     try std.testing.expectEqual(@as(u32, 2), f2.META_PAGE_1);
 }
 
-test "format2: page header encode/decode roundtrip" {
+test "format: page header encode/decode roundtrip" {
     const h = f2.PageHeader{
         .page_no = 42,
         .page_type = f2.PAGE_TYPE_LEAF,
@@ -42,7 +42,7 @@ test "format2: page header encode/decode roundtrip" {
     try std.testing.expectEqual(h.free_next, got.free_next);
 }
 
-test "format2: page header free page free_next preserved" {
+test "format: page header free page free_next preserved" {
     const h = f2.PageHeader{
         .page_no = 99,
         .page_type = f2.PAGE_TYPE_FREE,
@@ -57,7 +57,7 @@ test "format2: page header free page free_next preserved" {
     try std.testing.expectEqual(f2.PAGE_TYPE_FREE, got.page_type);
 }
 
-test "format2: page header zero values" {
+test "format: page header zero values" {
     const h = f2.PageHeader{
         .page_no = 0,
         .page_type = 0,
@@ -73,7 +73,7 @@ test "format2: page header zero values" {
     try std.testing.expectEqual(@as(u64, 0), got.gen);
 }
 
-test "format2: page checksum covers header + payload" {
+test "format: page checksum covers header + payload" {
     // 构造一个完整页（header + payload + checksum），验证 checksum 覆盖 header+payload
     var page: [f2.PAGE_SIZE]u8 = undefined;
     @memset(&page, 0xaa);
@@ -98,7 +98,7 @@ test "format2: page checksum covers header + payload" {
     try std.testing.expect(!f2.verifyPageChecksum(&page));
 }
 
-test "format2: page checksum tampered header fails" {
+test "format: page checksum tampered header fails" {
     var page: [f2.PAGE_SIZE]u8 = undefined;
     @memset(&page, 0);
     const h = f2.PageHeader{ .page_no = 7, .page_type = f2.PAGE_TYPE_LEAF, .gen = 3, .nkeys = 8, .free_next = 0 };
@@ -109,7 +109,7 @@ test "format2: page checksum tampered header fails" {
     try std.testing.expect(!f2.verifyPageChecksum(&page));
 }
 
-test "format2: meta page encode/decode roundtrip" {
+test "format: meta page encode/decode roundtrip" {
     const meta = f2.MetaPage{
         .magic = f2.MAGIC_V2,
         .version = 2,
@@ -137,7 +137,7 @@ test "format2: meta page encode/decode roundtrip" {
     try std.testing.expectEqual(meta.last_page, got.last_page);
 }
 
-test "format2: meta page magic and version validation" {
+test "format: meta page magic and version validation" {
     try std.testing.expect(f2.isValidMeta(.{
         .magic = f2.MAGIC_V2,
         .version = 2,
@@ -176,7 +176,7 @@ test "format2: meta page magic and version validation" {
     }));
 }
 
-test "format2: meta alternation — take larger sequence" {
+test "format: meta alternation — take larger sequence" {
     const meta0 = f2.MetaPage{
         .magic = f2.MAGIC_V2,
         .version = 2,
@@ -216,7 +216,7 @@ test "format2: meta alternation — take larger sequence" {
     try std.testing.expectEqual(@as(u64, 2000), got.?.entry_count);
 }
 
-test "format2: meta alternation — meta0 newer" {
+test "format: meta alternation — meta0 newer" {
     const meta0 = f2.MetaPage{
         .magic = f2.MAGIC_V2, .version = 2, .mapsize = 1 << 30,
         .sequence = 300, .root_page = 70, .entry_count = 3000, .byte_size = 150000,
@@ -239,7 +239,7 @@ test "format2: meta alternation — meta0 newer" {
     try std.testing.expectEqual(@as(u32, 70), got.?.root_page);
 }
 
-test "format2: meta alternation — one corrupt, take other" {
+test "format: meta alternation — one corrupt, take other" {
     const meta0 = f2.MetaPage{
         .magic = f2.MAGIC_V2, .version = 2, .mapsize = 1 << 30,
         .sequence = 500, .root_page = 100, .entry_count = 5000, .byte_size = 250000,
@@ -259,7 +259,7 @@ test "format2: meta alternation — one corrupt, take other" {
     try std.testing.expectEqual(@as(u32, 100), got.?.root_page);
 }
 
-test "format2: meta alternation — both corrupt returns null" {
+test "format: meta alternation — both corrupt returns null" {
     var page0: [f2.PAGE_SIZE]u8 = undefined;
     var page1: [f2.PAGE_SIZE]u8 = undefined;
     @memset(&page0, 0xff);
@@ -270,7 +270,7 @@ test "format2: meta alternation — both corrupt returns null" {
     try std.testing.expect(got == null);
 }
 
-test "format2: meta alternation — both empty returns null" {
+test "format: meta alternation — both empty returns null" {
     var page0: [f2.PAGE_SIZE]u8 = undefined;
     var page1: [f2.PAGE_SIZE]u8 = undefined;
     @memset(&page0, 0);
@@ -281,7 +281,7 @@ test "format2: meta alternation — both empty returns null" {
     try std.testing.expect(got == null);
 }
 
-test "format2: encode/decode MetaPage from page buffer" {
+test "format: encode/decode MetaPage from page buffer" {
     const meta = f2.MetaPage{
         .magic = f2.MAGIC_V2, .version = 2, .mapsize = 1 << 30,
         .sequence = 777, .root_page = 123, .entry_count = 9999, .byte_size = 500000,
@@ -304,7 +304,7 @@ test "format2: encode/decode MetaPage from page buffer" {
     try std.testing.expectEqual(@as(u64, 9999), got.?.entry_count);
 }
 
-test "format2: freelist page chain" {
+test "format: freelist page chain" {
     // 模拟 freelist 页链：page 100 → page 200 → page 300 (tail)
     var page100: [f2.PAGE_SIZE]u8 = undefined;
     var page200: [f2.PAGE_SIZE]u8 = undefined;
@@ -345,7 +345,7 @@ test "format2: freelist page chain" {
     try std.testing.expectEqual(@as(u32, 60), entries3[0]);
 }
 
-test "format2: freelist page with no entries" {
+test "format: freelist page with no entries" {
     var page: [f2.PAGE_SIZE]u8 = undefined;
     @memset(&page, 0);
     var h = f2.PageHeader{ .page_no = 50, .page_type = f2.PAGE_TYPE_FREE, .gen = 0, .nkeys = 0, .free_next = 0 };
@@ -354,7 +354,7 @@ test "format2: freelist page with no entries" {
     try std.testing.expectEqual(@as(usize, 0), entries.len);
 }
 
-test "format2: freelist page max entries fits in one page" {
+test "format: freelist page max entries fits in one page" {
     // 计算一页能装多少 u32 条目（4 字节 count + 剩余放条目）
     const max_entries = (f2.PAGE_SIZE - f2.PAGE_HEADER_SIZE - 4 - 4) / 4;
     try std.testing.expectEqual(@as(usize, 1016), max_entries);
@@ -376,7 +376,7 @@ test "format2: freelist page max entries fits in one page" {
     try std.testing.expectEqual(@as(u32, 1000 + max_entries - 1), got[got.len - 1]);
 }
 
-test "format2: readMetaPageSingle on junk page returns null" {
+test "format: readMetaPageSingle on junk page returns null" {
     var page: [f2.PAGE_SIZE]u8 = undefined;
     @memset(&page, 0xff);
     f2.setPageChecksum(&page, f2.computePageChecksum(&page));
@@ -384,7 +384,7 @@ test "format2: readMetaPageSingle on junk page returns null" {
     try std.testing.expect(got == null);
 }
 
-test "format2: computePageChecksum is deterministic" {
+test "format: computePageChecksum is deterministic" {
     var page: [f2.PAGE_SIZE]u8 = undefined;
     @memset(&page, 0x42);
     const cs1 = f2.computePageChecksum(&page);

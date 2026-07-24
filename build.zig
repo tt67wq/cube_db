@@ -43,7 +43,7 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
-    // Benchmark 可执行 + step（zig build bench -Doptimize=ReleaseFast）
+    // ponytail: bench step — v2 bench
     const bench_opts = b.addOptions();
     bench_opts.addOption([]const u8, "scale_filter", bench_scale);
     const bench_exe = b.addExecutable(.{
@@ -111,10 +111,10 @@ pub fn build(b: *std.Build) void {
     }
 
     // ponytail: per-test steps for faster iteration
-    // zig build test-format2 只跑 format2 测试
-    const format2_test = b.addTest(.{
+    // zig build test-format 只跑 format 测试
+    const format_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/format2_test.zig"),
+            .root_source_file = b.path("tests/format_test.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -123,9 +123,9 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    const run_format2_test = b.addRunArtifact(format2_test);
-    const format2_test_step = b.step("test-format2", "Run format2 tests only");
-    format2_test_step.dependOn(&run_format2_test.step);
+    const run_format_test = b.addRunArtifact(format_test);
+    const format_test_step = b.step("test-format", "Run format tests only");
+    format_test_step.dependOn(&run_format_test.step);
 
     // ponytail: zig build test-ps 只跑 page_store 测试
     const ps_test = b.addTest(.{
@@ -143,10 +143,10 @@ pub fn build(b: *std.Build) void {
     const ps_test_step = b.step("test-ps", "Run page_store tests only");
     ps_test_step.dependOn(&run_ps_test.step);
 
-    // ponytail: zig build test-btree2 只跑 btree2 测试
-    const btree2_test = b.addTest(.{
+    // ponytail: zig build test-btree 只跑 btree 测试
+    const btree_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/btree2_test.zig"),
+            .root_source_file = b.path("tests/btree_test.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -155,14 +155,14 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    const run_btree2_test = b.addRunArtifact(btree2_test);
-    const btree2_test_step = b.step("test-btree2", "Run btree2 tests only");
-    btree2_test_step.dependOn(&run_btree2_test.step);
+    const run_btree_test = b.addRunArtifact(btree_test);
+    const btree_test_step = b.step("test-btree", "Run btree tests only");
+    btree_test_step.dependOn(&run_btree_test.step);
 
-    // ponytail: zig build test-writer2 只跑 writer2 测试
-    const writer2_test = b.addTest(.{
+    // ponytail: zig build test-writer 只跑 writer 测试
+    const writer_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/writer2_test.zig"),
+            .root_source_file = b.path("tests/writer_test.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -171,9 +171,9 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    const run_writer2_test = b.addRunArtifact(writer2_test);
-    const writer2_test_step = b.step("test-writer2", "Run writer2 tests only");
-    writer2_test_step.dependOn(&run_writer2_test.step);
+    const run_writer_test = b.addRunArtifact(writer_test);
+    const writer_test_step = b.step("test-writer", "Run writer tests only");
+    writer_test_step.dependOn(&run_writer_test.step);
 
     // ponytail: zig build test-mvcc 只跑 MVCC 测试
     const mvcc_test = b.addTest(.{
@@ -191,10 +191,10 @@ pub fn build(b: *std.Build) void {
     const mvcc_test_step = b.step("test-mvcc", "Run MVCC reader tests only");
     mvcc_test_step.dependOn(&run_mvcc_test.step);
 
-    // ponytail: zig build test-db2 只跑 db2 测试
-    const db2_test = b.addTest(.{
+    // ponytail: zig build test-db 只跑 db 测试
+    const db_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/db2_test.zig"),
+            .root_source_file = b.path("tests/db_test.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -203,14 +203,14 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    const run_db2_test = b.addRunArtifact(db2_test);
-    const db2_test_step = b.step("test-db2", "Run db2 tests only");
-    db2_test_step.dependOn(&run_db2_test.step);
+    const run_db_test = b.addRunArtifact(db_test);
+    const db_test_step = b.step("test-db", "Run db tests only");
+    db_test_step.dependOn(&run_db_test.step);
 
-    // ponytail: zig build test-compact2 只跑 compact2 测试
-    const compact2_test = b.addTest(.{
+    // ponytail: zig build test-compact 只跑 compact 测试
+    const compact_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/compact2_test.zig"),
+            .root_source_file = b.path("tests/compact_test.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -219,26 +219,9 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    const run_compact2_test = b.addRunArtifact(compact2_test);
-    const compact2_test_step = b.step("test-compact2", "Run compact2 tests only");
-    compact2_test_step.dependOn(&run_compact2_test.step);
-
-    // ponytail: zig build bench-compare — 快速 v1 vs v2 对比
-    const bench_compare = b.addExecutable(.{
-        .name = "cube_bench_compare",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("bench/bench_compare.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "cube_db", .module = mod },
-                .{ .name = "zio", .module = zio_mod },
-            },
-        }),
-    });
-    const run_bench_compare = b.addRunArtifact(bench_compare);
-    const bench_compare_step = b.step("bench-compare", "Run v1 vs v2 quick benchmark");
-    bench_compare_step.dependOn(&run_bench_compare.step);
+    const run_compact_test = b.addRunArtifact(compact_test);
+    const compact_test_step = b.step("test-compact", "Run compact tests only");
+    compact_test_step.dependOn(&run_compact_test.step);
 
     // ponytail: zig build test-overflow 只跑 overflow 测试
     const overflow_test = b.addTest(.{

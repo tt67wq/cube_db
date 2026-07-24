@@ -1,7 +1,7 @@
 //! page_store.zig — 页 Store 接口（vtable）及内存实现（MemPageStore）。
 //! 生产级 FilePageStore（mmap）后续实现；MemPageStore 用于测试。
 const std = @import("std");
-const f2 = @import("format2.zig");
+const f2 = @import("format.zig");
 
 /// 数据页起始页号（0=NULL，1=meta0，2=meta1）
 pub const FIRST_DATA_PAGE: u32 = 3;
