@@ -86,6 +86,18 @@ cube_db/
     └── bench.zig          # 基准矩阵
 ```
 
+## 教程章节
+
+教程共 5 章，按概念递进，层叠深入。每章先讲设计原理，再贴核心源码逐段讲解，结尾附可运行示例。
+
+| 章节 | 内容 | 源码 |
+|------|------|------|
+| [01 — 页格式](01-page-format.md) | 固定 4KB 页、页头、meta/freelist 页、CRC | `format.zig`、`page_store.zig` |
+| [02 — B-tree](02-btree.md) | 页号寻址 COW B-tree、leaf/branch、点查/范围/插入 | `btree.zig` |
+| [03 — COW 写入](03-cow-write.md) | applyBatch、COW 新页、双 meta 交替、O(1) compact | `writer.zig` |
+| [04 — MVCC 读者安全](04-mvcc.md) | 读者代次、脏页延迟回收、并发读写 | `writer.zig`、`db.zig` |
+| [05 — 溢出页](05-overflow.md) | 大 value 溢出页链、写/读/回收 | `btree.zig` |
+
 ## 读完本教程你能学到什么？
 
 - 一个真实嵌入式 KV 引擎的完整数据流。
@@ -94,4 +106,4 @@ cube_db/
 - MVCC reader 安全回收机制。
 - 怎么用 Zig 写模块化、可测试的系统代码。
 
-好，开始。运行 `zig build test` 确保一切正常。
+好，开始。从 [第 01 章：页格式](01-page-format.md) 出发，运行 `zig build test` 确保一切正常。

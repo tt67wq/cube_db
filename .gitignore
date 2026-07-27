@@ -1,3 +1,4 @@
 .pi-subagents
 *.db
 *.db.compact
+.cache_zig
