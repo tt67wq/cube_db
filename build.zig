@@ -238,4 +238,22 @@ pub fn build(b: *std.Build) void {
     const run_overflow_test = b.addRunArtifact(overflow_test);
     const overflow_test_step = b.step("test-overflow", "Run overflow tests only");
     overflow_test_step.dependOn(&run_overflow_test.step);
+
+    // ponytail: bench_lsm — LSM vs COW latency comparison
+    const bench_lsm_exe = b.addExecutable(.{
+        .name = "bench_lsm",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/bench_lsm.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    b.installArtifact(bench_lsm_exe);
+    const bench_lsm_step = b.step("bench-lsm", "Run LSM vs COW benchmark");
+    const bench_lsm_cmd = b.addRunArtifact(bench_lsm_exe);
+    bench_lsm_step.dependOn(&bench_lsm_cmd.step);
 }

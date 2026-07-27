@@ -157,3 +157,32 @@ test "T05 大 value 溢出页链" {
     try std.testing.expectEqual(@as(u8, 0xAB), v.?[0]);
     try std.testing.expectEqual(@as(u8, 0xAB), v.?[4999]);
 }
+
+// ---- 第 06 章：LSM 层 ----
+test "T06 Memtable 基本操作" {
+    const allocator = std.testing.allocator;
+    var mt = cube.memtable.Memtable.init(allocator, 1024);
+    defer mt.deinit();
+
+    _ = try mt.put("hello", "world");
+    try std.testing.expectEqualStrings("world", mt.get("hello").?);
+
+    _ = try mt.put("hello", "new");
+    try std.testing.expectEqualStrings("new", mt.get("hello").?);
+
+    _ = try mt.delete("hello");
+    try std.testing.expectEqual(@as(?[]const u8, null), mt.get("hello"));
+}
+
+test "T06 Memtable 阈值" {
+    var mt = cube.memtable.Memtable.init(std.testing.allocator, 100);
+    defer mt.deinit();
+
+    try std.testing.expect(!mt.shouldFlush()); // 7+60=67 < 100
+    var big: [60]u8 = undefined;
+    @memset(&big, 'x');
+    _ = try mt.put("another", &big);
+    try std.testing.expect(!mt.shouldFlush()); // 67 < 100, still not enough
+    _ = try mt.put(&big, "hello");
+    try std.testing.expect(mt.shouldFlush()); // 67+60+5=132 >= 100 ✓
+}

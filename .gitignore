@@ -2,3 +2,4 @@
 *.db
 *.db.compact
 .cache_zig
+.xdg-cache/zig/
