@@ -45,7 +45,7 @@ graph TB
     end
 
     subgraph 共享基础设施 (黑盒，按需钻)
-        State["State<br/>(writer.zia)<br/>applyBatch / compact"]
+        State["State<br/>(writer.zig)<br/>applyBatch / compact"]
         Btree["B-tree<br/>(btree.zig)<br/>页面存储"]
         PageStore["PageStore<br/>(page_store.zig)<br/>页面分配/读写"]
         Format["Format<br/>(format.zig)<br/>页面编码"]
