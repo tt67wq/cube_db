@@ -125,23 +125,19 @@ pub const Wal = struct {
         return pos;
     }
 
-    pub fn replay(self: *Wal) ![]Entry {
+    /// Parse entries from a raw byte buffer (without header).
+    /// This is the pure parsing function used by fuzz + replay.
+    /// Input: buf without the 12-byte header (magic+version).
+    /// Returns: owned slice of entries, caller must free each key/value + slice.
+    pub fn parseEntries(allocator: std.mem.Allocator, buf: []const u8) ![]Entry {
         var entries = std.ArrayList(Entry).empty;
         errdefer {
             for (entries.items) |e| {
-                self.allocator.free(e.key);
-                self.allocator.free(e.value);
+                allocator.free(e.key);
+                allocator.free(e.value);
             }
-            entries.deinit(self.allocator);
+            entries.deinit(allocator);
         }
-
-        const file_size = c.lseek(self.fd, 0, c.SEEK_END);
-        if (file_size <= 12) return entries.toOwnedSlice(self.allocator);
-
-        const payload_len: usize = @intCast(file_size - 12);
-        const buf = try self.allocator.alloc(u8, payload_len);
-        defer self.allocator.free(buf);
-        _ = c.pread(self.fd, buf.ptr, buf.len, 12);
 
         var offset: usize = 0;
         while (offset + 9 <= buf.len) {
@@ -166,10 +162,10 @@ pub const Wal = struct {
                 continue;
             }
 
-            const key = try self.allocator.dupe(u8, buf[offset + 9 .. offset + 9 + key_len]);
-            const value = try self.allocator.dupe(u8, buf[offset + 9 + key_len .. offset + 9 + key_len + val_len]);
+            const key = try allocator.dupe(u8, buf[offset + 9 .. offset + 9 + key_len]);
+            const value = try allocator.dupe(u8, buf[offset + 9 + key_len .. offset + 9 + key_len + val_len]);
 
-            try entries.append(self.allocator, Entry{
+            try entries.append(allocator, Entry{
                 .entry_type = @as(EntryType, @enumFromInt(type_byte & 0x01)),
                 .key = key,
                 .value = value,
@@ -178,7 +174,28 @@ pub const Wal = struct {
             offset += entry_size;
         }
 
-        return entries.toOwnedSlice(self.allocator);
+        return entries.toOwnedSlice(allocator);
+    }
+
+    pub fn replay(self: *Wal) ![]Entry {
+        var entries = std.ArrayList(Entry).empty;
+        errdefer {
+            for (entries.items) |e| {
+                self.allocator.free(e.key);
+                self.allocator.free(e.value);
+            }
+            entries.deinit(self.allocator);
+        }
+
+        const file_size = c.lseek(self.fd, 0, c.SEEK_END);
+        if (file_size <= 12) return entries.toOwnedSlice(self.allocator);
+
+        const payload_len: usize = @intCast(file_size - 12);
+        const buf = try self.allocator.alloc(u8, payload_len);
+        defer self.allocator.free(buf);
+        _ = c.pread(self.fd, buf.ptr, buf.len, 12);
+
+        return parseEntries(self.allocator, buf);
     }
 
     pub fn checkpoint(self: *Wal) !void {
