@@ -24,7 +24,9 @@ zig build test          # all tests
 zig build bench -Doptimize=ReleaseFast  # benchmark
 ```
 
-## Benchmark (v2 small, MemPageStore)
+## Benchmark
+
+### Legacy (COW B-tree, v2 `bench/bench.zig`, MemPageStore, no fsync)
 
 ```
 op      scale  value  ops          time_ms      ops/s        avg_us/op
@@ -39,10 +41,52 @@ select  small  100B           100         99.6         1004       995.78
 select  small  10KB           100        269.6          371      2695.88
 ```
 
-> `zig build bench -Dbench-scale=small -Doptimize=ReleaseFast` — in-memory (MemPageStore), no fsync.
-> v2 COW page allocation drives put/delete cost. putBatch amortizes COW ~9× vs single put.
-> get reads mmap-backed pages, sub-50µs for both 100B and 10KB values.
+> Legacy COW path: each `put` allocates + copies pages (COW). `putBatch` amortizes COW ~9×.
 
+### LSM mode (`bench/bench_lsm.zig`, MemPageStore, no fsync)
+
+LSM mode uses memtable + WAL + optional background compaction. Single put goes to
+memtable + WAL (no per-op COW).
+
+#### Before WAL optimization (4 separate `pwrite` syscalls per op)
+
+```
+op            stage              us/op     %
+put (total)                     29.1    100%
+├─ WAL append (4×pwrite)        24.8     85%
+├─ Memtable put (dupe+HashMap)   4.1     14%
+└─ fmtKey + shouldFlush          0.1     ~0%
+
+get (total)                      2.5    100%
+├─ dupe value return             1.7     68%
+├─ db.get() wrapper overhead     0.6     24%
+└─ HashMap lookup + fmtKey       0.1      4%
+```
+
+#### After WAL optimization (single `pwrite` — contiguous buffer assembly)
+
+```
+op            stage              us/op     %
+put (total)                      9.7    100%
+├─ WAL append (single pwrite)    6.4     66%
+├─ Memtable put (dupe+HashMap)   3.2     33%
+└─ fmtKey + shouldFlush          0.1     ~1%
+
+get (total)                      2.5    100%
+├─ dupe value return             1.7     68%
+├─ db.get() wrapper overhead     0.6     24%
+└─ HashMap lookup + fmtKey       0.1      4%
+```
+
+| Metric | COW (baseline) | LSM (before opt) | LSM (after opt) | Δ vs baseline |
+|--------|:-:|:-:|:-:|:-:|
+| Single put 100B | 449.85 us | 29.1 us | **9.7 us** | **46× faster** |
+| Random get 100B | 34.91 us | 2.5 us | **2.5 us** | **14× faster** |
+
+> `zig build bench-lsm -Doptimize=ReleaseFast` — profiling bench with per-stage decomposition.
+> WAL optimization: 4 separate `pwrite` syscalls (hdr/key/value/crc) merged into 1,
+> using stack buffer for small entries (zero alloc) and heap for large.
+> Tested on Apple M1 Pro, 1000 ops, warmup 100.
 ## Quick start
 
 ```zig

@@ -98,24 +98,28 @@ pub const Wal = struct {
     pub fn append(self: *Wal, entry_type: EntryType, key: []const u8, value: []const u8) !u64 {
         const pos = self.append_pos;
 
-        var hdr: [9]u8 = undefined;
-        hdr[0] = @intFromEnum(entry_type);
-        std.mem.writeInt(u32, hdr[1..][0..4], @as(u32, @intCast(key.len)), .little);
-        std.mem.writeInt(u32, hdr[5..][0..4], @as(u32, @intCast(value.len)), .little);
+        // Assemble entry into contiguous buffer: hdr(9) | key | value | crc(4)
+        // Single pwrite instead of 4 syscalls. Format bytes identical.
+        const total: usize = 9 + key.len + value.len + 4;
+        var stack_buf: [4096]u8 = undefined;
+        const heap_buf = if (total > stack_buf.len) try self.allocator.alloc(u8, total) else null;
+        defer if (heap_buf) |hb| self.allocator.free(hb);
+        const buf: []u8 = if (heap_buf) |hb| hb else stack_buf[0..total];
 
+        // hdr
+        buf[0] = @intFromEnum(entry_type);
+        std.mem.writeInt(u32, buf[1..][0..4], @as(u32, @intCast(key.len)), .little);
+        std.mem.writeInt(u32, buf[5..][0..4], @as(u32, @intCast(value.len)), .little);
+        // key + value
+        @memcpy(buf[9 .. 9 + key.len], key);
+        @memcpy(buf[9 + key.len .. 9 + key.len + value.len], value);
+        // crc (over hdr+key+value = buf[0..total-4])
         var crc = std.hash.Crc32.init();
-        crc.update(hdr[0..9]);
-        crc.update(key);
-        crc.update(value);
+        crc.update(buf[0 .. total - 4]);
         const crc_val = crc.final();
+        std.mem.writeInt(u32, buf[total - 4 ..][0..4], @as(u32, crc_val), .little);
 
-        var crc_buf: [4]u8 = undefined;
-        std.mem.writeInt(u32, &crc_buf, @as(u32, crc_val), .little);
-
-        _ = c.pwrite(self.fd, &hdr, 9, tot(pos));
-        _ = c.pwrite(self.fd, key.ptr, key.len, tot(pos + 9));
-        _ = c.pwrite(self.fd, value.ptr, value.len, tot(pos + 9 + key.len));
-        _ = c.pwrite(self.fd, &crc_buf, 4, tot(pos + 9 + key.len + value.len));
+        _ = c.pwrite(self.fd, buf.ptr, total, tot(pos));
 
         self.append_pos = pos + 9 + key.len + value.len + 4;
         return pos;

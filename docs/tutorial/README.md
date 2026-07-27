@@ -21,7 +21,7 @@
 | 特性 | 说明 |
 |---|---|
 | 文件格式 | 固定 4KB 页 + 页头（page type, gen, nkeys, free_next） |
-| B-tree | 页号寻址（u32）COW B-tree |
+| B-tree | 页号寻址（u32）COW B-tree，LSM compactor 刷盘目标 |
 | Memtable | 内存写入缓冲区，HashMap O(1) put/get，阈值触发 flush |
 | WAL | 预写日志，CRC32 校验，crash replay 恢复 |
 | Compactor | 后台线程刷 memtable → B-tree，RwLock 并发安全 |
