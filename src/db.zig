@@ -23,6 +23,10 @@ pub const Db = struct {
     store_owned: bool,
     write_mutex: Mutex,
 
+    /// Micro-batching: staged entries pending commit
+    batch_threshold: usize,
+    pending: std.ArrayList(Entry),
+
     pub fn open(allocator: std.mem.Allocator, store: PageStore, opts: wrt.Options) !*Db {
         const state = try allocator.create(State);
         state.* = State.init(allocator, store, opts);
@@ -42,11 +46,21 @@ pub const Db = struct {
             .store = store,
             .store_owned = false,
             .write_mutex = .{},
+            .batch_threshold = opts.micro_batch.batch_threshold,
+            .pending = .empty,
         };
         return db;
     }
 
     pub fn close(self: *Db) void {
+        // Auto-flush any pending entries before closing
+        self.flush() catch {};
+        // If flush failed, still free pending to avoid leak
+        for (self.pending.items) |e| {
+            self.allocator.free(e.key);
+            if (!e.tombstone) self.allocator.free(e.value);
+        }
+        self.pending.deinit(self.allocator);
         _ = self.state.deinit();
         self.allocator.destroy(self.state);
         self.allocator.destroy(self);
@@ -62,26 +76,67 @@ pub const Db = struct {
 
     // ---- 隐式 txn 便捷 API（包隐式 WriteTxn） ----
 
+    /// Put with optional micro-batching: if batch_threshold > 0, stages the entry;
+    /// auto-flushes when threshold reached. Use flush() to force commit.
+    /// Use putDirect() to bypass micro-batching entirely.
     pub fn put(self: *Db, key: []const u8, value: []const u8) !void {
+        if (self.batch_threshold == 0) return self.putDirect(key, value);
+        // Copy key and value — caller's slices may not live until flush
+        const k = try self.allocator.dupe(u8, key);
+        const v = try self.allocator.dupe(u8, value);
+        try self.pending.append(self.allocator, .{ .key = k, .value = v, .tombstone = false });
+        if (self.pending.items.len >= self.batch_threshold) {
+            try self.flush();
+        }
+    }
+
+    /// Delete with optional micro-batching (same logic as put).
+    pub fn delete(self: *Db, key: []const u8) !void {
+        if (self.batch_threshold == 0) return self.deleteDirect(key);
+        const k = try self.allocator.dupe(u8, key);
+        try self.pending.append(self.allocator, .{ .key = k, .value = "", .tombstone = true });
+        if (self.pending.items.len >= self.batch_threshold) {
+            try self.flush();
+        }
+    }
+
+    /// Direct put — bypasses micro-batching, commits immediately.
+    pub fn putDirect(self: *Db, key: []const u8, value: []const u8) !void {
         var txn = try self.beginWriteTxn();
         defer txn.deinit();
         try txn.put(key, value);
         try txn.commit();
     }
 
+    /// Direct delete — bypasses micro-batching, commits immediately.
+    pub fn deleteDirect(self: *Db, key: []const u8) !void {
+        var txn = try self.beginWriteTxn();
+        defer txn.deinit();
+        try txn.delete(key);
+        try txn.commit();
+    }
+
+    /// Flush pending staged entries via a single batch commit.
+    /// No-op if nothing pending. Frees copied key/value strings after commit.
+    pub fn flush(self: *Db) !void {
+        if (self.pending.items.len == 0) return;
+        defer {
+            for (self.pending.items) |e| {
+                self.allocator.free(e.key);
+                if (!e.tombstone) self.allocator.free(e.value);
+            }
+            self.pending.clearRetainingCapacity();
+        }
+        try self.putBatch(self.pending.items);
+    }
+
+    /// Batch put: commit all entries in one WriteTxn (bypasses micro-batching).
     pub fn putBatch(self: *Db, entries: []const Entry) !void {
         var txn = try self.beginWriteTxn();
         defer txn.deinit();
         for (entries) |e| {
             if (e.tombstone) try txn.delete(e.key) else try txn.put(e.key, e.value);
         }
-        try txn.commit();
-    }
-
-    pub fn delete(self: *Db, key: []const u8) !void {
-        var txn = try self.beginWriteTxn();
-        defer txn.deinit();
-        try txn.delete(key);
         try txn.commit();
     }
 

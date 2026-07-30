@@ -9,6 +9,14 @@ const PageStore = ps.PageStore;
 
 pub const Options = struct {
     fsync: bool = true,
+    micro_batch: MicroBatchConfig = .{},
+};
+
+/// Micro-batching config: stage puts/deletes and commit in batches
+/// to amortize COW + meta write + fsync overhead.
+pub const MicroBatchConfig = struct {
+    /// Max staged entries before auto-flush. 0 = disabled (direct commit).
+    batch_threshold: usize = 0,
 };
 
 pub const OpResult = anyerror!void;
