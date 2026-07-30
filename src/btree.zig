@@ -1164,6 +1164,416 @@ pub fn insert(
     };
 }
 
+// ===== 批量插入（单 txn 内共享 COW 路径）=====
+
+/// 批量插入多条 entry，沿 B-tree 路径一次遍历。
+/// 同一 leaf 范围内的 entry 只复制一次页，避免逐条 COW。
+/// entries 必须按 key 排序（升序），同 key 取最后一条。
+pub fn insertBatch(
+    allocator: std.mem.Allocator,
+    store: PageStore,
+    root: u32,
+    entries: []const LeafEntry,
+    dirty: *std.ArrayList(u32),
+) !WriteResult {
+    if (entries.len == 0) {
+        return .{ .new_root = root, .live_delta = 0, .count_delta = 0 };
+    }
+
+    if (root == NULL_ROOT) {
+        // Fresh tree: build first leaf from all entries (may split)
+        return insertBatchFresh(allocator, store, entries, dirty);
+    }
+
+    // Read root to determine type
+    const payload = try readNodePayloadFast(store, root);
+    const is_leaf = payload[0] == LEAF_KIND;
+
+    const sub = if (is_leaf)
+        try insertBatchIntoLeaf(store, allocator, root, entries, dirty)
+    else
+        try insertBatchIntoBranch(store, allocator, root, entries, dirty);
+
+    if (sub.split_key) |sk| {
+        // Root split: create new root branch
+        var keys: [1][]const u8 = .{sk};
+        var children: [2]u32 = .{ sub.new_child, sub.split_right };
+        const new_page = try store.allocPage();
+        const pl = branchPayloadSize(&keys, &children);
+        var buf: [f2.PAGE_SIZE]u8 = undefined;
+        _ = encodeBranchPayload(buf[0..pl], &keys, &children);
+        try writeNodePage(store, new_page, f2.PAGE_TYPE_BRANCH, 2, buf[0..pl]);
+        return .{
+            .new_root = new_page,
+            .live_delta = sub.live_delta,
+            .count_delta = sub.count_delta,
+        };
+    }
+    return .{
+        .new_root = sub.new_child,
+        .live_delta = sub.live_delta,
+        .count_delta = sub.count_delta,
+    };
+}
+
+/// Fresh tree: first insert, build leaf(s) from sorted entries
+fn insertBatchFresh(
+    allocator: std.mem.Allocator,
+    store: PageStore,
+    entries: []const LeafEntry,
+    dirty: *std.ArrayList(u32),
+) !WriteResult {
+    if (entries.len <= LEAF_MAX_ENTRIES) {
+        // Fits in one leaf
+        const new_page = try store.allocPage();
+        const pl = leafPayloadSize(entries);
+        var buf: [f2.PAGE_SIZE]u8 = undefined;
+        _ = try encodeLeafPayload(buf[0..pl], entries, store, dirty);
+        try writeNodePage(store, new_page, f2.PAGE_TYPE_LEAF, @intCast(entries.len), buf[0..pl]);
+        var live: i64 = 0;
+        var count: i64 = 0;
+        for (entries) |e| {
+            live += @intCast(e.key.len + (if (e.tombstone) @as(usize, 0) else e.value.len) + 9);
+            if (!e.tombstone) count += 1;
+        }
+        return .{ .new_root = new_page, .live_delta = live, .count_delta = count };
+    }
+    // Need to split — build multiple leaves
+    return insertBatchSplitLeaves(allocator, store, entries, dirty);
+}
+
+/// Split sorted entries into multiple leaves, build branch tree
+fn insertBatchSplitLeaves(
+    allocator: std.mem.Allocator,
+    store: PageStore,
+    entries: []const LeafEntry,
+    dirty: *std.ArrayList(u32),
+) !WriteResult {
+    // Build leaves of LEAF_MAX_ENTRIES each
+    var leaf_pages = std.ArrayList(u32).empty;
+    defer leaf_pages.deinit(allocator);
+    var split_keys = std.ArrayList([]const u8).empty;
+    defer split_keys.deinit(allocator);
+    var live: i64 = 0;
+    var count: i64 = 0;
+
+    var pos: usize = 0;
+    while (pos < entries.len) {
+        const chunk_len = @min(LEAF_MAX_ENTRIES, entries.len - pos);
+        const chunk = entries[pos .. pos + chunk_len];
+        const page = try store.allocPage();
+        const pl = leafPayloadSize(chunk);
+        var buf: [f2.PAGE_SIZE]u8 = undefined;
+        _ = try encodeLeafPayload(buf[0..pl], chunk, store, dirty);
+        try writeNodePage(store, page, f2.PAGE_TYPE_LEAF, @intCast(chunk_len), buf[0..pl]);
+        try leaf_pages.append(allocator, page);
+        if (pos + chunk_len < entries.len) {
+            try split_keys.append(allocator, entries[pos + chunk_len].key);
+        }
+        for (chunk) |e| {
+            live += @intCast(e.key.len + (if (e.tombstone) @as(usize, 0) else e.value.len) + 9);
+            if (!e.tombstone) count += 1;
+        }
+        pos += chunk_len;
+    }
+
+    // Build branch tree from leaf pages
+    // Simple case: if only 2 leaves, single branch
+    if (leaf_pages.items.len <= BRANCH_MAX_CHILDREN) {
+        const new_root = try store.allocPage();
+        const pl = branchPayloadSize(split_keys.items, leaf_pages.items);
+        var buf: [f2.PAGE_SIZE]u8 = undefined;
+        _ = encodeBranchPayload(buf[0..pl], split_keys.items, leaf_pages.items);
+        try writeNodePage(store, new_root, f2.PAGE_TYPE_BRANCH, @intCast(leaf_pages.items.len), buf[0..pl]);
+        return .{ .new_root = new_root, .live_delta = live, .count_delta = count };
+    }
+    // Multiple branches needed — build multi-level tree
+    // For now, build one level at a time
+    var current_pages = leaf_pages.items;
+    var current_keys = split_keys.items;
+    while (current_pages.len > BRANCH_MAX_CHILDREN) {
+        var new_pages = std.ArrayList(u32).empty;
+        defer new_pages.deinit(allocator);
+        var new_keys = std.ArrayList([]const u8).empty;
+        defer new_keys.deinit(allocator);
+        var i: usize = 0;
+        while (i < current_pages.len) {
+            const chunk_len = @min(BRANCH_MAX_CHILDREN, current_pages.len - i);
+            const children = current_pages[i .. i + chunk_len];
+            const keys = if (i + chunk_len < current_pages.len) current_keys[i .. i + chunk_len - 1] else current_keys[i .. i + chunk_len - 1];
+            const page = try store.allocPage();
+            const pl = branchPayloadSize(keys, children);
+            var buf: [f2.PAGE_SIZE]u8 = undefined;
+            _ = encodeBranchPayload(buf[0..pl], keys, children);
+            try writeNodePage(store, page, f2.PAGE_TYPE_BRANCH, @intCast(children.len), buf[0..pl]);
+            try new_pages.append(allocator, page);
+            if (i + chunk_len < current_pages.len) {
+                try new_keys.append(allocator, current_keys[i + chunk_len - 1]);
+            }
+            i += chunk_len;
+        }
+        current_pages = new_pages.items;
+        current_keys = new_keys.items;
+    }
+    // Final root branch
+    const new_root = try store.allocPage();
+    const pl = branchPayloadSize(current_keys, current_pages);
+    var buf: [f2.PAGE_SIZE]u8 = undefined;
+    _ = encodeBranchPayload(buf[0..pl], current_keys, current_pages);
+    try writeNodePage(store, new_root, f2.PAGE_TYPE_BRANCH, @intCast(current_pages.len), buf[0..pl]);
+    return .{ .new_root = new_root, .live_delta = live, .count_delta = count };
+}
+
+/// Find the range of entries that belong to a given leaf (by scanning branch keys)
+fn entriesForChild(entries: []const LeafEntry, branch_keys: [][]u8, ci: usize) []const LeafEntry {
+    // entries[lo..hi] belong to child ci
+    // lo: first entry where key >= (ci == 0 ? -inf : branch_keys[ci-1] + 1)
+    // hi: first entry where key >= branch_keys[ci] (or end)
+    // Simplified: find entries whose key falls in child ci's range
+    var lo: usize = 0;
+    if (ci > 0) {
+        // Binary search for first entry > branch_keys[ci-1]
+        // (child ci holds keys > branch_keys[ci-1])
+        var l: usize = 0;
+        var h: usize = entries.len;
+        while (l < h) {
+            const mid = l + (h - l) / 2;
+            if (cmpKey(entries[mid].key, branch_keys[ci - 1]) != .gt) {
+                l = mid + 1;
+            } else {
+                h = mid;
+            }
+        }
+        lo = l;
+    }
+    var hi: usize = entries.len;
+    if (ci < branch_keys.len) {
+        // Find first entry >= branch_keys[ci]
+        // (entries >= branch_keys[ci] belong to child ci+1)
+        var l: usize = lo;
+        var h: usize = entries.len;
+        while (l < h) {
+            const mid = l + (h - l) / 2;
+            switch (cmpKey(entries[mid].key, branch_keys[ci])) {
+                .lt => l = mid + 1,
+                .eq, .gt => h = mid,
+            }
+        }
+        hi = l;
+    }
+    return entries[lo..hi];
+}
+
+/// Batch insert into leaf node
+fn insertBatchIntoLeaf(
+    store: PageStore,
+    allocator: std.mem.Allocator,
+    page_no: u32,
+    entries: []const LeafEntry,
+    dirty: *std.ArrayList(u32),
+) !InsertSub {
+    // Decode existing leaf
+    const old_page = try store.readPage(page_no);
+    var old_page_buf: [f2.PAGE_SIZE]u8 = undefined;
+    @memcpy(&old_page_buf, old_page[0..f2.PAGE_SIZE]);
+    const old_payload = old_page_buf[f2.PAGE_HEADER_SIZE .. f2.PAGE_SIZE - 4];
+
+    var leaf = try Leaf.fromPayload(allocator, store, old_payload, dirty);
+    defer leaf.deinit();
+
+    var live_delta: i64 = 0;
+    var count_delta: i64 = 0;
+
+    // Apply all entries to the leaf (entries are sorted)
+    for (entries) |e| {
+        const pos = leaf.findPos(e.key);
+        if (pos < leaf.entries.len and cmpKey(leaf.entries[pos].key, e.key) == .eq) {
+            // Overwrite
+            const old = leaf.entries[pos];
+            live_delta -= @as(i64, @intCast(old.key.len + old.value.len + 9));
+            allocator.free(old.key);
+            allocator.free(old.value);
+            if (!old.tombstone and e.tombstone) count_delta -= 1;
+            if (old.tombstone and !e.tombstone) count_delta += 1;
+            leaf.entries[pos] = .{
+                .tombstone = e.tombstone,
+                .key = try allocator.dupe(u8, e.key),
+                .value = if (e.tombstone) try allocator.dupe(u8, "") else try allocator.dupe(u8, e.value),
+            };
+            live_delta += @as(i64, @intCast(e.key.len + (if (e.tombstone) @as(usize, 0) else e.value.len) + 9));
+        } else {
+            // Insert
+            const new_entries = try allocator.alloc(LeafEntry, leaf.entries.len + 1);
+            @memcpy(new_entries[0..pos], leaf.entries[0..pos]);
+            new_entries[pos] = .{
+                .tombstone = e.tombstone,
+                .key = try allocator.dupe(u8, e.key),
+                .value = if (e.tombstone) try allocator.dupe(u8, "") else try allocator.dupe(u8, e.value),
+            };
+            @memcpy(new_entries[pos + 1 ..], leaf.entries[pos..]);
+            allocator.free(leaf.entries);
+            leaf.entries = new_entries;
+            live_delta += @as(i64, @intCast(e.key.len + (if (e.tombstone) @as(usize, 0) else e.value.len) + 9));
+            if (!e.tombstone) count_delta += 1;
+        }
+    }
+
+    // Mark old page as dirty
+    dirty.append(allocator, page_no) catch {};
+
+    // Split check
+    if (leaf.entries.len <= LEAF_MAX_ENTRIES) {
+        const new_page = try store.allocPage();
+        const pl = leafPayloadSize(leaf.entries);
+        var buf: [f2.PAGE_SIZE]u8 = undefined;
+        _ = try encodeLeafPayload(buf[0..pl], leaf.entries, store, dirty);
+        try writeNodePage(store, new_page, f2.PAGE_TYPE_LEAF, @intCast(leaf.entries.len), buf[0..pl]);
+        return .{ .new_child = new_page, .live_delta = live_delta, .count_delta = count_delta };
+    }
+    // Split
+    const mid = leaf.entries.len / 2;
+    const right_entries = leaf.entries[mid..];
+    const left_entries = leaf.entries[0..mid];
+    const left_page = try store.allocPage();
+    const left_pl = leafPayloadSize(left_entries);
+    var left_buf: [f2.PAGE_SIZE]u8 = undefined;
+    _ = try encodeLeafPayload(left_buf[0..left_pl], left_entries, store, dirty);
+    try writeNodePage(store, left_page, f2.PAGE_TYPE_LEAF, @intCast(left_entries.len), left_buf[0..left_pl]);
+    const right_page = try store.allocPage();
+    const right_pl = leafPayloadSize(right_entries);
+    var right_buf: [f2.PAGE_SIZE]u8 = undefined;
+    _ = try encodeLeafPayload(right_buf[0..right_pl], right_entries, store, dirty);
+    try writeNodePage(store, right_page, f2.PAGE_TYPE_LEAF, @intCast(right_entries.len), right_buf[0..right_pl]);
+    const split_key = try allocator.dupe(u8, right_entries[0].key);
+    return .{ .new_child = left_page, .split_key = split_key, .split_right = right_page, .live_delta = live_delta, .count_delta = count_delta };
+}
+
+/// Batch insert into branch node
+fn insertBatchIntoBranch(
+    store: PageStore,
+    allocator: std.mem.Allocator,
+    page_no: u32,
+    entries: []const LeafEntry,
+    dirty: *std.ArrayList(u32),
+) !InsertSub {
+    const payload = try readNodePayload(store, page_no);
+    var branch = try Branch.fromPayload(allocator, payload);
+    defer branch.deinit();
+
+    var live_delta: i64 = 0;
+    var count_delta: i64 = 0;
+
+    // Mark old page as dirty
+    dirty.append(allocator, page_no) catch {};
+
+    // Process each child that has entries
+    var ci: usize = 0;
+    while (ci < branch.children.len and entries.len > 0) {
+        // Find entries for this child
+        var lo: usize = 0;
+        if (ci > 0) {
+            // entries > branch.keys[ci-1]
+            // Binary search for first entry > branch.keys[ci-1]
+            var l: usize = 0;
+            var h: usize = entries.len;
+            while (l < h) {
+                const mid = l + (h - l) / 2;
+                if (cmpKey(entries[mid].key, branch.keys[ci - 1]) != .gt) {
+                    l = mid + 1;
+                } else {
+                    h = mid;
+                }
+            }
+            lo = l;
+        }
+        var hi: usize = entries.len;
+        if (ci < branch.keys.len) {
+            // entries < branch.keys[ci]
+            var l: usize = lo;
+            var h: usize = entries.len;
+            while (l < h) {
+                const mid = l + (h - l) / 2;
+                switch (cmpKey(entries[mid].key, branch.keys[ci])) {
+                    .lt => l = mid + 1,
+                    .eq, .gt => h = mid,
+                }
+            }
+            hi = l;
+        }
+        if (lo < hi) {
+            const child_entries = entries[lo..hi];
+            const child_off = branch.children[ci];
+
+            // Check if child is leaf or branch
+            const child_payload = try readNodePayloadFast(store, child_off);
+            const child_is_leaf = child_payload[0] == LEAF_KIND;
+
+            const sub = if (child_is_leaf)
+                try insertBatchIntoLeaf(store, allocator, child_off, child_entries, dirty)
+            else
+                try insertBatchIntoBranch(store, allocator, child_off, child_entries, dirty);
+
+            live_delta += sub.live_delta;
+            count_delta += sub.count_delta;
+            branch.children[ci] = sub.new_child;
+
+            if (sub.split_key) |sk| {
+                // Child split: insert new key + child
+                const new_keys = try allocator.alloc([]u8, branch.keys.len + 1);
+                const new_children = try allocator.alloc(u32, branch.children.len + 1);
+                @memcpy(new_keys[0..ci], branch.keys[0..ci]);
+                new_keys[ci] = sk;
+                @memcpy(new_keys[ci + 1 ..], branch.keys[ci..]);
+                @memcpy(new_children[0 .. ci + 1], branch.children[0 .. ci + 1]);
+                new_children[ci + 1] = sub.split_right;
+                @memcpy(new_children[ci + 2 ..], branch.children[ci + 1 ..]);
+                allocator.free(branch.keys);
+                allocator.free(branch.children);
+                branch.keys = new_keys;
+                branch.children = new_children;
+            }
+        }
+        ci += 1;
+    }
+
+    // Check branch split
+    if (branch.children.len <= BRANCH_MAX_CHILDREN) {
+        const new_page = try store.allocPage();
+        const keys_slice = try allocator.alloc([]const u8, branch.keys.len);
+        defer allocator.free(keys_slice);
+        for (branch.keys, 0..) |k, i| keys_slice[i] = k;
+        const pl = branchPayloadSize(keys_slice, branch.children);
+        var buf: [f2.PAGE_SIZE]u8 = undefined;
+        _ = encodeBranchPayload(buf[0..pl], keys_slice, branch.children);
+        try writeNodePage(store, new_page, f2.PAGE_TYPE_BRANCH, @intCast(branch.children.len), buf[0..pl]);
+        return .{ .new_child = new_page, .live_delta = live_delta, .count_delta = count_delta };
+    }
+    // Split branch
+    const mid = branch.keys.len / 2;
+    const up_key = try allocator.dupe(u8, branch.keys[mid]);
+    const right_keys = branch.keys[mid + 1 ..];
+    const right_children = branch.children[mid + 1 ..];
+    const right_page = try store.allocPage();
+    const rkeys_slice = try allocator.alloc([]const u8, right_keys.len);
+    defer allocator.free(rkeys_slice);
+    for (right_keys, 0..) |k, i| rkeys_slice[i] = k;
+    var rbuf: [f2.PAGE_SIZE]u8 = undefined;
+    const rpl = branchPayloadSize(rkeys_slice, right_children);
+    _ = encodeBranchPayload(rbuf[0..rpl], rkeys_slice, right_children);
+    try writeNodePage(store, right_page, f2.PAGE_TYPE_BRANCH, @intCast(right_children.len), rbuf[0..rpl]);
+    const left_keys = branch.keys[0..mid];
+    const left_children = branch.children[0 .. mid + 1];
+    const left_page = try store.allocPage();
+    const lkeys_slice = try allocator.alloc([]const u8, left_keys.len);
+    defer allocator.free(lkeys_slice);
+    for (left_keys, 0..) |k, i| lkeys_slice[i] = k;
+    var lbuf: [f2.PAGE_SIZE]u8 = undefined;
+    const lpl = branchPayloadSize(lkeys_slice, left_children);
+    _ = encodeBranchPayload(lbuf[0..lpl], lkeys_slice, left_children);
+    try writeNodePage(store, left_page, f2.PAGE_TYPE_BRANCH, @intCast(left_children.len), lbuf[0..lpl]);
+    return .{ .new_child = left_page, .split_key = up_key, .split_right = right_page, .live_delta = live_delta, .count_delta = count_delta };
+}
+
 // ===== 范围迭代器 =====
 
 pub const Iterator = struct {

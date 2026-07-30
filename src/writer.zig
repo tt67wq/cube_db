@@ -176,15 +176,35 @@ pub const State = struct {
         var batch_byte_delta: i64 = 0;
         var new_root = cur_root;
 
-        for (batch) |req| {
-            const wr = btree.insert(arena_alloc, self.store, new_root, req.key, req.value, req.tombstone, &batch_dirty) catch |err| {
-                for (batch) |r| r.future.set(err);
-                return;
+        // Sort and dedup entries by key, then batch insert via shared COW path
+        if (batch.len > 1) {
+            const SortCtx = struct {
+                fn lt(_: void, a: Request, b: Request) bool {
+                    return btree.cmpKey(a.key, b.key) == .lt;
+                }
             };
-            new_root = wr.new_root;
-            batch_entry_delta += wr.count_delta;
-            batch_byte_delta += wr.live_delta;
+            std.mem.sort(Request, @constCast(batch), {}, SortCtx.lt);
         }
+        // Build LeafEntry array from sorted+deduped requests
+        const sorted = try arena_alloc.alloc(btree.LeafEntry, batch.len);
+        var n: usize = 0;
+        for (batch) |req| {
+            if (n > 0 and btree.cmpKey(sorted[n - 1].key, req.key) == .eq) {
+                sorted[n - 1] = .{ .tombstone = req.tombstone, .key = req.key, .value = if (req.tombstone) "" else req.value };
+            } else {
+                sorted[n] = .{ .tombstone = req.tombstone, .key = req.key, .value = if (req.tombstone) "" else req.value };
+                n += 1;
+            }
+        }
+        const entries = sorted[0..n];
+
+        const wr = btree.insertBatch(arena_alloc, self.store, new_root, entries, &batch_dirty) catch |err| {
+            for (batch) |r| r.future.set(err);
+            return;
+        };
+        new_root = wr.new_root;
+        batch_entry_delta += wr.count_delta;
+        batch_byte_delta += wr.live_delta;
 
         // 3. 本批脏页进 pending_free（不立即回收，MVCC 安全）
         for (batch_dirty.items) |pn| {
