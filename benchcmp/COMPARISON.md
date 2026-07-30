@@ -129,8 +129,34 @@ clang++ -O3 -std=c++17 benchcmp.cpp \
 | micro-batching | `dcf1ab3` | 119µs | 35µs | 自动 batch 提交 |
 | **CRC 跳过** | **`2d1b69b`** | — | **2.73µs** | **readNodePayloadFast** |
 
+### LMDB 实测对比（2026-07-30）
+
+**同架构基准首次实测**（COW B-tree + mmap, no fsync）
+
+| 操作 | cube_db | **LMDB** | 差距 |
+|------|---------|----------|------|
+| get 100B | **2.73µs** | **0.29µs** | **9.4×** |
+| get 10KB | 47µs | 0.28µs | 168× |
+| put 100B | 119µs | 3.15µs | 38× |
+| put 10KB | 357µs | 7.63µs | 47× |
+| putBatch 100B | 24.75µs | 0.23µs | 107× |
+| putBatch 10KB | 86.86µs | 3.64µs | 24× |
+| delete 100B | 109µs | 1.80µs | 61× |
+| delete 10KB | 114µs | 4.66µs | 24× |
+
+**分析：**
+- **读路径**：get 100B 差距 9.4× — CRC 跳过优化效果显著（已从 62× 缩小），但 LMDB 的 mmap 零拷贝直读仍然更快
+- **写路径**：put 100B 差距 38× — LMDB 的 COW 实现更轻量（无 freelist、无 arena 开销）
+- **批量写**：putBatch 100B 差距 107× — 最大差距，LMDB 单 transaction 内几乎零开销
+
+**LMDB 优势来源：**
+- 直接 mmap 指针操作，无 vtable 间接调用
+- 无 CRC 校验
+- 无 freelist 管理（append-only）
+- 无 MVCC reader_count 原子操作
+
 ### 差距分析
 
-1. **读路径** — ✅ **已大幅优化**。get 100B 2.73µs 接近 LMDB ~1µs。剩余差距来自 B-tree 遍历深度 + page 指针偏移计算。
-2. **写路径** — COW 架构固有开销（每次 put 完整 B-tree 路径复制），group-commit 已缩小差距但未消除。
-3. **LMDB 待实测** — 需要实际安装 LMDB 补测验证。
+1. **读路径** — ✅ **已大幅优化**。get 100B 2.73µs vs LMDB 0.29µs，差距 **9.4×**（已从 62× 缩小）。剩余差距来自 B-tree 遍历深度 + page 指针偏移计算。
+2. **写路径** — COW 架构固有开销（每次 put 完整 B-tree 路径复制），group-commit 已缩小差距但未消除。put 100B vs LMDB 差距 **38×**。
+3. **批量写** — 最大差距 **107×**（putBatch 100B）。LMDB 单 transaction 内几乎零开销，cube_db 仍有 COW 逐页复制成本。
