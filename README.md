@@ -76,6 +76,7 @@ full API, and recipes see **[docs/usage.md](docs/usage.md)**.
 
 | 文档 | 内容 |
 |------|------|
+| [`20260730_shared_cow.md`](bench/results/20260730_shared_cow.md) | Shared COW path — putBatch 100B **619× 提速，超越 LMDB** |
 | [`20260730_read_crc_skip.md`](bench/results/20260730_read_crc_skip.md) | 读路径 CRC 跳过 — get 100B 13× 提速 |
 | [`20260730_micro_batch.md`](bench/results/20260730_micro_batch.md) | micro-batching / group-commit — put 100B 4.0× 提速 |
 | [`20260730_zero_copy.md`](bench/results/20260730_zero_copy.md) | zero-copy get + bug fix 数据 |
@@ -87,7 +88,7 @@ full API, and recipes see **[docs/usage.md](docs/usage.md)**.
 
 ## Tests
 
-161 tests across 18 modules + 4 fuzz targets, all passing:
+177 tests across 19 modules + 4 fuzz targets, all passing:
 
 | Module | Tests | File |
 |--------|-------|------|
@@ -110,6 +111,8 @@ full API, and recipes see **[docs/usage.md](docs/usage.md)**.
 | COW fast path | 5 | `tests/cow_fast_test.zig` |
 | Crash recovery framework | 4 | `tests/crash_recovery_framework_test.zig` |
 | Group commit | 10 | `tests/group_commit_test.zig` |
+| Group commit ext | 11 | `tests/group_commit_ext_test.zig` |
+| **Shared COW** | **8** | `tests/shared_cow_test.zig` |
 
 ```bash
 zig build test test-fuzz        # all unit/integration + fuzz regression
