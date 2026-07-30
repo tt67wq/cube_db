@@ -11,6 +11,8 @@ pub const file_page_store = @import("file_page_store.zig");
 pub const Db = db.Db;
 pub const Entry = db.Entry;
 pub const Options = writer.Options;
+pub const WriteTxn = db.WriteTxn;
+pub const ReadTxn = db.ReadTxn;
 
 test {
     std.testing.refAllDecls(@This());

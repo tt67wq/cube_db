@@ -8,6 +8,7 @@ const btree = @import("btree.zig");
 const wrt = @import("writer.zig");
 const PageStore = ps.PageStore;
 const State = wrt.State;
+const Mutex = zio.Mutex;
 
 pub const Entry = struct {
     key: []const u8,
@@ -20,6 +21,7 @@ pub const Db = struct {
     state: *State,
     store: PageStore,
     store_owned: bool,
+    write_mutex: Mutex,
 
     pub fn open(allocator: std.mem.Allocator, store: PageStore, opts: wrt.Options) !*Db {
         const state = try allocator.create(State);
@@ -39,6 +41,7 @@ pub const Db = struct {
             .state = state,
             .store = store,
             .store_owned = false,
+            .write_mutex = .{},
         };
         return db;
     }
@@ -57,50 +60,36 @@ pub const Db = struct {
         return self.state.entry_count.load(.acquire);
     }
 
+    // ---- 隐式 txn 便捷 API（包隐式 WriteTxn） ----
+
     pub fn put(self: *Db, key: []const u8, value: []const u8) !void {
-        var future: zio.Future(wrt.OpResult) = .{};
-        try self.state.applyBatch(&.{.{
-            .key = key,
-            .value = value,
-            .tombstone = false,
-            .future = &future,
-        }});
-        _ = try future.wait();
+        var txn = try self.beginWriteTxn();
+        defer txn.deinit();
+        try txn.put(key, value);
+        try txn.commit();
     }
 
     pub fn putBatch(self: *Db, entries: []const Entry) !void {
-        const reqs = try self.allocator.alloc(wrt.Request, entries.len);
-        defer self.allocator.free(reqs);
-        var futures = try self.allocator.alloc(zio.Future(wrt.OpResult), entries.len);
-        defer self.allocator.free(futures);
-
-        for (entries, 0..) |e, i| {
-            futures[i] = .{};
-            reqs[i] = .{
-                .key = e.key,
-                .value = e.value,
-                .tombstone = e.tombstone,
-                .future = &futures[i],
-            };
+        var txn = try self.beginWriteTxn();
+        defer txn.deinit();
+        for (entries) |e| {
+            if (e.tombstone) try txn.delete(e.key) else try txn.put(e.key, e.value);
         }
-        try self.state.applyBatch(reqs);
-        for (futures) |*f| _ = try f.wait();
+        try txn.commit();
     }
+
+    pub fn delete(self: *Db, key: []const u8) !void {
+        var txn = try self.beginWriteTxn();
+        defer txn.deinit();
+        try txn.delete(key);
+        try txn.commit();
+    }
+
+    // ---- 读路径（默认快照 = 当前 root） ----
 
     pub fn get(self: *Db, key: []const u8) !?[]u8 {
         const root = self.state.getRoot();
         return try btree.get(self.allocator, self.store, root, key);
-    }
-
-    pub fn delete(self: *Db, key: []const u8) !void {
-        var future: zio.Future(wrt.OpResult) = .{};
-        try self.state.applyBatch(&.{.{
-            .key = key,
-            .value = "",
-            .tombstone = true,
-            .future = &future,
-        }});
-        _ = try future.wait();
     }
 
     pub fn select(self: *Db, min: ?[]const u8, max: ?[]const u8) !btree.Iterator {
@@ -116,6 +105,20 @@ pub const Db = struct {
         return self.state.dirtCount();
     }
 
+    // ---- 显式事务 API（LMDB 式） ----
+
+    /// 开写事务：单写者互斥。写暂存缓冲，commit 时 applyBatch+meta 切换+fsync。
+    pub fn beginWriteTxn(self: *Db) !WriteTxn {
+        self.write_mutex.lock() catch return error.LockFailed;
+        return .{ .db = self, .staged = .empty, .finished = false };
+    }
+
+    /// 开读事务：取当前 root 快照，不阻写者（MVCC）。结束须调 endReadTxn/ReadTxn.end。
+    pub fn beginReadTxn(self: *Db) !ReadTxn {
+        _ = self.state.beginRead();
+        return .{ .db = self, .snapshot_root = self.state.getRoot() };
+    }
+
     pub fn beginRead(self: *Db) u64 {
         return self.state.beginRead();
     }
@@ -125,6 +128,93 @@ pub const Db = struct {
     }
 };
 
+/// 写事务（LMDB 式）。单写者互斥；写暂存缓冲，commit 时原子 applyBatch + meta 切换 + fsync。
+/// abort 丢弃暂存，不应用。键/值为调用者拥有切片，事务存活期间须保持有效。
+pub const WriteTxn = struct {
+    db: *Db,
+    staged: std.ArrayList(Entry),
+    finished: bool,
+    staged_freed: bool = false,
+
+    pub fn put(self: *WriteTxn, key: []const u8, value: []const u8) !void {
+        if (self.finished) return error.TxnFinished;
+        try self.staged.append(self.db.allocator, .{ .key = key, .value = value, .tombstone = false });
+    }
+
+    pub fn delete(self: *WriteTxn, key: []const u8) !void {
+        if (self.finished) return error.TxnFinished;
+        try self.staged.append(self.db.allocator, .{ .key = key, .value = "", .tombstone = true });
+    }
+
+    /// 提交：applyBatch + meta 切换 + fsync。完成或出错后 finished=true，释放互斥。
+    pub fn commit(self: *WriteTxn) !void {
+        if (self.finished) return error.TxnFinished;
+        self.finished = true;
+        defer self.db.write_mutex.unlock();
+        defer {
+            self.staged_freed = true;
+            self.staged.deinit(self.db.allocator);
+        }
+        if (self.staged.items.len == 0) return;
+
+        const reqs = try self.db.allocator.alloc(wrt.Request, self.staged.items.len);
+        defer self.db.allocator.free(reqs);
+        var futures = try self.db.allocator.alloc(zio.Future(wrt.OpResult), self.staged.items.len);
+        defer self.db.allocator.free(futures);
+        for (self.staged.items, 0..) |e, i| {
+            futures[i] = .{};
+            reqs[i] = .{ .key = e.key, .value = e.value, .tombstone = e.tombstone, .future = &futures[i] };
+        }
+        try self.db.state.applyBatch(reqs);
+        for (futures) |*f| _ = try f.wait();
+    }
+
+    /// 中止：丢弃暂存，不应用。释放互斥。
+    pub fn abort(self: *WriteTxn) !void {
+        if (self.finished) return;
+        self.finished = true;
+        self.staged_freed = true;
+        self.staged.deinit(self.db.allocator);
+        self.db.write_mutex.unlock();
+    }
+
+    /// 析构：未 commit/abort 时调 abort（防止泄漏互斥）。
+    pub fn deinit(self: *WriteTxn) void {
+        if (!self.staged_freed) {
+            self.staged_freed = true;
+            self.staged.deinit(self.db.allocator);
+        }
+        if (!self.finished) {
+            self.finished = true;
+            self.db.write_mutex.unlock();
+        }
+    }
+};
+
+/// 读事务（LMDB 式）。持有快照 root（MVCC），不阻写者。结束须调 end（或 deinit）。
+pub const ReadTxn = struct {
+    db: *Db,
+    snapshot_root: u32,
+    ended: bool = false,
+
+    pub fn get(self: *ReadTxn, key: []const u8) !?[]u8 {
+        return try btree.get(self.db.allocator, self.db.store, self.snapshot_root, key);
+    }
+
+    pub fn select(self: *ReadTxn, min: ?[]const u8, max: ?[]const u8) !btree.Iterator {
+        return try btree.select(self.db.allocator, self.db.store, self.snapshot_root, min, max);
+    }
+
+    pub fn end(self: *ReadTxn) void {
+        if (self.ended) return;
+        self.ended = true;
+        self.db.state.endRead();
+    }
+
+    pub fn deinit(self: *ReadTxn) void {
+        self.end();
+    }
+};
 test "db: open default state" {
     var ms = ps.MemPageStore.init(std.testing.allocator, 1000);
     defer ms.deinit();
