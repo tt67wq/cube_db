@@ -37,3 +37,15 @@ test "fuzz probe — deterministic corpus replay from known inputs" {
     }
     _ = &probe_seen_count;
 }
+
+test "fuzz probe — long run stops at 50ms deadline" {
+    var ctx: usize = 0;
+    const seed = std.testing.random_seed;
+    const start_ns = std.Io.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .awake).nanoseconds;
+    const iters = try fuzz.fuzzLongRun(usize, &ctx, probeTestOne, 50, seed);
+    const elapsed_ns = std.Io.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .awake).nanoseconds - start_ns;
+    try std.testing.expect(iters > 0);
+    const elapsed_ms = @divTrunc(elapsed_ns, std.time.ns_per_ms);
+    try std.testing.expect(elapsed_ms < 500); // must not exceed 10x budget
+    try std.testing.expect(elapsed_ms >= 40);  // must not exit way early
+}

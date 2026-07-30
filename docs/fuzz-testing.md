@@ -30,7 +30,7 @@ zig build test && zig build test-fuzz
 
 ```
 tests/fuzz/
-├── common.zig              # 公共框架：fuzzLoop + replayCorpus
+├── common.zig              # 公共框架：fuzzLoop + fuzzLongRun + replayCorpus
 ├── probe_test.zig          # F1: 探针测试
 ├── wal_fuzz_test.zig       # F2: WAL 解析 fuzz
 ├── api_fuzz_test.zig       # F3: DB API 操作序列 fuzz
@@ -45,14 +45,6 @@ tests/fuzz/
 ## 发现 crash 后的操作
 
 ### 1. 保存 crash 输入到 corpus
-
-```bash
-# 先跑 smoke 找到一个 crash：
-zig test tests/fuzz/wal_fuzz_test.zig  --cache-dir .zig-cache \
-  --global-cache-dir .xdg-cache/zig \
-  -Mcube_db=src/root.zig -Mzio=../zio/src/zio.zig -lc
-# → 错误输出中会有 crash input
-```
 
 crash 输入作为 `.bin` 文件保存在 `tests/fuzz/corpus/<target>/`，下次 `replayCorpus` 会自动重放。
 
@@ -77,22 +69,44 @@ zig build test         # 全量单测不崩
 
 ## 本地长跑
 
-CI 只跑 100-1000 次迭代/smoke。本地可以调大迭代数跑更久：
+`fuzz.fuzzLongRun(ctx, target, max_time_ms, seed)` 按时间预算跑循环，不用改迭代数：
 
-```bash
-# 直接改测试文件的 max_iters 参数（如 1000 → 100000）
-# 然后跑
-zig test tests/fuzz/wal_fuzz_test.zig  --cache-dir .zig-cache \
-  --global-cache-dir .xdg-cache/zig \
-  -Mcube_db=src/root.zig -Mzio=../zio/src/zio.zig -lc
+```zig
+// 在测试文件里，替换 fuzz.fuzzLoop 为 fuzz.fuzzLongRun
+test "WAL long run" {
+    var ctx: usize = 0;
+    const seed = std.testing.random_seed;
+    _ = try fuzz.fuzzLongRun(usize, &ctx, walParseTestOne, 30_000, seed);
+}
 ```
 
-或直接用 `build.zig`：
+然后跑 `zig build test-fuzz`。30 秒后自动停，无 crash 无 leak 则 green。
 
-```bash
-zig build test-fuzz
-# 在测试文件里调大迭代数后重新跑
-```
+`fuzzLongRun` 使用 `.awake` 单调时钟，不受系统时间跳变影响，每 64 轮检查一次 deadline（~100ns 精度）。
+
+### 建 build option（可选）
+
+在 `build.zig` 的 fuzz 测试块里加 `-Dfuzz-long=<ms>` 参数控制，默认 0 跳过。
+每个目标读 option 后决定是否跑 long-run 测试。
+
+## 泄漏检测
+
+### 当前机制
+
+`std.testing.allocator` 在每个 test 结束后自动检测泄漏。如果 fuzz 目标有泄漏，
+test runner 会报告 `[DebugAllocator] (err): memory address 0x... leaked:` 并 exit 1。
+
+### 逐轮泄漏检测（未实现）
+
+`fuzzLongRun` 的逐轮泄漏检查因 `DebugAllocator.deinit()` 会在中途触发 `std.debug.log`，
+导致 test runner 的 `log_err_count > 0` 而 exit 1（即使 test 断言通过）。
+
+**workaround 方向**：
+- 用 `std.heap.GeneralPurposeAllocator(.{ .verbose_log = false })` 替代 `testing.allocator`
+- 每 N 轮检查 `gpa.detectLeaks()` 是否 > 0
+- 但需要改 fuzz 目标接口（传 allocator 而不是硬编码 `testing.allocator`）
+
+当前 end-of-test 泄漏检测已够用：慢泄漏会被累加，最后 `deinit` 会抓到。
 
 ## oracle 细则
 
@@ -104,7 +118,7 @@ zig build test-fuzz
 
 ### DB API oracle
 
-- api_fuzz_test 里的 `execOneOp` 对每次 get 执行一致性检查
+- `api_fuzz_test` 里的 `execOneOp` 对每次 get 执行一致性检查
 - `error.ModelMismatch` 说明 Db 和 `StringHashMap` 参考模型不一致——这是 bug
 - 覆盖 put/get/delete 三种操作
 
@@ -129,5 +143,8 @@ error: expected type '*const debug.StackTrace', found '*builtin.StackTrace'
 
 ### 无 coverage guidance
 
-当前 `fuzzLoop` 是纯随机扫描，不是 coverage-guided 的 AFL/libFuzzer 风格。发现新路径的效率较低，但作为 CI smoke 足够。要真正的 coverage-guided fuzz 需要 `-ffuzz` bug 修掉。
+当前 `fuzzLoop` 和 `fuzzLongRun` 是纯随机扫描，不是 coverage-guided 的 AFL/libFuzzer 风格。发现新路径的效率较低，但作为 CI smoke 足够。要真正的 coverage-guided fuzz 需要 `-ffuzz` bug 修掉。
 
+### 逐轮泄漏检测未实现
+
+见上方"泄漏检测"章节。`DebugAllocator.deinit()` 的日志机制导致 mid-run 检查不可行，目前只有 end-of-test 泄漏检测。

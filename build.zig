@@ -308,6 +308,21 @@ pub fn build(b: *std.Build) void {
     });
     const run_fuzz_format = b.addRunArtifact(fuzz_format);
 
+    // ponytail: long-run fuzz (not included in test-fuzz, run on demand)
+    const fuzz_long = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/fuzz/long_run_2min.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    const run_fuzz_long = b.addRunArtifact(fuzz_long);
+    const fuzz_long_step = b.step("long-run", "Run 2-minute long-run fuzz tests");
+    fuzz_long_step.dependOn(&run_fuzz_long.step);
     const fuzz_step = b.step("test-fuzz", "Run fuzz corpus replay tests (deterministic)");
     fuzz_step.dependOn(&run_fuzz_probe.step);
     fuzz_step.dependOn(&run_fuzz_wal.step);

@@ -1,6 +1,7 @@
 //! Common fuzz framework for cube_db.
 //! Provides:
 //! - fuzzLoop: loop over random Smith inputs (random property test)
+//! - fuzzLongRun: time-budgeted loop (ms deadline)
 //! - replayCorpus: replay known inputs from files
 //!
 //! Zig 0.16.0 compiler bug: `-ffuzz` causes `builtin.StackTrace != debug.StackTrace`
@@ -10,6 +11,7 @@
 
 const std = @import("std");
 const Io = std.Io;
+
 /// Maximum iterations for a smoke fuzz run (CI: 30s ≈ 100k iterations).
 pub const SMOKE_ITERS: usize = 100_000;
 
@@ -32,15 +34,44 @@ pub fn fuzzLoop(
 ) !usize {
     var prng = std.Random.DefaultPrng.init(seed);
     const rand = prng.random();
-
     var input_buf: [MAX_INPUT_BYTES]u8 = undefined;
     var i: usize = 0;
     while (i < max_iters) : (i += 1) {
         const len = rand.intRangeAtMost(usize, 0, MAX_INPUT_BYTES);
         rand.bytes(input_buf[0..len]);
-
         var smith = std.testing.Smith{ .in = input_buf[0..len] };
         try target(context, &smith);
+    }
+    return i;
+}
+
+/// Run a fuzz target with a time budget (milliseconds).
+/// Uses monotonic clock (.awake) for deadline, checks every 64 iterations.
+/// Returns the number of iterations run, or an error if the target panics.
+pub fn fuzzLongRun(
+    comptime Context: type,
+    context: *Context,
+    comptime target: fn (context: *Context, smith: *std.testing.Smith) anyerror!void,
+    max_time_ms: u64,
+    seed: u64,
+) !usize {
+    const io = Io.Threaded.global_single_threaded.io();
+    const start_ns = Io.Timestamp.now(io, .awake).nanoseconds;
+    const budget: i96 = @intCast(@as(i96, max_time_ms) * std.time.ns_per_ms);
+    const deadline_ns = start_ns + budget;
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rand = prng.random();
+    var input_buf: [MAX_INPUT_BYTES]u8 = undefined;
+    var i: usize = 0;
+    while (true) {
+        if (i & 63 == 0) {
+            if (Io.Timestamp.now(io, .awake).nanoseconds >= deadline_ns) break;
+        }
+        const len = rand.intRangeAtMost(usize, 0, MAX_INPUT_BYTES);
+        rand.bytes(input_buf[0..len]);
+        var smith = std.testing.Smith{ .in = input_buf[0..len] };
+        try target(context, &smith);
+        i += 1;
     }
     return i;
 }
