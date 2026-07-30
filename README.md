@@ -76,6 +76,7 @@ full API, and recipes see **[docs/usage.md](docs/usage.md)**.
 
 | 文档 | 内容 |
 |------|------|
+| [`20260730_micro_batch.md`](bench/results/20260730_micro_batch.md) | micro-batching / group-commit — put 100B 4.0× 提速 |
 | [`20260730_zero_copy.md`](bench/results/20260730_zero_copy.md) | zero-copy get + bug fix 数据 |
 | [`20260730_cow_opt.md`](bench/results/20260730_cow_opt.md) | COW 写路径优化 — put 100B 4.7× 提速 |
 | [`20260730_bench.md`](bench/results/20260730_bench.md) | 优化前基准数据（small scale 全矩阵） |
@@ -85,7 +86,7 @@ full API, and recipes see **[docs/usage.md](docs/usage.md)**.
 
 ## Tests
 
-142 tests across 17 modules + 4 fuzz targets, all passing:
+161 tests across 18 modules + 4 fuzz targets, all passing:
 
 | Module | Tests | File |
 |--------|-------|------|
@@ -107,6 +108,7 @@ full API, and recipes see **[docs/usage.md](docs/usage.md)**.
 | Zero-copy | 7 | `tests/zero_copy_test.zig` |
 | COW fast path | 5 | `tests/cow_fast_test.zig` |
 | Crash recovery framework | 4 | `tests/crash_recovery_framework_test.zig` |
+| Group commit | 10 | `tests/group_commit_test.zig` |
 
 ```bash
 zig build test test-fuzz        # all unit/integration + fuzz regression

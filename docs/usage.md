@@ -161,7 +161,7 @@ if (v) |value| {
 - 溢出值（>3800B）返回 `null`，需 fallback 到 `get()`
 - 比 `get` 快 ~3.5×（消除 `allocator.dupe` 开销）
 
-### 3.3 写：put / putBatch / delete
+### 3.3 写：put / putBatch / delete / flush
 
 ```zig
 try db.put("hello", "world");   // 单条，1 次 commit
@@ -178,6 +178,30 @@ const entries = [_]Entry{
 };
 try db.putBatch(&entries); // 整批 1 次 commit
 ```
+
+**Micro-batching（自动批量提交）：**
+
+```zig
+var db = try Db.open(allocator, store, .{
+    .micro_batch = .{ .batch_threshold = 100 },
+});
+// 前 99 次 put 暂存，第 100 次自动 flush
+try db.put("k1", "v1");
+try db.put("k2", "v2");
+// ... 第 100 次 put 触发批量提交
+
+// 强制提交暂存数据
+try db.flush();
+
+// 跳过 batching，立即提交
+try db.putDirect("urgent", "now");
+```
+
+- `batch_threshold = 0`（默认）：禁用 batching，`put`/`delete` 立即提交
+- `batch_threshold > 0`：暂存到 pending，达到阈值自动 `flush()`
+- `flush()`：强制提交所有 pending entries
+- `putDirect()`/`deleteDirect()`：跳过 batching，立即提交
+- `close()`：自动 flush 残留 entries
 
 Entry 结构：
 
