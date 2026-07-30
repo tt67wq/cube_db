@@ -74,32 +74,19 @@ defer if (v) |val| allocator.free(val);
 
 ## Benchmark
 
-小规模，10k ops，MemPageStore（内存），无 fsync。
-`zig build bench -Doptimize=ReleaseFast -Dbench-scale=small`：
+最新 benchmark 数据见 [`bench/results/`](bench/results/)：
 
-```
-op      scale  value  ops          time_ms      ops/s        avg_us/op
-put     small  100B         10000       5053.0         1979       505.30
-put     small  10KB         10000      20047.5          499      2004.75
-putbatch small  100B         10000        725.5        13783        72.55
-putbatch small  10KB         10000        403.2        24801        40.32
-get     small  100B         10000        355.3        28148        35.53
-get     small  10KB         10000        464.0        21550        46.40
-delete  small  100B         10000       3963.9         2523       396.39
-select  small  100B           100         98.1         1019       981.02
-select  small  10KB           100        309.9          323      3098.99
-compact small  100B             1          0.0            -        11.00
-```
+| 文档 | 内容 |
+|------|------|
+| [`20260730_cow_opt.md`](bench/results/20260730_cow_opt.md) | COW 写路径优化 — put 100B 4.7× 提速 |
+| [`20260730_bench.md`](bench/results/20260730_bench.md) | 优化前基准数据（small scale 全矩阵） |
+| [`20260727_wal_opt.md`](bench/results/20260727_wal_opt.md) | 历史 WAL 优化（LSM 层，已移除） |
 
-> 读 = mmap 零拷贝（get 100B ~35µs，近常数，不随 value 线性涨）。
-> 写受 COW 逐页分配+拷贝主导（put 100B ~505µs）；
-> `putBatch` 摊薄 COW 路径 ~7×（100B）。
-> 完整矩阵 + large scale 说明：[`bench/results/20260730_bench.md`](bench/results/20260730_bench.md)。
-> 对标 LMDB/LevelDB（SQLite/RocksDB 对比）：[`benchcmp/COMPARISON.md`](benchcmp/COMPARISON.md)。
+> 与 SQLite/RocksDB 对比：[`benchcmp/COMPARISON.md`](benchcmp/COMPARISON.md)
 
 ## 测试
 
-121 测试，15 个模块 + 4 个 fuzz target，全部通过：
+126 测试，15 个模块 + 4 个 fuzz target，全部通过：
 
 | 模块 | 数量 | 文件 |
 |------|------|------|
