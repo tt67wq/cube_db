@@ -49,9 +49,10 @@ fn keysFor(scale: Scale, v: VSize) usize {
 }
 
 fn mapsizeFor(scale: Scale, v: VSize) u32 {
-    // 足够容纳所有 key 的页数
+    // 足够容纳所有 key 的页数（含溢出页）
     const n = keysFor(scale, v);
-    return @as(u32, @intCast(cube.page_store.FIRST_DATA_PAGE + n + 1000));
+    const overflow_pages: u32 = if (v == .b10k) 3 else 0; // 10KB ≈ 3 overflow pages
+    return @as(u32, @intCast(cube.page_store.FIRST_DATA_PAGE + n * (1 + overflow_pages) + 10000));
 }
 
 fn runPut(allocator: std.mem.Allocator, cell: Cell, n: usize, value: []const u8) !Result {

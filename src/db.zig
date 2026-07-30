@@ -171,7 +171,7 @@ pub const WriteTxn = struct {
             reqs[i] = .{ .key = e.key, .value = e.value, .tombstone = e.tombstone, .future = &futures[i] };
         }
         try self.db.state.applyBatch(reqs);
-        for (futures) |*f| _ = try f.wait();
+        for (futures) |*f| try (try f.wait()).value;
     }
 
     /// 中止：丢弃暂存，不应用。释放互斥。
