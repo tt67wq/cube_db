@@ -125,7 +125,7 @@ var db = try Db.open(allocator, fps.store(), .{});
 defer db.close();
 ```
 
-### 3.2 读：get
+### 3.2 读：get / getBorrowed
 
 ```zig
 const v = try db.get("hello");
@@ -140,6 +140,26 @@ if (v) |value| {
 - 返回 `!?[]u8`：`null` = key 不存在（或被 delete）。
 - 非 null 的 value 是新分配的拷贝，必须 `free`。
 - get 无锁、无 fsync，读原子 root 快照。
+
+**Zero-copy 读（ReadTxn）：**
+
+```zig
+var r = try db.beginReadTxn();
+defer r.end();
+const v = try r.getBorrowed("hello");
+if (v) |value| {
+    // value 是借用切片，指向页缓冲区
+    // 在 ReadTxn 生命周期内有效，无需 free
+    std.debug.print("hello = {s}\n", .{value});
+} else {
+    std.debug.print("(missing)\n", .{});
+}
+```
+
+- `getBorrowed` 返回 `?[]const u8`：指向页 payload 的借用切片
+- **无需 `free`**，但必须在 `ReadTxn.end()` 前使用
+- 溢出值（>3800B）返回 `null`，需 fallback 到 `get()`
+- 比 `get` 快 ~3.5×（消除 `allocator.dupe` 开销）
 
 ### 3.3 写：put / putBatch / delete
 
