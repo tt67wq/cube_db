@@ -94,3 +94,9 @@ clang++ -O3 -std=c++17 benchcmp.cpp \
 ```
 
 若 sandbox 拒 `/var/folders` clang cache: 加 `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk` 并用 `/Library/Developer/CommandLineTools/usr/bin/clang++` 直连(绕 xcrun)。
+
+---
+
+## 更新注记 (P4, 2025-07-30)
+
+`Db.put`/`putBatch`/`delete` 现在包装显式 `WriteTxn`（LMDB 式 `beginWriteTxn`/`commit`/`abort`，单写者互斥 + 一次 applyBatch + 一次 meta 切换 + 可选 fsync）。写吞吐特性不变（put 100B ≈ 465us/op，仍受 COW 逐页分配+拷贝限制，见 README 基准）。读路径已切到 LMDB 式 1TB 预留 mmap 区（FilePageStore），零拷贝 page 指针读。对标 SQLite/RocksDB 的数字仍然成立（见上表）。后续若优化 COW 写路径或加 group-commit 多 txn 合并，差距可进一步收窄。

@@ -277,6 +277,19 @@ pub fn build(b: *std.Build) void {
     });
     const run_fuzz_format = b.addRunArtifact(fuzz_format);
 
+    const fuzz_meta_corrupt = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/fuzz/meta_corrupt_fuzz_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    const run_fuzz_meta = b.addRunArtifact(fuzz_meta_corrupt);
+
     // ponytail: long-run fuzz (not included in test-fuzz, run on demand)
     const fuzz_long = b.addTest(.{
         .root_module = b.createModule(.{
@@ -296,4 +309,5 @@ pub fn build(b: *std.Build) void {
     fuzz_step.dependOn(&run_fuzz_probe.step);
     fuzz_step.dependOn(&run_fuzz_api.step);
     fuzz_step.dependOn(&run_fuzz_format.step);
+    fuzz_step.dependOn(&run_fuzz_meta.step);
 }
