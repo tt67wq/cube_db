@@ -154,15 +154,22 @@ pub const State = struct {
         const cur_entry_count = self.entry_count.load(.acquire);
         const cur_byte_size = self.byte_size.load(.acquire);
 
-        // 2. 收集脏页
+        // 2. Arena for COW path temporary allocations (key/value dupe, Leaf/Branch decode).
+        // Eliminates per-allocation syscall overhead: ~145 alloc/free per btree.insert
+        // collapses to arena bump-pointer, freed in one shot at batch end.
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+
+        // 收集脏页（arena-backed: btree.insert 用 arena_alloc append）
         var batch_dirty = std.ArrayList(u32).empty;
-        defer batch_dirty.deinit(self.allocator);
+        defer batch_dirty.deinit(arena_alloc);
         var batch_entry_delta: i64 = 0;
         var batch_byte_delta: i64 = 0;
         var new_root = cur_root;
 
         for (batch) |req| {
-            const wr = btree.insert(self.allocator, self.store, new_root, req.key, req.value, req.tombstone, &batch_dirty) catch |err| {
+            const wr = btree.insert(arena_alloc, self.store, new_root, req.key, req.value, req.tombstone, &batch_dirty) catch |err| {
                 for (batch) |r| r.future.set(err);
                 return;
             };

@@ -518,6 +518,76 @@ const InsertSub = struct {
     count_delta: i64 = 0,
 };
 
+/// Scan branch payload to find child index and children-section byte offset for a key.
+/// Returns the child index (0..count-1) and the byte offset where the children
+/// section starts in the payload (after the keys section).
+fn findChildIdxAndOffset(payload: []const u8, key: []const u8) !struct {
+    idx: usize,
+    child: u32,
+    children_offset: usize,
+} {
+    if (payload.len < 3) return error.Truncated;
+    if (payload[0] != BRANCH_KIND) return error.CorruptCrc;
+    const count = std.mem.readInt(u16, payload[1..3], .big);
+    var pos: usize = 3;
+    var child_idx: usize = 0;
+    var found = false;
+    var i: usize = 0;
+    while (i + 1 < count) : (i += 1) {
+        if (pos + 4 > payload.len) return error.Truncated;
+        const klen = std.mem.readInt(u32, payload[pos..][0..4], .big);
+        pos += 4;
+        if (pos + klen > payload.len) return error.Truncated;
+        const ek = payload[pos .. pos + klen];
+        pos += klen;
+        if (!found and cmpKey(ek, key) == .gt) {
+            child_idx = i;
+            found = true;
+        }
+    }
+    if (!found) child_idx = count - 1;
+    // pos is now at children section start
+    if (pos + 4 * count > payload.len) return error.Truncated;
+    const child = std.mem.readInt(u32, payload[pos + child_idx * 4 ..][0..4], .big);
+    return .{ .idx = child_idx, .child = child, .children_offset = pos };
+}
+
+/// Fast path: copy old branch page + patch single child pointer.
+/// Used when the child didn't split (no new key/child to insert into branch).
+/// Zero heap allocations — just page copy + 4-byte write + checksum.
+fn cowBranchNoSplit(
+    store: PageStore,
+    old_page_no: u32,
+    child_idx: usize,
+    children_offset: usize,
+    new_child: u32,
+) !u32 {
+    // Copy old page to stack buffer first — allocPage/writePage may trigger
+    // HashMap resize which invalidates the slice from readPage.
+    const old_page = try store.readPage(old_page_no);
+    var page_copy: [f2.PAGE_SIZE]u8 = undefined;
+    @memcpy(&page_copy, old_page[0..f2.PAGE_SIZE]);
+
+    const new_page_no = try store.allocPage();
+    const new_page = try store.writePage(new_page_no);
+
+    // Copy old page data to new page
+    @memcpy(new_page[0..f2.PAGE_SIZE], &page_copy);
+
+    // Update page_no in header (first 4 bytes, little-endian)
+    std.mem.writeInt(u32, new_page[0..4], new_page_no, .little);
+
+    // Patch child pointer (big-endian, as encoded by encodeBranchPayload)
+    const child_byte_offset = f2.PAGE_HEADER_SIZE + children_offset + child_idx * 4;
+    std.mem.writeInt(u32, new_page[child_byte_offset..][0..4], new_child, .big);
+
+    // Recompute checksum
+    const arr: *[f2.PAGE_SIZE]u8 = @ptrCast(new_page.ptr);
+    f2.setPageChecksum(arr, f2.computePageChecksum(arr));
+
+    return new_page_no;
+}
+
 fn insertIntoLeaf(
     store: PageStore,
     allocator: std.mem.Allocator,
@@ -527,33 +597,278 @@ fn insertIntoLeaf(
     tombstone: bool,
     dirty: *std.ArrayList(u32),
 ) !InsertSub {
-    const payload = try readNodePayload(store, page_no);
-    var leaf = try Leaf.fromPayload(allocator, store, payload, dirty);
-    defer leaf.deinit();
+    // Copy old page to stack buffer — allocPage may trigger HashMap resize.
+    const old_page = try store.readPage(page_no);
+    var old_page_buf: [f2.PAGE_SIZE]u8 = undefined;
+    @memcpy(&old_page_buf, old_page[0..f2.PAGE_SIZE]);
+    const old_payload = old_page_buf[f2.PAGE_HEADER_SIZE .. f2.PAGE_SIZE - 4];
 
+    // Scan leaf payload to find entry position and byte offsets.
+    // Returns: entry index, found (key exists), byte offset of entry start,
+    // byte offset after entry end, old entry metadata (for live_delta/count_delta).
+    if (old_payload.len < 3) return error.Truncated;
+    if (old_payload[0] != LEAF_KIND) return error.CorruptCrc;
+    const old_count = std.mem.readInt(u16, old_payload[1..3], .big);
+
+    var pos: usize = 3;
+    var entry_idx: usize = 0;
+    var found = false;
+    var gt_break = false; // true if we broke at cmp == .gt (insert before this entry)
+    var entry_start: usize = 0;
+    var entry_end: usize = 0;
+    var entries_end: usize = 3; // end of all entries (after header), updated as we scan
+    var old_tombstone = false;
+    var old_vlen: u32 = 0;
+    var old_overflow_page: u32 = 0;
+    var old_is_overflow = false;
+    var old_key_len: u32 = 0;
+
+    var i: usize = 0;
+    while (i < old_count) : (i += 1) {
+        if (pos + 1 + 4 > old_payload.len) return error.Truncated;
+        const start = pos;
+        const ts = old_payload[pos] == 1;
+        pos += 1;
+        const klen = std.mem.readInt(u32, old_payload[pos..][0..4], .big);
+        pos += 4;
+        if (pos + klen > old_payload.len) return error.Truncated;
+        const ek = old_payload[pos .. pos + klen];
+        pos += klen;
+        if (pos + 4 > old_payload.len) return error.Truncated;
+        const vlen = std.mem.readInt(u32, old_payload[pos..][0..4], .big);
+        pos += 4;
+        if (pos + 1 > old_payload.len) return error.Truncated;
+        const flags = old_payload[pos];
+        pos += 1;
+        const is_ov = (flags & LEAF_FLAG_OVERFLOW != 0);
+        if (is_ov) {
+            if (pos + 4 > old_payload.len) return error.Truncated;
+            // Don't read overflow page yet — only if this is the matching entry
+            pos += 4;
+        } else {
+            if (pos + vlen > old_payload.len) return error.Truncated;
+            pos += vlen;
+        }
+
+        const cmp = cmpKey(ek, key);
+        if (cmp == .eq) {
+            found = true;
+            entry_idx = i;
+            entry_start = start;
+            entry_end = pos;
+            old_tombstone = ts;
+            old_vlen = vlen;
+            old_is_overflow = is_ov;
+            old_key_len = klen;
+            if (is_ov) {
+                // Read overflow page number (4 bytes after flags)
+                old_overflow_page = std.mem.readInt(u32, old_payload[entry_start + 1 + 4 + klen + 4 + 1 ..][0..4], .little);
+            }
+            // Continue scanning to find entries_end
+            i += 1;
+            while (i < old_count) : (i += 1) {
+                if (pos + 1 + 4 > old_payload.len) return error.Truncated;
+                pos += 1;
+                const klen2 = std.mem.readInt(u32, old_payload[pos..][0..4], .big);
+                pos += 4;
+                if (pos + klen2 > old_payload.len) return error.Truncated;
+                pos += klen2;
+                if (pos + 4 > old_payload.len) return error.Truncated;
+                const vlen2 = std.mem.readInt(u32, old_payload[pos..][0..4], .big);
+                pos += 4;
+                if (pos + 1 > old_payload.len) return error.Truncated;
+                const flags2 = old_payload[pos];
+                pos += 1;
+                if (flags2 & LEAF_FLAG_OVERFLOW != 0) {
+                    if (pos + 4 > old_payload.len) return error.Truncated;
+                    pos += 4;
+                } else {
+                    if (pos + vlen2 > old_payload.len) return error.Truncated;
+                    pos += vlen2;
+                }
+            }
+            entries_end = pos;
+            break;
+        } else if (cmp == .gt) {
+            gt_break = true;
+            entry_idx = i;
+            entry_start = start;
+            entry_end = start; // same as start — no entry to replace
+            // Continue scanning to find entries_end
+            entries_end = pos;
+            i += 1;
+            while (i < old_count) : (i += 1) {
+                if (pos + 1 + 4 > old_payload.len) return error.Truncated;
+                pos += 1;
+                const klen2 = std.mem.readInt(u32, old_payload[pos..][0..4], .big);
+                pos += 4;
+                if (pos + klen2 > old_payload.len) return error.Truncated;
+                pos += klen2;
+                if (pos + 4 > old_payload.len) return error.Truncated;
+                const vlen2 = std.mem.readInt(u32, old_payload[pos..][0..4], .big);
+                pos += 4;
+                if (pos + 1 > old_payload.len) return error.Truncated;
+                const flags2 = old_payload[pos];
+                pos += 1;
+                if (flags2 & LEAF_FLAG_OVERFLOW != 0) {
+                    if (pos + 4 > old_payload.len) return error.Truncated;
+                    pos += 4;
+                } else {
+                    if (pos + vlen2 > old_payload.len) return error.Truncated;
+                    pos += vlen2;
+                }
+            }
+            entries_end = pos;
+            break;
+        }
+        // cmp == .lt, continue scanning
+        entries_end = pos;
+    }
+    if (!found and !gt_break) {
+        // Key not found, loop completed — insert at end
+        entry_idx = i;
+        entry_start = entries_end;
+        entry_end = entries_end;
+    }
+
+    // Compute live_delta and count_delta
     var live_delta: i64 = 0;
     var count_delta: i64 = 0;
-
-    const pos = leaf.findPos(key);
-    if (pos < leaf.entries.len and cmpKey(leaf.entries[pos].key, key) == .eq) {
-        // 覆盖
-        const old = leaf.entries[pos];
-        live_delta -= @as(i64, @intCast(old.key.len + old.value.len + 9));
-        allocator.free(old.key);
-        allocator.free(old.value);
-        if (!old.tombstone and tombstone) {
+    if (found) {
+        // Overwrite: subtract old entry size
+        const old_val_sz: usize = if (old_is_overflow) @as(usize, 4) else @as(usize, old_vlen);
+        live_delta -= @as(i64, @intCast(old_key_len + old_val_sz + 9));
+        if (!old_tombstone and tombstone) {
             count_delta = -1;
-        } else if (old.tombstone and !tombstone) {
+        } else if (old_tombstone and !tombstone) {
             count_delta = 1;
         }
+    } else {
+        if (!tombstone) count_delta = 1;
+    }
+    live_delta += @as(i64, @intCast(key.len + (if (tombstone) @as(usize, 0) else value.len) + 9));
+
+    // Free old overflow pages if overwriting an overflow entry
+    if (found and old_is_overflow) {
+        freeOverflowPages(store, old_overflow_page, dirty, allocator);
+    }
+
+    // Determine new entry count
+    const new_count: u16 = if (found) old_count else old_count + 1;
+
+    // Mark old page as dirty
+    dirty.append(allocator, page_no) catch {};
+
+    // Check if split needed
+    if (new_count > LEAF_MAX_ENTRIES) {
+        // Split — fall back to decode/encode path
+        return insertIntoLeafSplit(store, allocator, old_page_buf[0..], key, value, tombstone, dirty, found, live_delta, count_delta);
+    }
+
+    // Build new leaf payload in stack buffer (no heap allocation)
+    var new_payload: [f2.PAGE_SIZE - f2.PAGE_HEADER_SIZE - 4]u8 = undefined;
+    var wpos: usize = 0;
+
+    // Header
+    new_payload[wpos] = LEAF_KIND;
+    wpos += 1;
+    std.mem.writeInt(u16, new_payload[wpos..][0..2], new_count, .big);
+    wpos += 2;
+
+    // Copy entries before the insert/overwrite position
+    const before_len = entry_start - 3; // subtract header (3 bytes)
+    if (before_len > 0) {
+        @memcpy(new_payload[wpos..][0..before_len], old_payload[3 .. 3 + before_len]);
+        wpos += before_len;
+    }
+
+    // Write new entry
+    new_payload[wpos] = if (tombstone) @as(u8, 1) else 0;
+    wpos += 1;
+    std.mem.writeInt(u32, new_payload[wpos..][0..4], @intCast(key.len), .big);
+    wpos += 4;
+    @memcpy(new_payload[wpos..][0..key.len], key);
+    wpos += key.len;
+    const val_len: u32 = if (tombstone) 0 else @intCast(value.len);
+    std.mem.writeInt(u32, new_payload[wpos..][0..4], val_len, .big);
+    wpos += 4;
+    if (!tombstone and value.len > MAX_INLINE_VALUE) {
+        // Overflow
+        new_payload[wpos] = LEAF_FLAG_OVERFLOW;
+        wpos += 1;
+        const ov_page = try writeOverflowPages(store, value);
+        std.mem.writeInt(u32, new_payload[wpos..][0..4], ov_page, .little);
+        wpos += 4;
+    } else {
+        new_payload[wpos] = 0;
+        wpos += 1;
+        if (!tombstone) {
+            @memcpy(new_payload[wpos..][0..value.len], value);
+            wpos += value.len;
+        }
+    }
+
+    // Copy entries after the insert/overwrite position
+    if (found) {
+        // Overwrite: copy entries after the old entry up to entries_end
+        const after_len = entries_end - entry_end;
+        if (after_len > 0) {
+            @memcpy(new_payload[wpos..][0..after_len], old_payload[entry_end .. entry_end + after_len]);
+            wpos += after_len;
+        }
+    } else {
+        // Insert: copy entries from entry_start to entries_end (actual entry data, not padding)
+        const after_len = entries_end - entry_start;
+        if (after_len > 0) {
+            @memcpy(new_payload[wpos..][0..after_len], old_payload[entry_start .. entry_start + after_len]);
+            wpos += after_len;
+        }
+    }
+
+    // Write to new page
+    const new_page = try store.allocPage();
+    try writeNodePage(store, new_page, f2.PAGE_TYPE_LEAF, new_count, new_payload[0..wpos]);
+
+    return .{
+        .new_child = new_page,
+        .live_delta = live_delta,
+        .count_delta = count_delta,
+    };
+}
+
+/// Split path: decode leaf, split into two pages, return split result.
+/// Used when the leaf is full and needs to split.
+fn insertIntoLeafSplit(
+    store: PageStore,
+    allocator: std.mem.Allocator,
+    old_page: []const u8,
+    key: []const u8,
+    value: []const u8,
+    tombstone: bool,
+    dirty: *std.ArrayList(u32),
+    found: bool,
+    live_delta: i64,
+    count_delta: i64,
+) !InsertSub {
+    // Decode the old leaf using the copied page buffer
+    const old_payload = old_page[f2.PAGE_HEADER_SIZE .. f2.PAGE_SIZE - 4];
+    var leaf = try Leaf.fromPayload(allocator, store, old_payload, dirty);
+    defer leaf.deinit();
+
+    // Apply the insert/overwrite to the in-memory leaf
+    const pos = leaf.findPos(key);
+    if (found) {
+        // Overwrite existing entry
+        const old_entry = leaf.entries[pos];
+        allocator.free(old_entry.key);
+        allocator.free(old_entry.value);
         leaf.entries[pos] = .{
             .tombstone = tombstone,
             .key = try allocator.dupe(u8, key),
             .value = if (tombstone) try allocator.dupe(u8, "") else try allocator.dupe(u8, value),
         };
-        live_delta += @as(i64, @intCast(key.len + (if (tombstone) @as(usize, 0) else value.len) + 9));
     } else {
-        // 新增
+        // Insert new entry
         const new_entries = try allocator.alloc(LeafEntry, leaf.entries.len + 1);
         @memcpy(new_entries[0..pos], leaf.entries[0..pos]);
         new_entries[pos] = .{
@@ -562,30 +877,11 @@ fn insertIntoLeaf(
             .value = if (tombstone) try allocator.dupe(u8, "") else try allocator.dupe(u8, value),
         };
         @memcpy(new_entries[pos + 1 ..], leaf.entries[pos..]);
-        // 旧 entries 的 key/value 指针已拷贝到 new_entries（转移所有权），只释放数组
         allocator.free(leaf.entries);
         leaf.entries = new_entries;
-        live_delta += @as(i64, @intCast(key.len + (if (tombstone) @as(usize, 0) else value.len) + 9));
-        if (!tombstone) count_delta = 1;
     }
 
-    // 记录旧页为脏
-    dirty.append(allocator, page_no) catch {};
-
-    // 分裂判定
-    if (leaf.entries.len <= LEAF_MAX_ENTRIES) {
-        const new_page = try store.allocPage();
-        const pl = leafPayloadSize(leaf.entries);
-        var payload_buf: [f2.PAGE_SIZE]u8 = undefined;
-        _ = try encodeLeafPayload(payload_buf[0..pl], leaf.entries, store, dirty);
-        try writeNodePage(store, new_page, f2.PAGE_TYPE_LEAF, @intCast(leaf.entries.len), payload_buf[0..pl]);
-        return .{
-            .new_child = new_page,
-            .live_delta = live_delta,
-            .count_delta = count_delta,
-        };
-    }
-    // 分裂
+    // Split
     const mid = leaf.entries.len / 2;
     const right_entries = leaf.entries[mid..];
     const left_entries = leaf.entries[0..mid];
@@ -619,16 +915,12 @@ fn insertIntoBranch(
     dirty: *std.ArrayList(u32),
 ) !InsertSub {
     const payload = try readNodePayload(store, page_no);
-    var branch = try Branch.fromPayload(allocator, payload);
-    defer branch.deinit();
 
-    var live_delta: i64 = 0;
-    var count_delta: i64 = 0;
+    // Fast path: find child index by scanning raw payload (no decode/alloc)
+    const loc = try findChildIdxAndOffset(payload, key);
+    const child_off = loc.child;
 
-    const ci = branch.findChild(key);
-    const child_off = branch.children[ci];
-
-    // 递归插入子节点
+    // Recursively insert into child
     const child_is_leaf = blk: {
         const cpayload = try readNodePayload(store, child_off);
         break :blk cpayload[0] == LEAF_KIND;
@@ -637,92 +929,96 @@ fn insertIntoBranch(
         try insertIntoLeaf(store, allocator, child_off, key, value, tombstone, dirty)
     else
         try insertIntoBranch(store, allocator, child_off, key, value, tombstone, dirty);
-    live_delta += sub.live_delta;
-    count_delta += sub.count_delta;
 
-    // 记录旧页为脏
+    const live_delta: i64 = sub.live_delta;
+    const count_delta: i64 = sub.count_delta;
+
+    // Mark old page as dirty
     dirty.append(allocator, page_no) catch {};
 
-    // 替换子指针
-    branch.children[ci] = sub.new_child;
-
-    if (sub.split_key) |sk| {
-        // 子分裂，在 branch 插入新 key + 右子
-        const new_keys = try allocator.alloc([]u8, branch.keys.len + 1);
-        const new_children = try allocator.alloc(u32, branch.children.len + 1);
-        @memcpy(new_keys[0..ci], branch.keys[0..ci]);
-        new_keys[ci] = sk;
-        @memcpy(new_keys[ci + 1 ..], branch.keys[ci..]);
-        @memcpy(new_children[0 .. ci + 1], branch.children[0 .. ci + 1]);
-        new_children[ci + 1] = sub.split_right;
-        @memcpy(new_children[ci + 2 ..], branch.children[ci + 1 ..]);
-        // 旧 keys/children 数组指针已转移（key 元素指针在 new_keys 中），只释放数组
-        allocator.free(branch.keys);
-        allocator.free(branch.children);
-        branch.keys = new_keys;
-        branch.children = new_children;
-
-        // 分裂判定
-        if (branch.children.len <= BRANCH_MAX_CHILDREN) {
-            const new_page = try store.allocPage();
-            const keys_slice = try allocator.alloc([]const u8, branch.keys.len);
-            defer allocator.free(keys_slice);
-            for (branch.keys, 0..) |k, i| keys_slice[i] = k;
-            const pl = branchPayloadSize(keys_slice, branch.children);
-            var buf: [f2.PAGE_SIZE]u8 = undefined;
-            _ = encodeBranchPayload(buf[0..pl], keys_slice, branch.children);
-            try writeNodePage(store, new_page, f2.PAGE_TYPE_BRANCH, @intCast(branch.children.len), buf[0..pl]);
-            return .{
-                .new_child = new_page,
-                .live_delta = live_delta,
-                .count_delta = count_delta,
-            };
-        }
-        // 分裂 branch
-        const mid = branch.keys.len / 2;
-        const up_key = try allocator.dupe(u8, branch.keys[mid]);
-        // 右半
-        const right_keys = branch.keys[mid + 1 ..];
-        const right_children = branch.children[mid + 1 ..];
-        const right_page = try store.allocPage();
-        const rkeys_slice = try allocator.alloc([]const u8, right_keys.len);
-        defer allocator.free(rkeys_slice);
-        for (right_keys, 0..) |k, i| rkeys_slice[i] = k;
-        var rbuf: [f2.PAGE_SIZE]u8 = undefined;
-        const rpl = branchPayloadSize(rkeys_slice, right_children);
-        _ = encodeBranchPayload(rbuf[0..rpl], rkeys_slice, right_children);
-        try writeNodePage(store, right_page, f2.PAGE_TYPE_BRANCH, @intCast(right_children.len), rbuf[0..rpl]);
-        // 左半
-        const left_keys = branch.keys[0..mid];
-        const left_children = branch.children[0 .. mid + 1];
-        const left_page = try store.allocPage();
-        const lkeys_slice = try allocator.alloc([]const u8, left_keys.len);
-        defer allocator.free(lkeys_slice);
-        for (left_keys, 0..) |k, i| lkeys_slice[i] = k;
-        var lbuf: [f2.PAGE_SIZE]u8 = undefined;
-        const lpl = branchPayloadSize(lkeys_slice, left_children);
-        _ = encodeBranchPayload(lbuf[0..lpl], lkeys_slice, left_children);
-        try writeNodePage(store, left_page, f2.PAGE_TYPE_BRANCH, @intCast(left_children.len), lbuf[0..lpl]);
-        // branch.deinit() 处理释放，不手动 free
+    if (sub.split_key == null) {
+        // Fast path: child didn't split — copy page + patch child pointer
+        const new_page = try cowBranchNoSplit(store, page_no, loc.idx, loc.children_offset, sub.new_child);
         return .{
-            .new_child = left_page,
-            .split_key = up_key,
-            .split_right = right_page,
+            .new_child = new_page,
             .live_delta = live_delta,
             .count_delta = count_delta,
         };
     }
-    // 无分裂：写新 branch
-    const new_page = try store.allocPage();
-    const keys_slice = try allocator.alloc([]const u8, branch.keys.len);
-    defer allocator.free(keys_slice);
-    for (branch.keys, 0..) |k, i| keys_slice[i] = k;
-    const pl = branchPayloadSize(keys_slice, branch.children);
-    var buf: [f2.PAGE_SIZE]u8 = undefined;
-    _ = encodeBranchPayload(buf[0..pl], keys_slice, branch.children);
-    try writeNodePage(store, new_page, f2.PAGE_TYPE_BRANCH, @intCast(branch.children.len), buf[0..pl]);
+
+    // Slow path: child split — re-read payload (recursive insert may have
+    // allocated pages, invalidating the earlier borrowed slice), decode branch,
+    // insert new key + child, encode
+    const fresh_payload = try readNodePayload(store, page_no);
+    var branch = try Branch.fromPayload(allocator, fresh_payload);
+    defer branch.deinit();
+
+    const ci = loc.idx;
+
+    // Replace child pointer
+    branch.children[ci] = sub.new_child;
+
+    // Insert new key + right child at position ci
+    const sk = sub.split_key.?;
+    const new_keys = try allocator.alloc([]u8, branch.keys.len + 1);
+    const new_children = try allocator.alloc(u32, branch.children.len + 1);
+    @memcpy(new_keys[0..ci], branch.keys[0..ci]);
+    new_keys[ci] = sk;
+    @memcpy(new_keys[ci + 1 ..], branch.keys[ci..]);
+    @memcpy(new_children[0 .. ci + 1], branch.children[0 .. ci + 1]);
+    new_children[ci + 1] = sub.split_right;
+    @memcpy(new_children[ci + 2 ..], branch.children[ci + 1 ..]);
+    // Old keys/children arrays: key pointers transferred to new_keys, only free arrays
+    allocator.free(branch.keys);
+    allocator.free(branch.children);
+    branch.keys = new_keys;
+    branch.children = new_children;
+
+    // Split check
+    if (branch.children.len <= BRANCH_MAX_CHILDREN) {
+        const new_page = try store.allocPage();
+        const keys_slice = try allocator.alloc([]const u8, branch.keys.len);
+        defer allocator.free(keys_slice);
+        for (branch.keys, 0..) |k, i| keys_slice[i] = k;
+        const pl = branchPayloadSize(keys_slice, branch.children);
+        var buf: [f2.PAGE_SIZE]u8 = undefined;
+        _ = encodeBranchPayload(buf[0..pl], keys_slice, branch.children);
+        try writeNodePage(store, new_page, f2.PAGE_TYPE_BRANCH, @intCast(branch.children.len), buf[0..pl]);
+        return .{
+            .new_child = new_page,
+            .live_delta = live_delta,
+            .count_delta = count_delta,
+        };
+    }
+    // Split branch
+    const mid = branch.keys.len / 2;
+    const up_key = try allocator.dupe(u8, branch.keys[mid]);
+    // Right half
+    const right_keys = branch.keys[mid + 1 ..];
+    const right_children = branch.children[mid + 1 ..];
+    const right_page = try store.allocPage();
+    const rkeys_slice = try allocator.alloc([]const u8, right_keys.len);
+    defer allocator.free(rkeys_slice);
+    for (right_keys, 0..) |k, i| rkeys_slice[i] = k;
+    var rbuf: [f2.PAGE_SIZE]u8 = undefined;
+    const rpl = branchPayloadSize(rkeys_slice, right_children);
+    _ = encodeBranchPayload(rbuf[0..rpl], rkeys_slice, right_children);
+    try writeNodePage(store, right_page, f2.PAGE_TYPE_BRANCH, @intCast(right_children.len), rbuf[0..rpl]);
+    // Left half
+    const left_keys = branch.keys[0..mid];
+    const left_children = branch.children[0 .. mid + 1];
+    const left_page = try store.allocPage();
+    const lkeys_slice = try allocator.alloc([]const u8, left_keys.len);
+    defer allocator.free(lkeys_slice);
+    for (left_keys, 0..) |k, i| lkeys_slice[i] = k;
+    var lbuf: [f2.PAGE_SIZE]u8 = undefined;
+    const lpl = branchPayloadSize(lkeys_slice, left_children);
+    _ = encodeBranchPayload(lbuf[0..lpl], lkeys_slice, left_children);
+    try writeNodePage(store, left_page, f2.PAGE_TYPE_BRANCH, @intCast(left_children.len), lbuf[0..lpl]);
     return .{
-        .new_child = new_page,
+        .new_child = left_page,
+        .split_key = up_key,
+        .split_right = right_page,
         .live_delta = live_delta,
         .count_delta = count_delta,
     };
