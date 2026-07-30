@@ -76,6 +76,7 @@ full API, and recipes see **[docs/usage.md](docs/usage.md)**.
 
 | 文档 | 内容 |
 |------|------|
+| [`20260730_read_crc_skip.md`](bench/results/20260730_read_crc_skip.md) | 读路径 CRC 跳过 — get 100B 13× 提速 |
 | [`20260730_micro_batch.md`](bench/results/20260730_micro_batch.md) | micro-batching / group-commit — put 100B 4.0× 提速 |
 | [`20260730_zero_copy.md`](bench/results/20260730_zero_copy.md) | zero-copy get + bug fix 数据 |
 | [`20260730_cow_opt.md`](bench/results/20260730_cow_opt.md) | COW 写路径优化 — put 100B 4.7× 提速 |

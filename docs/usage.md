@@ -140,6 +140,7 @@ if (v) |value| {
 - 返回 `!?[]u8`：`null` = key 不存在（或被 delete）。
 - 非 null 的 value 是新分配的拷贝，必须 `free`。
 - get 无锁、无 fsync，读原子 root 快照。
+- **读路径优化**：跳过 CRC 校验，get 100B ~2.7µs（接近 LMDB 级）
 
 **Zero-copy 读（ReadTxn）：**
 
