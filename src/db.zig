@@ -206,6 +206,13 @@ pub const ReadTxn = struct {
         return try btree.get(self.db.allocator, self.db.store, self.snapshot_root, key);
     }
 
+    /// Zero-copy get: returns a borrowed slice into the page buffer.
+    /// No allocation, no free needed. Valid for the ReadTxn's lifetime.
+    /// Returns null for overflow values (use get() for those).
+    pub fn getBorrowed(self: *ReadTxn, key: []const u8) !?[]const u8 {
+        return try btree.getBorrowed(self.db.store, self.snapshot_root, key);
+    }
+
     pub fn select(self: *ReadTxn, min: ?[]const u8, max: ?[]const u8) !btree.Iterator {
         return try btree.select(self.db.allocator, self.db.store, self.snapshot_root, min, max);
     }

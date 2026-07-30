@@ -417,6 +417,80 @@ pub const Branch = struct {
 
 // ===== get =====
 
+/// Borrowed get: returns a slice pointing directly into the page buffer.
+/// No heap allocation for inline values. For overflow values, falls back
+/// to allocator.dupe (caller must free overflow returns).
+/// The returned slice is valid as long as the page is not freed — which
+/// is guaranteed by MVCC COW (old pages are not overwritten).
+/// For overflow values, returns null — use get() for those.
+pub fn getBorrowed(store: PageStore, root: u32, key: []const u8) !?[]const u8 {
+    if (root == NULL_ROOT) return null;
+    var cur = root;
+    var depth: u32 = 0;
+    while (depth < 1000) : (depth += 1) {
+        const payload = try readNodePayload(store, cur);
+        if (payload.len == 0) return error.Truncated;
+        if (payload[0] == LEAF_KIND) {
+            return findInLeafBorrowed(payload, key);
+        } else {
+            cur = try findInBranchPayload(payload, key);
+        }
+    }
+    return error.Truncated;
+}
+
+/// Like findInLeaf but returns a borrowed slice into the page payload
+/// for inline values. Returns null for overflow values (caller should
+/// use get() for those) or tombstones.
+fn findInLeafBorrowed(payload: []const u8, key: []const u8) !?[]const u8 {
+    if (payload.len < 3) return error.Truncated;
+    if (payload[0] != LEAF_KIND) return error.CorruptCrc;
+    const count = std.mem.readInt(u16, payload[1..3], .big);
+    var pos: usize = 3;
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        if (pos + 1 + 4 > payload.len) return error.Truncated;
+        const tombstone = payload[pos] == 1;
+        pos += 1;
+        const klen = std.mem.readInt(u32, payload[pos..][0..4], .big);
+        pos += 4;
+        if (pos + klen > payload.len) return error.Truncated;
+        const ek = payload[pos .. pos + klen];
+        pos += klen;
+        if (pos + 4 > payload.len) return error.Truncated;
+        const vlen = std.mem.readInt(u32, payload[pos..][0..4], .big);
+        pos += 4;
+        if (pos + 1 > payload.len) return error.Truncated;
+        const flags = payload[pos];
+        pos += 1;
+        switch (cmpKey(ek, key)) {
+            .lt => {
+                if (flags & LEAF_FLAG_OVERFLOW == 0) {
+                    if (pos + vlen > payload.len) return error.Truncated;
+                    pos += vlen;
+                } else {
+                    if (pos + 4 > payload.len) return error.Truncated;
+                    pos += 4;
+                }
+                continue;
+            },
+            .eq => {
+                if (tombstone) return null;
+                if (flags & LEAF_FLAG_OVERFLOW != 0) {
+                    // Overflow: can't return borrowed slice (spans multiple pages)
+                    // Return null to signal caller to use get() instead
+                    return null;
+                }
+                if (pos + vlen > payload.len) return error.Truncated;
+                // Return borrowed slice directly into page payload
+                return payload[pos .. pos + vlen];
+            },
+            .gt => return null,
+        }
+    }
+    return null;
+}
+
 pub fn get(allocator: std.mem.Allocator, store: PageStore, root: u32, key: []const u8) !?[]u8 {
     if (root == NULL_ROOT) return null;
     var cur = root;
