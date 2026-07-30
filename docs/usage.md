@@ -1,4 +1,4 @@
-# cube_db 使用手册（v2）
+# cube_db 使用手册
 
 cube_db 是一个用 Zig 0.16.0 编写的嵌入式键值存储引擎。固定页（4KB） + freelist 页面复用 + COW B-tree：
 
@@ -15,8 +15,8 @@ cube_db 是一个用 Zig 0.16.0 编写的嵌入式键值存储引擎。固定页
 ## 目录
 
 1. [安装与构建](#1-安装与构建)
-2. [v2 快速开始](#2-v2-快速开始)
-3. [v2 API](#3-v2-api)
+2. [快速开始](#2-快速开始)
+3. [API](#3-api)
 4. [错误处理](#4-错误处理)
 5. [并发与 MVCC](#5-并发与-mvcc)
 6. [常见配方](#6-常见配方)
@@ -56,9 +56,9 @@ const Options = cube.Options;
 
 ---
 
-## 2. v2 快速开始
+## 2. 快速开始
 
-v2 使用固定大小页（4KB）和 freelist 页面复用，无需全量 rewrite。
+cube_db 使用固定大小页（4KB）和 freelist 页面复用，无需全量 rewrite。
 
 ### 内存模式（测试/原型）
 
@@ -87,7 +87,7 @@ pub fn main() !void {
 ### 文件模式（持久化）
 
 ```zig
-var fps = try cube.file_page_store.create(allocator, "my_v2.db", 1 << 30); // 1GB mapsize
+var fps = try cube.file_page_store.FilePageStore.init(allocator, "my.db"); // LMDB 式 1TB 预留 mmap
 defer fps.deinit();
 var db = try Db.open(allocator, fps.store(), .{});
 defer db.close();
@@ -95,11 +95,11 @@ defer db.close();
 try db.put("hello", "world");
 ```
 
-v2 的 `open` 从 meta page（page 1/2）恢复状态：root、sequence、entry_count、byte_size。恢复无需扫全文件，O(1)。
+`open` 从 meta page（page 1/2）恢复状态：root、sequence、entry_count、byte_size。恢复无需扫全文件，O(1)。
 
 ---
 
-## 3. v2 API
+## 3. API
 
 ### 3.1 打开与关闭
 
@@ -113,7 +113,7 @@ defer db.close();
 
 ```zig
 // 文件模式（mmap）
-var fps = try cube.file_page_store.create(allocator, "path.db", 1 << 30);
+var fps = try cube.file_page_store.FilePageStore.init(allocator, "path.db");
 defer fps.deinit();
 var db = try Db.open(allocator, fps.store(), .{});
 defer db.close();
@@ -176,7 +176,29 @@ const dels = [_]Entry{
 try db.putBatch(&dels);
 ```
 
-### 3.4 范围查询：select
+### 3.4 显式事务（LMDB 式）
+
+`put`/`putBatch`/`delete` 是便捷 API（内部包隐式 WriteTxn，立即提交）。需多步原子或 abort 时用显式事务：
+
+```zig
+// 写事务：单写者互斥，commit = applyBatch + meta 切换 + fsync；abort 丢弃不落盘
+var w = try db.beginWriteTxn();
+defer w.deinit(); // 未 commit/abort 时 deinit 自动 abort
+try w.put("k", "v");
+try w.delete("old");
+try w.commit(); // 原子提交
+
+// 读事务：MVCC 快照（持有开 txn 时的 root），不阻塞写者
+var r = try db.beginReadTxn();
+defer r.end();
+const v = try r.get("k");
+defer if (v) |val| allocator.free(val);
+```
+
+- WriteTxn：单写者互斥（同一时刻仅一个活跃）；`commit` 后原子可见，`abort` 丢弃。
+- ReadTxn：快照隔离，写者提交新版本后 reader 仍读旧快照，直到 `end`。
+- 跨 `beginWriteTxn`/`commit` 的 key/value 须保持有效（借用切片）。
+### 3.5 范围查询：select
 
 ```zig
 var it = try db.select("b", "d"); // [min, max)
@@ -207,9 +229,9 @@ while (try it.next()) |e| {
 }
 ```
 
-### 3.5 压缩：compact
+### 3.6 压缩：compact
 
-v2 compact 是 **O(1)** 的——只写 meta page，不重写数据。
+compact 是 **O(1)** 的——只写 meta page，不重写数据。
 
 ```zig
 try db.compact(); // 立即回收所有脏页（需要无活跃 reader）
@@ -218,7 +240,7 @@ try db.compact(); // 立即回收所有脏页（需要无活跃 reader）
 - 有活跃 reader 时，脏页会留在 pending_free 中直到 reader 结束。
 - compact 会自动 flush 所有可 flush 的 pending_free。
 
-### 3.6 选项：Options
+### 3.7 选项：Options
 
 ```zig
 var db = try Db.open(allocator, store, .{
@@ -230,7 +252,7 @@ var db = try Db.open(allocator, store, .{
 |---|---|---|---|
 | `fsync` | `bool` | `true` | 写操作是否 fsync 落盘。`false` = 更快但 crash 丢数据 |
 
-v2 compact 是 O(1) 的，无需 v1 的 `auto_compact_*` 参数。
+compact 是 O(1) 的（meta 页切换，不重写数据）。
 
 ---
 
@@ -352,6 +374,20 @@ try db.compact();                     // O(1) meta 切换
 // MVCC reader
 db.beginRead();
 db.endRead();
+
+// 显式事务（LMDB 式）
+var w = try db.beginWriteTxn();          // 单写者互斥
+defer w.deinit();                       // 未 commit/abort 自动 abort
+try w.put(key, value);                  // 暂存
+try w.commit();                         // applyBatch + meta 切换 + fsync
+// w.abort();                          // 丢弃
+
+var r = try db.beginReadTxn();          // MVCC 快照，不阻写者
+defer r.end();
+const rv = try r.get(key);              // 借用快照
+// try r.select(min, max);
+
+try db.sync();                          // async 模式下显式冲刷
 ```
 
 ### 类型
@@ -360,7 +396,9 @@ db.endRead();
 |---|---|
 | `Db` | 数据库句柄，所有操作的入口 |
 | `Entry` | `struct { key: []const u8, value: []const u8, tombstone: bool = false }` |
-| `Options` | `struct { fsync: bool = true }` |
+| `Options` | `struct { fsync: bool = true }`（fsync=false 开 async 模式） |
+| `WriteTxn` | `db.beginWriteTxn()`，单写者互斥，`commit`/`abort`/`deinit` |
+| `ReadTxn` | `db.beginReadTxn()`，MVCC 快照，`get`/`select`/`end`/`deinit` |
 | `Iterator` | `select` 返回，有 `.next() !?LeafEntry` 与 `.deinit()` |
 
 ### 所有权规则速记
