@@ -69,13 +69,33 @@ pub const FilePageStore = struct {
             .meta1 = [_]u8{0} ** PAGE_SIZE,
         };
 
-        // 从 mmap 区加载 meta 缓冲区，再尝试恢复 next_free
+        // 从 mmap 区加载 meta 缓冲区，再尝试恢复 next_free 和 meta_index
         @memcpy(fps.meta0[0..PAGE_SIZE], fps.pagePtr(f2.META_PAGE_0)[0..PAGE_SIZE]);
         @memcpy(fps.meta1[0..PAGE_SIZE], fps.pagePtr(f2.META_PAGE_1)[0..PAGE_SIZE]);
-        if (f2.readMetaPage(&fps.meta0, &fps.meta1)) |m| {
-            fps.next_free = @max(fps.next_free, m.last_page + 1);
+        // Determine which meta page is active (higher sequence) and set meta_index
+        // to write the OTHER page next (alternating write for crash safety)
+        const m0 = f2.readMetaPageSingle(&fps.meta0);
+        const m1 = f2.readMetaPageSingle(&fps.meta1);
+        if (m0 != null and m1 != null) {
+            // Both valid: active page is the one with higher sequence;
+            // meta_index should point to the inactive (older) page to overwrite next
+            if (m0.?.sequence >= m1.?.sequence) {
+                // meta0 is active (was last written with meta_index=0), so next write goes to meta1
+                fps.meta_index = 1;
+                fps.next_free = @max(fps.next_free, m0.?.last_page + 1);
+            } else {
+                // meta1 is active (was last written with meta_index=1), so next write goes to meta0
+                fps.meta_index = 0;
+                fps.next_free = @max(fps.next_free, m1.?.last_page + 1);
+            }
+        } else if (m0 != null) {
+            fps.meta_index = 1; // only meta0 valid, next write to meta1
+            fps.next_free = @max(fps.next_free, m0.?.last_page + 1);
+        } else if (m1 != null) {
+            fps.meta_index = 0; // only meta1 valid, next write to meta0
+            fps.next_free = @max(fps.next_free, m1.?.last_page + 1);
         }
-        // meta_index 从 0 起；readMetaPage 选较新有效页，下次 writeMeta 覆盖非活动页后交替
+        // else: both null (fresh DB), meta_index stays 0, next_free stays FIRST_DATA_PAGE
         return fps;
 
     }
@@ -160,9 +180,18 @@ pub const FilePageStore = struct {
 
     fn vtWriteMeta(ptr: *anyopaque, meta: *const f2.MetaPage) !void {
         const self: *FilePageStore = @ptrCast(@alignCast(ptr));
+        // Override last_page with actual highest allocated page for correct recovery on reopen
+        var meta_copy = meta.*;
+        if (self.next_free > ps.FIRST_DATA_PAGE) {
+            meta_copy.last_page = self.next_free - 1;
+        } else {
+            meta_copy.last_page = 0;
+        }
+        // Determine which meta page to write (opposite of the active one)
+        // meta_index tracks which page was last written; next write goes to the other
         const page = if (self.meta_index == 0) &self.meta0 else &self.meta1;
         const page_no = if (self.meta_index == 0) f2.META_PAGE_0 else f2.META_PAGE_1;
-        f2.writeMetaPage(page, meta, self.meta_index);
+        f2.writeMetaPage(page, &meta_copy, self.meta_index);
         self.flushMetaBuffer(page_no);
         self.meta_index = 1 - self.meta_index;
     }
