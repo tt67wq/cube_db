@@ -239,24 +239,6 @@ pub fn build(b: *std.Build) void {
     const overflow_test_step = b.step("test-overflow", "Run overflow tests only");
     overflow_test_step.dependOn(&run_overflow_test.step);
 
-    // ponytail: bench_lsm — LSM vs COW latency comparison
-    const bench_lsm_exe = b.addExecutable(.{
-        .name = "bench_lsm",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("bench/bench_lsm.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "cube_db", .module = mod },
-                .{ .name = "zio", .module = zio_mod },
-            },
-        }),
-    });
-    b.installArtifact(bench_lsm_exe);
-    const bench_lsm_step = b.step("bench-lsm", "Run LSM vs COW benchmark");
-    const bench_lsm_cmd = b.addRunArtifact(bench_lsm_exe);
-    bench_lsm_step.dependOn(&bench_lsm_cmd.step);
-
     // Once fixed, add `test-fuzz-coverage` with `-ffuzz` for coverage-guided fuzzing.
     // CI: `zig build test-fuzz` = determinant regression + smoke (~2s total).
     const fuzz_probe = b.addTest(.{
@@ -268,19 +250,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_fuzz_probe = b.addRunArtifact(fuzz_probe);
-
-    const fuzz_wal = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/fuzz/wal_fuzz_test.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "cube_db", .module = mod },
-                .{ .name = "zio", .module = zio_mod },
-            },
-        }),
-    });
-    const run_fuzz_wal = b.addRunArtifact(fuzz_wal);
 
     const fuzz_api = b.addTest(.{
         .root_module = b.createModule(.{
@@ -325,7 +294,6 @@ pub fn build(b: *std.Build) void {
     fuzz_long_step.dependOn(&run_fuzz_long.step);
     const fuzz_step = b.step("test-fuzz", "Run fuzz corpus replay tests (deterministic)");
     fuzz_step.dependOn(&run_fuzz_probe.step);
-    fuzz_step.dependOn(&run_fuzz_wal.step);
     fuzz_step.dependOn(&run_fuzz_api.step);
     fuzz_step.dependOn(&run_fuzz_format.step);
 }

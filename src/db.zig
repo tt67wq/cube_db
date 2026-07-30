@@ -6,13 +6,8 @@ const f2 = @import("format.zig");
 const ps = @import("page_store.zig");
 const btree = @import("btree.zig");
 const wrt = @import("writer.zig");
-const memtable = @import("memtable.zig");
-const wal_mod = @import("wal.zig");
-const compactor_mod = @import("compactor.zig");
-
 const PageStore = ps.PageStore;
 const State = wrt.State;
-const RwLock = zio.RwLock;
 
 pub const Entry = struct {
     key: []const u8,
@@ -25,12 +20,6 @@ pub const Db = struct {
     state: *State,
     store: PageStore,
     store_owned: bool,
-
-    // LSM fields (optional, set via open options)
-    mt: ?*memtable.Memtable = null,
-    wal: ?*wal_mod.Wal = null,
-    rwlock: ?*RwLock = null,
-    compactor: ?*compactor_mod.Compactor = null,
 
     pub fn open(allocator: std.mem.Allocator, store: PageStore, opts: wrt.Options) !*Db {
         const state = try allocator.create(State);
@@ -69,16 +58,6 @@ pub const Db = struct {
     }
 
     pub fn put(self: *Db, key: []const u8, value: []const u8) !void {
-        // LSM path: write to memtable + WAL
-        if (self.mt) |mt| {
-            if (self.wal) |w| _ = try w.append(.put, key, value);
-            _ = try mt.put(key, value);
-            if (mt.shouldFlush()) {
-                if (self.compactor) |c| c.signal(mt);
-            }
-            return;
-        }
-        // Fallback to original COW path
         var future: zio.Future(wrt.OpResult) = .{};
         try self.state.applyBatch(&.{.{
             .key = key,
@@ -109,27 +88,11 @@ pub const Db = struct {
     }
 
     pub fn get(self: *Db, key: []const u8) !?[]u8 {
-        // LSM path: check memtable first
-        if (self.mt) |mt| {
-            // Take read lock if available
-            if (self.rwlock) |rw| try rw.lockShared();
-            defer if (self.rwlock) |rw| rw.unlockShared();
-
-            if (mt.get(key)) |val| {
-                return try self.allocator.dupe(u8, val);
-            }
-        }
-        // Fallback to B-tree
         const root = self.state.getRoot();
         return try btree.get(self.allocator, self.store, root, key);
     }
 
     pub fn delete(self: *Db, key: []const u8) !void {
-        if (self.mt) |mt| {
-            if (self.wal) |w| _ = try w.append(.delete, key, "");
-            _ = try mt.delete(key);
-            return;
-        }
         var future: zio.Future(wrt.OpResult) = .{};
         try self.state.applyBatch(&.{.{
             .key = key,
@@ -169,90 +132,4 @@ test "db: open default state" {
     defer db.close();
     try std.testing.expectEqual(@as(u32, btree.NULL_ROOT), db.getRoot());
     try std.testing.expectEqual(@as(u64, 0), db.entryCount());
-}
-
-test "db: lsm get checks memtable first" {
-    const allocator = std.testing.allocator;
-    var ms = ps.MemPageStore.init(allocator, 1000);
-    defer ms.deinit();
-    var db = try Db.open(allocator, ms.store(), .{});
-    defer db.close();
-
-    // Create memtable and attach to Db
-    var mt = memtable.Memtable.init(allocator, 1024);
-    defer mt.deinit();
-    _ = try mt.put("mem", "table");
-
-    db.mt = &mt;
-
-    // Get should find the value in memtable
-    {
-        const v = try db.get("mem");
-        defer if (v) |val| allocator.free(val);
-        try std.testing.expectEqualStrings("table", v.?);
-    }
-
-    // Get for non-existent key returns null
-    {
-        const v = try db.get("nonexistent");
-        defer if (v) |val| allocator.free(val);
-        try std.testing.expectEqual(@as(?[]u8, null), v);
-    }
-
-    // Detach memtable, get should return null (B-tree is empty)
-    db.mt = null;
-    {
-        const v = try db.get("mem");
-        defer if (v) |val| allocator.free(val);
-        try std.testing.expectEqual(@as(?[]u8, null), v);
-    }
-}
-
-test "db: lsm put writes to memtable" {
-    const allocator = std.testing.allocator;
-    var ms = ps.MemPageStore.init(allocator, 1000);
-    defer ms.deinit();
-    var db = try Db.open(allocator, ms.store(), .{});
-    defer db.close();
-
-    var mt = memtable.Memtable.init(allocator, 1024);
-    defer mt.deinit();
-    db.mt = &mt;
-
-    // Put writes to memtable
-    try db.put("key", "value");
-    try std.testing.expectEqualStrings("value", mt.get("key").?);
-    try std.testing.expectEqual(@as(usize, 1), mt.count());
-
-    // get also finds it
-    {
-        const v = try db.get("key");
-        defer if (v) |val| allocator.free(val);
-        try std.testing.expectEqualStrings("value", v.?);
-    }
-}
-
-test "db: lsm delete writes tombstone to memtable" {
-    const allocator = std.testing.allocator;
-    var ms = ps.MemPageStore.init(allocator, 1000);
-    defer ms.deinit();
-    var db = try Db.open(allocator, ms.store(), .{});
-    defer db.close();
-
-    var mt = memtable.Memtable.init(allocator, 1024);
-    defer mt.deinit();
-    db.mt = &mt;
-
-    try db.put("key", "value");
-    try std.testing.expectEqualStrings("value", mt.get("key").?);
-
-    try db.delete("key");
-    try std.testing.expectEqual(@as(?[]const u8, null), mt.get("key"));
-
-    // get returns null
-    {
-        const v = try db.get("key");
-        defer if (v) |val| allocator.free(val);
-        try std.testing.expectEqual(@as(?[]u8, null), v);
-    }
 }
