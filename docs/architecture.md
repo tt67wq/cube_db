@@ -2,7 +2,7 @@
 
 > 本文档描述 cube_db 的核心架构设计：COW B-tree、MVCC 快照隔离、freelist 页复用、崩溃恢复机制。
 > 
-> 对应代码版本：commit `57e18cd` (2026-07-30)
+> 对应代码版本：commit `0a5200c` (2026-07-30)
 
 ---
 
@@ -307,7 +307,7 @@ Leaf 无分裂时（常见 case）：
               ▼                         ▼
         ┌─────────────┐           ┌─────────────┐
         │MemPageStore │           │FilePageStore│
-        │ 内存 HashMap │           │ mmap (TODO) │
+        │ 内存 HashMap │           │ mmap 持久化  │
         └─────────────┘           └─────────────┘
 ```
 
@@ -320,7 +320,54 @@ Leaf 无分裂时（常见 case）：
 | `btree.zig` | COW B-tree 核心：get/insert/select、页编码解码 |
 | `format.zig` | 页头/meta/freelist 编解码、CRC32 校验 |
 | `page_store.zig` | PageStore vtable 抽象、MemPageStore 实现 |
-| `file_page_store.zig` | FilePageStore（mmap，待完成）|
+| `file_page_store.zig` | FilePageStore（mmap 持久化）|
+
+---
+
+## 9. FilePageStore（mmap 持久化）
+
+FilePageStore 提供基于 mmap 的文件持久化存储，LMDB 风格：
+
+### 9.1 设计
+
+- **1TB 预留虚拟区**：`mmap` 时申请 1TB 虚拟地址空间（64-bit 系统充裕），实际文件按需 `ftruncate` 增长
+- **MAP_SHARED**：写操作经页缓存落盘，`fsync` 保证持久化
+- **零拷贝读**：reader 直接经 mmap 指针读，无需 `read()` 系统调用
+
+### 9.2 页分配与文件增长
+
+```
+allocPage():
+  1. freelist 非空？pop() 复用
+  2. 否则 bump next_free++
+  3. ensureFileGrowth(page_no) — ftruncate 文件到覆盖该页
+```
+
+### 9.3 Meta 页管理
+
+- **双 meta 页交替**：meta 写入 page 1 和 page 2 交替进行
+- **meta_index 恢复**：reopen 时比较两个 meta 页的 sequence，确定活跃的 meta 页，下次写入目标为非活跃页
+- **last_page 跟踪**：meta 中记录 `last_page = next_free - 1`，reopen 时正确恢复 `next_free`
+
+### 9.4 崩溃恢复
+
+```
+启动 ──→ mmap 文件 ──→ 读 meta page 1 & 2 ──→ 取 sequence 较大者
+                                              │
+                                              ▼
+                                        恢复 root、next_free
+                                        校验 magic + version + CRC
+```
+
+### 9.5 与 MemPageStore 对比
+
+| 特性 | MemPageStore | FilePageStore |
+|------|-------------|---------------|
+| 持久化 | 否（内存 HashMap） | 是（mmap + fsync） |
+| 读路径 | 内存拷贝 | mmap 零拷贝 |
+| 写路径 | 内存写入 | mmap + 页缓存 |
+| 恢复 | 不支持 | O(1) 双 meta 页恢复 |
+| 适用场景 | 测试/原型 | 生产环境 |
 
 ---
 

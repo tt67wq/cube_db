@@ -97,6 +97,12 @@ try db.put("hello", "world");
 
 `open` 从 meta page（page 1/2）恢复状态：root、sequence、entry_count、byte_size。恢复无需扫全文件，O(1)。
 
+**FilePageStore 特性：**
+- **mmap 1TB 预留区**：64-bit 系统虚拟地址空间充裕，文件按需 `ftruncate` 增长
+- **零拷贝读**：reader 直接经 mmap 指针读，无需 `read()` 系统调用
+- **双 meta 页交替**：meta 写入 page 1 和 page 2 交替进行，崩溃后取 sequence 较大者恢复
+- **fsync 落盘**：`commit` 后自动 `fsync`，保证崩溃安全
+
 ---
 
 ## 3. API
