@@ -101,6 +101,11 @@ pub const Db = struct {
         try self.state.compact();
     }
 
+    /// 显式 sync（async 模式下手动冲刷已提交数据到磁盘）。
+    pub fn sync(self: *Db) !void {
+        try self.store.sync();
+    }
+
     pub fn dirtCount(self: *Db) u64 {
         return self.state.dirtCount();
     }

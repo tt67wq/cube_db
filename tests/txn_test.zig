@@ -176,3 +176,32 @@ test "concurrency: 2 writers + 2 readers interleave, no deadlock" {
     defer if (v) |val| alloc.free(val);
     try std.testing.expect(v != null);
 }
+
+// ===== group commit：单 txn 多操作 = 一次 applyBatch + 一次 fsync =====
+test "group commit: 16 puts in one txn = single commit, single fsync batch" {
+    var ms = ps.MemPageStore.init(alloc, 4000);
+    defer ms.deinit();
+    var db = try Db.open(alloc, ms.store(), .{});
+    defer db.close();
+    // group commit 语义：单 WriteTxn 中 16 次 put → 一次 commit 走一次 applyBatch + 一次 meta 切换
+    // key 用堆分配（避免 bufPrint 复用栈缓冲的别名 bug）
+    const keys = try alloc.alloc([]u8, 16);
+    defer {
+        for (keys) |k| alloc.free(k);
+        alloc.free(keys);
+    }
+    var txn = try db.beginWriteTxn();
+    for (keys, 0..) |*k, i| {
+        k.* = try std.fmt.allocPrint(alloc, "g{d}", .{i});
+        try txn.put(k.*, "v");
+    }
+    try txn.commit();
+    // 提交后 entryCount 应=16（一次提交即一致）
+    try std.testing.expectEqual(@as(u64, 16), db.entryCount());
+    // 全部 key 可读
+    for (keys) |k| {
+        const v = try db.get(k);
+        defer if (v) |val| alloc.free(val);
+        try std.testing.expectEqualStrings("v", v.?);
+    }
+}
