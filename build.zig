@@ -68,6 +68,25 @@ pub fn build(b: *std.Build) void {
         bench_cmd.addArgs(args);
     }
 
+    // ponytail: bench-get-profile — get 分阶段耗时分解
+    const get_profile_exe = b.addExecutable(.{
+        .name = "get_profile",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/get_profile.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    b.installArtifact(get_profile_exe);
+
+    const get_profile_step = b.step("bench-get-profile", "Run get phase-by-phase timing breakdown");
+    const get_profile_cmd = b.addRunArtifact(get_profile_exe);
+    get_profile_step.dependOn(&get_profile_cmd.step);
+
     // Library unit tests (test blocks inside src/).
     const mod_tests = b.addTest(.{
         .root_module = mod,

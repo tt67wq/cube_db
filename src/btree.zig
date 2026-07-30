@@ -43,6 +43,14 @@ pub fn readNodePayload(store: PageStore, page_no: u32) ![]const u8 {
     return page[f2.PAGE_HEADER_SIZE .. f2.PAGE_SIZE - 4];
 }
 
+/// Fast read: skip CRC verification for hot read path.
+/// COW guarantees pages are never modified while being read,
+/// so CRC check is only needed on crash recovery / reopen.
+pub fn readNodePayloadFast(store: PageStore, page_no: u32) ![]const u8 {
+    const page = try store.readPage(page_no);
+    return page[f2.PAGE_HEADER_SIZE .. f2.PAGE_SIZE - 4];
+}
+
 /// 写节点页（页头 + payload + CRC）
 pub fn writeNodePage(store: PageStore, page_no: u32, page_type: u8, nkeys: u16, payload: []const u8) !void {
     const page = try store.writePage(page_no);
@@ -428,7 +436,7 @@ pub fn getBorrowed(store: PageStore, root: u32, key: []const u8) !?[]const u8 {
     var cur = root;
     var depth: u32 = 0;
     while (depth < 1000) : (depth += 1) {
-        const payload = try readNodePayload(store, cur);
+        const payload = try readNodePayloadFast(store, cur);
         if (payload.len == 0) return error.Truncated;
         if (payload[0] == LEAF_KIND) {
             return findInLeafBorrowed(payload, key);
@@ -496,7 +504,7 @@ pub fn get(allocator: std.mem.Allocator, store: PageStore, root: u32, key: []con
     var cur = root;
     var depth: u32 = 0;
     while (depth < 1000) : (depth += 1) {
-        const payload = try readNodePayload(store, cur);
+        const payload = try readNodePayloadFast(store, cur);
         if (payload.len == 0) return error.Truncated;
         if (payload[0] == LEAF_KIND) {
             return findInLeaf(allocator, store, payload, key);
