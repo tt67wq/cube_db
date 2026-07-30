@@ -84,7 +84,7 @@ full API, and recipes see **[docs/usage.md](docs/usage.md)**.
 
 ## Tests
 
-121 tests across 15 modules + 4 fuzz targets, all passing:
+142 tests across 17 modules + 4 fuzz targets, all passing:
 
 | Module | Tests | File |
 |--------|-------|------|
@@ -103,6 +103,9 @@ full API, and recipes see **[docs/usage.md](docs/usage.md)**.
 | Stress (1k keys) | 2 | `tests/stress_test.zig` |
 | Tutorial smoke | 5 | `tests/tutorial_smoke_test.zig` |
 | Fuzz (probe/api/format/meta-corrupt) | 9 | `tests/fuzz/*` |
+| Zero-copy | 7 | `tests/zero_copy_test.zig` |
+| COW fast path | 5 | `tests/cow_fast_test.zig` |
+| Crash recovery framework | 4 | `tests/crash_recovery_framework_test.zig` |
 
 ```bash
 zig build test test-fuzz        # all unit/integration + fuzz regression
