@@ -1,143 +1,221 @@
-//! file_page_store.zig — 文件页 Store（mmap 读写）
-//! 创建/打开文件，mmap 固定大小 mapsize，管理 freelist + meta 交替。
+//! file_page_store.zig — 文件页 Store（LMDB 式 1TB 预留 mmap 区）
+//!
+//! open 时 mmap 1TB MAP_SHARED 预留虚拟区（方案 I，spike_mmap.zig 已验证 macOS 可行）。
+//! 文件按需 ftruncate 增长，reader 经同一 mmap 指针读新数据，无 SIGBUS、无需重 mmap。
+//! 写路径保留 PageStore 页接口（allocPage/freePage/writePage）；读路径零拷贝直接 mmap 指针。
 const std = @import("std");
-const zio = @import("zio");
+const f2 = @import("format.zig");
+const ps = @import("page_store.zig");
 const c = @cImport({
     @cInclude("sys/mman.h");
+    @cInclude("sys/stat.h");
+    @cInclude("fcntl.h");
     @cInclude("unistd.h");
 });
-const f2 = @import("format.zig");
 
 const PAGE_SIZE = f2.PAGE_SIZE;
 
-const FilePageStore = @This();
+/// 1 TB 预留虚拟区（LMDB 式占位；64-bit 系统虚拟地址空间充裕）
+pub const REGION_SIZE: u64 = 1 << 40;
 
-allocator: std.mem.Allocator,
-file: zio.File,
-fd: i32,
-mapsize: u64,
-mmap_ptr: [*]u8,
-freelist: std.ArrayList(u32),
-next_free: u32,
-meta_index: u32,
-meta0: [PAGE_SIZE]u8,
-meta1: [PAGE_SIZE]u8,
+pub const FilePageStore = struct {
+    allocator: std.mem.Allocator,
+    fd: c_int,
+    region_size: u64,
+    mmap_ptr: [*]u8,
+    freelist: std.ArrayList(u32),
+    next_free: u32,
+    meta_index: u32,
+    meta0: [PAGE_SIZE]u8,
+    meta1: [PAGE_SIZE]u8,
 
-pub fn create(allocator: std.mem.Allocator, path: []const u8, mapsize: u64) !FilePageStore {
-    const cwd = zio.Dir.cwd();
-    const file = try cwd.createFile(path, .{ .read = true, .truncate = false, .exclusive = false });
-    // grow file to mapsize (write 1 byte at the end creates sparse file)
-    if (mapsize > 0) _ = try file.write(&.{0}, mapsize - 1);
-    const fd = file.fd;
+    /// open（或创建）path，mmap 1TB 预留区。文件按需增长。
+    pub fn init(allocator: std.mem.Allocator, path: []const u8) !FilePageStore {
+        const path_z = try allocator.dupeZ(u8, path);
+        defer allocator.free(path_z);
+        const fd = c.open(path_z, @as(c_int, c.O_RDWR | c.O_CREAT), @as(c.mode_t, 0o644));
+        if (fd < 0) return error.OpenFailed;
 
-    const ptr = try mmapRW(fd, mapsize);
-    // 初始化 freelist（从已有 meta 恢复），先设默认值
-    var fps = FilePageStore{
-        .allocator = allocator,
-        .file = file,
-        .fd = fd,
-        .mapsize = mapsize,
-        .mmap_ptr = ptr,
-        .freelist = .empty,
-        .next_free = f2.META_PAGE_1 + 1, // first data page after meta0, meta1
-        .meta_index = 0,
-        .meta0 = [_]u8{0} ** PAGE_SIZE,
-        .meta1 = [_]u8{0} ** PAGE_SIZE,
-    };
+        // 初始文件至少覆盖 meta0 + meta1（3 页）
+        var st: c.struct_stat = undefined;
+        if (c.fstat(fd, &st) != 0) {
+            _ = c.close(fd);
+            return error.FstatFailed;
+        }
+        const min_size: u64 = @as(u64, ps.FIRST_DATA_PAGE) * PAGE_SIZE;
+        if (@as(u64, @intCast(st.st_size)) < min_size) {
+            if (c.ftruncate(fd, @as(c.off_t, @intCast(min_size))) != 0) {
+                _ = c.close(fd);
+                return error.TruncateFailed;
+            }
+        }
 
-    // 尝试从文件已有 meta 恢复
-    const loaded_meta = fps.store().readMeta() catch null;
-    if (loaded_meta) |m| {
-        fps.next_free = @max(fps.next_free, m.last_page + 1);
+        // mmap 1TB MAP_SHARED 预留区
+        const ptr = c.mmap(null, REGION_SIZE, @as(c_int, c.PROT_READ) | @as(c_int, c.PROT_WRITE), @as(c_int, c.MAP_SHARED), fd, 0);
+        if (ptr == c.MAP_FAILED) {
+            _ = c.close(fd);
+            return error.MapFailed;
+        }
+
+        var fps: FilePageStore = .{
+            .allocator = allocator,
+            .fd = fd,
+            .region_size = REGION_SIZE,
+            .mmap_ptr = @ptrCast(ptr),
+            .freelist = .empty,
+            .next_free = ps.FIRST_DATA_PAGE,
+            .meta_index = 0,
+            .meta0 = [_]u8{0} ** PAGE_SIZE,
+            .meta1 = [_]u8{0} ** PAGE_SIZE,
+        };
+
+        // 从 mmap 区加载 meta 缓冲区，再尝试恢复 next_free
+        @memcpy(fps.meta0[0..PAGE_SIZE], fps.pagePtr(f2.META_PAGE_0)[0..PAGE_SIZE]);
+        @memcpy(fps.meta1[0..PAGE_SIZE], fps.pagePtr(f2.META_PAGE_1)[0..PAGE_SIZE]);
+        if (f2.readMetaPage(&fps.meta0, &fps.meta1)) |m| {
+            fps.next_free = @max(fps.next_free, m.last_page + 1);
+        }
+        // meta_index 从 0 起；readMetaPage 选较新有效页，下次 writeMeta 覆盖非活动页后交替
+        return fps;
+
     }
 
-    return fps;
-}
+    pub fn deinit(self: *FilePageStore) void {
+        _ = c.munmap(@ptrCast(self.mmap_ptr), REGION_SIZE);
+        _ = c.close(self.fd);
+        self.freelist.deinit(self.allocator);
+    }
 
-pub fn deinit(self: *FilePageStore) void {
-    _ = c.munmap(@ptrCast(self.mmap_ptr), self.mapsize);
-    _ = c.close(self.fd);
-    self.freelist.deinit(self.allocator);
-}
+    /// 预留虚拟区大小（字节）
+    pub fn regionSize(self: *const FilePageStore) u64 {
+        return self.region_size;
+    }
 
-pub fn store(self: *FilePageStore) @import("page_store.zig").PageStore {
-    return .{
-        .ptr = self,
-        .vtable = &file_vtable,
-    };
-}
+    pub fn store(self: *FilePageStore) ps.PageStore {
+        return .{ .ptr = self, .vtable = &file_vtable };
+    }
 
-fn mmapRW(fd: i32, size: u64) ![*]u8 {
-    const aligned = std.mem.alignForward(u64, size, @as(u64, std.heap.page_size_min));
-    const ptr = c.mmap(null, aligned, @as(c_int, c.PROT_READ) | @as(c_int, c.PROT_WRITE), @as(c_int, c.MAP_SHARED), fd, 0);
-    if (ptr == c.MAP_FAILED) return error.MapFailed;
-    return @as([*]u8, @ptrCast(ptr));
-}
+    fn pagePtr(self: *FilePageStore, page_no: u32) [*]u8 {
+        return self.mmap_ptr + @as(usize, @intCast(page_no)) * PAGE_SIZE;
+    }
 
-fn pagePtr(self: *FilePageStore, page_no: u32) [*]u8 {
-    return self.mmap_ptr + @as(usize, @intCast(page_no)) * PAGE_SIZE;
-}
+    /// 将 meta 缓冲区刷到文件（mmap 区可见）
+    fn flushMetaBuffer(self: *FilePageStore, page_no: u32) void {
+        const buf = if (page_no == f2.META_PAGE_0) &self.meta0 else &self.meta1;
+        const dst = self.pagePtr(page_no);
+        @memcpy(dst[0..PAGE_SIZE], buf[0..PAGE_SIZE]);
+    }
 
-fn vtAllocPage(ptr: *anyopaque) !u32 {
-    const self: *FilePageStore = @ptrCast(@alignCast(ptr));
-    if (self.freelist.items.len > 0) return self.freelist.pop().?;
-    const pn = self.next_free;
-    if (@as(u64, pn) * PAGE_SIZE >= self.mapsize) return error.MapFull;
-    self.next_free = pn + 1;
-    return pn;
-}
+    /// 确保文件已增长到覆盖 page_no（含整页）
+    fn ensureFileGrowth(self: *FilePageStore, page_no: u32) !void {
+        const needed: u64 = (@as(u64, page_no) + 1) * PAGE_SIZE;
+        var st: c.struct_stat = undefined;
+        if (c.fstat(self.fd, &st) != 0) return error.FstatFailed;
+        if (@as(u64, @intCast(st.st_size)) < needed) {
+            if (c.ftruncate(self.fd, @as(c.off_t, @intCast(needed))) != 0) return error.TruncateFailed;
+        }
+    }
 
-fn vtFreePage(ptr: *anyopaque, page_no: u32) void {
-    const self: *FilePageStore = @ptrCast(@alignCast(ptr));
-    self.freelist.append(self.allocator, page_no) catch {};
-}
+    // ===== PageStore vtable =====
 
-fn vtReadPage(ptr: *anyopaque, page_no: u32) ![]const u8 {
-    const self: *FilePageStore = @ptrCast(@alignCast(ptr));
-    if (page_no == f2.META_PAGE_0) return &self.meta0;
-    if (page_no == f2.META_PAGE_1) return &self.meta1;
-    return self.pagePtr(page_no)[0..PAGE_SIZE];
-}
+    fn vtAllocPage(ptr: *anyopaque) !u32 {
+        const self: *FilePageStore = @ptrCast(@alignCast(ptr));
+        if (self.freelist.items.len > 0) return self.freelist.pop().?;
+        const pn = self.next_free;
+        if (@as(u64, pn) * PAGE_SIZE >= self.region_size) return error.MapFull;
+        try self.ensureFileGrowth(pn);
+        self.next_free = pn + 1;
+        return pn;
+    }
 
-fn vtWritePage(ptr: *anyopaque, page_no: u32) ![]u8 {
-    const self: *FilePageStore = @ptrCast(@alignCast(ptr));
-    if (page_no == f2.META_PAGE_0) return &self.meta0;
-    if (page_no == f2.META_PAGE_1) return &self.meta1;
-    return self.pagePtr(page_no)[0..PAGE_SIZE];
-}
+    fn vtFreePage(ptr: *anyopaque, page_no: u32) void {
+        const self: *FilePageStore = @ptrCast(@alignCast(ptr));
+        self.freelist.append(self.allocator, page_no) catch {};
+    }
 
-fn vtReadMeta(ptr: *anyopaque) !?f2.MetaPage {
-    const self: *FilePageStore = @ptrCast(@alignCast(ptr));
-    return f2.readMetaPage(&self.meta0, &self.meta1);
-}
+    fn vtReadPage(ptr: *anyopaque, page_no: u32) ![]const u8 {
+        const self: *FilePageStore = @ptrCast(@alignCast(ptr));
+        if (page_no == f2.META_PAGE_0) return &self.meta0;
+        if (page_no == f2.META_PAGE_1) return &self.meta1;
+        if (@as(u64, page_no) * PAGE_SIZE >= self.region_size) return error.PageNotFound;
+        return self.pagePtr(page_no)[0..PAGE_SIZE];
+    }
 
-fn vtWriteMeta(ptr: *anyopaque, meta: *const f2.MetaPage) !void {
-    const self: *FilePageStore = @ptrCast(@alignCast(ptr));
-    const page = if (self.meta_index == 0) &self.meta0 else &self.meta1;
-    f2.writeMetaPage(page, meta, self.meta_index);
-    // 将 meta 页刷到文件
-    const page_no = if (self.meta_index == 0) f2.META_PAGE_0 else f2.META_PAGE_1;
-    @memcpy(self.pagePtr(page_no)[0..PAGE_SIZE], page[0..PAGE_SIZE]);
-    self.meta_index = 1 - self.meta_index;
-}
+    fn vtWritePage(ptr: *anyopaque, page_no: u32) ![]u8 {
+        const self: *FilePageStore = @ptrCast(@alignCast(ptr));
+        if (page_no == f2.META_PAGE_0) return &self.meta0;
+        if (page_no == f2.META_PAGE_1) return &self.meta1;
+        if (@as(u64, page_no) * PAGE_SIZE >= self.region_size) return error.MapFull;
+        try self.ensureFileGrowth(page_no);
+        return self.pagePtr(page_no)[0..PAGE_SIZE];
+    }
 
-fn vtSync(ptr: *anyopaque) !void {
-    const self: *FilePageStore = @ptrCast(@alignCast(ptr));
-    _ = c.msync(self.mmap_ptr, self.mapsize, c.MS_SYNC);
-}
+    fn vtReadMeta(ptr: *anyopaque) !?f2.MetaPage {
+        const self: *FilePageStore = @ptrCast(@alignCast(ptr));
+        // 先从 mmap 区同步到缓冲区，再读（reader 可能跨进程写）
+        @memcpy(self.meta0[0..PAGE_SIZE], self.pagePtr(f2.META_PAGE_0)[0..PAGE_SIZE]);
+        @memcpy(self.meta1[0..PAGE_SIZE], self.pagePtr(f2.META_PAGE_1)[0..PAGE_SIZE]);
+        return f2.readMetaPage(&self.meta0, &self.meta1);
+    }
 
-fn vtMapSize(ptr: *anyopaque) u64 {
-    const self: *FilePageStore = @ptrCast(@alignCast(ptr));
-    return self.mapsize / PAGE_SIZE;
-}
+    fn vtWriteMeta(ptr: *anyopaque, meta: *const f2.MetaPage) !void {
+        const self: *FilePageStore = @ptrCast(@alignCast(ptr));
+        const page = if (self.meta_index == 0) &self.meta0 else &self.meta1;
+        const page_no = if (self.meta_index == 0) f2.META_PAGE_0 else f2.META_PAGE_1;
+        f2.writeMetaPage(page, meta, self.meta_index);
+        self.flushMetaBuffer(page_no);
+        self.meta_index = 1 - self.meta_index;
+    }
 
-const file_vtable: @import("page_store.zig").PageStore.VTable = .{
-    .allocPage = vtAllocPage,
-    .freePage = vtFreePage,
-    .readPage = vtReadPage,
-    .writePage = vtWritePage,
-    .readMeta = vtReadMeta,
-    .writeMeta = vtWriteMeta,
-    .sync = vtSync,
-    .mapsize = vtMapSize,
+    fn vtSync(ptr: *anyopaque) !void {
+        const self: *FilePageStore = @ptrCast(@alignCast(ptr));
+        // fsync(fd) flush page cache for the inode（mmap MAP_SHARED 写经页缓存）
+        if (c.fsync(self.fd) != 0) return error.SyncFailed;
+    }
+
+    fn vtMapSize(ptr: *anyopaque) u64 {
+        const self: *FilePageStore = @ptrCast(@alignCast(ptr));
+        return self.region_size / PAGE_SIZE;
+    }
 };
+
+const file_vtable: ps.PageStore.VTable = .{
+    .allocPage = FilePageStore.vtAllocPage,
+    .freePage = FilePageStore.vtFreePage,
+    .readPage = FilePageStore.vtReadPage,
+    .writePage = FilePageStore.vtWritePage,
+    .readMeta = FilePageStore.vtReadMeta,
+    .writeMeta = FilePageStore.vtWriteMeta,
+    .sync = FilePageStore.vtSync,
+    .mapsize = FilePageStore.vtMapSize,
+};
+
+fn unlinkPath(path: []const u8) void {
+    var buf: [256]u8 = undefined;
+    if (path.len >= buf.len) return;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    _ = c.unlink(@ptrCast(&buf));
+}
+test "file_page_store: 1TB region reserved on open" {
+    const allocator = std.testing.allocator;
+    const path = ".fps_region_test.db";
+    defer unlinkPath(path);
+    var fps = try FilePageStore.init(allocator, path);
+    defer fps.deinit();
+    try std.testing.expect(fps.regionSize() >= (1 << 40));
+}
+
+test "file_page_store: alloc grows file, read-back visible" {
+    const allocator = std.testing.allocator;
+    const path = ".fps_grow_test.db";
+    defer unlinkPath(path);
+    var fps = try FilePageStore.init(allocator, path);
+    defer fps.deinit();
+    const s = fps.store();
+    const pn = try s.allocPage();
+    const w = try s.writePage(pn);
+    @memcpy(w[0..4], "ABCD");
+    const r = try s.readPage(pn);
+    try std.testing.expectEqualStrings("ABCD", r[0..4]);
+}
