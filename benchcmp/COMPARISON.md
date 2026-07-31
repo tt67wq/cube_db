@@ -178,12 +178,15 @@ clang++ -O3 -std=c++17 benchcmp.cpp \
 > ⚠️ **重要修正（2026-07-31）**：
 > - putBatch MemPageStore 0.04µs / FilePageStore+fsync 0.24µs 数字**受 applyBatch key/value 共享 bug 影响**，实际只插入 1 条而非 10K 条
 > - 修复后重测数字：MemPageStore 0.06µs，FilePageStore+fsync 10K 0.68µs
-> - 以下矩阵已用修复后数据更新
+> - **⚠️ 新发现（2026-07-31）：insertBatch 在真实负载下（大量 key 落同一 leaf）有容量溢出 bug，当前 putBatch 功能不可靠**
+> - 以下矩阵数字基于**顺序均匀 key 分布**（恰好不触发溢出），不代表真实场景性能
+> - 等 #26 彻底修复后重测
 
 > **数据说明**：
 > - cube_db MemPageStore/FilePageStore 数据：实测（Apple M1 Pro, small scale, 10k ops）
 > - LMDB MDB_NOSYNC 数据：实测（同机器）
 > - LMDB default 数据：实测（同机器）
+> - **⚠️ 所有 putBatch 数字基于顺序均匀 key 分布，真实场景可能 SEGV**
 
 | 后端 | sync 策略 | put 100B | putBatch 100B (per-entry) | putBatch 10K (txn total) | get 100B | 备注 |
 |------|----------|---------|--------------------------|------------------------|---------|------|
