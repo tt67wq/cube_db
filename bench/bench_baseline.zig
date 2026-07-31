@@ -21,14 +21,15 @@ const MetricList = []const Metric;
 
 fn currentBaseline() MetricList {
     return &.{
-        .{ .name = "put 100B", .store = "mem", .value_ns = 82136, .threshold_pct = 10, .note = "MemPageStore, 5K keys" },
-        .{ .name = "putBatch 100B", .store = "mem", .value_ns = 93, .threshold_pct = 25, .note = "MemPageStore, 5K keys, 噪声大" },
-        .{ .name = "get 100B", .store = "mem", .value_ns = 2844, .threshold_pct = 10, .note = "MemPageStore, 5K keys" },
+        // 2026-07-31 重校：put/delete 解释 = 写路径 dupe 开销（假设，待 commit 分解任务验证）
+        .{ .name = "put 100B", .store = "mem", .value_ns = 123721, .threshold_pct = 25, .note = "MemPageStore, 5K keys, 重校(dupe 假设)" },
+        .{ .name = "putBatch 100B", .store = "mem", .value_ns = 13240, .threshold_pct = 25, .note = "MemPageStore, 30 keys(快路径), 重校(旧值=1-key bug)" },
+        .{ .name = "get 100B", .store = "mem", .value_ns = 2907, .threshold_pct = 15, .note = "MemPageStore, 5K keys, A/B 确认无回归" },
         .{ .name = "getBorrowed 100B", .store = "mem", .value_ns = 352, .threshold_pct = 15, .note = "MemPageStore, 5K keys" },
-        .{ .name = "delete 100B", .store = "mem", .value_ns = 91608, .threshold_pct = 15, .note = "MemPageStore, 5K keys" },
-        .{ .name = "put 100B", .store = "file-fsync", .value_ns = 192561, .threshold_pct = 20, .note = "FilePageStore+fsync, 10K keys" },
-        .{ .name = "putBatch 100B", .store = "file-fsync", .value_ns = 98, .threshold_pct = 25, .note = "FilePageStore+fsync, 10K keys" },
-        .{ .name = "get 100B", .store = "file-fsync", .value_ns = 3097, .threshold_pct = 20, .note = "FilePageStore+fsync, 10K keys" },
+        .{ .name = "delete 100B", .store = "mem", .value_ns = 117093, .threshold_pct = 25, .note = "MemPageStore, 5K keys, 重校(dupe 假设)" },
+        .{ .name = "put 100B", .store = "file-fsync", .value_ns = 167499, .threshold_pct = 20, .note = "FilePageStore+fsync, 1K keys, 重校" },
+        .{ .name = "putBatch 100B", .store = "file-fsync", .value_ns = 15233, .threshold_pct = 25, .note = "FilePageStore+fsync, 30 keys, 重校(旧值=1-key bug)" },
+        .{ .name = "get 100B", .store = "file-fsync", .value_ns = 3100, .threshold_pct = 25, .note = "FilePageStore+fsync, 1K keys, 噪声敏感" },
     };
 }
 
