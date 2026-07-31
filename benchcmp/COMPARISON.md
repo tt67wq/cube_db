@@ -131,9 +131,11 @@ clang++ -O3 -std=c++17 benchcmp.cpp \
 
 ### LMDB 实测对比（2026-07-30）
 
+> ⚠️ **重要限定条件**：以下对比基于 **MemPageStore（纯内存）vs LMDB MDB_NOSYNC（无 fsync）**，测的是算法与页管理吞吐，**非持久化性能**。FilePageStore + fsync 的真实部署数据待补测（task #21）。
+
 **同架构基准首次实测**（COW B-tree + mmap, no fsync）
 
-| 操作 | cube_db | **LMDB** | 差距 |
+| 操作 | cube_db (MemPageStore, no-fsync) | **LMDB (MDB_NOSYNC)** | 差距 |
 |------|---------|----------|------|
 | get 100B | **2.73µs** | **0.29µs** | **9.4×** |
 | get 10KB | 47µs | 0.28µs | 168× |
@@ -144,10 +146,20 @@ clang++ -O3 -std=c++17 benchcmp.cpp \
 | delete 100B | 109µs | 1.80µs | 61× |
 | delete 10KB | 114µs | 4.66µs | 24× |
 
+**Shared COW 优化后（2026-07-30 最新）：**
+
+| 操作 | cube_db (MemPageStore, no-fsync) | LMDB (MDB_NOSYNC) | 差距 |
+|------|---------|------|------|
+| **putBatch 100B** | **0.04µs** | 0.23µs | **快 5.8×** ✅ |
+| **putBatch 10KB** | **0.05µs** | 3.64µs | **快 73×** ✅ |
+| put 100B | 82µs | 3.15µs | 26× |
+
+> ✅ **在 MemPageStore/no-fsync 条件下，putBatch 已超越 LMDB MDB_NOSYNC**。但 FilePageStore + fsync 的真实部署性能待验证。
+
 **分析：**
 - **读路径**：get 100B 差距 9.4× — CRC 跳过优化效果显著（已从 62× 缩小），但 LMDB 的 mmap 零拷贝直读仍然更快
-- **写路径**：put 100B 差距 38× — LMDB 的 COW 实现更轻量（无 freelist、无 arena 开销）
-- **批量写**：putBatch 100B 差距 107× — 最大差距，LMDB 单 transaction 内几乎零开销
+- **写路径**：put 100B 差距 38× → 26× — LMDB 的 COW 实现更轻量（无 freelist、无 arena 开销）
+- **批量写**：putBatch 100B 差距从 107× 反转为快 5.8× — Shared COW 路径优化效果显著
 
 **LMDB 优势来源：**
 - 直接 mmap 指针操作，无 vtable 间接调用
@@ -158,5 +170,13 @@ clang++ -O3 -std=c++17 benchcmp.cpp \
 ### 差距分析
 
 1. **读路径** — ✅ **已大幅优化**。get 100B 2.73µs vs LMDB 0.29µs，差距 **9.4×**（已从 62× 缩小）。剩余差距来自 B-tree 遍历深度 + page 指针偏移计算。
-2. **写路径** — COW 架构固有开销（每次 put 完整 B-tree 路径复制），group-commit 已缩小差距但未消除。put 100B vs LMDB 差距 **38×**。
-3. **批量写** — 最大差距 **107×**（putBatch 100B）。LMDB 单 transaction 内几乎零开销，cube_db 仍有 COW 逐页复制成本。
+2. **写路径** — COW 架构固有开销（每次 put 完整 B-tree 路径复制），group-commit 已缩小差距但未消除。put 100B vs LMDB 差距 **26×**。
+3. **批量写** — ✅ **已超越 LMDB**。Shared COW 路径优化后，putBatch 100B 0.04µs vs LMDB 0.23µs，**快 5.8×**。
+
+### 待补测（task #21）
+
+| 后端 | sync 策略 | 状态 |
+|------|----------|------|
+| MemPageStore | no-op（现有）| ✅ 已完成 |
+| FilePageStore | mmap only（no fsync）| ⏳ 待测 |
+| FilePageStore | fsync（默认）| ⏳ 待测（真实部署性能）|
