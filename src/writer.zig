@@ -176,7 +176,17 @@ pub const State = struct {
         var batch_byte_delta: i64 = 0;
         var new_root = cur_root;
 
-        // Copy keys/values into arena first (caller slices may not survive — e.g. stack buffer reuse)
+        // Fast path for single entry: use insert directly (avoids sort/dupe/insertBatch overhead)
+        if (batch.len == 1) {
+            const wr = btree.insert(arena_alloc, self.store, new_root, batch[0].key, batch[0].value, batch[0].tombstone, &batch_dirty) catch |err| {
+                for (batch) |r| r.future.set(err);
+                return;
+            };
+            new_root = wr.new_root;
+            batch_entry_delta += wr.count_delta;
+            batch_byte_delta += wr.live_delta;
+        } else {
+            // Copy keys/values into arena first (caller slices may not survive — e.g. stack buffer reuse)
         const arena_entries = try arena_alloc.alloc(btree.LeafEntry, batch.len);
         for (batch, 0..) |req, i| {
             arena_entries[i] = .{
@@ -215,6 +225,7 @@ pub const State = struct {
         new_root = wr.new_root;
         batch_entry_delta += wr.count_delta;
         batch_byte_delta += wr.live_delta;
+        } // end else (batch.len > 1)
 
         // 3. 本批脏页进 pending_free（不立即回收，MVCC 安全）
         for (batch_dirty.items) |pn| {

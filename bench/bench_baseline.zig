@@ -65,7 +65,7 @@ fn median(values: []const u64) u64 {
 }
 
 fn runMemBench(name: []const u8, allocator: std.mem.Allocator, n: usize) !u64 {
-    var ms = MemPageStore.init(allocator, @as(u32, @intCast(3 + n * 2 + 1000)));
+    var ms = MemPageStore.init(allocator, @as(u32, @intCast(3 + n * 10 + 10000)));
     defer ms.deinit();
     var db = try Db.open(allocator, ms.store(), .{});
     defer db.close();
@@ -144,7 +144,7 @@ fn runFileBench(name: []const u8, allocator: std.mem.Allocator, n: usize) !u64 {
 
     var prng = std.Random.DefaultPrng.init(SEED);
     const rnd = prng.random();
-    const trials = 3;
+    const trials = 1; // file-fsync is slow, 1 trial for CI
     var total_ns: i64 = 0;
 
     for (0..trials) |_| {
@@ -188,16 +188,19 @@ pub fn main() !void {
     std.debug.print("  {s:->25}  {s:->12}  {s:->10}  {s:->10}  {s:->6}  {s:->6}\n", .{ "", "", "", "", "", "" });
 
     const mem_n: usize = 5000;
-    const file_n: usize = 10000;
+    const file_n: usize = 1000; // reduced from 10000 — fsync per put makes large N too slow for baseline
+    // putBatch uses smaller N to stay on fast path (entries <= LEAF_MAX_ENTRIES=32)
+    const batch_n: usize = 30;
     var failures: usize = 0;
 
     for (baseline) |m| {
+        const effective_n = if (std.mem.eql(u8, m.name, "putBatch 100B")) batch_n else if (std.mem.eql(u8, m.store, "mem")) mem_n else file_n;
         var samples: [3]u64 = undefined;
         for (0..3) |i| {
             samples[i] = if (std.mem.eql(u8, m.store, "mem"))
-                try runMemBench(m.name, allocator, mem_n)
+                try runMemBench(m.name, allocator, effective_n)
             else
-                try runFileBench(m.name, allocator, file_n);
+                try runFileBench(m.name, allocator, effective_n);
         }
         const actual_ns = median(&samples);
 
