@@ -68,6 +68,29 @@ pub fn build(b: *std.Build) void {
         bench_cmd.addArgs(args);
     }
 
+    // ponytail: fps-bench — FilePageStore benchmark (2x2 matrix: no-fsync/fsync)
+    const fps_bench_exe = b.addExecutable(.{
+        .name = "fps_bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/fps_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    fps_bench_exe.root_module.link_libc = true;
+    b.installArtifact(fps_bench_exe);
+
+    const fps_bench_step = b.step("fps-bench", "Run FilePageStore benchmark (2x2 matrix)");
+    const fps_bench_cmd = b.addRunArtifact(fps_bench_exe);
+    fps_bench_step.dependOn(&fps_bench_cmd.step);
+    if (b.args) |args| {
+        fps_bench_cmd.addArgs(args);
+    }
+
     // ponytail: bench-get-profile — get 分阶段耗时分解
     const get_profile_exe = b.addExecutable(.{
         .name = "get_profile",
