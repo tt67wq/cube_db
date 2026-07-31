@@ -1238,17 +1238,8 @@ fn insertBatchFresh(
         }
         return .{ .new_root = new_page, .live_delta = live, .count_delta = count };
     }
-    // Too many entries for single leaf — fallback to per-entry insert
-    var new_root: u32 = NULL_ROOT;
-    var live: i64 = 0;
-    var count: i64 = 0;
-    for (entries) |e| {
-        const wr = try insert(allocator, store, new_root, e.key, e.value, e.tombstone, dirty);
-        new_root = wr.new_root;
-        live += wr.live_delta;
-        count += wr.count_delta;
-    }
-    return .{ .new_root = new_root, .live_delta = live, .count_delta = count };
+    // Too many entries for single leaf — use efficient bulk-load split
+    return insertBatchSplitLeaves(allocator, store, entries, dirty);
 }
 
 /// Split sorted entries into multiple leaves, build branch tree
@@ -1297,14 +1288,22 @@ fn insertBatchSplitLeaves(
         return .{ .new_root = new_root, .live_delta = live, .count_delta = count };
     }
     // Multiple branches needed — build multi-level tree
-    // For now, build one level at a time
     var current_pages = leaf_pages.items;
     var current_keys = split_keys.items;
+    var level_pages_a = std.ArrayList(u32).empty;
+    defer level_pages_a.deinit(allocator);
+    var level_keys_a = std.ArrayList([]const u8).empty;
+    defer level_keys_a.deinit(allocator);
+    var level_pages_b = std.ArrayList(u32).empty;
+    defer level_pages_b.deinit(allocator);
+    var level_keys_b = std.ArrayList([]const u8).empty;
+    defer level_keys_b.deinit(allocator);
+    var use_a = true;
     while (current_pages.len > BRANCH_MAX_CHILDREN) {
-        var new_pages = std.ArrayList(u32).empty;
-        defer new_pages.deinit(allocator);
-        var new_keys = std.ArrayList([]const u8).empty;
-        defer new_keys.deinit(allocator);
+        var new_pages = if (use_a) &level_pages_a else &level_pages_b;
+        var new_keys = if (use_a) &level_keys_a else &level_keys_b;
+        new_pages.clearRetainingCapacity();
+        new_keys.clearRetainingCapacity();
         var i: usize = 0;
         while (i < current_pages.len) {
             const chunk_len = @min(BRANCH_MAX_CHILDREN, current_pages.len - i);
@@ -1323,6 +1322,7 @@ fn insertBatchSplitLeaves(
         }
         current_pages = new_pages.items;
         current_keys = new_keys.items;
+        use_a = !use_a;
     }
     // Final root branch
     const new_root = try store.allocPage();
@@ -1381,8 +1381,6 @@ fn insertBatchIntoLeaf(
     entries: []const LeafEntry,
     dirty: *std.ArrayList(u32),
 ) !InsertSub {
-    // No guard here — the caller (insertBatch) guards at the top level.
-    // This function only handles batches that fit (at most one split).
     const old_page = try store.readPage(page_no);
     var old_page_buf: [f2.PAGE_SIZE]u8 = undefined;
     @memcpy(&old_page_buf, old_page[0..f2.PAGE_SIZE]);
@@ -1394,49 +1392,95 @@ fn insertBatchIntoLeaf(
     var live_delta: i64 = 0;
     var count_delta: i64 = 0;
 
-    for (entries) |e| {
-        const pos = leaf.findPos(e.key);
-        if (pos < leaf.entries.len and cmpKey(leaf.entries[pos].key, e.key) == .eq) {
-            // Overwrite
-            const old = leaf.entries[pos];
-            live_delta -= @as(i64, @intCast(old.key.len + old.value.len + 9));
-            allocator.free(old.key);
-            allocator.free(old.value);
-            if (!old.tombstone and e.tombstone) count_delta -= 1;
-            if (old.tombstone and !e.tombstone) count_delta += 1;
-            leaf.entries[pos] = .{
-                .tombstone = e.tombstone,
-                .key = try allocator.dupe(u8, e.key),
-                .value = if (e.tombstone) try allocator.dupe(u8, "") else try allocator.dupe(u8, e.value),
-            };
-            live_delta += @as(i64, @intCast(e.key.len + (if (e.tombstone) @as(usize, 0) else e.value.len) + 9));
-        } else {
-            // Insert
-            const new_entries = try allocator.alloc(LeafEntry, leaf.entries.len + 1);
-            @memcpy(new_entries[0..pos], leaf.entries[0..pos]);
-            new_entries[pos] = .{
-                .tombstone = e.tombstone,
-                .key = try allocator.dupe(u8, e.key),
-                .value = if (e.tombstone) try allocator.dupe(u8, "") else try allocator.dupe(u8, e.value),
-            };
-            @memcpy(new_entries[pos + 1 ..], leaf.entries[pos..]);
-            allocator.free(leaf.entries);
-            leaf.entries = new_entries;
-            live_delta += @as(i64, @intCast(e.key.len + (if (e.tombstone) @as(usize, 0) else e.value.len) + 9));
-            if (!e.tombstone) count_delta += 1;
+    // O(n+m) merge: both old leaf entries and batch entries are sorted.
+    // Merge with overwrite (batch entries win = last write wins).
+    const merged = try allocator.alloc(LeafEntry, leaf.entries.len + entries.len);
+    defer allocator.free(merged);
+    var mi: usize = 0;
+
+    var oi: usize = 0; // old leaf entries index
+    var bi: usize = 0; // batch entries index
+    while (oi < leaf.entries.len and bi < entries.len) {
+        const old_e = leaf.entries[oi];
+        const new_e = entries[bi];
+        switch (cmpKey(old_e.key, new_e.key)) {
+            .lt => {
+                // Old entry not in batch — keep as-is
+                merged[mi] = old_e;
+                mi += 1;
+                oi += 1;
+            },
+            .gt => {
+                // New entry not in old — insert
+                merged[mi] = .{
+                    .tombstone = new_e.tombstone,
+                    .key = try allocator.dupe(u8, new_e.key),
+                    .value = if (new_e.tombstone) try allocator.dupe(u8, "") else try allocator.dupe(u8, new_e.value),
+                };
+                live_delta += @as(i64, @intCast(new_e.key.len + (if (new_e.tombstone) @as(usize, 0) else new_e.value.len) + 9));
+                if (!new_e.tombstone) count_delta += 1;
+                mi += 1;
+                bi += 1;
+            },
+            .eq => {
+                // Overwrite: batch entry wins (last write wins)
+                const old = old_e;
+                live_delta -= @as(i64, @intCast(old.key.len + old.value.len + 9));
+                if (!old.tombstone and new_e.tombstone) count_delta -= 1;
+                if (old.tombstone and !new_e.tombstone) count_delta += 1;
+                // Free old entry's key/value (they're owned by leaf, which we'll deinit)
+                // We can't free here because leaf.deinit() will try to free them too.
+                // Instead, we replace the old entry in leaf.entries so deinit won't double-free.
+                leaf.entries[oi] = .{
+                    .tombstone = false,
+                    .key = &[_]u8{},
+                    .value = &[_]u8{},
+                };
+                allocator.free(old.key);
+                allocator.free(old.value);
+                merged[mi] = .{
+                    .tombstone = new_e.tombstone,
+                    .key = try allocator.dupe(u8, new_e.key),
+                    .value = if (new_e.tombstone) try allocator.dupe(u8, "") else try allocator.dupe(u8, new_e.value),
+                };
+                live_delta += @as(i64, @intCast(new_e.key.len + (if (new_e.tombstone) @as(usize, 0) else new_e.value.len) + 9));
+                mi += 1;
+                oi += 1;
+                bi += 1;
+            },
         }
     }
+    // Remaining old entries
+    while (oi < leaf.entries.len) {
+        merged[mi] = leaf.entries[oi];
+        mi += 1;
+        oi += 1;
+    }
+    // Remaining batch entries
+    while (bi < entries.len) {
+        const new_e = entries[bi];
+        merged[mi] = .{
+            .tombstone = new_e.tombstone,
+            .key = try allocator.dupe(u8, new_e.key),
+            .value = if (new_e.tombstone) try allocator.dupe(u8, "") else try allocator.dupe(u8, new_e.value),
+        };
+        live_delta += @as(i64, @intCast(new_e.key.len + (if (new_e.tombstone) @as(usize, 0) else new_e.value.len) + 9));
+        if (!new_e.tombstone) count_delta += 1;
+        mi += 1;
+        bi += 1;
+    }
+    const merged_entries = merged[0..mi];
 
     // Mark old page as dirty
     dirty.append(allocator, page_no) catch {};
 
     // Split check
-    if (leaf.entries.len <= LEAF_MAX_ENTRIES) {
+    if (merged_entries.len <= LEAF_MAX_ENTRIES) {
         const new_page = try store.allocPage();
-        const pl = leafPayloadSize(leaf.entries);
+        const pl = leafPayloadSize(merged_entries);
         var buf: [f2.PAGE_SIZE]u8 = undefined;
-        _ = try encodeLeafPayload(buf[0..pl], leaf.entries, store, dirty);
-        try writeNodePage(store, new_page, f2.PAGE_TYPE_LEAF, @intCast(leaf.entries.len), buf[0..pl]);
+        _ = try encodeLeafPayload(buf[0..pl], merged_entries, store, dirty);
+        try writeNodePage(store, new_page, f2.PAGE_TYPE_LEAF, @intCast(merged_entries.len), buf[0..pl]);
         return .{ .new_child = new_page, .live_delta = live_delta, .count_delta = count_delta };
     }
     // Multiple pages needed — chunk into LEAF_MAX_ENTRIES, build leaf pages + branch tree
@@ -1445,17 +1489,17 @@ fn insertBatchIntoLeaf(
     var split_keys = std.ArrayList([]const u8).empty;
     defer split_keys.deinit(allocator);
     var pos: usize = 0;
-    while (pos < leaf.entries.len) {
-        const chunk_len = @min(LEAF_MAX_ENTRIES, leaf.entries.len - pos);
-        const chunk = leaf.entries[pos .. pos + chunk_len];
+    while (pos < merged_entries.len) {
+        const chunk_len = @min(LEAF_MAX_ENTRIES, merged_entries.len - pos);
+        const chunk = merged_entries[pos .. pos + chunk_len];
         const page = try store.allocPage();
         const pl = leafPayloadSize(chunk);
         var buf: [f2.PAGE_SIZE]u8 = undefined;
         _ = try encodeLeafPayload(buf[0..pl], chunk, store, dirty);
         try writeNodePage(store, page, f2.PAGE_TYPE_LEAF, @intCast(chunk_len), buf[0..pl]);
         try leaf_pages.append(allocator, page);
-        if (pos + chunk_len < leaf.entries.len) {
-            try split_keys.append(allocator, leaf.entries[pos + chunk_len].key);
+        if (pos + chunk_len < merged_entries.len) {
+            try split_keys.append(allocator, merged_entries[pos + chunk_len].key);
         }
         pos += chunk_len;
     }
