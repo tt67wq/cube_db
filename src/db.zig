@@ -131,6 +131,8 @@ pub const Db = struct {
     }
 
     /// Batch put: commit all entries in one WriteTxn (bypasses micro-batching).
+    /// Keys and values are copied internally during applyBatch, so caller's
+    /// slices only need to be valid during the putBatch call itself.
     pub fn putBatch(self: *Db, entries: []const Entry) !void {
         var txn = try self.beginWriteTxn();
         defer txn.deinit();

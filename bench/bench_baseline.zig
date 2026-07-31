@@ -53,6 +53,15 @@ fn fmtKey(buf: *[12]u8, i: usize) ![]const u8 {
     return std.fmt.bufPrint(buf, "{d:0>10}", .{i});
 }
 
+fn median(values: []const u64) u64 {
+    var buf: [16]u64 = undefined;
+    std.debug.assert(values.len <= buf.len);
+    @memcpy(buf[0..values.len], values);
+    const arr = buf[0..values.len];
+    std.mem.sort(u64, arr, {}, std.sort.asc(u64));
+    return arr[arr.len / 2];
+}
+
 fn runMemBench(name: []const u8, allocator: std.mem.Allocator, n: usize) !u64 {
     var ms = MemPageStore.init(allocator, @as(u32, @intCast(3 + n * 2 + 1000)));
     defer ms.deinit();
@@ -177,10 +186,14 @@ pub fn main() !void {
     var failures: usize = 0;
 
     for (baseline) |m| {
-        const actual_ns = if (std.mem.eql(u8, m.store, "mem"))
-            try runMemBench(m.name, allocator, mem_n)
-        else
-            try runFileBench(m.name, allocator, file_n);
+        var samples: [3]u64 = undefined;
+        for (0..3) |i| {
+            samples[i] = if (std.mem.eql(u8, m.store, "mem"))
+                try runMemBench(m.name, allocator, mem_n)
+            else
+                try runFileBench(m.name, allocator, file_n);
+        }
+        const actual_ns = median(&samples);
 
         const degradation = if (actual_ns > m.value_ns) (actual_ns - m.value_ns) * 100 / m.value_ns else 0;
         const passed = degradation < m.threshold_pct;
