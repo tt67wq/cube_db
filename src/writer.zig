@@ -185,14 +185,14 @@ pub const State = struct {
             };
             std.mem.sort(Request, @constCast(batch), {}, SortCtx.lt);
         }
-        // Build LeafEntry array from sorted+deduped requests
+        // Build LeafEntry array from sorted+deduped requests (copy key/value — caller slices may not survive)
         const sorted = try arena_alloc.alloc(btree.LeafEntry, batch.len);
         var n: usize = 0;
         for (batch) |req| {
             if (n > 0 and btree.cmpKey(sorted[n - 1].key, req.key) == .eq) {
-                sorted[n - 1] = .{ .tombstone = req.tombstone, .key = req.key, .value = if (req.tombstone) "" else req.value };
+                sorted[n - 1] = .{ .tombstone = req.tombstone, .key = try arena_alloc.dupe(u8, req.key), .value = if (req.tombstone) "" else try arena_alloc.dupe(u8, req.value) };
             } else {
-                sorted[n] = .{ .tombstone = req.tombstone, .key = req.key, .value = if (req.tombstone) "" else req.value };
+                sorted[n] = .{ .tombstone = req.tombstone, .key = try arena_alloc.dupe(u8, req.key), .value = if (req.tombstone) "" else try arena_alloc.dupe(u8, req.value) };
                 n += 1;
             }
         }

@@ -210,6 +210,97 @@ fn runGet(path: []const u8, cfg: Config, w: *Io.Writer) !void {
     try w.flush();
 }
 
+fn fileSize(path: []const u8) u64 {
+    const f2c = @cImport({
+        @cInclude("sys/stat.h");
+    });
+    var buf: [256]u8 = undefined;
+    if (path.len >= buf.len) return 0;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    var st: f2c.struct_stat = undefined;
+    _ = f2c.stat(@ptrCast(&buf), &st);
+    return @intCast(st.st_size);
+}
+
+fn runLargeScale(path: []const u8, n: usize, fsync: bool, label: []const u8, w: *Io.Writer) !void {
+    const allocator = std.heap.page_allocator;
+    var vbuf: [100]u8 = undefined;
+    @memset(&vbuf, 'x');
+
+    // --- putBatch + fsync ---
+    {
+        unlinkPath(path);
+        var fps = try FilePageStore.init(allocator, path);
+        defer fps.deinit();
+        var db = try Db.open(allocator, fps.store(), .{ .fsync = fsync });
+        defer db.close();
+
+        const entries = try allocator.alloc(Entry, n);
+        defer allocator.free(entries);
+        const keybufs = try allocator.alloc([12]u8, n);
+        defer allocator.free(keybufs);
+        for (entries, 0..) |*e, i| {
+            const k = try fmtKey(&keybufs[i], i);
+            e.* = .{ .key = k, .value = &vbuf };
+        }
+
+        const start = monoNs();
+        try db.putBatch(entries);
+        const ns = monoNs() - start;
+        const avg_us = @as(f64, @floatFromInt(ns)) / 1000.0 / @as(f64, @floatFromInt(n));
+
+        std.debug.print("  (entryCount={d}, next_free={d})\n", .{db.entryCount(), fps.next_free});
+        var buf2: [300]u8 = undefined;
+        const fsize = @as(u64, fps.next_free) * 4096;
+        const line = try std.fmt.bufPrint(&buf2, "  {s:<12} putBatch {d:>7} keys  per-entry={d:>8.2}us  total={d:>8.2}ms  filesize={d:>8} bytes ({d:.1}MB)\n", .{
+            label, n, avg_us, @as(f64, @floatFromInt(ns)) / 1e6, fsize, @as(f64, @floatFromInt(fsize)) / 1e6,
+        });
+        try w.writeAll(line);
+        try w.flush();
+    }
+
+    // --- get (cold: reopen first, then warm) ---
+    {
+        var fps = try FilePageStore.init(allocator, path);
+        defer fps.deinit();
+        var db = try Db.open(allocator, fps.store(), .{});
+        defer db.close();
+
+        var prng = std.Random.DefaultPrng.init(42);
+        const rnd = prng.random();
+        var kbuf: [12]u8 = undefined;
+
+        // Cold start: first 100 gets after reopen
+        const cold_start = monoNs();
+        for (0..@min(n, 100)) |_| {
+            const idx = rnd.uintLessThan(usize, n);
+            const k = try fmtKey(&kbuf, idx);
+            if (try db.get(k)) |got| allocator.free(got);
+        }
+        const cold_ns = monoNs() - cold_start;
+
+        // Warm get
+        const warm_n = @min(n, 10000);
+        const warm_start = monoNs();
+        for (0..warm_n) |_| {
+            const idx = rnd.uintLessThan(usize, n);
+            const k = try fmtKey(&kbuf, idx);
+            if (try db.get(k)) |got| allocator.free(got);
+        }
+        const warm_ns = monoNs() - warm_start;
+
+        var buf2: [300]u8 = undefined;
+        const line = try std.fmt.bufPrint(&buf2, "  {s:<12} get     {d:>7} keys  cold-100={d:>8.2}us  warm-{d}={d:>8.2}us/op\n", .{
+            label, n, @as(f64, @floatFromInt(cold_ns)) / 1000.0, warm_n, @as(f64, @floatFromInt(warm_ns)) / 1000.0 / @as(f64, @floatFromInt(warm_n)),
+        });
+        try w.writeAll(line);
+        try w.flush();
+    }
+
+    unlinkPath(path);
+}
+
 pub fn main(init: std.process.Init) !void {
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_file_writer: Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
@@ -253,6 +344,15 @@ pub fn main(init: std.process.Init) !void {
         try runGet(path, .{ .fsync = true, .n = n, .value_size = 100, .label = "fsync" }, w);
 
         try runPutBatchScan(path, true, "fsync", w);
+    }
+
+    // --- large scale: 10k / 100k / 1M ---
+    try w.writeAll("\n== Large Scale (FilePageStore + fsync) ==\n");
+    try w.flush();
+
+    for ([_]usize{ 10_000, 100_000, 1_000_000 }) |keys_n| {
+        const path = ".bench_fps_large.db";
+        try runLargeScale(path, keys_n, true, "fsync", w);
     }
 
     try w.writeAll("\nDone.\n");
