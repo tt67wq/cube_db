@@ -1185,13 +1185,6 @@ pub fn insertBatch(
         return insertBatchFresh(allocator, store, entries, dirty);
     }
 
-    // Guard: if batch is large, fallback to per-entry insert for correctness.
-    // The shared COW fast path only works when entries fit in existing leaves
-    // without causing multi-splits (which require branch-level coordination).
-    if (entries.len > LEAF_MAX_ENTRIES) {
-        return insertBatchFallback(allocator, store, root, entries, dirty);
-    }
-
     // Read root to determine type
     const payload = try readNodePayloadFast(store, root);
     const is_leaf = payload[0] == LEAF_KIND;
