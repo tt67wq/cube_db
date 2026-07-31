@@ -1185,6 +1185,13 @@ pub fn insertBatch(
         return insertBatchFresh(allocator, store, entries, dirty);
     }
 
+    // Guard: if batch is large, fallback to per-entry insert for correctness.
+    // The shared COW fast path only works when entries fit in existing leaves
+    // without causing multi-splits (which require branch-level coordination).
+    if (entries.len > LEAF_MAX_ENTRIES) {
+        return insertBatchFallback(allocator, store, root, entries, dirty);
+    }
+
     // Read root to determine type
     const payload = try readNodePayloadFast(store, root);
     const is_leaf = payload[0] == LEAF_KIND;
@@ -1238,8 +1245,17 @@ fn insertBatchFresh(
         }
         return .{ .new_root = new_page, .live_delta = live, .count_delta = count };
     }
-    // Need to split — build multiple leaves
-    return insertBatchSplitLeaves(allocator, store, entries, dirty);
+    // Too many entries for single leaf — fallback to per-entry insert
+    var new_root: u32 = NULL_ROOT;
+    var live: i64 = 0;
+    var count: i64 = 0;
+    for (entries) |e| {
+        const wr = try insert(allocator, store, new_root, e.key, e.value, e.tombstone, dirty);
+        new_root = wr.new_root;
+        live += wr.live_delta;
+        count += wr.count_delta;
+    }
+    return .{ .new_root = new_root, .live_delta = live, .count_delta = count };
 }
 
 /// Split sorted entries into multiple leaves, build branch tree
@@ -1300,7 +1316,7 @@ fn insertBatchSplitLeaves(
         while (i < current_pages.len) {
             const chunk_len = @min(BRANCH_MAX_CHILDREN, current_pages.len - i);
             const children = current_pages[i .. i + chunk_len];
-            const keys = if (i + chunk_len < current_pages.len) current_keys[i .. i + chunk_len - 1] else current_keys[i .. i + chunk_len - 1];
+            const keys = current_keys[i .. i + chunk_len - 1];
             const page = try store.allocPage();
             const pl = branchPayloadSize(keys, children);
             var buf: [f2.PAGE_SIZE]u8 = undefined;
@@ -1372,7 +1388,8 @@ fn insertBatchIntoLeaf(
     entries: []const LeafEntry,
     dirty: *std.ArrayList(u32),
 ) !InsertSub {
-    // Decode existing leaf
+    // No guard here — the caller (insertBatch) guards at the top level.
+    // This function only handles batches that fit (at most one split).
     const old_page = try store.readPage(page_no);
     var old_page_buf: [f2.PAGE_SIZE]u8 = undefined;
     @memcpy(&old_page_buf, old_page[0..f2.PAGE_SIZE]);
@@ -1384,7 +1401,6 @@ fn insertBatchIntoLeaf(
     var live_delta: i64 = 0;
     var count_delta: i64 = 0;
 
-    // Apply all entries to the leaf (entries are sorted)
     for (entries) |e| {
         const pos = leaf.findPos(e.key);
         if (pos < leaf.entries.len and cmpKey(leaf.entries[pos].key, e.key) == .eq) {
@@ -1430,22 +1446,123 @@ fn insertBatchIntoLeaf(
         try writeNodePage(store, new_page, f2.PAGE_TYPE_LEAF, @intCast(leaf.entries.len), buf[0..pl]);
         return .{ .new_child = new_page, .live_delta = live_delta, .count_delta = count_delta };
     }
-    // Split
-    const mid = leaf.entries.len / 2;
-    const right_entries = leaf.entries[mid..];
-    const left_entries = leaf.entries[0..mid];
-    const left_page = try store.allocPage();
-    const left_pl = leafPayloadSize(left_entries);
-    var left_buf: [f2.PAGE_SIZE]u8 = undefined;
-    _ = try encodeLeafPayload(left_buf[0..left_pl], left_entries, store, dirty);
-    try writeNodePage(store, left_page, f2.PAGE_TYPE_LEAF, @intCast(left_entries.len), left_buf[0..left_pl]);
-    const right_page = try store.allocPage();
-    const right_pl = leafPayloadSize(right_entries);
-    var right_buf: [f2.PAGE_SIZE]u8 = undefined;
-    _ = try encodeLeafPayload(right_buf[0..right_pl], right_entries, store, dirty);
-    try writeNodePage(store, right_page, f2.PAGE_TYPE_LEAF, @intCast(right_entries.len), right_buf[0..right_pl]);
-    const split_key = try allocator.dupe(u8, right_entries[0].key);
-    return .{ .new_child = left_page, .split_key = split_key, .split_right = right_page, .live_delta = live_delta, .count_delta = count_delta };
+    // Multiple pages needed — chunk into LEAF_MAX_ENTRIES, build leaf pages + branch tree
+    var leaf_pages = std.ArrayList(u32).empty;
+    defer leaf_pages.deinit(allocator);
+    var split_keys = std.ArrayList([]const u8).empty;
+    defer split_keys.deinit(allocator);
+    var pos: usize = 0;
+    while (pos < leaf.entries.len) {
+        const chunk_len = @min(LEAF_MAX_ENTRIES, leaf.entries.len - pos);
+        const chunk = leaf.entries[pos .. pos + chunk_len];
+        const page = try store.allocPage();
+        const pl = leafPayloadSize(chunk);
+        var buf: [f2.PAGE_SIZE]u8 = undefined;
+        _ = try encodeLeafPayload(buf[0..pl], chunk, store, dirty);
+        try writeNodePage(store, page, f2.PAGE_TYPE_LEAF, @intCast(chunk_len), buf[0..pl]);
+        try leaf_pages.append(allocator, page);
+        if (pos + chunk_len < leaf.entries.len) {
+            try split_keys.append(allocator, leaf.entries[pos + chunk_len].key);
+        }
+        pos += chunk_len;
+    }
+    // Build branch tree from leaf pages
+    var current_pages = leaf_pages.items;
+    var current_keys = split_keys.items;
+    while (current_pages.len > BRANCH_MAX_CHILDREN) {
+        var new_pages = std.ArrayList(u32).empty;
+        defer new_pages.deinit(allocator);
+        var new_keys = std.ArrayList([]const u8).empty;
+        defer new_keys.deinit(allocator);
+        var i: usize = 0;
+        while (i < current_pages.len) {
+            const chunk_len = @min(BRANCH_MAX_CHILDREN, current_pages.len - i);
+            const children = current_pages[i .. i + chunk_len];
+            const keys = current_keys[i .. i + chunk_len - 1];
+            const page = try store.allocPage();
+            const pl = branchPayloadSize(keys, children);
+            var buf: [f2.PAGE_SIZE]u8 = undefined;
+            _ = encodeBranchPayload(buf[0..pl], keys, children);
+            try writeNodePage(store, page, f2.PAGE_TYPE_BRANCH, @intCast(children.len), buf[0..pl]);
+            try new_pages.append(allocator, page);
+            if (i + chunk_len < current_pages.len) {
+                try new_keys.append(allocator, current_keys[i + chunk_len - 1]);
+            }
+            i += chunk_len;
+        }
+        current_pages = new_pages.items;
+        current_keys = new_keys.items;
+    }
+    // Final root branch
+    const new_page = try store.allocPage();
+    const pl = branchPayloadSize(current_keys, current_pages);
+    var buf: [f2.PAGE_SIZE]u8 = undefined;
+    _ = encodeBranchPayload(buf[0..pl], current_keys, current_pages);
+    try writeNodePage(store, new_page, f2.PAGE_TYPE_BRANCH, @intCast(current_pages.len), buf[0..pl]);
+    return .{ .new_child = new_page, .live_delta = live_delta, .count_delta = count_delta };
+}
+
+/// Fallback: when batch is too large for shared COW path, use per-entry insert.
+/// Correct but slower — the shared COW optimization only applies to small batches.
+fn insertBatchFallback(
+    allocator: std.mem.Allocator,
+    store: PageStore,
+    root: u32,
+    entries: []const LeafEntry,
+    dirty: *std.ArrayList(u32),
+) !WriteResult {
+    var new_root = root;
+    var live_delta: i64 = 0;
+    var count_delta: i64 = 0;
+
+    for (entries) |e| {
+        const wr = try insert(allocator, store, new_root, e.key, e.value, e.tombstone, dirty);
+        new_root = wr.new_root;
+        live_delta += wr.live_delta;
+        count_delta += wr.count_delta;
+    }
+
+    return .{ .new_root = new_root, .live_delta = live_delta, .count_delta = count_delta };
+}
+
+/// Fallback: when entries exceed leaf capacity, use per-entry insertIntoLeaf.
+fn insertBatchIntoLeafFallback(
+    store: PageStore,
+    allocator: std.mem.Allocator,
+    page_no: u32,
+    entries: []const LeafEntry,
+    dirty: *std.ArrayList(u32),
+) !InsertSub {
+    // Fallback: use per-entry insertIntoLeaf (not insert, which expects root).
+    // This keeps the same COW semantics as the branch caller expects.
+    var new_child = page_no;
+    var live_delta: i64 = 0;
+    var count_delta: i64 = 0;
+    var pending_split_key: ?[]u8 = null;
+    var pending_split_right: u32 = 0;
+
+    for (entries) |e| {
+        const sub = try insertIntoLeaf(store, allocator, new_child, e.key, e.value, e.tombstone, dirty);
+        new_child = sub.new_child;
+        live_delta += sub.live_delta;
+        count_delta += sub.count_delta;
+        // If this entry caused a split, we need to propagate it.
+        // But insertIntoLeaf only splits within the leaf — the branch caller
+        // will see the split_key/split_right from the last InsertSub.
+        if (sub.split_key) |sk| {
+            if (pending_split_key) |old| allocator.free(old);
+            pending_split_key = sk;
+            pending_split_right = sub.split_right;
+        }
+    }
+
+    return .{
+        .new_child = new_child,
+        .split_key = pending_split_key,
+        .split_right = pending_split_right,
+        .live_delta = live_delta,
+        .count_delta = count_delta,
+    };
 }
 
 /// Batch insert into branch node

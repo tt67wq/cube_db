@@ -155,7 +155,8 @@ test "insertbatch_overflow: duplicate keys in batch, last wins" {
 
 // 场景 5：大 batch 顺序 key（10KB value，触发 overflow 页 + 分裂）
 test "insertbatch_overflow: 10K sequential keys with 10KB values" {
-    var ms = newStore(100003);
+    // 10KB × 10000 ≈ 100MB 数据，mapsize 需要足够大
+    var ms = newStore(300000000);
     defer ms.deinit();
     var db = try Db.open(testing.allocator, ms.store(), .{});
     defer db.close();
