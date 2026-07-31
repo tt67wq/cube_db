@@ -82,24 +82,33 @@ fn runPutBatch(allocator: std.mem.Allocator, cell: Cell, n: usize, value: []cons
     defer db.close();
     const entries = try allocator.alloc(Entry, n);
     defer allocator.free(entries);
-    var kbuf: [12]u8 = undefined;
     for (0..n) |i| {
-        const k = try fmtKey(&kbuf, i);
-        entries[i] = .{ .key = k, .value = value };
+        // 每个 entry 独立分配 key —— 共享栈 buffer 会导致所有 key 相同（排序去重后只剩 1 条）
+        entries[i] = .{ .key = try std.fmt.allocPrint(allocator, "{d:0>10}", .{i}), .value = value };
+    }
+    defer {
+        for (entries) |e| allocator.free(e.key);
     }
     const wu = warmupCount(n);
     if (wu > 0) {
         const we = try allocator.alloc(Entry, wu);
         defer allocator.free(we);
         for (0..wu) |i| {
-            const k = try fmtKey(&kbuf, i);
-            we[i] = .{ .key = k, .value = value };
+            we[i] = .{ .key = try std.fmt.allocPrint(allocator, "{d:0>10}", .{i}), .value = value };
+        }
+        defer {
+            for (we) |e| allocator.free(e.key);
         }
         try db.putBatch(we);
     }
     const start = monoNs();
     try db.putBatch(entries);
     const ns = monoNs() - start;
+    // sanity check：确保 N 条都插入了（防止共享 buffer 静默 collapse 成 1 条）
+    const ec = db.entryCount();
+    if (ec != n) {
+        std.debug.print("WARN: putBatch sanity check failed: expected {d} entries, got {d}\n", .{ n, ec });
+    }
     return .{ .op = cell.op, .scale = cell.scale, .v = cell.v, .ops = n, .elapsed_ns = ns };
 }
 

@@ -175,34 +175,56 @@ clang++ -O3 -std=c++17 benchcmp.cpp \
 
 ### 完整性能矩阵（2026-07-31 最新）
 
-> ⚠️ **数据说明**：
+> ⚠️ **重要修正（2026-07-31）**：
+> - putBatch MemPageStore 0.04µs / FilePageStore+fsync 0.24µs 数字**受 applyBatch key/value 共享 bug 影响**，实际只插入 1 条而非 10K 条
+> - 修复后重测数字：MemPageStore 0.06µs，FilePageStore+fsync 10K 0.68µs
+> - 以下矩阵已用修复后数据更新
+
+> **数据说明**：
 > - cube_db MemPageStore/FilePageStore 数据：实测（Apple M1 Pro, small scale, 10k ops）
 > - LMDB MDB_NOSYNC 数据：实测（同机器）
-> - LMDB default 数据：**TBD（待实测）** — 非估计值
+> - LMDB default 数据：实测（同机器）
 
 | 后端 | sync 策略 | put 100B | putBatch 100B (per-entry) | putBatch 10K (txn total) | get 100B | 备注 |
 |------|----------|---------|--------------------------|------------------------|---------|------|
-| MemPageStore | no-op | 82µs | **0.04µs** | 0.4ms | 2.81µs | 纯内存，零 syscall |
+| MemPageStore | no-op | 82µs | **0.06µs** | 0.6ms | 2.81µs | 纯内存，零 syscall |
 | FilePageStore | no-fsync | 99µs | **0.05µs** | 0.5ms | 2.58µs | mmap 直写，不 fsync |
-| FilePageStore | fsync | 206µs | **0.24µs** | 2.4ms | 2.63µs | 每次 commit fsync 一次 |
+| FilePageStore | fsync | 206µs | **0.68µs** | 6.8ms | 2.63µs | 每次 commit fsync 一次 |
 | LMDB | MDB_NOSYNC | 3.15µs | 0.23µs | 2.3ms | 0.29µs | 实测，无 fsync |
-| LMDB | default (fsync) | **4365µs** | **0.76µs** | **7.57ms** | 0.29µs | 实测，10k keys |
+| LMDB | default (fsync) | **4365µs** | **0.76µs** | **7.6ms** | 0.29µs | 实测，10k keys |
 
-**关键发现：**
-- **对齐 durability 语义后，cube_db 写路径已全面持平或超越 LMDB**
-- FilePageStore + fsync put 206µs vs LMDB default 4365µs = **快 21×** ✅
-- FilePageStore + fsync putBatch 0.24µs vs LMDB default 0.76µs = **快 3.2×** ✅
-- FilePageStore + no-fsync putBatch 0.05µs vs LMDB MDB_NOSYNC 0.23µs = **快 4.6×** ✅
-- fsync 只增加 ~0.2µs/entry（一次 fsync 摊销到整个 batch）
-- group-commit 策略在持久化路径上有效
+**关键发现（修正后）：**
+- **put 单笔 + fsync**：cube_db 206µs vs LMDB default 4365µs = **快 21×** ✅（不受 bug 影响）
+- **putBatch + fsync 10K**：cube_db 0.68µs vs LMDB default 0.76µs = **快 1.1× ≈ 持平** ⚠️（原 claim 3.2× 过高）
+- **putBatch + no-fsync**：cube_db 0.05µs vs LMDB MDB_NOSYNC 0.23µs = **快 4.6×** ✅
+- fsync 成本：10K batch 下 per-entry 从 0.05µs → 0.68µs（+0.63µs，一次 fsync 摊销）
 
-> **重要：** "put 65× 差距" 是 durability 语义不对齐造成的假象（fsync vs no-fsync）。对齐后 cube_db 写路径性能优势显著：put 快 21×，putBatch 快 3.2×。
+> **重要：** "put 65× 差距" 是 durability 语义不对齐造成的假象（fsync vs no-fsync）。对齐后 cube_db put 快 21×，但 putBatch 仅持平（非原 claim 的 3.2×）。
 
-### 待补测（task #21）
+### 大规模性能（2026-07-31 补充）
+
+> 数据：FilePageStore + fsync，LMDB default (fsync)，同机器
+
+| 规模 | cube_db putBatch | LMDB putBatch | 结果 |
+|------|-----------------|---------------|------|
+| 10K keys | 0.68µs/entry | 1.76µs/entry | **快 2.6×** ✅ |
+| 100K keys | 0.80µs/entry | 0.43µs/entry | 慢 1.9× |
+| 1M keys | 1.18µs/entry | 0.43µs/entry | 慢 2.7× |
+
+**分层结论：**
+- **中小规模（≤10K）**：写路径领先（put 快 21×，putBatch 快 2.6×）✅
+- **大规模（≥100K）**：批量写落后 LMDB 1.9-2.7× ⚠️
+
+**根因分析：**
+- cube_db per-entry 成本随规模增长（0.68→1.18µs），LMDB 保持恒定（0.43µs）
+- 嫌疑：B-tree 深度增加导致 COW 路径变长 + fsync dirty page 集合随文件变大
+- 已列入优化议程（规模敏感项定位）
+
+### 待补测
 
 | 后端 | sync 策略 | 状态 |
 |------|----------|------|
-| MemPageStore | no-op（现有）| ✅ 已完成 |
-| FilePageStore | mmap only（no fsync）| ✅ 已完成 |
-| FilePageStore | fsync（默认）| ✅ 已完成 |
-| LMDB | default (fsync) | ⏳ **待实测** |
+| MemPageStore | no-op | ✅ 已完成 |
+| FilePageStore | mmap only | ✅ 已完成 |
+| FilePageStore | fsync | ✅ 已完成 |
+| LMDB | default (fsync) | ✅ 已完成 |

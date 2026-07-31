@@ -10,8 +10,8 @@ fn newStore() MemPageStore {
     return MemPageStore.init(std.testing.allocator, 100000);
 }
 
-/// 关键场景：entries 的 key 共享同一个栈 buffer（模拟 bench.zig 的 runPutBatch）
-/// 之前这个场景会让 insertBatch 的排序去重 collapse 成 1 条
+// 关键场景：entries 的 key 共享同一个栈 buffer（模拟 bench.zig 的 runPutBatch）
+// 之前这个场景会让 insertBatch 的排序去重 collapse 成 1 条
 test "putbatch: shared stack buffer keys, all N inserted correctly" {
     var ms = newStore();
     defer ms.deinit();
@@ -43,7 +43,7 @@ test "putbatch: shared stack buffer keys, all N inserted correctly" {
     }
 }
 
-/// putBatch 后逐条验证 + delete 全部后 count 归零
+// putBatch 后逐条验证 + delete 全部后 count 归零
 test "putbatch: 10K entries all inserted, then all deleted" {
     var ms = newStore();
     defer ms.deinit();
@@ -83,7 +83,7 @@ test "putbatch: 10K entries all inserted, then all deleted" {
     try std.testing.expectEqual(@as(u64, 0), db.entryCount());
 }
 
-/// 两个 putBatch 连续插入（不同 key 集），验证都能正确插入
+// 两个 putBatch 连续插入（不同 key 集），验证都能正确插入
 test "putbatch: two batches with distinct keys" {
     var ms = newStore();
     defer ms.deinit();
@@ -128,7 +128,7 @@ test "putbatch: two batches with distinct keys" {
     }
 }
 
-/// putBatch 含 tombstone（delete）
+// putBatch 含 tombstone（delete）
 test "putbatch: mixed put + delete in one batch" {
     var ms = newStore();
     defer ms.deinit();
