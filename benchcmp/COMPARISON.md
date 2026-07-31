@@ -173,10 +173,31 @@ clang++ -O3 -std=c++17 benchcmp.cpp \
 2. **写路径** — COW 架构固有开销（每次 put 完整 B-tree 路径复制），group-commit 已缩小差距但未消除。put 100B vs LMDB 差距 **26×**。
 3. **批量写** — ✅ **已超越 LMDB**。Shared COW 路径优化后，putBatch 100B 0.04µs vs LMDB 0.23µs，**快 5.8×**。
 
+### 完整性能矩阵（2026-07-31 最新）
+
+> ⚠️ **数据说明**：
+> - cube_db MemPageStore/FilePageStore 数据：实测（Apple M1 Pro, small scale, 10k ops）
+> - LMDB MDB_NOSYNC 数据：实测（同机器）
+> - LMDB default 数据：**TBD（待实测）** — 非估计值
+
+| 后端 | sync 策略 | put 100B | putBatch 100B (per-entry) | putBatch 10K (txn total) | get 100B | 备注 |
+|------|----------|---------|--------------------------|------------------------|---------|------|
+| MemPageStore | no-op | 82µs | **0.04µs** | 0.4ms | 2.81µs | 纯内存，零 syscall |
+| FilePageStore | no-fsync | 99µs | **0.05µs** | 0.5ms | 2.58µs | mmap 直写，不 fsync |
+| FilePageStore | fsync | 206µs | **0.24µs** | 2.4ms | 2.63µs | 每次 commit fsync 一次 |
+| LMDB | MDB_NOSYNC | 3.15µs | 0.23µs | 2.3ms | 0.29µs | 实测，无 fsync |
+| LMDB | default | TBD | TBD | TBD | 0.29µs | **待实测**（需补测）|
+
+**关键发现：**
+- FilePageStore + fsync putBatch 0.24µs vs LMDB MDB_NOSYNC 0.23µs = **基本持平** ✅
+- fsync 只增加 ~0.2µs/entry（一次 fsync 摊销到整个 batch）
+- group-commit 策略在持久化路径上有效
+
 ### 待补测（task #21）
 
 | 后端 | sync 策略 | 状态 |
 |------|----------|------|
 | MemPageStore | no-op（现有）| ✅ 已完成 |
-| FilePageStore | mmap only（no fsync）| ⏳ 待测 |
-| FilePageStore | fsync（默认）| ⏳ 待测（真实部署性能）|
+| FilePageStore | mmap only（no fsync）| ✅ 已完成 |
+| FilePageStore | fsync（默认）| ✅ 已完成 |
+| LMDB | default (fsync) | ⏳ **待实测** |
