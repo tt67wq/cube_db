@@ -176,27 +176,37 @@ pub const State = struct {
         var batch_byte_delta: i64 = 0;
         var new_root = cur_root;
 
-        // Sort and dedup entries by key, then batch insert via shared COW path
-        if (batch.len > 1) {
+        // Copy keys/values into arena first (caller slices may not survive — e.g. stack buffer reuse)
+        const arena_entries = try arena_alloc.alloc(btree.LeafEntry, batch.len);
+        for (batch, 0..) |req, i| {
+            arena_entries[i] = .{
+                .tombstone = req.tombstone,
+                .key = try arena_alloc.dupe(u8, req.key),
+                .value = if (req.tombstone) try arena_alloc.dupe(u8, "") else try arena_alloc.dupe(u8, req.value),
+            };
+        }
+
+        // Sort by key
+        if (arena_entries.len > 1) {
             const SortCtx = struct {
-                fn lt(_: void, a: Request, b: Request) bool {
+                fn lt(_: void, a: btree.LeafEntry, b: btree.LeafEntry) bool {
                     return btree.cmpKey(a.key, b.key) == .lt;
                 }
             };
-            std.mem.sort(Request, @constCast(batch), {}, SortCtx.lt);
+            std.mem.sort(btree.LeafEntry, arena_entries, {}, SortCtx.lt);
         }
-        // Build LeafEntry array from sorted+deduped requests (copy key/value — caller slices may not survive)
-        const sorted = try arena_alloc.alloc(btree.LeafEntry, batch.len);
+
+        // Dedup (last write wins)
         var n: usize = 0;
-        for (batch) |req| {
-            if (n > 0 and btree.cmpKey(sorted[n - 1].key, req.key) == .eq) {
-                sorted[n - 1] = .{ .tombstone = req.tombstone, .key = try arena_alloc.dupe(u8, req.key), .value = if (req.tombstone) "" else try arena_alloc.dupe(u8, req.value) };
+        for (arena_entries) |e| {
+            if (n > 0 and btree.cmpKey(arena_entries[n - 1].key, e.key) == .eq) {
+                arena_entries[n - 1] = e;
             } else {
-                sorted[n] = .{ .tombstone = req.tombstone, .key = try arena_alloc.dupe(u8, req.key), .value = if (req.tombstone) "" else try arena_alloc.dupe(u8, req.value) };
+                arena_entries[n] = e;
                 n += 1;
             }
         }
-        const entries = sorted[0..n];
+        const entries = arena_entries[0..n];
 
         const wr = btree.insertBatch(arena_alloc, self.store, new_root, entries, &batch_dirty) catch |err| {
             for (batch) |r| r.future.set(err);

@@ -131,12 +131,29 @@ pub const Db = struct {
     }
 
     /// Batch put: commit all entries in one WriteTxn (bypasses micro-batching).
-    /// Keys and values are copied internally during applyBatch, so caller's
-    /// slices only need to be valid during the putBatch call itself.
+    /// Keys and values are copied internally, so caller's slices only need to be
+    /// valid during the putBatch call itself (not after).
     pub fn putBatch(self: *Db, entries: []const Entry) !void {
+        // Copy entries into owned memory — caller's slices may be stack-allocated
+        // and reused in loops (e.g. fmtKey with shared buffer)
+        const owned = try self.allocator.alloc(Entry, entries.len);
+        defer {
+            for (owned) |e| {
+                self.allocator.free(e.key);
+                if (!e.tombstone) self.allocator.free(e.value);
+            }
+            self.allocator.free(owned);
+        }
+        for (entries, 0..) |e, i| {
+            owned[i] = .{
+                .key = try self.allocator.dupe(u8, e.key),
+                .value = if (e.tombstone) try self.allocator.dupe(u8, "") else try self.allocator.dupe(u8, e.value),
+                .tombstone = e.tombstone,
+            };
+        }
         var txn = try self.beginWriteTxn();
         defer txn.deinit();
-        for (entries) |e| {
+        for (owned) |e| {
             if (e.tombstone) try txn.delete(e.key) else try txn.put(e.key, e.value);
         }
         try txn.commit();
