@@ -200,12 +200,26 @@ pub const WriteTxn = struct {
 
     pub fn put(self: *WriteTxn, key: []const u8, value: []const u8) !void {
         if (self.finished) return error.TxnFinished;
-        try self.staged.append(self.db.allocator, .{ .key = key, .value = value, .tombstone = false });
+        // 复制 key/value —— 调用方 slice（如栈 buffer）可能不活到 commit
+        const k = try self.db.allocator.dupe(u8, key);
+        errdefer self.db.allocator.free(k);
+        const v = try self.db.allocator.dupe(u8, value);
+        try self.staged.append(self.db.allocator, .{ .key = k, .value = v, .tombstone = false });
     }
 
     pub fn delete(self: *WriteTxn, key: []const u8) !void {
         if (self.finished) return error.TxnFinished;
-        try self.staged.append(self.db.allocator, .{ .key = key, .value = "", .tombstone = true });
+        // 复制 key —— 调用方 slice 可能不活到 commit
+        const k = try self.db.allocator.dupe(u8, key);
+        try self.staged.append(self.db.allocator, .{ .key = k, .value = "", .tombstone = true });
+    }
+
+    /// 释放 staged entries 中复制的 key/value
+    fn freeStaged(self: *WriteTxn) void {
+        for (self.staged.items) |e| {
+            self.db.allocator.free(e.key);
+            if (!e.tombstone) self.db.allocator.free(e.value);
+        }
     }
 
     /// 提交：applyBatch + meta 切换 + fsync。完成或出错后 finished=true，释放互斥。
@@ -215,6 +229,7 @@ pub const WriteTxn = struct {
         defer self.db.write_mutex.unlock();
         defer {
             self.staged_freed = true;
+            self.freeStaged();
             self.staged.deinit(self.db.allocator);
         }
         if (self.staged.items.len == 0) return;
@@ -236,6 +251,7 @@ pub const WriteTxn = struct {
         if (self.finished) return;
         self.finished = true;
         self.staged_freed = true;
+        self.freeStaged();
         self.staged.deinit(self.db.allocator);
         self.db.write_mutex.unlock();
     }
@@ -244,6 +260,7 @@ pub const WriteTxn = struct {
     pub fn deinit(self: *WriteTxn) void {
         if (!self.staged_freed) {
             self.staged_freed = true;
+            self.freeStaged();
             self.staged.deinit(self.db.allocator);
         }
         if (!self.finished) {

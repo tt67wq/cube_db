@@ -191,11 +191,11 @@ clang++ -O3 -std=c++17 benchcmp.cpp \
 | FilePageStore | no-fsync | 99µs | **0.05µs** | 0.5ms | 2.58µs | mmap 直写，不 fsync |
 | FilePageStore | fsync | 206µs | **0.68µs** | 6.8ms | 2.63µs | 每次 commit fsync 一次 |
 | LMDB | MDB_NOSYNC | 3.15µs | 0.23µs | 2.3ms | 0.29µs | 实测，无 fsync |
-| LMDB | default (fsync) | **4365µs** | **0.76µs** | **7.6ms** | 0.29µs | 实测，10k keys |
+| LMDB | default (fsync, warm) | **4365µs** | **1.30µs** | **13.0ms** | 0.29µs | 实测，10k keys，warm 状态 |
 
 **关键发现（修正后）：**
 - **put 单笔 + fsync**：cube_db 206µs vs LMDB default 4365µs = **快 21×** ✅（不受 bug 影响）
-- **putBatch + fsync 10K**：cube_db 0.68µs vs LMDB default 0.76µs = **快 1.1× ≈ 持平** ⚠️（原 claim 3.2× 过高）
+- **putBatch + fsync 10K**：cube_db 0.68µs vs LMDB warm 1.30µs = **快 1.9×** ✅（原 claim 3.2× 过高）
 - **putBatch + no-fsync**：cube_db 0.05µs vs LMDB MDB_NOSYNC 0.23µs = **快 4.6×** ✅
 - fsync 成本：10K batch 下 per-entry 从 0.05µs → 0.68µs（+0.63µs，一次 fsync 摊销）
 
@@ -205,14 +205,16 @@ clang++ -O3 -std=c++17 benchcmp.cpp \
 
 > 数据：FilePageStore + fsync，LMDB default (fsync)，同机器
 
-| 规模 | cube_db putBatch | LMDB putBatch | 结果 |
-|------|-----------------|---------------|------|
-| 10K keys | 0.68µs/entry | 1.76µs/entry | **快 2.6×** ✅ |
+| 规模 | cube_db putBatch | LMDB warm | 结果 |
+|------|-----------------|-----------|------|
+| 10K keys | 0.68µs/entry | **1.30µs/entry** | **快 1.9×** ✅ |
 | 100K keys | 0.80µs/entry | 0.43µs/entry | 慢 1.9× |
 | 1M keys | 1.18µs/entry | 0.43µs/entry | 慢 2.7× |
 
+> **测量条件**：warm 状态（预写入后重开），LMDB mapsize 预留 1GB
+
 **分层结论：**
-- **中小规模（≤10K）**：写路径领先（put 快 21×，putBatch 快 2.6×）✅
+- **中小规模（≤10K）**：写路径领先（put 快 21×，putBatch 快 1.9×）✅
 - **大规模（≥100K）**：批量写落后 LMDB 1.9-2.7× ⚠️
 
 **根因分析：**
