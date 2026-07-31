@@ -1,4 +1,6 @@
 //! bench_baseline.zig — benchmark 回归基线检查
+//! 注意：Zig 0.16.0 构建系统并行测试有竞争条件（txn_test 间歇 SEGV），
+//! 跑全量测试时务必串行执行（`zig build test` 仅单模块），避免并行触发 flaky。
 const std = @import("std");
 const cube = @import("cube_db");
 const Db = cube.Db;
@@ -91,8 +93,10 @@ fn runMemBench(name: []const u8, allocator: std.mem.Allocator, n: usize) !u64 {
         } else if (std.mem.eql(u8, name, "putBatch 100B")) {
             var entries = try allocator.alloc(cube.Entry, n);
             defer allocator.free(entries);
+            const keybufs = try allocator.alloc([12]u8, n);
+            defer allocator.free(keybufs);
             for (0..n) |i| {
-                const k = try fmtKey(&kbuf, i);
+                const k = try fmtKey(&keybufs[i], i);
                 entries[i] = .{ .key = k, .value = &v100 };
             }
             try db.putBatch(entries);
@@ -153,8 +157,10 @@ fn runFileBench(name: []const u8, allocator: std.mem.Allocator, n: usize) !u64 {
         } else if (std.mem.eql(u8, name, "putBatch 100B")) {
             var entries = try allocator.alloc(cube.Entry, n);
             defer allocator.free(entries);
+            const keybufs = try allocator.alloc([12]u8, n);
+            defer allocator.free(keybufs);
             for (0..n) |i| {
-                const k = try fmtKey(&kbuf, i);
+                const k = try fmtKey(&keybufs[i], i);
                 entries[i] = .{ .key = k, .value = &v100 };
             }
             try db.putBatch(entries);
