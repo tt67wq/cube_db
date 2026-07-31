@@ -1462,11 +1462,23 @@ fn insertBatchIntoLeaf(
     // Build branch tree from leaf pages
     var current_pages = leaf_pages.items;
     var current_keys = split_keys.items;
+    // Intermediate arrays for multi-level branch building. We manage their
+    // lifetime manually — defer inside the while body would free them before
+    // the next iteration reads current_pages/current_keys (use-after-free).
+    var level_pages_a = std.ArrayList(u32).empty;
+    defer level_pages_a.deinit(allocator);
+    var level_keys_a = std.ArrayList([]const u8).empty;
+    defer level_keys_a.deinit(allocator);
+    var level_pages_b = std.ArrayList(u32).empty;
+    defer level_pages_b.deinit(allocator);
+    var level_keys_b = std.ArrayList([]const u8).empty;
+    defer level_keys_b.deinit(allocator);
+    var use_a = true;
     while (current_pages.len > BRANCH_MAX_CHILDREN) {
-        var new_pages = std.ArrayList(u32).empty;
-        defer new_pages.deinit(allocator);
-        var new_keys = std.ArrayList([]const u8).empty;
-        defer new_keys.deinit(allocator);
+        var new_pages = if (use_a) &level_pages_a else &level_pages_b;
+        var new_keys = if (use_a) &level_keys_a else &level_keys_b;
+        new_pages.clearRetainingCapacity();
+        new_keys.clearRetainingCapacity();
         var i: usize = 0;
         while (i < current_pages.len) {
             const chunk_len = @min(BRANCH_MAX_CHILDREN, current_pages.len - i);
@@ -1485,6 +1497,7 @@ fn insertBatchIntoLeaf(
         }
         current_pages = new_pages.items;
         current_keys = new_keys.items;
+        use_a = !use_a;
     }
     // Final root branch
     const new_page = try store.allocPage();
@@ -1582,16 +1595,15 @@ fn insertBatchIntoBranch(
         // Find entries for this child
         var lo: usize = 0;
         if (ci > 0) {
-            // entries > branch.keys[ci-1]
-            // Binary search for first entry > branch.keys[ci-1]
+            // entries >= branch.keys[ci-1]  (branch key is min key of child ci)
             var l: usize = 0;
             var h: usize = entries.len;
             while (l < h) {
                 const mid = l + (h - l) / 2;
-                if (cmpKey(entries[mid].key, branch.keys[ci - 1]) != .gt) {
-                    l = mid + 1;
+                if (cmpKey(entries[mid].key, branch.keys[ci - 1]) == .lt) {
+                    l = mid + 1; // entry < key → skip, look right
                 } else {
-                    h = mid;
+                    h = mid;     // entry >= key → candidate, look left
                 }
             }
             lo = l;

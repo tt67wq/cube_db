@@ -251,10 +251,13 @@ pub const WriteTxn = struct {
         }
         if (self.staged.items.len == 0) return;
 
-        const reqs = try self.db.allocator.alloc(wrt.Request, self.staged.items.len);
-        defer self.db.allocator.free(reqs);
-        var futures = try self.db.allocator.alloc(zio.Future(wrt.OpResult), self.staged.items.len);
-        defer self.db.allocator.free(futures);
+        // Arena for futures allocation — avoids large stack frame when batch is big
+        var commit_arena = std.heap.ArenaAllocator.init(self.db.allocator);
+        defer commit_arena.deinit();
+        const arena_alloc = commit_arena.allocator();
+
+        const reqs = try arena_alloc.alloc(wrt.Request, self.staged.items.len);
+        var futures = try arena_alloc.alloc(zio.Future(wrt.OpResult), self.staged.items.len);
         for (self.staged.items, 0..) |e, i| {
             futures[i] = .{};
             reqs[i] = .{ .key = e.key, .value = e.value, .tombstone = e.tombstone, .future = &futures[i] };
