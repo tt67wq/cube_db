@@ -110,6 +110,25 @@ pub fn build(b: *std.Build) void {
     const get_profile_cmd = b.addRunArtifact(get_profile_exe);
     get_profile_step.dependOn(&get_profile_cmd.step);
 
+    // ponytail: bench-baseline — benchmark 回归基线检查
+    const baseline_exe = b.addExecutable(.{
+        .name = "bench_baseline",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/bench_baseline.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    b.installArtifact(baseline_exe);
+
+    const baseline_step = b.step("bench-baseline", "Check benchmark regression baseline");
+    const baseline_cmd = b.addRunArtifact(baseline_exe);
+    baseline_step.dependOn(&baseline_cmd.step);
+
     // Library unit tests (test blocks inside src/).
     const mod_tests = b.addTest(.{
         .root_module = mod,
