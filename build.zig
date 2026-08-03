@@ -146,6 +146,38 @@ pub fn build(b: *std.Build) void {
     const profile_commit_cmd = b.addRunArtifact(profile_commit_exe);
     profile_commit_step.dependOn(&profile_commit_cmd.step);
 
+    // mmap-vs-pwrite — FPS 判别式实验（#41）：mmap MAP_SHARED vs pwrite 顺序写 100MB
+    const mmap_pwrite_exe = b.addExecutable(.{
+        .name = "mmap_vs_pwrite",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/mmap_vs_pwrite.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(mmap_pwrite_exe);
+    const mmap_pwrite_step = b.step("mmap-vs-pwrite", "Discriminating experiment: mmap vs pwrite 100MB (#41)");
+    const mmap_pwrite_cmd = b.addRunArtifact(mmap_pwrite_exe);
+    mmap_pwrite_step.dependOn(&mmap_pwrite_cmd.step);
+
+    // profile-fps — FPS 写路径计数器剖析（#41）
+    const profile_fps_exe = b.addExecutable(.{
+        .name = "profile_fps",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/profile_fps.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    b.installArtifact(profile_fps_exe);
+    const profile_fps_step = b.step("profile-fps", "FPS write path counters (#41)");
+    const profile_fps_cmd = b.addRunArtifact(profile_fps_exe);
+    profile_fps_step.dependOn(&profile_fps_cmd.step);
+
     // ponytail: bench-baseline — benchmark 回归基线检查
     const baseline_exe = b.addExecutable(.{
         .name = "bench_baseline",

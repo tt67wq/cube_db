@@ -18,6 +18,38 @@ const PAGE_SIZE = f2.PAGE_SIZE;
 /// 1 TB 预留虚拟区（LMDB 式占位；64-bit 系统虚拟地址空间充裕）
 pub const REGION_SIZE: u64 = 1 << 40;
 
+/// #41 FPS 写路径计数器（profile 开关，不进生产热路径）
+pub const FpsCounters = struct {
+    pub var enable: bool = false;
+    pub var write_page_calls: u64 = 0;
+    pub var alloc_page_calls: u64 = 0;
+    pub var free_page_calls: u64 = 0;
+    pub var read_page_calls: u64 = 0;
+    pub var fstat_calls: u64 = 0;
+    pub var ftruncate_calls: u64 = 0;
+    pub var write_page_ns: u64 = 0;
+    pub var alloc_page_ns: u64 = 0;
+    pub var ensure_growth_ns: u64 = 0;
+
+    pub fn reset() void {
+        write_page_calls = 0;
+        alloc_page_calls = 0;
+        free_page_calls = 0;
+        read_page_calls = 0;
+        fstat_calls = 0;
+        ftruncate_calls = 0;
+        write_page_ns = 0;
+        alloc_page_ns = 0;
+        ensure_growth_ns = 0;
+    }
+
+    pub fn now() i64 {
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(.MONOTONIC, &ts);
+        return @as(i64, @intCast(ts.sec)) * 1_000_000_000 + @as(i64, @intCast(ts.nsec));
+    }
+};
+
 pub const FilePageStore = struct {
     allocator: std.mem.Allocator,
     fd: c_int,
@@ -128,33 +160,42 @@ pub const FilePageStore = struct {
 
     /// 确保文件已增长到覆盖 page_no（含整页）
     fn ensureFileGrowth(self: *FilePageStore, page_no: u32) !void {
+        const t0 = if (FpsCounters.enable) FpsCounters.now() else 0;
         const needed: u64 = (@as(u64, page_no) + 1) * PAGE_SIZE;
         var st: c.struct_stat = undefined;
         if (c.fstat(self.fd, &st) != 0) return error.FstatFailed;
+        if (FpsCounters.enable) FpsCounters.fstat_calls += 1;
         if (@as(u64, @intCast(st.st_size)) < needed) {
             if (c.ftruncate(self.fd, @as(c.off_t, @intCast(needed))) != 0) return error.TruncateFailed;
+            if (FpsCounters.enable) FpsCounters.ftruncate_calls += 1;
         }
+        if (FpsCounters.enable) FpsCounters.ensure_growth_ns += @intCast(FpsCounters.now() - t0);
     }
 
     // ===== PageStore vtable =====
 
     fn vtAllocPage(ptr: *anyopaque) !u32 {
         const self: *FilePageStore = @ptrCast(@alignCast(ptr));
+        const t0 = if (FpsCounters.enable) FpsCounters.now() else 0;
+        if (FpsCounters.enable) FpsCounters.alloc_page_calls += 1;
         if (self.freelist.items.len > 0) return self.freelist.pop().?;
         const pn = self.next_free;
         if (@as(u64, pn) * PAGE_SIZE >= self.region_size) return error.MapFull;
         try self.ensureFileGrowth(pn);
         self.next_free = pn + 1;
+        if (FpsCounters.enable) FpsCounters.alloc_page_ns += @intCast(FpsCounters.now() - t0);
         return pn;
     }
 
     fn vtFreePage(ptr: *anyopaque, page_no: u32) void {
         const self: *FilePageStore = @ptrCast(@alignCast(ptr));
+        if (FpsCounters.enable) FpsCounters.free_page_calls += 1;
         self.freelist.append(self.allocator, page_no) catch {};
     }
 
     fn vtReadPage(ptr: *anyopaque, page_no: u32) ![]const u8 {
         const self: *FilePageStore = @ptrCast(@alignCast(ptr));
+        if (FpsCounters.enable) FpsCounters.read_page_calls += 1;
         if (page_no == f2.META_PAGE_0) return &self.meta0;
         if (page_no == f2.META_PAGE_1) return &self.meta1;
         if (@as(u64, page_no) * PAGE_SIZE >= self.region_size) return error.PageNotFound;
@@ -163,10 +204,13 @@ pub const FilePageStore = struct {
 
     fn vtWritePage(ptr: *anyopaque, page_no: u32) ![]u8 {
         const self: *FilePageStore = @ptrCast(@alignCast(ptr));
+        const t0 = if (FpsCounters.enable) FpsCounters.now() else 0;
+        if (FpsCounters.enable) FpsCounters.write_page_calls += 1;
         if (page_no == f2.META_PAGE_0) return &self.meta0;
         if (page_no == f2.META_PAGE_1) return &self.meta1;
         if (@as(u64, page_no) * PAGE_SIZE >= self.region_size) return error.MapFull;
         try self.ensureFileGrowth(page_no);
+        if (FpsCounters.enable) FpsCounters.write_page_ns += @intCast(FpsCounters.now() - t0);
         return self.pagePtr(page_no)[0..PAGE_SIZE];
     }
 
