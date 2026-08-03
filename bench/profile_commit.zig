@@ -1,5 +1,5 @@
 //! profile_commit.zig — #35: commit 路径规模敏感项分解
-//! 计时埋点：dupe / sort / dedup / insertBatch / pending_free / meta
+//! 计时埋点：dupe / order_detect / sort / dedup / insertBatch / pending_free / meta
 //! 用法：zig build profile-commit -Doptimize=ReleaseFast
 const std = @import("std");
 const cube = @import("cube_db");
@@ -13,28 +13,36 @@ fn monoNs() i64 {
     return @as(i64, @intCast(ts.sec)) * 1_000_000_000 + @as(i64, @intCast(ts.nsec));
 }
 
+/// 构建 entries：key 用单个连续缓冲区（模拟真实有序批量导入，避免 TLB 抖动）
+/// 返回 entries + key_buf（调用方负责释放）
+fn buildEntries(allocator: std.mem.Allocator, n: usize) !struct { entries: []Entry, key_buf: []u8 } {
+    const entries = try allocator.alloc(Entry, n);
+    errdefer allocator.free(entries);
+    const key_buf = try allocator.alloc(u8, n * 10);
+    errdefer allocator.free(key_buf);
+    for (0..n) |i| {
+        const k = try std.fmt.bufPrint(key_buf[i * 10 ..][0..10], "{d:0>10}", .{i});
+        entries[i] = .{ .key = k, .value = "v" };
+    }
+    return .{ .entries = entries, .key_buf = key_buf };
+}
+
 fn runScale(allocator: std.mem.Allocator, n: usize, label: []const u8) !void {
-    // 预分配页池容量（消除 resize 变量，专注 commit 路径本身）
     var ms = cube.page_store.MemPageStore.init(allocator, @as(u32, @intCast(3 + n * 10 + 10000)));
     defer ms.deinit();
     var db = try Db.open(allocator, ms.store(), .{});
     defer db.close();
 
-    // 构建 entries（预构建，不计时）
-    const entries = try allocator.alloc(Entry, n);
-    defer allocator.free(entries);
-    for (entries, 0..) |*e, i| {
-        e.* = .{ .key = try std.fmt.allocPrint(allocator, "{d:0>10}", .{i}), .value = "v" };
-    }
-    defer for (entries) |e| allocator.free(e.key);
+    const built = try buildEntries(allocator, n);
+    defer allocator.free(built.entries);
+    defer allocator.free(built.key_buf);
 
     writer.ProfileStats.reset();
     writer.ProfileStats.enable = true;
     defer writer.ProfileStats.enable = false;
 
-    // 分段计时 putBatch 整体 vs applyBatch 内部
     const t_staging0 = monoNs();
-    try db.putBatch(entries);
+    try db.putBatch(built.entries);
     const t_staging1 = monoNs();
 
     const elapsed = t_staging1 - t_staging0;
@@ -52,7 +60,7 @@ fn runScale(allocator: std.mem.Allocator, n: usize, label: []const u8) !void {
 pub fn main() !void {
     const alloc = std.heap.page_allocator;
 
-    // 拐点扫描：100K → 500K
+    // 拐点扫描：100K → 500K（连续 key，有序）
     try runScale(alloc, 100_000, "100K");
     try runScale(alloc, 200_000, "200K");
     try runScale(alloc, 300_000, "300K");

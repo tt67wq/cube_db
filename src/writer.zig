@@ -15,6 +15,7 @@ pub const ProfileStats = struct {
     // 各段耗时（ns）与调用次数
     pub var txn_dupe_ns: u64 = 0;
     pub var txn_sort_ns: u64 = 0;
+    pub var txn_order_ns: u64 = 0;
     pub var txn_dedup_ns: u64 = 0;
     pub var txn_insertbatch_ns: u64 = 0;
     pub var txn_pending_free_ns: u64 = 0;
@@ -31,6 +32,7 @@ pub const ProfileStats = struct {
     pub fn reset() void {
         txn_dupe_ns = 0;
         txn_sort_ns = 0;
+        txn_order_ns = 0;
         txn_dedup_ns = 0;
         txn_insertbatch_ns = 0;
         txn_pending_free_ns = 0;
@@ -60,6 +62,7 @@ pub const ProfileStats = struct {
         std.debug.print("  每 entry:  {d} ns ({d:.3} us)\n", .{ per_entry, @as(f64, @floatFromInt(per_entry)) / 1000.0 });
         inline for (.{
             .{ "dupe        ", txn_dupe_ns },
+            .{ "order_detect", txn_order_ns },
             .{ "sort        ", txn_sort_ns },
             .{ "dedup       ", txn_dedup_ns },
             .{ "insertBatch ", txn_insertbatch_ns },
@@ -269,9 +272,9 @@ pub const State = struct {
             batch_byte_delta += wr.live_delta;
         } else {
             // Copy keys/values into arena first (caller slices may not survive — e.g. stack buffer reuse)
-        const t_dupe0 = if (prof) ProfileStats.now() else 0;
 
         // O(n) 有序性检测：strict（严格递增，无重复）/ non_dec（非递减，含重复）/ unordered
+        const t_order0 = if (prof) ProfileStats.now() else 0;
         const Order = enum { strict, non_dec, unordered };
         const order = blk: {
             if (batch.len <= 1) break :blk Order.strict;
@@ -285,7 +288,9 @@ pub const State = struct {
             }
             break :blk if (has_dup) Order.non_dec else Order.strict;
         };
+        if (prof) ProfileStats.txn_order_ns += @intCast(ProfileStats.now() - t_order0);
 
+        const t_dupe0 = if (prof) ProfileStats.now() else 0;
         const arena_entries = try arena_alloc.alloc(btree.LeafEntry, batch.len);
         if (order != .unordered) {
             // Fast path: 有序输入，跳过 dupe + sort，直接引用 caller 切片
