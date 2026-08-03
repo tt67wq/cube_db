@@ -134,13 +134,13 @@ pub const Db = struct {
     /// Keys and values are copied internally, so caller's slices only need to be
     /// valid during the putBatch call itself (not after).
     pub fn putBatch(self: *Db, entries: []const Entry) !void {
-        // 直接批量构建：跳过 per-entry dupe + staging，直接构建 Request 数组进 applyBatch。
-        // applyBatch 内部会 dupe key/value 到其 arena，无需在此预复制。
+        // 直接批量构建：跳过 per-entry staging + arena dupe。
+        // Request 直接引用调用方的 key/value 切片（applyBatch 内 insertBatch 会 dupe 到 leaf，
+        // 切片只需在 putBatch 调用期间有效即可）。
         // 调用方须保证 entries 的 key/value 在 putBatch 调用期间有效（值语义由调用方保证）。
         self.write_mutex.lock() catch return error.LockFailed;
         defer self.write_mutex.unlock();
 
-        // 用 page_allocator 直接分配 Request/Futures 数组（单次 mmap，非 per-entry）
         const reqs = try self.allocator.alloc(wrt.Request, entries.len);
         defer self.allocator.free(reqs);
         var futures = try self.allocator.alloc(zio.Future(wrt.OpResult), entries.len);

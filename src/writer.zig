@@ -271,12 +271,25 @@ pub const State = struct {
             // Copy keys/values into arena first (caller slices may not survive — e.g. stack buffer reuse)
         const t_dupe0 = if (prof) ProfileStats.now() else 0;
         const arena_entries = try arena_alloc.alloc(btree.LeafEntry, batch.len);
+        // 预分配连续 key/value 缓冲区（单次分配），memcpy 进去，排序读取连续内存（热 cache）
+        var key_buf_len: usize = 0;
+        for (batch) |req| {
+            key_buf_len += req.key.len;
+            if (!req.tombstone) key_buf_len += req.value.len;
+        }
+        const key_buf = try arena_alloc.alloc(u8, key_buf_len);
+        var key_off: usize = 0;
         for (batch, 0..) |req, i| {
-            arena_entries[i] = .{
-                .tombstone = req.tombstone,
-                .key = try arena_alloc.dupe(u8, req.key),
-                .value = if (req.tombstone) try arena_alloc.dupe(u8, "") else try arena_alloc.dupe(u8, req.value),
-            };
+            @memcpy(key_buf[key_off..][0..req.key.len], req.key);
+            const k = key_buf[key_off..][0..req.key.len];
+            key_off += req.key.len;
+            var v: []const u8 = "";
+            if (!req.tombstone) {
+                @memcpy(key_buf[key_off..][0..req.value.len], req.value);
+                v = key_buf[key_off..][0..req.value.len];
+                key_off += req.value.len;
+            }
+            arena_entries[i] = .{ .tombstone = req.tombstone, .key = k, .value = v };
         }
         if (prof) ProfileStats.txn_dupe_ns += @intCast(ProfileStats.now() - t_dupe0);
 
