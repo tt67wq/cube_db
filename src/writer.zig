@@ -270,64 +270,111 @@ pub const State = struct {
         } else {
             // Copy keys/values into arena first (caller slices may not survive — e.g. stack buffer reuse)
         const t_dupe0 = if (prof) ProfileStats.now() else 0;
-        const arena_entries = try arena_alloc.alloc(btree.LeafEntry, batch.len);
-        // 预分配连续 key/value 缓冲区（单次分配），memcpy 进去，排序读取连续内存（热 cache）
-        var key_buf_len: usize = 0;
-        for (batch) |req| {
-            key_buf_len += req.key.len;
-            if (!req.tombstone) key_buf_len += req.value.len;
-        }
-        const key_buf = try arena_alloc.alloc(u8, key_buf_len);
-        var key_off: usize = 0;
-        for (batch, 0..) |req, i| {
-            @memcpy(key_buf[key_off..][0..req.key.len], req.key);
-            const k = key_buf[key_off..][0..req.key.len];
-            key_off += req.key.len;
-            var v: []const u8 = "";
-            if (!req.tombstone) {
-                @memcpy(key_buf[key_off..][0..req.value.len], req.value);
-                v = key_buf[key_off..][0..req.value.len];
-                key_off += req.value.len;
-            }
-            arena_entries[i] = .{ .tombstone = req.tombstone, .key = k, .value = v };
-        }
-        if (prof) ProfileStats.txn_dupe_ns += @intCast(ProfileStats.now() - t_dupe0);
 
-        // Sort by key
-        const t_sort0 = if (prof) ProfileStats.now() else 0;
-        if (arena_entries.len > 1) {
-            const SortCtx = struct {
-                fn lt(_: void, a: btree.LeafEntry, b: btree.LeafEntry) bool {
-                    return btree.cmpKey(a.key, b.key) == .lt;
+        // O(n) 有序性检测：strict（严格递增，无重复）/ non_dec（非递减，含重复）/ unordered
+        const Order = enum { strict, non_dec, unordered };
+        const order = blk: {
+            if (batch.len <= 1) break :blk Order.strict;
+            var has_dup = false;
+            for (1..batch.len) |i| {
+                switch (btree.cmpKey(batch[i - 1].key, batch[i].key)) {
+                    .lt => {},
+                    .eq => has_dup = true,
+                    .gt => break :blk Order.unordered,
                 }
-            };
-            std.mem.sort(btree.LeafEntry, arena_entries, {}, SortCtx.lt);
-        }
-        if (prof) ProfileStats.txn_sort_ns += @intCast(ProfileStats.now() - t_sort0);
-
-        // Dedup (last write wins)
-        const t_dedup0 = if (prof) ProfileStats.now() else 0;
-        var n: usize = 0;
-        for (arena_entries) |e| {
-            if (n > 0 and btree.cmpKey(arena_entries[n - 1].key, e.key) == .eq) {
-                arena_entries[n - 1] = e;
-            } else {
-                arena_entries[n] = e;
-                n += 1;
             }
-        }
-        const entries = arena_entries[0..n];
-        if (prof) ProfileStats.txn_dedup_ns += @intCast(ProfileStats.now() - t_dedup0);
-
-        const t_ib0 = if (prof) ProfileStats.now() else 0;
-        const wr = btree.insertBatch(arena_alloc, self.store, new_root, entries, &batch_dirty) catch |err| {
-            for (batch) |r| r.future.set(err);
-            return;
+            break :blk if (has_dup) Order.non_dec else Order.strict;
         };
-        if (prof) ProfileStats.txn_insertbatch_ns += @intCast(ProfileStats.now() - t_ib0);
-        new_root = wr.new_root;
-        batch_entry_delta += wr.count_delta;
-        batch_byte_delta += wr.live_delta;
+
+        const arena_entries = try arena_alloc.alloc(btree.LeafEntry, batch.len);
+        if (order != .unordered) {
+            // Fast path: 有序输入，跳过 dupe + sort，直接引用 caller 切片
+            for (batch, 0..) |req, i| {
+                arena_entries[i] = .{ .tombstone = req.tombstone, .key = req.key, .value = req.value };
+            }
+            if (prof) ProfileStats.txn_dupe_ns += @intCast(ProfileStats.now() - t_dupe0);
+
+            // O(n) dedup（非递减含重复时去相邻重复，last-write-wins）
+            var n: usize = 0;
+            for (arena_entries) |e| {
+                if (n > 0 and btree.cmpKey(arena_entries[n - 1].key, e.key) == .eq) {
+                    arena_entries[n - 1] = e;
+                } else {
+                    arena_entries[n] = e;
+                    n += 1;
+                }
+            }
+            const entries = arena_entries[0..n];
+
+            const t_ib0 = if (prof) ProfileStats.now() else 0;
+            const wr = btree.insertBatch(arena_alloc, self.store, new_root, entries, &batch_dirty) catch |err| {
+                for (batch) |r| r.future.set(err);
+                return;
+            };
+            if (prof) ProfileStats.txn_insertbatch_ns += @intCast(ProfileStats.now() - t_ib0);
+            new_root = wr.new_root;
+            batch_entry_delta += wr.count_delta;
+            batch_byte_delta += wr.live_delta;
+        } else {
+            // Unordered: 当前路径（dupe + sort + dedup）
+            // 预分配连续 key/value 缓冲区（单次分配），memcpy 进去，排序读取连续内存（热 cache）
+            var key_buf_len: usize = 0;
+            for (batch) |req| {
+                key_buf_len += req.key.len;
+                if (!req.tombstone) key_buf_len += req.value.len;
+            }
+            const key_buf = try arena_alloc.alloc(u8, key_buf_len);
+            var key_off: usize = 0;
+            for (batch, 0..) |req, i| {
+                @memcpy(key_buf[key_off..][0..req.key.len], req.key);
+                const k = key_buf[key_off..][0..req.key.len];
+                key_off += req.key.len;
+                var v: []const u8 = "";
+                if (!req.tombstone) {
+                    @memcpy(key_buf[key_off..][0..req.value.len], req.value);
+                    v = key_buf[key_off..][0..req.value.len];
+                    key_off += req.value.len;
+                }
+                arena_entries[i] = .{ .tombstone = req.tombstone, .key = k, .value = v };
+            }
+            if (prof) ProfileStats.txn_dupe_ns += @intCast(ProfileStats.now() - t_dupe0);
+
+            // Sort by key
+            const t_sort0 = if (prof) ProfileStats.now() else 0;
+            if (arena_entries.len > 1) {
+                const SortCtx = struct {
+                    fn lt(_: void, a: btree.LeafEntry, b: btree.LeafEntry) bool {
+                        return btree.cmpKey(a.key, b.key) == .lt;
+                    }
+                };
+                std.mem.sort(btree.LeafEntry, arena_entries, {}, SortCtx.lt);
+            }
+            if (prof) ProfileStats.txn_sort_ns += @intCast(ProfileStats.now() - t_sort0);
+
+            // Dedup (last write wins)
+            const t_dedup0 = if (prof) ProfileStats.now() else 0;
+            var n: usize = 0;
+            for (arena_entries) |e| {
+                if (n > 0 and btree.cmpKey(arena_entries[n - 1].key, e.key) == .eq) {
+                    arena_entries[n - 1] = e;
+                } else {
+                    arena_entries[n] = e;
+                    n += 1;
+                }
+            }
+            const entries = arena_entries[0..n];
+            if (prof) ProfileStats.txn_dedup_ns += @intCast(ProfileStats.now() - t_dedup0);
+
+            const t_ib0 = if (prof) ProfileStats.now() else 0;
+            const wr = btree.insertBatch(arena_alloc, self.store, new_root, entries, &batch_dirty) catch |err| {
+                for (batch) |r| r.future.set(err);
+                return;
+            };
+            if (prof) ProfileStats.txn_insertbatch_ns += @intCast(ProfileStats.now() - t_ib0);
+            new_root = wr.new_root;
+            batch_entry_delta += wr.count_delta;
+            batch_byte_delta += wr.live_delta;
+        } // end unordered path
         } // end else (batch.len > 1)
 
         // 3. 本批脏页进 pending_free（不立即回收，MVCC 安全）
