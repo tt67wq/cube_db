@@ -134,26 +134,12 @@ pub const Db = struct {
     /// Keys and values are copied internally, so caller's slices only need to be
     /// valid during the putBatch call itself (not after).
     pub fn putBatch(self: *Db, entries: []const Entry) !void {
-        // Copy entries into owned memory — caller's slices may be stack-allocated
-        // and reused in loops (e.g. fmtKey with shared buffer)
-        const owned = try self.allocator.alloc(Entry, entries.len);
-        defer {
-            for (owned) |e| {
-                self.allocator.free(e.key);
-                if (!e.tombstone) self.allocator.free(e.value);
-            }
-            self.allocator.free(owned);
-        }
-        for (entries, 0..) |e, i| {
-            owned[i] = .{
-                .key = try self.allocator.dupe(u8, e.key),
-                .value = if (e.tombstone) try self.allocator.dupe(u8, "") else try self.allocator.dupe(u8, e.value),
-                .tombstone = e.tombstone,
-            };
-        }
+        // 直接走 txn：put/delete 立即 dupe 进 staging arena，无需预先复制。
+        // 调用方须保证 entries 的 key/value 在 putBatch 调用期间有效（值语义由调用方保证，
+        // 共享 buffer 会导致 key collapse —— 这是调用方语义，不是 putBatch 的 bug）。
         var txn = try self.beginWriteTxn();
         defer txn.deinit();
-        for (owned) |e| {
+        for (entries) |e| {
             if (e.tombstone) try txn.delete(e.key) else try txn.put(e.key, e.value);
         }
         try txn.commit();
@@ -189,7 +175,13 @@ pub const Db = struct {
     /// 开写事务：单写者互斥。写暂存缓冲，commit 时 applyBatch+meta 切换+fsync。
     pub fn beginWriteTxn(self: *Db) !WriteTxn {
         self.write_mutex.lock() catch return error.LockFailed;
-        return .{ .db = self, .staged = .empty, .finished = false };
+        return .{
+            .db = self,
+            .staged = .empty,
+            .finished = false,
+            // Arena for staging: put/delete dupe 进 arena，commit/abort 统一释放，零 syscall
+            .staging_arena = std.heap.ArenaAllocator.init(self.allocator),
+        };
     }
 
     /// 开读事务：取当前 root 快照，不阻写者（MVCC）。结束须调 endReadTxn/ReadTxn.end。
@@ -208,46 +200,41 @@ pub const Db = struct {
 };
 
 /// 写事务（LMDB 式）。单写者互斥；写暂存缓冲，commit 时原子 applyBatch + meta 切换 + fsync。
-/// abort 丢弃暂存，不应用。键/值为调用者拥有切片，事务存活期间须保持有效。
+/// abort 丢弃暂存，不应用。键/值为调用者拥有切片，put/delete 时立即 dupe 进 staging arena。
 pub const WriteTxn = struct {
     db: *Db,
     staged: std.ArrayList(Entry),
     finished: bool,
-    staged_freed: bool = false,
+    staging_arena: std.heap.ArenaAllocator,
+    arena_freed: bool = false,
 
     pub fn put(self: *WriteTxn, key: []const u8, value: []const u8) !void {
         if (self.finished) return error.TxnFinished;
-        // 复制 key/value —— 调用方 slice（如栈 buffer）可能不活到 commit
-        const k = try self.db.allocator.dupe(u8, key);
-        errdefer self.db.allocator.free(k);
-        const v = try self.db.allocator.dupe(u8, value);
-        try self.staged.append(self.db.allocator, .{ .key = k, .value = v, .tombstone = false });
+        // 复制 key/value 进 arena —— 调用方 slice（如栈 buffer）可能不活到 commit
+        const alloc = self.staging_arena.allocator();
+        const k = try alloc.dupe(u8, key);
+        const v = try alloc.dupe(u8, value);
+        try self.staged.append(alloc, .{ .key = k, .value = v, .tombstone = false });
     }
 
     pub fn delete(self: *WriteTxn, key: []const u8) !void {
         if (self.finished) return error.TxnFinished;
-        // 复制 key —— 调用方 slice 可能不活到 commit
-        const k = try self.db.allocator.dupe(u8, key);
-        try self.staged.append(self.db.allocator, .{ .key = k, .value = "", .tombstone = true });
-    }
-
-    /// 释放 staged entries 中复制的 key/value
-    fn freeStaged(self: *WriteTxn) void {
-        for (self.staged.items) |e| {
-            self.db.allocator.free(e.key);
-            if (!e.tombstone) self.db.allocator.free(e.value);
-        }
+        // 复制 key 进 arena —— 调用方 slice 可能不活到 commit
+        const alloc = self.staging_arena.allocator();
+        const k = try alloc.dupe(u8, key);
+        try self.staged.append(alloc, .{ .key = k, .value = "", .tombstone = true });
     }
 
     /// 提交：applyBatch + meta 切换 + fsync。完成或出错后 finished=true，释放互斥。
+    /// staging arena 在 commit 完成后统一释放（applyBatch 已把 key/value dupe 进自己的 arena，
+    /// 页面写入是 copy 语义，无残留引用）。
     pub fn commit(self: *WriteTxn) !void {
         if (self.finished) return error.TxnFinished;
         self.finished = true;
         defer self.db.write_mutex.unlock();
         defer {
-            self.staged_freed = true;
-            self.freeStaged();
-            self.staged.deinit(self.db.allocator);
+            self.arena_freed = true;
+            self.staging_arena.deinit();
         }
         if (self.staged.items.len == 0) return;
 
@@ -266,22 +253,20 @@ pub const WriteTxn = struct {
         for (futures) |*f| try (try f.wait()).value;
     }
 
-    /// 中止：丢弃暂存，不应用。释放互斥。
+    /// 中止：丢弃暂存，不应用。释放互斥。arena 整体释放。
     pub fn abort(self: *WriteTxn) !void {
         if (self.finished) return;
         self.finished = true;
-        self.staged_freed = true;
-        self.freeStaged();
-        self.staged.deinit(self.db.allocator);
+        self.arena_freed = true;
+        self.staging_arena.deinit();
         self.db.write_mutex.unlock();
     }
 
     /// 析构：未 commit/abort 时调 abort（防止泄漏互斥）。
     pub fn deinit(self: *WriteTxn) void {
-        if (!self.staged_freed) {
-            self.staged_freed = true;
-            self.freeStaged();
-            self.staged.deinit(self.db.allocator);
+        if (!self.arena_freed) {
+            self.arena_freed = true;
+            self.staging_arena.deinit();
         }
         if (!self.finished) {
             self.finished = true;

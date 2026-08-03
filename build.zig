@@ -110,6 +110,24 @@ pub fn build(b: *std.Build) void {
     const get_profile_cmd = b.addRunArtifact(get_profile_exe);
     get_profile_step.dependOn(&get_profile_cmd.step);
 
+    // perf-batch — putBatch performance measurement
+    const perf_batch_exe = b.addExecutable(.{
+        .name = "perf_batch",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/perf_batch.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    b.installArtifact(perf_batch_exe);
+    const perf_batch_step = b.step("perf-batch", "Run putBatch performance measurement");
+    const perf_batch_cmd = b.addRunArtifact(perf_batch_exe);
+    perf_batch_step.dependOn(&perf_batch_cmd.step);
+
     // ponytail: bench-baseline — benchmark 回归基线检查
     const baseline_exe = b.addExecutable(.{
         .name = "bench_baseline",
@@ -267,6 +285,22 @@ pub fn build(b: *std.Build) void {
     const run_db_test = b.addRunArtifact(db_test);
     const db_test_step = b.step("test-db", "Run db tests only");
     db_test_step.dependOn(&run_db_test.step);
+
+    // txn_arena_test — WriteTxn staging arena 化测试
+    const txn_arena_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/txn_arena_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    const run_txn_arena_test = b.addRunArtifact(txn_arena_test);
+    const txn_arena_step = b.step("test-txn-arena", "Run txn arena tests only");
+    txn_arena_step.dependOn(&run_txn_arena_test.step);
 
     // ponytail: zig build test-compact 只跑 compact 测试
     const compact_test = b.addTest(.{
