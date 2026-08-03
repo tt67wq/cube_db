@@ -194,17 +194,18 @@ clang++ -O3 -std=c++17 benchcmp.cpp \
 | 后端 | sync 策略 | put 100B | putBatch 有序 (per-entry) | putBatch 无序 (per-entry) | get 100B | 备注 |
 |------|----------|---------|--------------------------|--------------------------|---------|------|
 | MemPageStore | no-op | 82µs | **0.47µs (1M)** | **1.88µs (100K)** | 2.81µs | 收官（#39 有序 fast path）|
-| FilePageStore | no-fsync | 99µs | 待补测（有序 fast path 下未验证）| 待补测 | 2.58µs | mmap 直写，不 fsync |
-| FilePageStore | fsync | 206µs | 待补测（有序 fast path 下未验证）| 待补测 | 2.63µs | 每次 commit fsync 一次 |
+| FilePageStore | no-fsync | 99µs | **18.3µs (1M)** | **1.14µs (100K)** | 2.58µs | 脏页 mmap 写入主导 |
+| FilePageStore | fsync | 206µs | **18.3µs (1M)** | **1.14µs (100K)** | 2.63µs | 脏页写入 + fsync |
 | LMDB | MDB_NOSYNC | 3.15µs | 0.37µs | 0.23µs | 0.29µs | 实测，无 fsync |
 | LMDB | default (fsync, warm) | **4365µs** | **1.30µs** | **0.76µs** | 0.29µs | 实测，10k keys，warm 状态 |
 
-**🏆 写路径收官成绩（2026-08-03，MemPageStore 实测）：**
-- **有序批量 1M**：cube_db 0.47µs vs LMDB 0.37µs = **1.27×**（目标 3× 达成）✅
-- **无序批量 100K**：cube_db 1.88µs（#37 staging 消除后受益，低于旧 4.26µs）
+**🏆 写路径收官成绩（2026-08-03）：**
+- **有序批量 1M（MemPageStore 算法层）**：cube_db 0.47µs vs LMDB 0.37µs = **1.27×**（目标 3× 达成）✅
+- **有序批量 1M（FilePageStore 真实部署）**：18.3µs（脏页 mmap 写入主导）— 与 MemPageStore 差 39×，持久化路径待优化
+- **无序批量 100K（MemPageStore）**：1.88µs；**（FilePageStore）**：1.14µs（sort/dedup 主导，页存储开销占比小）
 - **put 单笔 + fsync**：cube_db 206µs vs LMDB default 4365µs = **快 21×** ✅
 - **get 10K**：cube_db 2.81µs vs LMDB 0.29µs = **9.7×**（读路径，后续优化项）
-- ⚠️ FilePageStore 的有序/无序 putBatch 待补测（见矩阵标注）
+- ⚠️ 分层说明：MemPageStore = 算法层性能，FilePageStore = 真实部署（含持久化开销）
 
 ### 大规模性能（2026-08-03 收官）
 
