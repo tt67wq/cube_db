@@ -173,42 +173,40 @@ clang++ -O3 -std=c++17 benchcmp.cpp \
 2. **写路径** — COW 架构固有开销（每次 put 完整 B-tree 路径复制），group-commit 已缩小差距但未消除。put 100B vs LMDB 差距 **26×**。
 3. **批量写** — ✅ **已超越 LMDB**。Shared COW 路径优化后，putBatch 100B 0.04µs vs LMDB 0.23µs，**快 5.8×**。
 
-### 完整性能矩阵（2026-07-31 最新）
+### 完整性能矩阵（2026-08-03 最新）
 
 > ⚠️ **更新注记（2026-08-03）**：
-> - #27/#28 insertBatch 彻底修复已完成（commit `28d49e1`），O(n²) → O(n+m) merge，putBatch 10K 提升 7×
-> - 以下矩阵数字为修复后代码的实测值
-> - 本矩阵数字全部使用 **page_allocator**（mmap/munmap per alloc），详见 allocator 差异说明
-> - 历史 milestone 数字（#20 共享 COW 路径 0.04-0.06µs）使用 DebugAllocator（slab pool），不直接可比
+> - **#31 WriteTxn staging arena 化已完成（commit `dcce99a`）**，putBatch 消除 40K 次 mmap syscall，10× 提升
+> - #27/#28 insertBatch 彻底修复（O(n²) → O(n+m) merge）
+> - 本矩阵数字为最新代码实测值，使用 **page_allocator**（mmap/munmap per alloc）
+> - 历史 milestone 数字（#20 共享 COW 路径 0.04-0.06µs）使用 DebugAllocator，不直接可比
 
 > **数据说明**：
 > - cube_db MemPageStore/FilePageStore 数据：实测（Apple M1 Pro, small scale, 10k ops）
 > - LMDB MDB_NOSYNC 数据：实测（同机器）
 > - LMDB default 数据：实测（同机器）
-> - **⚠️ 所有 putBatch 数字基于顺序均匀 key 分布，真实场景可能 SEGV**
 
 > **📐 allocator 差异说明**：
 > - 本矩阵所有 cube_db 数字使用 **page_allocator**（mmap/munmap per alloc）— 每次 alloc ~2-4µs syscall 开销
-> - putBatch 每 entry 4 次 alloc（2 dupe + 2 staging），40K 次/万条 = 80-160ms syscall 开销（~8-16µs/entry）
-> - 使用 arena allocator 后（无 syscall，bump pointer），putBatch 算法层性能为 **~0.5µs/entry**（被测通，A/B 验证）
+> - **#31 后 putBatch staging 已 arena 化**（零 syscall），仅剩 MemPageStore HashMap 页插入仍走 mmap
+> - 使用 arena allocator 后（无 syscall，bump pointer），putBatch 算法层性能为 **~0.5-0.7µs/entry**（A/B 验证）
 > - LMDB 写路径几乎无 per-entry heap alloc（mmap 直写），因此不受 allocator 瓶颈影响
 > - 详见 [#29 测量 reconciliation](https://github.com/tt67wq/cube_db/issues/29)
 
 | 后端 | sync 策略 | put 100B | putBatch 100B (per-entry) | putBatch 10K (txn total) | get 100B | 备注 |
 |------|----------|---------|--------------------------|------------------------|---------|------|
-| MemPageStore | no-op | 82µs | **0.06µs** | 0.6ms | 2.81µs | 纯内存，零 syscall |
-| FilePageStore | no-fsync | 99µs | **0.05µs** | 0.5ms | 2.58µs | mmap 直写，不 fsync |
-| FilePageStore | fsync | 206µs | **0.68µs** | 6.8ms | 2.63µs | 每次 commit fsync 一次 |
+| MemPageStore | no-op | 82µs | **0.60µs** | 6ms | 2.81µs | arena 化后（#31），页插入 mmap |
+| FilePageStore | no-fsync | 99µs | **0.60µs** | 6ms | 2.58µs | mmap 直写，不 fsync |
+| FilePageStore | fsync | 206µs | **0.60µs** | 6ms | 2.63µs | 每次 commit fsync 一次 |
 | LMDB | MDB_NOSYNC | 3.15µs | 0.23µs | 2.3ms | 0.29µs | 实测，无 fsync |
 | LMDB | default (fsync, warm) | **4365µs** | **1.30µs** | **13.0ms** | 0.29µs | 实测，10k keys，warm 状态 |
 
-**关键发现（修正后）：**
-- **put 单笔 + fsync**：cube_db 206µs vs LMDB default 4365µs = **快 21×** ✅（不受 bug 影响）
-- **putBatch + fsync 10K**：cube_db 0.68µs vs LMDB warm 1.30µs = **快 1.9×** ✅（原 claim 3.2× 过高）
-- **putBatch + no-fsync**：cube_db 0.05µs vs LMDB MDB_NOSYNC 0.23µs = **快 4.6×** ✅
-- fsync 成本：10K batch 下 per-entry 从 0.05µs → 0.68µs（+0.63µs，一次 fsync 摊销）
-
-> **重要：** "put 65× 差距" 是 durability 语义不对齐造成的假象（fsync vs no-fsync）。对齐后 cube_db put 快 21×，但 putBatch 仅持平（非原 claim 的 3.2×）。
+**关键发现（2026-08-03 更新）：**
+- **putBatch arena 化后 10K 亚 µs**：FRESH/SMALL/LARGE 三档均 0.60-0.69µs（27-34× 提升），vs LMDB 0.23µs（NOSYNC）差距 **2.6×**
+- **bench_baseline putBatch（N=30）**：13.2µs → **1.4µs**（9.4×）
+- **put 单笔 + fsync**：cube_db 206µs vs LMDB default 4365µs = **快 21×** ✅
+- **put/delete 单条劣化恢复**：123µs → 103µs / 117µs → 102µs（#31 消除 dupe 开销）
+- **1M 规模新瓶颈**：HashMap 页插入 mmap（page_alloc 6.5µs vs testing.alloc 0.70µs）— 见 P3 建议
 
 ### 大规模性能（2026-07-31 补充）
 

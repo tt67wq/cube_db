@@ -76,6 +76,7 @@ full API, and recipes see **[docs/usage.md](docs/usage.md)**.
 
 | 文档 | 内容 |
 |------|------|
+| [`20260803_arena_opt.md`](bench/results/20260803_arena_opt.md) | WriteTxn staging arena 化 — putBatch 10K **0.6µs（27× 提升）** |
 | [`20260730_shared_cow.md`](bench/results/20260730_shared_cow.md) | Shared COW path — putBatch 100B **619× 提速，超越 LMDB** |
 | [`20260730_read_crc_skip.md`](bench/results/20260730_read_crc_skip.md) | 读路径 CRC 跳过 — get 100B 13× 提速 |
 | [`20260730_micro_batch.md`](bench/results/20260730_micro_batch.md) | micro-batching / group-commit — put 100B 4.0× 提速 |
@@ -88,7 +89,7 @@ full API, and recipes see **[docs/usage.md](docs/usage.md)**.
 
 ## Tests
 
-177 tests across 19 modules + 4 fuzz targets, all passing:
+~200 tests across 25+ modules (auto-discovered), all passing:
 
 | Module | Tests | File |
 |--------|-------|------|
@@ -109,10 +110,17 @@ full API, and recipes see **[docs/usage.md](docs/usage.md)**.
 | Fuzz (probe/api/format/meta-corrupt) | 9 | `tests/fuzz/*` |
 | Zero-copy | 7 | `tests/zero_copy_test.zig` |
 | COW fast path | 5 | `tests/cow_fast_test.zig` |
-| Crash recovery framework | 4 | `tests/crash_recovery_framework_test.zig` |
+| Crash recovery framework | 4 | `tests/crash_recovery_framework.zig` |
 | Group commit | 10 | `tests/group_commit_test.zig` |
 | Group commit ext | 11 | `tests/group_commit_ext_test.zig` |
-| **Shared COW** | **8** | `tests/shared_cow_test.zig` |
+| Shared COW | 8 | `tests/shared_cow_test.zig` |
+| putBatch correctness | 4 | `tests/putbatch_correctness_test.zig` |
+| insertBatch overflow | 5 | `tests/insertbatch_overflow_test.zig` |
+| insertBatch capaware | 7 | `tests/insertbatch_capaware_test.zig` |
+| crash putBatch | 5 | `tests/crash_putbatch_test.zig` |
+| **Txn arena** | **7** | `tests/txn_arena_test.zig` |
+| **Txn abort arena** | **4** | `tests/txn_abort_arena_test.zig` |
+| 3-state | 3 | `tests/pb_3state_test.zig` |
 
 ```bash
 zig build test test-fuzz        # all unit/integration + fuzz regression
