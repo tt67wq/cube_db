@@ -137,11 +137,14 @@ pub const Db = struct {
         // 直接走 txn：put/delete 立即 dupe 进 staging arena，无需预先复制。
         // 调用方须保证 entries 的 key/value 在 putBatch 调用期间有效（值语义由调用方保证，
         // 共享 buffer 会导致 key collapse —— 这是调用方语义，不是 putBatch 的 bug）。
+        const prof = wrt.ProfileStats.enable;
+        const t0 = if (prof) wrt.ProfileStats.now() else 0;
         var txn = try self.beginWriteTxn();
         defer txn.deinit();
         for (entries) |e| {
             if (e.tombstone) try txn.delete(e.key) else try txn.put(e.key, e.value);
         }
+        if (prof) wrt.ProfileStats.db_staging_ns += @intCast(wrt.ProfileStats.now() - t0);
         try txn.commit();
     }
 
@@ -243,14 +246,19 @@ pub const WriteTxn = struct {
         defer commit_arena.deinit();
         const arena_alloc = commit_arena.allocator();
 
+        const prof = wrt.ProfileStats.enable;
+        const t_reqs0 = if (prof) wrt.ProfileStats.now() else 0;
         const reqs = try arena_alloc.alloc(wrt.Request, self.staged.items.len);
         var futures = try arena_alloc.alloc(zio.Future(wrt.OpResult), self.staged.items.len);
         for (self.staged.items, 0..) |e, i| {
             futures[i] = .{};
             reqs[i] = .{ .key = e.key, .value = e.value, .tombstone = e.tombstone, .future = &futures[i] };
         }
+        if (prof) wrt.ProfileStats.db_reqs_ns += @intCast(wrt.ProfileStats.now() - t_reqs0);
         try self.db.state.applyBatch(reqs);
+        const t_wait0 = if (prof) wrt.ProfileStats.now() else 0;
         for (futures) |*f| try (try f.wait()).value;
+        if (prof) wrt.ProfileStats.db_futures_wait_ns += @intCast(wrt.ProfileStats.now() - t_wait0);
     }
 
     /// 中止：丢弃暂存，不应用。释放互斥。arena 整体释放。

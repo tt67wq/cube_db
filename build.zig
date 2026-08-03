@@ -128,6 +128,24 @@ pub fn build(b: *std.Build) void {
     const perf_batch_cmd = b.addRunArtifact(perf_batch_exe);
     perf_batch_step.dependOn(&perf_batch_cmd.step);
 
+    // profile-commit — commit 路径分段耗时剖析 (#35)
+    const profile_commit_exe = b.addExecutable(.{
+        .name = "profile_commit",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/profile_commit.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    b.installArtifact(profile_commit_exe);
+    const profile_commit_step = b.step("profile-commit", "Run commit path phase profiling (#35)");
+    const profile_commit_cmd = b.addRunArtifact(profile_commit_exe);
+    profile_commit_step.dependOn(&profile_commit_cmd.step);
+
     // ponytail: bench-baseline — benchmark 回归基线检查
     const baseline_exe = b.addExecutable(.{
         .name = "bench_baseline",
