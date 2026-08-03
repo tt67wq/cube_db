@@ -199,13 +199,21 @@ clang++ -O3 -std=c++17 benchcmp.cpp \
 | LMDB | MDB_NOSYNC | 3.15µs | 0.37µs | 0.23µs | 0.29µs | 实测，无 fsync |
 | LMDB | default (fsync, warm) | **4365µs** | **1.30µs** | **0.76µs** | 0.29µs | 实测，10k keys，warm 状态 |
 
-**🏆 写路径收官成绩（2026-08-03）：**
-- **有序批量 1M（MemPageStore 算法层）**：cube_db 0.47µs vs LMDB 0.37µs = **1.27×**（目标 3× 达成）✅
-- **有序批量 1M（FilePageStore 真实部署）**：18.3µs（脏页 mmap 写入主导）— 与 MemPageStore 差 39×，持久化路径待优化
-- **无序批量 100K（MemPageStore）**：1.88µs；**（FilePageStore）**：1.14µs（sort/dedup 主导，页存储开销占比小）
+**🏆 写路径收官成绩（2026-08-03，双层结论）：**
+
+**算法层（MemPageStore）— parity 达成 ✅**
+- **有序批量 1M**：cube_db 0.47µs vs LMDB 0.37µs = **1.27×**（目标 3× 达成）✅
+- **无序批量 100K**：1.88µs（#37 staging 消除后受益）
+
+**持久化层（FilePageStore）— 待攻坚 ⚠️**
+- **有序批量 1M**：**18.3µs/entry** vs LMDB 0.37µs = **49×**（脏页 mmap 写入主导）
+- **无序批量 100K**：1.14µs（sort/dedup 主导，页存储开销占比小）
+- ⚠️ cody 发现规模异常：100K→1M per-entry 增长 16×（MemPageStore 恒定），指向 FPS commit 路径超线性成本
+- **这是真实部署的最后一场仗** — 已建议立项 FPS 写路径规模化瓶颈分解
+
+**其他场景：**
 - **put 单笔 + fsync**：cube_db 206µs vs LMDB default 4365µs = **快 21×** ✅
 - **get 10K**：cube_db 2.81µs vs LMDB 0.29µs = **9.7×**（读路径，后续优化项）
-- ⚠️ 分层说明：MemPageStore = 算法层性能，FilePageStore = 真实部署（含持久化开销）
 
 ### 大规模性能（2026-08-03 收官）
 
