@@ -68,7 +68,8 @@ pub const PageStore = struct {
 /// 不持久化，不支持跨生命周期恢复。
 pub const MemPageStore = struct {
     allocator: std.mem.Allocator,
-    pages: std.AutoHashMap(u32, [f2.PAGE_SIZE]u8),
+    // slab 页池：按页号索引的 4KB 页数组（ArrayList 几何增长，替代 HashMap 每页 mmap）
+    pages: std.ArrayList([f2.PAGE_SIZE]u8),
     freelist: std.ArrayList(u32),
     next_free: u32,
     max_pages: u32,
@@ -79,7 +80,7 @@ pub const MemPageStore = struct {
     pub fn init(allocator: std.mem.Allocator, mapsize_pages: u32) MemPageStore {
         return .{
             .allocator = allocator,
-            .pages = std.AutoHashMap(u32, [f2.PAGE_SIZE]u8).init(allocator),
+            .pages = .empty,
             .freelist = .empty,
             .next_free = FIRST_DATA_PAGE,
             .max_pages = mapsize_pages,
@@ -90,12 +91,19 @@ pub const MemPageStore = struct {
     }
 
     pub fn deinit(self: *MemPageStore) void {
-        self.pages.deinit();
+        self.pages.deinit(self.allocator);
         self.freelist.deinit(self.allocator);
     }
 
     pub fn store(self: *MemPageStore) PageStore {
         return .{ .ptr = self, .vtable = &mem_vtable };
+    }
+
+    /// 确保页数组至少包含 index+1 个页（不足则几何增长，摊销 O(1)）
+    fn ensurePage(self: *MemPageStore, index: u32) !void {
+        if (index < self.pages.items.len) return;
+        const need = @as(usize, index) + 1;
+        try self.pages.appendNTimes(self.allocator, [_]u8{0} ** f2.PAGE_SIZE, need - self.pages.items.len);
     }
 
     fn vtAllocPage(ptr: *anyopaque) !u32 {
@@ -104,7 +112,7 @@ pub const MemPageStore = struct {
         const pn = self.next_free;
         if (pn >= self.max_pages) return error.MapFull;
         self.next_free = pn + 1;
-        try self.pages.put(pn, [_]u8{0} ** f2.PAGE_SIZE);
+        try self.ensurePage(pn);
         return pn;
     }
 
@@ -117,17 +125,16 @@ pub const MemPageStore = struct {
         const self: *MemPageStore = @ptrCast(@alignCast(ptr));
         if (page_no == f2.META_PAGE_0) return &self.meta0;
         if (page_no == f2.META_PAGE_1) return &self.meta1;
-        const entry = self.pages.getPtr(page_no) orelse return error.PageNotFound;
-        return entry;
+        if (page_no >= self.pages.items.len) return error.PageNotFound;
+        return &self.pages.items[page_no];
     }
 
     fn vtWritePage(ptr: *anyopaque, page_no: u32) ![]u8 {
         const self: *MemPageStore = @ptrCast(@alignCast(ptr));
         if (page_no == f2.META_PAGE_0) return &self.meta0;
         if (page_no == f2.META_PAGE_1) return &self.meta1;
-        const gop = try self.pages.getOrPut(page_no);
-        if (!gop.found_existing) gop.value_ptr.* = [_]u8{0} ** f2.PAGE_SIZE;
-        return gop.value_ptr;
+        try self.ensurePage(page_no);
+        return &self.pages.items[page_no];
     }
 
     fn vtReadMeta(ptr: *anyopaque) !?f2.MetaPage {

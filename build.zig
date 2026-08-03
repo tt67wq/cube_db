@@ -222,6 +222,22 @@ pub fn build(b: *std.Build) void {
     const ps_test_step = b.step("test-ps", "Run page_store tests only");
     ps_test_step.dependOn(&run_ps_test.step);
 
+    // slab_page_store_test — MemPageStore slab 页池改造测试
+    const slab_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/slab_page_store_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    const run_slab_test = b.addRunArtifact(slab_test);
+    const slab_test_step = b.step("test-slab", "Run slab page store tests only");
+    slab_test_step.dependOn(&run_slab_test.step);
+
     // ponytail: zig build test-btree 只跑 btree 测试
     const btree_test = b.addTest(.{
         .root_module = b.createModule(.{
