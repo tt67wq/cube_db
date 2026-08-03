@@ -134,18 +134,29 @@ pub const Db = struct {
     /// Keys and values are copied internally, so caller's slices only need to be
     /// valid during the putBatch call itself (not after).
     pub fn putBatch(self: *Db, entries: []const Entry) !void {
-        // 直接走 txn：put/delete 立即 dupe 进 staging arena，无需预先复制。
-        // 调用方须保证 entries 的 key/value 在 putBatch 调用期间有效（值语义由调用方保证，
-        // 共享 buffer 会导致 key collapse —— 这是调用方语义，不是 putBatch 的 bug）。
+        // 直接批量构建：跳过 per-entry dupe + staging，直接构建 Request 数组进 applyBatch。
+        // applyBatch 内部会 dupe key/value 到其 arena，无需在此预复制。
+        // 调用方须保证 entries 的 key/value 在 putBatch 调用期间有效（值语义由调用方保证）。
+        self.write_mutex.lock() catch return error.LockFailed;
+        defer self.write_mutex.unlock();
+
+        // 用 page_allocator 直接分配 Request/Futures 数组（单次 mmap，非 per-entry）
+        const reqs = try self.allocator.alloc(wrt.Request, entries.len);
+        defer self.allocator.free(reqs);
+        var futures = try self.allocator.alloc(zio.Future(wrt.OpResult), entries.len);
+        defer self.allocator.free(futures);
+
         const prof = wrt.ProfileStats.enable;
         const t0 = if (prof) wrt.ProfileStats.now() else 0;
-        var txn = try self.beginWriteTxn();
-        defer txn.deinit();
-        for (entries) |e| {
-            if (e.tombstone) try txn.delete(e.key) else try txn.put(e.key, e.value);
+
+        for (entries, 0..) |e, i| {
+            futures[i] = .{};
+            reqs[i] = .{ .key = e.key, .value = e.value, .tombstone = e.tombstone, .future = &futures[i] };
         }
+
         if (prof) wrt.ProfileStats.db_staging_ns += @intCast(wrt.ProfileStats.now() - t0);
-        try txn.commit();
+        try self.state.applyBatch(reqs);
+        for (futures) |*f| try (try f.wait()).value;
     }
 
     // ---- 读路径（默认快照 = 当前 root） ----
