@@ -76,6 +76,7 @@ full API, and recipes see **[docs/usage.md](docs/usage.md)**.
 
 | 文档 | 内容 |
 |------|------|
+| [`20260803_ordered_fastpath.md`](bench/results/20260803_ordered_fastpath.md) | 🏆 写路径收官 — 有序 fast path，1M **0.47µs（1.27× LMDB）** |
 | [`20260803_arena_opt.md`](bench/results/20260803_arena_opt.md) | WriteTxn staging arena 化 — putBatch 10K **0.6µs（27× 提升）** |
 | [`20260730_shared_cow.md`](bench/results/20260730_shared_cow.md) | Shared COW path — putBatch 100B **619× 提速，超越 LMDB** |
 | [`20260730_read_crc_skip.md`](bench/results/20260730_read_crc_skip.md) | 读路径 CRC 跳过 — get 100B 13× 提速 |

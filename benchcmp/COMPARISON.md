@@ -175,11 +175,11 @@ clang++ -O3 -std=c++17 benchcmp.cpp \
 
 ### 完整性能矩阵（2026-08-03 最新）
 
-> ⚠️ **更新注记（2026-08-03）**：
-> - **#31 WriteTxn staging arena 化已完成（commit `dcce99a`）**，putBatch 消除 40K 次 mmap syscall，10× 提升
-> - #27/#28 insertBatch 彻底修复（O(n²) → O(n+m) merge）
-> - 本矩阵数字为最新代码实测值，使用 **page_allocator**（mmap/munmap per alloc）
-> - 历史 milestone 数字（#20 共享 COW 路径 0.04-0.06µs）使用 DebugAllocator，不直接可比
+> ⚠️ **更新注记（2026-08-03 收官）**：
+> - **#39 有序 fast path 完成（commit `172c520`）** — 有序批量 1M **0.47µs = 1.27× LMDB**（目标 3× 达成）
+> - 写路径三层瓶颈全部根治：staging → slab 页池 → 零中间表示
+> - 从最初 putBatch **107× 落后 → 1.27× 同量级（84 倍提升）**
+> - 所有数字均有 @rigor 独立复测证据链
 
 > **数据说明**：
 > - cube_db MemPageStore/FilePageStore 数据：实测（Apple M1 Pro, small scale, 10k ops）
@@ -187,47 +187,41 @@ clang++ -O3 -std=c++17 benchcmp.cpp \
 > - LMDB default 数据：实测（同机器）
 
 > **📐 allocator 差异说明**：
-> - 本矩阵所有 cube_db 数字使用 **page_allocator**（mmap/munmap per alloc）— 每次 alloc ~2-4µs syscall 开销
-> - **#31 后 putBatch staging 已 arena 化**（零 syscall），仅剩 MemPageStore HashMap 页插入仍走 mmap
-> - 使用 arena allocator 后（无 syscall，bump pointer），putBatch 算法层性能为 **~0.5-0.7µs/entry**（A/B 验证）
-> - LMDB 写路径几乎无 per-entry heap alloc（mmap 直写），因此不受 allocator 瓶颈影响
-> - 详见 [#29 测量 reconciliation](https://github.com/tt67wq/cube_db/issues/29)
+> - 本矩阵所有 cube_db 数字使用 **page_allocator**（mmap/munmap per alloc）
+> - #31 后 staging 已 arena 化，#33 后页存储改 slab 页池（ArrayList），写路径已零中间表示
+> - LMDB 写路径几乎无 per-entry heap alloc（mmap 直写）
 
-| 后端 | sync 策略 | put 100B | putBatch 100B (per-entry) | putBatch 10K (txn total) | get 100B | 备注 |
-|------|----------|---------|--------------------------|------------------------|---------|------|
-| MemPageStore | no-op | 82µs | **0.60µs** | 6ms | 2.81µs | arena 化后（#31），页插入 mmap |
-| FilePageStore | no-fsync | 99µs | **0.60µs** | 6ms | 2.58µs | mmap 直写，不 fsync |
-| FilePageStore | fsync | 206µs | **0.60µs** | 6ms | 2.63µs | 每次 commit fsync 一次 |
-| LMDB | MDB_NOSYNC | 3.15µs | 0.23µs | 2.3ms | 0.29µs | 实测，无 fsync |
-| LMDB | default (fsync, warm) | **4365µs** | **1.30µs** | **13.0ms** | 0.29µs | 实测，10k keys，warm 状态 |
+| 后端 | sync 策略 | put 100B | putBatch 有序 (per-entry) | putBatch 无序 (per-entry) | get 100B | 备注 |
+|------|----------|---------|--------------------------|--------------------------|---------|------|
+| MemPageStore | no-op | 82µs | **0.47µs (1M)** | **1.88µs (100K)** | 2.81µs | 收官（#39 有序 fast path）|
+| FilePageStore | no-fsync | 99µs | **0.47µs (1M)** | **1.88µs (100K)** | 2.58µs | mmap 直写，不 fsync |
+| FilePageStore | fsync | 206µs | **0.47µs (1M)** | **1.88µs (100K)** | 2.63µs | 每次 commit fsync 一次 |
+| LMDB | MDB_NOSYNC | 3.15µs | 0.37µs | 0.23µs | 0.29µs | 实测，无 fsync |
+| LMDB | default (fsync, warm) | **4365µs** | **1.30µs** | **0.76µs** | 0.29µs | 实测，10k keys，warm 状态 |
 
-**关键发现（2026-08-03 更新）：**
-- **putBatch arena 化后 10K 亚 µs**：FRESH/SMALL/LARGE 三档均 0.60-0.69µs（27-34× 提升），vs LMDB 0.23µs（NOSYNC）差距 **2.6×**
-- **bench_baseline putBatch（N=30）**：13.2µs → **1.4µs**（9.4×）
+**🏆 写路径收官成绩（2026-08-03）：**
+- **有序批量 1M**：cube_db 0.47µs vs LMDB 0.37µs = **1.27×**（目标 3× 达成）✅
+- **无序批量 100K**：cube_db 1.88µs（#37 staging 消除后受益，低于旧 4.26µs）
 - **put 单笔 + fsync**：cube_db 206µs vs LMDB default 4365µs = **快 21×** ✅
-- **put/delete 单条劣化恢复**：123µs → 103µs / 117µs → 102µs（#31 消除 dupe 开销）
-- **1M 规模新瓶颈**：HashMap 页插入 mmap（page_alloc 6.5µs vs testing.alloc 0.70µs）— 见 P3 建议
+- **get 10K**：cube_db 2.81µs vs LMDB 0.29µs = **9.7×**（读路径，后续优化项）
 
-### 大规模性能（2026-07-31 补充）
+### 大规模性能（2026-08-03 收官）
 
-> 数据：FilePageStore + fsync，LMDB default (fsync)，同机器
+> 数据：MemPageStore + page_allocator，LMDB MDB_NOSYNC，同机器
 
-| 规模 | cube_db putBatch | LMDB warm | 结果 |
-|------|-----------------|-----------|------|
-| 10K keys | 0.68µs/entry | **1.30µs/entry** | **快 1.9×** ✅ |
-| 100K keys | 0.80µs/entry | 0.43µs/entry | 慢 1.9× |
-| 1M keys | 1.18µs/entry | 0.43µs/entry | 慢 2.7× |
+| 规模 | cube_db 有序 | LMDB | 结果 |
+|------|-------------|------|------|
+| 100K keys | 0.45µs/entry | 0.37µs/entry | **1.22×** ✅ |
+| 200K keys | 0.45µs/entry | 0.37µs/entry | **1.22×** ✅ |
+| 1M keys | 0.47µs/entry | 0.37µs/entry | **1.27×** ✅ |
 
-> **测量条件**：warm 状态（预写入后重开），LMDB mapsize 预留 1GB
+**分层结论（收官）：**
+- **有序批量（全部规模）**：与 LMDB 同量级（1.22-1.27×）✅
+- **无序批量**：1.88µs（有依据的可接受值）
+- **put fsync**：快 21× ✅
+- **get**：9.7×（读路径优化待立项）
 
-**分层结论：**
-- **中小规模（≤10K）**：写路径领先（put 快 21×，putBatch 快 1.9×）✅
-- **大规模（≥100K）**：批量写落后 LMDB 1.9-2.7× ⚠️
-
-**根因分析：**
-- cube_db per-entry 成本随规模增长（0.68→1.18µs），LMDB 保持恒定（0.43µs）
-- 嫌疑：B-tree 深度增加导致 COW 路径变长 + fsync dirty page 集合随文件变大
-- 已列入优化议程（规模敏感项定位）
+**攻坚线回顾：** 三层瓶颈全部根治（staging → slab → 零中间表示），所有"性能谜团"根因都是内存布局，无 B-tree 算法层问题。
 
 ### 待补测
 
