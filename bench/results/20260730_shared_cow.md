@@ -37,6 +37,11 @@
 
 > **超越 LMDB！** putBatch 100B 0.04µs vs LMDB 0.23µs = 快 5.8×
 
+> ⚠️ **注意：0.04µs 数字受 #20 applyBatch key/value 共享 bug 影响（只插入 1 条而非 10K 条）**
+> 修复后（#26/#27/#28）在 page_allocator 下实测：~16-28µs/entry
+> 使用 arena allocator（无 syscall）：~0.5µs/entry
+> 详见 [#29 测量 reconciliation](benchcmp/COMPARISON.md#-allocator-差异说明)
+
 ### 单条写（附带收益）
 
 | 操作 | 优化前 | 优化后 | 提速 |

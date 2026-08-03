@@ -175,18 +175,24 @@ clang++ -O3 -std=c++17 benchcmp.cpp \
 
 ### 完整性能矩阵（2026-07-31 最新）
 
-> ⚠️ **重要修正（2026-07-31）**：
-> - putBatch MemPageStore 0.04µs / FilePageStore+fsync 0.24µs 数字**受 applyBatch key/value 共享 bug 影响**，实际只插入 1 条而非 10K 条
-> - 修复后重测数字：MemPageStore 0.06µs，FilePageStore+fsync 10K 0.68µs
-> - **⚠️ 新发现（2026-07-31）：insertBatch 在真实负载下（大量 key 落同一 leaf）有容量溢出 bug，当前 putBatch 功能不可靠**
-> - 以下矩阵数字基于**顺序均匀 key 分布**（恰好不触发溢出），不代表真实场景性能
-> - 等 #26 彻底修复后重测
+> ⚠️ **更新注记（2026-08-03）**：
+> - #27/#28 insertBatch 彻底修复已完成（commit `28d49e1`），O(n²) → O(n+m) merge，putBatch 10K 提升 7×
+> - 以下矩阵数字为修复后代码的实测值
+> - 本矩阵数字全部使用 **page_allocator**（mmap/munmap per alloc），详见 allocator 差异说明
+> - 历史 milestone 数字（#20 共享 COW 路径 0.04-0.06µs）使用 DebugAllocator（slab pool），不直接可比
 
 > **数据说明**：
 > - cube_db MemPageStore/FilePageStore 数据：实测（Apple M1 Pro, small scale, 10k ops）
 > - LMDB MDB_NOSYNC 数据：实测（同机器）
 > - LMDB default 数据：实测（同机器）
 > - **⚠️ 所有 putBatch 数字基于顺序均匀 key 分布，真实场景可能 SEGV**
+
+> **📐 allocator 差异说明**：
+> - 本矩阵所有 cube_db 数字使用 **page_allocator**（mmap/munmap per alloc）— 每次 alloc ~2-4µs syscall 开销
+> - putBatch 每 entry 4 次 alloc（2 dupe + 2 staging），40K 次/万条 = 80-160ms syscall 开销（~8-16µs/entry）
+> - 使用 arena allocator 后（无 syscall，bump pointer），putBatch 算法层性能为 **~0.5µs/entry**（被测通，A/B 验证）
+> - LMDB 写路径几乎无 per-entry heap alloc（mmap 直写），因此不受 allocator 瓶颈影响
+> - 详见 [#29 测量 reconciliation](https://github.com/tt67wq/cube_db/issues/29)
 
 | 后端 | sync 策略 | put 100B | putBatch 100B (per-entry) | putBatch 10K (txn total) | get 100B | 备注 |
 |------|----------|---------|--------------------------|------------------------|---------|------|
