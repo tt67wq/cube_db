@@ -90,8 +90,20 @@ pub fn decodePageHeader(buf: []const u8) PageHeader {
 
 // ===== 页校验和 =====
 
+const builtin = @import("builtin");
+const crc32_hw = @import("crc32_hw.zig");
+
 /// 计算整页 CRC32（覆盖 bytes [0..PAGE_SIZE-4)）
+/// ARM64 使用硬件 CRC32 指令，其他平台走软件表驱动
 pub fn computePageChecksum(page: *const [PAGE_SIZE]u8) u32 {
+    return switch (builtin.cpu.arch) {
+        .aarch64, .aarch64_be => crc32_hw.computePageChecksumHw(page),
+        else => computePageChecksumSw(page),
+    };
+}
+
+/// 软件路径（表驱动 CRC32）
+pub fn computePageChecksumSw(page: *const [PAGE_SIZE]u8) u32 {
     var crc = Crc32.init();
     crc.update(page[0 .. PAGE_SIZE - 4]);
     return crc.final();

@@ -240,6 +240,23 @@ pub fn build(b: *std.Build) void {
     }
 
     // ponytail: per-test steps for faster iteration
+
+    // crc32_hw_test — hardware CRC32 vs software CRC32 consistency tests
+    const crc32_hw_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/crc32_hw_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    const run_crc32_hw_test = b.addRunArtifact(crc32_hw_test);
+    const crc32_hw_test_step = b.step("test-crc32", "Run crc32_hw tests only");
+    crc32_hw_test_step.dependOn(&run_crc32_hw_test.step);
+
     // zig build test-format 只跑 format 测试
     const format_test = b.addTest(.{
         .root_module = b.createModule(.{
