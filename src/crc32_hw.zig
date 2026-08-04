@@ -20,7 +20,9 @@ pub fn crc32Sw(init: u32, data: []const u8) u32 {
     return crc.final();
 }
 
-/// Hardware CRC32 (ARM64 inline asm) or software fallback.
+/// Hardware CRC32 (ARM64 inline asm, or software fallback).
+/// Note: x86 SSE4.2 crc32 uses Castagnoli polynomial (CRC-32C), not IEEE 802.3.
+/// So x86_64 falls back to software. ARM64 uses hardware CRC32 (IEEE polynomial).
 pub fn crc32Hw(init: u32, data: []const u8) u32 {
     return switch (builtin.cpu.arch) {
         .aarch64, .aarch64_be => crc32HwArm64(init, data),

@@ -178,6 +178,24 @@ pub fn build(b: *std.Build) void {
     const profile_fps_cmd = b.addRunArtifact(profile_fps_exe);
     profile_fps_step.dependOn(&profile_fps_cmd.step);
 
+    // crc32-bench — CRC32 硬件 (ARMv8) vs 软件 (表驱动) 单页耗时对比
+    const crc32_bench_exe = b.addExecutable(.{
+        .name = "crc32_bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/crc32_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    b.installArtifact(crc32_bench_exe);
+    const crc32_bench_step = b.step("crc32-bench", "CRC32 hardware vs software single-page timing");
+    const crc32_bench_cmd = b.addRunArtifact(crc32_bench_exe);
+    crc32_bench_step.dependOn(&crc32_bench_cmd.step);
+
     // ponytail: bench-baseline — benchmark 回归基线检查
     const baseline_exe = b.addExecutable(.{
         .name = "bench_baseline",
