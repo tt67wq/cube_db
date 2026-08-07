@@ -5,29 +5,29 @@
 > **主作者**：wanqiang（112 次）/ admin（2 次）
 > **代码规模**：约 3700 行 Zig + 36 个测试文件 + 10 份基准报告
 
-本文是一部按时间线展开的项目演进史。目标：让不熟悉 Zig 与 KV 引擎的读者也能读懂"这个项目是怎么一步步长成现在这样的"。
+这是一部按时间线展开的项目演进史。想搞清楚"这个项目是怎么一步步长成现在这样的"，跟着纪元往下读就行。不熟 Zig、不熟 KV 引擎？没关系，下面每个概念都会顺手讲清楚。
 
 ---
 
 ## 阅读指南：先认识几个核心概念
 
-读编年史前，先建立 7 个概念地基。后面每个纪元都是在反复打磨它们。
+正式开读前，先认 7 个反复登场的主角。后面每个纪元都在打磨它们，先混个脸熟，故事就顺了。
 
 | 概念 | 一句话解释 | 在 cube_db 中的角色 |
 |------|-----------|-------------------|
-| **B+tree（B 树）** | 磁盘友好的平衡多路树，数据只在叶子，分支节点只存导航键 | 存储所有 key-value 的骨架 |
-| **COW（Copy-On-Write，写时复制）** | 永不原地修改页面，修改就复制一份新页面，旧页面留给读者 | 崩溃安全的根基；读不阻塞写 |
+| **B+tree（B 树）** | 磁盘友好的平衡多路树，数据只在叶子，分支节点只存导航键 | 存所有 key-value 的骨架 |
+| **COW（Copy-On-Write，写时复制）** | 永不原地改页面，要改就复制一份新的，旧页面留给读者 | 崩溃安全的根基；读不阻塞写 |
 | **mmap（内存映射文件）** | 把文件映射进进程地址空间，读文件 = 读内存指针 | 读路径零拷贝；1TB 预留区 |
-| **MVCC（多版本并发控制）** | 读事务看到开始那一刻的"快照"，不受之后写入影响 | 读不阻塞写、写不阻塞读 |
-| **freelist（空闲页表）** | 记录哪些页面被释放、可复用 | 页面回收再分配 |
+| **MVCC（多版本并发控制）** | 读事务看到开始那一刻的"快照"，后面写入影响不到它 | 读不阻塞写、写不阻塞读 |
+| **freelist（空闲页表）** | 记录哪些页面被释放、还能复用 | 页面回收再分配 |
 | **meta page（元页面）** | 存"数据库根指针在哪、第几次提交"的小页面，是"提交点" | commit = 切换 meta 指针 |
 | **WAL（预写日志）** | 写入前先记一条日志，崩溃后重放恢复 | **最终版无 WAL**（曾短暂实验后删除，见第四纪），靠 COW + meta 切换实现崩溃安全 |
 
-还有一个贯穿全程的关键词：
+还有个全程刷存在感的关键词：
 
-- **fsync**：强制操作系统把内存里的脏页刷到物理磁盘。不 fsync，数据可能只是内存里的幻觉，断电就没了。它是"耐久性（durability）"的边界。
+- **fsync**：强制操作系统把内存里的脏页刷到物理磁盘。不 fsync，数据可能只是内存里的幻觉，断电就没了。它是"耐久性（durability）"的边界，也是性能的大敌——后面好多故事都绕着它转。
 
-记住这 7+1 个词，下面的故事就顺畅了。
+7+1 个词记牢，下面的戏就好看懂了。
 
 ---
 
@@ -48,20 +48,20 @@
 
 ## 第一纪 · 起源（2026-07-22，4 次提交）
 
-### 概念背景：项目要做什么
+### 这天在干嘛
 
-作者想用 Zig 0.16.0 写一个**嵌入式 KV 引擎**——就像 SQLite 之于 SQL，但只管 key-value。"嵌入式"意味着它是个库（链接进你的程序），不是独立服务。参照对象是 LMDB（OpenLDAP 用的那个，以极简和高性能著称）。
+作者要用 Zig 0.16.0 搓一个**嵌入式 KV 引擎**——你可以理解成"只管 key-value 的 SQLite"，或者"自己手搓的 LMDB"。"嵌入式"是说它是个库（链接进你的程序），不是独立服务。参照对象是 LMDB（OpenLDAP 用的那个，以极简和高性能著称）。第一天不追求架构完美，能跑起来就算赢。
 
 ### 提交脉络
 
-**`54d3d42 first version`** —— 一切的开端。一次性落地的初版（v1）代码结构：
+**`54d3d42 first version`** —— 第一铲土。一口气落地的初版（v1）：
 
 ```
 src/
   store.zig        # 存储接口（Store trait）
   file_store.zig   # 文件存储实现
   fault_store.zig  # 注入故障的存储（测试用）
-  btree.zig        # B 树（913 行，最大的模块）
+  btree.zig        # B 树（913 行，当天最大头）
   db.zig           # 数据库句柄 + API（214 行）
   format.zig       # 页面格式（351 行）
   writer.zig       # 写入器（158 行）
@@ -69,76 +69,76 @@ src/
   main.zig         # 入口
 ```
 
-这一版的 B 树还不是 COW 的——它是"就地修改 + 全量重写式 compaction"。存储层用 **trait（接口）抽象**：`Store` 定义读写页面的接口，`FileStore` / `FaultStore` 是实现。这是典型的面向对象思路。
+这版 B 树还不是 COW——就地改 + 全量重写式压缩。存储层走接口抽象老路：`Store` 定读写页面的规矩，`FileStore` / `FaultStore` 照着实现。典型的面向对象思路。能跑，但方向没定，活了一天就被推翻了。
 
 > **Zig 小知识**：Zig 没有类和继承，做"接口"靠 **vtable**——一个 `*anyopaque`（类型擦除指针）+ 一个函数指针表（`*const VTable`），调用时用 `@ptrCast(@alignCast(self))` 把擦除的指针还原回来。这就是 cube_db 后来 `PageStore` 的写法。
 
-**`ff4a773 hide zio runtime behind sync Db API`** —— 把异步运行时（`zio`）藏到同步 API 后面。用户调用 `db.put()` 是同步的，内部可能走协程，但用户无感。
+**`ff4a773 hide zio runtime behind sync Db API`** —— 把异步运行时（`zio`）藏到同步 API 后面。用户调 `db.put()` 是同步的，内部可能走协程，但用户无感。
 
-**`97b877a close D4 coroutine bet, remove dead mailbox/writerLoop code`** —— 关掉"D4 协程"的赌注，删掉用不到的 mailbox/writerLoop 死代码。-33 行 writer、-18 行 db。**第一次做减法**。
+**`97b877a close D4 coroutine bet, remove dead mailbox/writerLoop code`** —— 关掉"D4 协程"的赌注，顺手清掉用不到的 mailbox/writerLoop 死代码（-33 行 writer、-18 行 db）。**第一次做减法**，后面会越减越狠。
 
-### 第一纪小结
+### 小结
 
-v1 是个"能跑但方向没定"的原型：接口式存储、就地修改 B 树、协程运行时。它活了一天就被重写了。
+v1 是个"能跑但方向没定"的原型：接口式存储、就地修改 B 树、协程运行时。活了一天就进坟墓了——下一纪直接开棺重写。
 
 ---
 
 ## 第二纪 · 批量写入与读路径加速（2026-07-23，16 次提交）
 
-### 概念背景：为什么单条 put 慢
+### 为什么单条 put 慢
 
-每条 `put` 都要：分配页面 → B 树插入 → 写 meta → fsync。**fsync 是毫秒级**的昂贵操作。如果一次提交 1000 条 key，逐条 put = 1000 次 fsync，灾难。解法是 **batch**：攒一批，一次提交、一次 fsync。
+每条 `put` 都要：分配页面 → B 树插入 → 写 meta → fsync。**fsync 是毫秒级**的昂贵操作。要一次提交 1000 条 key，逐条 put = 1000 次 fsync，灾难。解法就俩字：**batch**——攒一批，一次提交、一次 fsync，把那笔昂贵的 syscall 摊薄。
 
 ### 提交脉络
 
-**`5d13612 add benchmark`** + **`b83e1e4 drop runtime`** —— 先加基准测试（没有度量就没有优化），然后彻底砍掉运行时，回归纯同步。**作者很快意识到：KV 引擎不需要异步运行时，同步最简单也最快。**
+**`5d13612 add benchmark`** + **`b83e1e4 drop runtime`** —— 先加基准测试（没有度量就没有优化，这是项目第一条铁律），然后彻底砍掉运行时，回归纯同步。**作者很快想明白：KV 引擎不需要异步运行时，同步最简单也最快。** 这个判断后面再没动摇过。
 
 **`5fb4724 ~ eb59146 BTreeBatch 系列`**（4 次提交）—— 用 TDD（测试驱动）一步步搭 `BTreeBatch`：
 1. `5fb4724` 骨架：apply + commit 去重，测试 1 跑绿
 2. `23b8871` 节点缓存 + arena 管理的 flush（+297 行 btree）
-3. `eb59146` 拆分成独立文件 `btree_batch.zig`（btree -354 行，抽离）
+3. `eb59146` 拆成独立文件 `btree_batch.zig`（btree -354 行，抽离）
 4. `cb80fbb` 2000 条混合操作模型测试，去重 + select 计数对得上
 
-> **arena allocator（竞技场分配器）**：一种"批发式"内存分配器——一次性申请一大块，内部指针单调递增地分，**释放时整块一起还**。在批量插入里用 arena：所有临时 COW 页面分配飞快（无碎片管理），事务结束一次性丢弃。这是后面贯穿全项目的关键优化。
+> **arena allocator（竞技场分配器）**：一种"批发式"内存分配器——一次性申请一大块，内部指针单调递增地分，**释放时整块一起还**。批量插入用它最爽：所有临时 COW 页面分配飞快（无碎片管理），事务结束一把丢弃。这招后面贯穿全项目。
 
 **`6097762 db: add putBatch([]Entry)`** —— 公共 API 落地：`putBatch([]Entry)` 一次提交多条。4 个测试跑绿。
 
-**`ed9d54f bench: putbatch ~1000x`** —— 结果惊人：单线程 putBatch **~1000 倍**于逐条 put（0.15us/op vs 178us）。fsync 摊薄到整批上，收益巨大。
+**`ed9d54f bench: putbatch ~1000x`** —— 结果惊人：单线程 putBatch **~1000 倍**于逐条 put（0.15us/op vs 178us）。fsync 摊薄到整批上，收益直接起飞。
 
-**`b592414 group commit: leader/follower`** —— group commit（组提交）：多个线程同时 put，**leader 线程负责真正提交，follower 线程挂在自己的 future 上等**。16 个线程 × 50 条 put 合并，~6.8 倍提升。
+**`b592414 group commit: leader/follower`** —— group commit（组提交）：多个线程同时 put，**leader 负责真正提交，follower 挂在自己的 future 上等**。16 个线程 × 50 条 put 合并，~6.8 倍提升。
 
-> **group commit 的本质**：把"多次 fsync"合并成"一次 fsync"。LMDB/PostgreSQL/MySQL 都用这招。代价是 follower 要等待，增加延迟。
+> **group commit 的本质**：把"多次 fsync"合并成"一次 fsync"。LMDB/PostgreSQL/MySQL 都用这招。代价是 follower 要等，增加延迟——拿延迟换吞吐的经典交换。
 
 **`b72502e get read path: mmap + skip-decode + read-no-CRC`** —— 读路径三连击：
 1. **mmap**：读页面直接用内存指针，不 `read()` 系统调用
 2. **skip-decode**：热路径跳过反序列化，直接在原始字节上二分查找
 3. **read-no-CRC**：读时不校验 CRC（COW 保证页面不会被原地改，信任度高）
 
-这是把读路径推向"LMDB 级别"的关键一步。
+这是把读路径往"LMDB 级别"推的关键一步。
 
 **`9619b31 read path: zero-copy`**（07-24 开头，但属同一波）—— 进一步零拷贝：去掉 marker 字节、`readBorrow` 直接返回 mmap 指针、跳过分支节点解码。读到 LMDB 水平（100B ~3us，10KB ~5-13us）。
 
-### 第二纪小结
+### 小结
 
 这纪的主题是**两条性能曲线同时拉升**：
 - **写**：putBatch + group commit，把 fsync 摊薄 1000 倍
 - **读**：mmap + 零拷贝 + 跳 CRC，把单次 get 压到微秒级
 
-但底层的 B 树还是 v1 的就地修改式。这成了下一纪要推翻的对象。
+风光归风光，底层 B 树还是 v1 的就地修改式。这成了下一纪要推翻的靶子。
 
 ---
 
 ## 第三纪 · v2 大重写（2026-07-24，16 次提交）
 
-### 概念背景：为什么 v1 的 B 树必须推翻
+### 为什么 v1 的 B 树必须推翻
 
-v1 的 B 树**就地修改页面**。这带来两个致命问题：
+v1 的 B 树**就地修改页面**。两个致命伤：
 1. **崩溃不安全**：写到一半断电，页面半新半旧，数据损坏
 2. **读阻塞写**：写入时要锁页面，读者得等
 
 LMDB 的答案是 **COW（写时复制）**：要改一个页面？复制一份新的，改新的，旧页面原封不动留给正在读的人。所有修改最终汇聚到一个新的 **meta page**，commit = 原子地切换 meta 指针。旧 meta 还在，崩溃了读旧 meta 即可——**天然崩溃安全，无需 WAL**。
 
-作者决定推翻 v1 的 B 树，重写成页地址式 COW B 树。这就是 "v2"。
+作者拍板：推翻 v1 的 B 树，重写成页地址式 COW B 树。这就是 "v2"。
 
 ### 提交脉络：v2 七连击
 
@@ -154,13 +154,13 @@ LMDB 的答案是 **COW（写时复制）**：要改一个页面？复制一份�
 | `2cf9d73` compact v2 | **O(1) meta 切换** | 压缩不再是全量重写，只切指针 |
 | `9424b12` overflow pages | 大值溢出页链 | value > 3800B 走溢出页链 |
 
-**`5da8aa3 FilePageStore + v1 vs v2 对比基准`** —— `file_page_store.zig` +143 行首次登场：真正的文件存储（之前是内存 `MemPageStore`）。同时跑 v1 vs v2 基准，证明 v2 方向对。
+**`5da8aa3 FilePageStore + v1 vs v2 对比基准`** —— `file_page_store.zig` +143 行首次登场：真正的文件存储（之前是内存 `MemPageStore`）。顺手跑 v1 vs v2 基准，证明 v2 方向对。
 
-> **页地址式 B 树 vs 指针式**：v1 的节点持有内存指针；v2 的节点只持 **页号（u32）**。读页号对应的页面时才从 page store 取。这看似多一层间接，但它让 B 树**与具体存储解耦**——可以放内存、可以放文件、可以放 mmap。这是 COW 能成立的前提。
+> **页地址式 B 树 vs 指针式**：v1 节点持有内存指针；v2 节点只持 **页号（u32）**，要用时才从 page store 取。看似多一层间接，但它让 B 树**与具体存储解耦**——能放内存、能放文件、能放 mmap。这是 COW 能成立的前提。
 
-> **meta 双页交替**：磁盘上有两个 meta 页（page 1 和 page 2）。这次提交写 meta1，下次写 meta2，轮流来。每次写完整的 meta（含 CRC）。崩溃恢复时读两个，**校验 CRC + 取 sequence 更大的那个**。这就是 cube_db 的"原子 meta 切换"——不是单条原子指令，而是"旧页不动 + CRC 防撕裂 + 序号选新"。
+> **meta 双页交替**：磁盘上有两个 meta 页（page 1、page 2）。这次写 meta1，下次写 meta2，轮流来，每次写完整 meta（含 CRC）。崩溃恢复读两个，**校验 CRC + 取 sequence 更大的那个**。这就是 cube_db 的"原子 meta 切换"——不是单条原子指令，而是"旧页不动 + CRC 防撕裂 + 序号选新"三件套。
 
-**`717c2f9 refactor: remove CubDB v1, rename v2 files`** —— **决定性的一刀**：57 个文件，+2024 / **−9579** 行。删掉 v1 全部代码（`store.zig`/`file_store.zig`/`fault_store.zig`），把 v2 文件名的 '2' 后缀去掉（`btree2.zig` → `btree.zig`）。**v1 正式退场，v2 成为唯一真相。**
+**`717c2f9 refactor: remove CubDB v1, rename v2 files`** —— **决定性的一刀**：57 个文件，+2024 / **−9579** 行。删掉 v1 全部代码（`store.zig`/`file_store.zig`/`fault_store.zig`），把 v2 文件名的 '2' 后缀抹掉（`btree2.zig` → `btree.zig`）。**v1 正式退场，v2 成为唯一真相。**
 
 文件结构从这一刻起基本定型（和今天对比，只差 `crc32_hw.zig`）：
 
@@ -176,53 +176,53 @@ src/
   main.zig            # 入口
 ```
 
-### 第三纪小结
+### 小结
 
-这是项目的**奠基日**。一天之内确立了 LMDB 式的核心架构：COW B 树 + freelist + MVCC + overflow + 双 meta 交替 + O(1) 压缩。v1 被彻底清除。后面所有的优化都在这套骨架上做。
+项目的**奠基日**。一天确立了 LMDB 式核心架构：COW B 树 + freelist + MVCC + overflow + 双 meta 交替 + O(1) 压缩。v1 连根拔起。后面所有优化都在这套骨架上做。
 
 ---
 
 ## 第四纪 · LSM 岔路（2026-07-27，7 次提交）
 
-### 概念背景：LSM 是什么，为什么要试又为什么放弃
+### LSM 是什么，为什么要试又为什么放弃
 
-**LSM（Log-Structured Merge-tree）** 是另一类 KV 引擎架构（RocksDB/LevelDB 用它）。思路：写入先进内存表（memtable），攒够了落盘成有序文件（SSTable），后台定期合并（compaction）。为了崩溃安全，写 memtable 前先记 WAL。
+**LSM（Log-Structured Merge-tree）** 是另一类 KV 引擎架构（RocksDB/LevelDB 用它）。思路：写入先进内存表（memtable），攒够了落盘成有序文件（SSTable），后台定期合并（compaction）。为崩溃安全，写 memtable 前先记 WAL。
 
-LMDB（COW B 树）和 LSM 是两条路线。作者在这个周末**试了一下 LSM**：加 memtable + WAL + compactor。然后发现：cube_db 的 COW B 树已经够好，LSM 是画蛇添足。**3 天后整个删除。**
+LMDB（COW B 树）和 LSM 是两条路线。这个周末作者**手痒试了一下 LSM**：加 memtable + WAL + compactor。结果发现：cube_db 的 COW B 树已经够好，LSM 是画蛇添足。**3 天后整个删除，干净利落。**
 
 ### 提交脉络
 
-**`6649a3b 5-chapter tutorial`** —— 给初学者写 5 章教程（页面格式 → 溢出页），+1248 行。作者很重视教学。
+**`6649a3b 5-chapter tutorial`** —— 给初学者写 5 章教程（页面格式 → 溢出页），+1248 行。作者很重视教学，这点贯穿全程。
 
 **`3beede5 LSM layer`** —— 加 memtable、WAL、compactor。db.zig +122 行接入 LSM 数据流。
 
 **`f1496bd merge WAL 4×pwrite → single pwrite`** —— LSM 唯一的性能优化：把 WAL 的 4 次 `pwrite` 合并成 1 次，3.3 倍快。
 **`3ba8933` bench: WAL single-pwrite 基准数据** —— 配 f1496bd 的基准记录。
 
-> **pwrite vs fsync**：`pwrite` 是"在指定偏移写"，不移动文件指针；`fsync` 是"确保写到磁盘"。WAL 追加日志用 pwrite 高效，但耐久性最终靠 fsync。
+> **pwrite vs fsync**：`pwrite` 是"在指定偏移写"，不移动文件指针；`fsync` 是"确保写到磁盘"。WAL 追加日志用 pwrite 高效，但耐久性最终还得靠 fsync 收尾。
 
-**`320ec0a fuzz framework`**（+2342/−1479，28 文件）—— **重要遗产**：TDD 式模糊测试框架，3 个 fuzz 目标（API fuzz、格式 fuzz、WAL parse）+ 框架自检探针。模糊测试用随机字节流当输入，对比 `std.StringHashMap` 参考模型，找边界 bug。这个框架活过了 LSM 删除，留到今天。
+**`320ec0a fuzz framework`**（+2342/−1479，28 文件）—— **重要遗产**：TDD 式模糊测试框架，3 个 fuzz 目标（API fuzz、格式 fuzz、WAL parse）+ 框架自检探针。模糊测试拿随机字节流当输入，对比 `std.StringHashMap` 参考模型，专找边界 bug。这框架活过了 LSM 删除，一直留到今天。
 
 **`9082b5b wrapup tutorial`** —— 带 LSM 数据流图的收尾教程。
-**`85d174f Add benccmp`** —— 加 `benchcmp/` 对比工具（LMDB 对标二进制 + COMPARISON.md）。这个工具存活至今，是后面所有 LMDB 对标数据的承载体——编年史提到的 COMPARISON.md 就在这里。
+**`85d174f Add benccmp`** —— 加 `benchcmp/` 对比工具（LMDB 对标二进制 + COMPARISON.md）。这工具存活至今，是后面所有 LMDB 对标数据的承载体——编年史老提到的 COMPARISON.md 就住在这。
 
-### 第四纪小结
+### 小结
 
-这是一次**有代价的探索**：LSM 层加了又删，但**模糊测试框架**和**教程体系**留了下来，成为后续正确性的护城河。作者的选择很果断：试错 3 天，发现不对立刻砍掉（下一纪的 `2cca3aa`）。
+一次**有代价的探索**：LSM 层加了又删，但**模糊测试框架**和**教程体系**留了下来，成了后续正确性的护城河。作者的选择很果断：试错 3 天，发现不对下一纪就一刀砍掉。
 
 ---
 
 ## 第五纪 · 正本清源（2026-07-30，31 次提交）
 
-### 概念背景：这一天发生了什么
+### 这天发生了什么
 
-07-30 是项目的**超级日**——31 次提交，从早到晚。主题是：删掉 LSM 岔路，把架构彻底锚定在 LMDB 正统路线上，然后一口气补齐崩溃恢复、显式事务、COW 写优化、零拷贝读、CRC 跳过。这一天产出了今天代码库 70% 的灵魂。
+07-30 是项目的**超级日**——31 次提交，从早到晚。主题：删掉 LSM 岔路，把架构彻底锚定在 LMDB 正统路线上，然后一口气补齐崩溃恢复、显式事务、COW 写优化、零拷贝读、CRC 跳过。这一天产出了今天代码库 70% 的灵魂。看提交密度就知道，作者这天进入了心流。
 
 ### 提交脉络（按主题分组）
 
 #### 5.1 清算 LSM（2 次）
 
-- **`2cca3aa remove LSM layer`**：10 文件 **−1437 行**。删掉 wal/memtable/compactor 全部代码和测试。注释明确："consolidate on pure COW B-tree (LMDB-style)"。**LSM 岔路正式终结。**
+- **`2cca3aa remove LSM layer`**：10 文件 **−1437 行**。wal/memtable/compactor 全部代码和测试连根删除。注释写得明明白白："consolidate on pure COW B-tree (LMDB-style)"。**LSM 岔路正式终结。**
 - **`9dc184a long-run fuzz`**：带时间预算的长跑模糊（50ms 探针截止 + 2 分钟长跑）。
 
 #### 5.2 文件存储升级（2 次）
@@ -234,22 +234,22 @@ LMDB（COW B 树）和 LSM 是两条路线。作者在这个周末**试了一下
 
 #### 5.3 显式事务（3 次）
 
-- **`3830286 explicit LMDB-style transactions`**：db.zig 124/−34（整提交 +304/−34，三文件）。引入 `WriteTxn`（单写者互斥）和 `ReadTxn`（MVCC 快照）。之前只有隐式事务，现在用户可以显式控制：`beginWriteTxn` / `commit` / `abort` / `deinit`。
+- **`3830286 explicit LMDB-style transactions`**：db.zig 124/−34（整提交 +304/−34，三文件）。引入 `WriteTxn`（单写者互斥）和 `ReadTxn`（MVCC 快照）。之前只有隐式事务，现在用户能显式控制：`beginWriteTxn` / `commit` / `abort` / `deinit`。
 - **`7406987 durability/crash-recovery tests`**：+218。异步/同步模式（`Options{fsync}`）+ group commit 验证。
 - **`5d0382b crash harness (fork+kill)`**：+281。**关键测试设施**：`fork` 子进程写数据，中途 `kill -9` 模拟崩溃，父进程重开库验证数据完整。还有 meta 损坏 fuzz + 1k key 压力测试。
 
-> **fork+kill 崩溃测试**：这是验证"崩溃安全"最硬核的办法。光单元测试不够——你得真的把进程杀掉，看重启后数据对不对。LMDB、SQLite 都有这类测试。
+> **fork+kill 崩溃测试**：验证"崩溃安全"最硬核的办法。光单元测试不够——你得真把进程杀掉，看重启后数据对不对。LMDB、SQLite 都有这类测试。
 
 #### 5.4 COW 写路径优化（1 次，但 +691/−121）
 
-- **`57e18cd COW write path optimization`**：btree.zig **+414/−118**。put 100B **4.2 倍**，put 10KB **2.0 倍**。这是写路径第一次大规模优化，把 COW 插入的热路径重写。
+- **`57e18cd COW write path optimization`**：btree.zig **+414/−118**。put 100B **4.2 倍**，put 10KB **2.0 倍**。写路径第一次大规模优化，把 COW 插入的热路径整个重写。
 
 #### 5.5 零拷贝读 + 修复（4 次）
 
 - **`8010f02 zero-copy getBorrowed`**：btree +74。`ReadTxn.getBorrowed` 直接返回 mmap 指针，零拷贝。
 - **`3a47cd4 ReadTxn 生命周期 fuzz`**：+269。专门 fuzz 读事务的生命周期（开始/结束时序）。
 - **`684be09 crash recovery 测试框架`**：+398。系统化的崩溃恢复测试框架。
-- **`559a214 fix future error 静默丢弃`**：**重要 bug 修复**——`WriteTxn.commit` 里 future 的 error 被吞掉，修复在 db.zig 一行 `try`；同提交删除了临时的 repro_delete_test.zig（-42 行）。
+- **`559a214 fix future error 静默丢弃`**：**重要 bug 修复**——`WriteTxn.commit` 里 future 的 error 被吞掉了，修复就 db.zig 一行 `try`；同提交删了临时的 repro_delete_test.zig（-42 行）。
 
 #### 5.6 微批处理 + 读 CRC 跳过 + 共享 COW（3 次，性能三连击）
 
@@ -257,23 +257,23 @@ LMDB（COW B 树）和 LSM 是两条路线。作者在这个周末**试了一下
 - **`2d1b69b skip CRC on read path`**：get 100B **35us → 2.8us（12.7 倍）**。读路径不校验 CRC——COW 保证页面不被原地改，信任度高。
 - **`2c156c6 shared COW path for putBatch`**：btree **+410**。putBatch **24.75us → 0.04us（619 倍！）**。批量插入时多个 key 共享同一条 COW 路径，避免重复分配。
 
-> **619 倍是什么概念**：这是算法层面的胜利——把"每条 key 独立走一遍 COW 插入"换成"整批一次走完 COW 路径"。后面第七纪会继续在这个方向榨取。
+> **619 倍是什么概念**：算法层面的胜利——把"每条 key 独立走一遍 COW 插入"换成"整批一次走完 COW 路径"。后面第七纪会继续在这个方向榨取。
 
 #### 5.7 文档收尾（多次）
 
 `ca06a49`（同步 README，删 LSM/WAL/v1 残留）、`1605086`（写 `docs/architecture.md`，339 行设计文档）、`e5d281d`（基准数据文档）。
 
-### 第五纪小结
+### 小结
 
-31 次提交，项目灵魂定型。删 LSM、上 1TB mmap、上显式事务、上崩溃恢复测试、COW 写优化、零拷贝读、CRC 跳过、共享 COW。**今天的架构在这一天基本长成。** 这一天的提交密度（31 次）说明作者进入了心流状态。
+31 次提交，项目灵魂定型。删 LSM、上 1TB mmap、上显式事务、上崩溃恢复测试、COW 写优化、零拷贝读、CRC 跳过、共享 COW。**今天的架构在这一天基本长成。**
 
 ---
 
 ## 第六纪 · 基准与正确性危机（2026-07-31，22 次提交）
 
-### 概念背景：性能跑出来后，正确性是下一个战场
+### 性能跑出来后，正确性是下一个战场
 
-第五纪把性能拉到 LMDB 级别后，新的问题浮现：**putBatch 在大规模下有正确性 bug**。这一纪一半在补基准（和 LMDB 对比），一半在修 putBatch 的溢出/分裂 bug。
+第五纪把性能拉到 LMDB 级别后，新问题冒头：**putBatch 在大规模下有正确性 bug**。这纪一半在补基准（和 LMDB 对标），一半在修 putBatch 的溢出/分裂 bug。性能追平的代价是正确性反噬——经典剧情。
 
 ### 提交脉络
 
@@ -287,11 +287,11 @@ LMDB（COW B 树）和 LSM 是两条路线。作者在这个周末**试了一下
 
 #### 6.2 putBatch 正确性危机（5 次，核心）
 
-- **`65d82cd putBatch 正确性测试 + insertBatch leaf 溢出回归`**：+258/−46。**发现了 bug**：`insertBatchIntoLeaf` 在叶子页溢出时分裂逻辑有缺陷。新增 `insertbatch_overflow_test.zig`（188 行）；`putbatch_correctness_test.zig` 实为 `18fd2be` 引入，本提交复用它。
+- **`65d82cd putBatch 正确性测试 + insertBatch leaf 溢出回归`**：+258/−46。**发现 bug**：`insertBatchIntoLeaf` 在叶子页溢出时分裂逻辑有缺陷。新增 `insertbatch_overflow_test.zig`（188 行）；`putbatch_correctness_test.zig` 实为 `18fd2be` 引入，本提交复用它。
 
-> **叶子页溢出问题**：一个叶子页最多 32 条 entry（`LEAF_MAX_ENTRIES`）。批量插入 100 条到一个叶子，必须"分裂"成多个叶子。v2 初版的分裂是"先全塞进去再分裂"（O(n²)），且容量判断有错——会溢出。
+> **叶子页溢出问题**：一个叶子页最多 32 条 entry（`LEAF_MAX_ENTRIES`）。批量插 100 条进一个叶子，必须"分裂"成多个叶子。v2 初版的分裂是"先全塞进去再分裂"（O(n²)），且容量判断有错——会溢出。
 
-- **`69db8ed fix insertBatchIntoLeaf capacity-aware split + putBatch key copy`**：btree **+138/−21**。**容量感知分裂**：插入前先算会不会超容量，超了就提前分裂。同时修 key 拷贝的生命周期 bug。
+- **`69db8ed fix insertBatchIntoLeaf capacity-aware split + putBatch key copy`**：btree **+138/−21**。**容量感知分裂**：插入前先算会不会超容量，超了就提前分裂。顺手修 key 拷贝的生命周期 bug。
 - **`b1179fe fix single-entry fast path in applyBatch`**：修单条插入的快路径。
 - **`157e22d wip: leaf-capacity-aware multi-split (partial)`**：多级分裂的半成品（WIP）。
 - **`bb91eca fix insertBatchIntoBranch partition bug + futures arena`**：修分支节点分裂的分区 bug + future 改用 arena 分配。
@@ -304,17 +304,17 @@ LMDB（COW B 树）和 LSM 是两条路线。作者在这个周末**试了一下
 - **`f7fdb37 recalibrate benchmark baseline`**：修完 bug 后性能数字变了，重新校准基线。
 - **`bc41ce6 fix bench_baseline putBatch shared buffer`**：基准自己也有 bug——共享 buffer 导致 key 被覆盖，改成 per-entry 分配。
 
-### 第六纪小结
+### 小结
 
-性能追平 LMDB 后，**正确性反噬**：putBatch 的大规模溢出分裂有 bug。这一纪用容量感知分裂 + O(n+m) 归并修好了。同时建立了和 LMDB 对标的基准矩阵 + 回归基线系统。**教训：性能优化的尽头是正确性测试。**
+性能追平 LMDB 后，**正确性反噬**：putBatch 的大规模溢出分裂有 bug。这纪用容量感知分裂 + O(n+m) 归并修好了，同时建起和 LMDB 对标的基准矩阵 + 回归基线系统。**教训：性能优化的尽头是正确性测试。**
 
 ---
 
 ## 第七纪 · 写路径收官（2026-08-03，16 次提交）
 
-### 概念背景：把 putBatch 的延迟榨干
+### 把 putBatch 的延迟榨干
 
-第六纪把 putBatch 修对之后，这一纪的目标是**把 putBatch 的单条延迟从微秒级压到纳秒级**，对标 LMDB 的算法层性能。手段是一连串"消除每条 key 的额外开销"的微优化。
+第六纪把 putBatch 修对之后，这纪的目标是**把 putBatch 的单条延迟从微秒级压到纳秒级**，对标 LMDB 的算法层性能。手段是一连串"消除每条 key 的额外开销"的微优化，一条链往下榨。
 
 ### 提交脉络（一条优化链）
 
@@ -334,16 +334,16 @@ profiling 埋点         →  找到下一个瓶颈
 
 逐条看：
 
-- **`7a9cc93 WriteTxn abort 路径正确性测试`**：+123。先补 abort 路径测试（优化前先有测试护栏）。
+- **`7a9cc93 WriteTxn abort 路径正确性测试`**：+123。先补 abort 路径测试（优化前先有测试护栏，这是规矩）。
 - **`dcce99a WriteTxn staging arena 化`**：+335/−48。把 staging（暂存）层改成 arena 分配——putBatch 的 dupe/staging **零 syscall**。
 - **`b809c87 MemPageStore slab 页池`**：+259/−9。`MemPageStore` 从 HashMap 改成 **ArrayList slab**——消除每页一次 mmap。同时新增 `slab_page_store_test` / `slab_memory_test`。
 
 > **slab（页池）**：预分配一大块连续内存当页面池，按索引取页。比 HashMap（每页一次 mmap）快几个数量级。这是测试用 `MemPageStore` 的优化，不影响 `FilePageStore`。
 
-- **`6cfe7df commit 路径 profiling 埋点`**：writer +100。给 commit 路径加规模敏感的计时埋点 + `profile-commit` 工具。**先测量再优化。**
-- **`25d529c putBatch 直接批量构建，跳过 staging 层`**：staging **4300 → 25 ns/entry**。跳过 WriteTxn staging 直连 applyBatch。但提交消息明言**总耗时 5.1µs/entry 与优化前持平**——瓶颈转移到 applyBatch 内部 arena dupe（4481 ns/entry），为下一步定位靶点。
+- **`6cfe7df commit 路径 profiling 埋点`**：writer +100。给 commit 路径加规模敏感的计时埋点 + `profile-commit` 工具。**先测量再优化**，又一条铁律。
+- **`25d529c putBatch 直接批量构建，跳过 staging 层`**：staging **4300 → 25 ns/entry**。跳过 WriteTxn staging 直连 applyBatch。但提交消息明言**总耗时 5.1µs/entry 与优化前持平**——瓶颈转移到 applyBatch 内部 arena dupe（4481 ns/entry），等于把靶点暴露给下一步。
 - **`3850771 applyBatch 预分配连续 key 缓冲区`**：消除 per-entry 的 arena dupe（重复拷贝）开销。
-- **`c79b550 putBatch 有序 fast path`**：writer +99/−52。**O(n) 单调性检测**：如果输入 key 已经有序，跳过 sort + dedup。
+- **`c79b550 putBatch 有序 fast path`**：writer +99/−52。**O(n) 单调性检测**：输入 key 已有序就跳过 sort + dedup。
 - **`172c520 order_detect 独立计时`**：把单调性检测单独计时，验证它本身够快。
 - **`7156efd FPS 写路径计数器 + 判别式实验`**：+480。给 FilePageStore 写路径加性能计数器，做判别式实验（A/B 测）找出真正的瓶颈。
 
@@ -351,19 +351,19 @@ profiling 埋点         →  找到下一个瓶颈
 
 - **`f327da0` 写路径收官文档**、`60ddac2` 补证据链、`1b38a4a` 补 FilePageStore 实测数据、`ec55c89` + `4ae1d65` **终局 COMPARISON.md**：双层结论叙事——**算法层 parity 1.27x（追平 LMDB）/ 持久化层 1.9–2.6×**。
 
-> **"算法层 vs 持久化层"**：作者把性能分成两层。算法层（B 树插入、内存操作）追平 LMDB（1.27 倍）。持久化层（FilePageStore 真实堆分配）1.9–2.6× LMDB。**注意：早期一度报告的 49× 差距是 `page_allocator`（每 key 一次 mmap = 1M 独立页 = 最坏 TLB 分散）的人工伪影**，`4ae1d65` 自己就把它修正成 2× 矩阵；剩余 2.6× 差距在 `insertBatch` 的 B-tree 操作，不是 fsync 物理限制。这个分层认知很清醒。
+> **"算法层 vs 持久化层"**：作者把性能分两层。算法层（B 树插入、内存操作）追平 LMDB（1.27 倍）。持久化层（FilePageStore 真实堆分配）1.9–2.6× LMDB。**注意：早期一度报告的 49× 差距是 `page_allocator`（每 key 一次 mmap = 1M 独立页 = 最坏 TLB 分散）的人工伪影**，`4ae1d65` 自己就把它修正成 2× 矩阵；剩余 2.6× 差距在 `insertBatch` 的 B-tree 操作，不是 fsync 物理限制。这个分层认知很清醒。
 
-### 第七纪小结
+### 小结
 
-写路径的"榨干"之纪。arena → slab → 跳 staging → 预分配 → 有序 fast path，一条链把 putBatch 单条延迟压到纳秒级。配套建立了 profiling 工具和回归基线。**算法层追平 LMDB（1.27x），剩下的差距在 insertBatch 树操作 vs LMDB 优化，不是 fsync 物理限制。**
+写路径的"榨干"之纪。arena → slab → 跳 staging → 预分配 → 有序 fast path，一条链把 putBatch 单条延迟压到纳秒级，配套建起 profiling 工具和回归基线。**算法层追平 LMDB（1.27x），剩下的差距在 insertBatch 树操作 vs LMDB 优化，不是 fsync 物理限制。**
 
 ---
 
 ## 第八纪 · 硬件加速（2026-08-04，2 次提交）
 
-### 概念背景：CRC32 的软件实现是瓶颈
+### CRC32 的软件实现是瓶颈
 
-每个页面尾部有 4 字节 CRC32 校验。软件 CRC32（查表法）在写大量页面时成为热点。ARM64 处理器有**硬件 CRC32 指令**（`crc32x/crc32w/crc32h/crc32b`），一条指令算 8 字节，实测比软件快 23 倍。
+每个页面尾部有 4 字节 CRC32 校验。软件 CRC32（查表法）在写大量页面时成了热点。ARM64 处理器有**硬件 CRC32 指令**（`crc32x/crc32w/crc32h/crc32b`），一条指令算 8 字节，实测比软件快 23 倍。该上硬件了。
 
 ### 提交脉络
 
@@ -372,9 +372,9 @@ profiling 埋点         →  找到下一个瓶颈
 
 > **Zig 内联汇编**：cube_db 没有用 `@cImport` 拉 C 头文件，而是直接写内联汇编 `asm volatile ("crc32x w0, w1, x2")` 调 ARMv8 的 CRC32 指令。`crc32x/crc32w/crc32h/crc32b` 分别处理 64/32/16/8 字节，每 64B 一轮（8×crc32x）降循环开销。非 ARM64 平台回退到 `std.hash.crc.Crc32` 软件实现。
 
-### 第八纪小结
+### 小结
 
-收尾之纪。用硬件指令给 CRC32 提速，是"最后一公里"的优化。项目到这里告一段落（至少 git 历史到此）。
+收尾之纪。用硬件指令给 CRC32 提速，"最后一公里"的优化。项目到这里告一段落（至少 git 历史到此）。
 
 ---
 
@@ -418,7 +418,7 @@ profiling 埋点         →  找到下一个瓶颈
 HEAD: 36 个测试文件
 ```
 
-测试和功能几乎 1:1 同步增长，且**总是先写测试再优化**（TDD 风格贯穿全程）。
+测试和功能几乎 1:1 同步长，而且**总是先写测试再优化**（TDD 风格贯穿全程）。
 
 ---
 
@@ -440,7 +440,7 @@ HEAD: 36 个测试文件
 
 ## 给学习者的阅读路线图
 
-如果想系统性读懂这份代码，建议按"演进顺序"读，而不是按"当前文件"读。这样能理解每个设计**为什么**是这样。
+想系统性读懂这份代码，建议按"演进顺序"读，别按"当前文件"读。这样能理解每个设计**为什么**是这样。
 
 ### 路线 A：跟编年史走（推荐）
 
@@ -544,10 +544,10 @@ HEAD: 36 个测试文件
 
 ## 结语：这个项目教会我们什么
 
-回看 14 天 114 次提交，几条清晰的主线：
+回看 14 天 114 次提交，几条主线清清楚楚：
 
 1. **先跑通再优化，先正确再性能**。v1 能跑就重写 v2；v2 正确了才追性能；性能追上了 putBatch 溢出 bug 反噬，回头补正确性。
-2. **试错要快，砍要果断**。LSM 试了 3 天，发现不对立刻 −1437 行全删。不留死代码。
+2. **试错要快，砍要果断**。LSM 试了 3 天，发现不对立刻 −1437 行全删，不留死代码。
 3. **度量驱动**。几乎每次性能优化都配基准 + 回归基线 + profiling 工具。没有度量的优化是盲飞。
 4. **测试是护城河**。从 2 个测试长到 36 个，先写测试再优化（TDD），崩溃安全靠 fork+kill 真杀进程。
 5. **分层认知要清醒**。算法层追平 LMDB（1.27x）后，作者把一度报告的 49× 差距自己修正成 2× 矩阵——49× 是 `page_allocator` 伪影，真实差距 1.9–2.6× 在 `insertBatch` 树操作，非 fsync 物理限制。
