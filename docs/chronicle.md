@@ -216,56 +216,68 @@ LMDB（COW B 树）和 LSM 是两条路线。这个周末作者**手痒试了一
 
 ### 这天发生了什么
 
-07-30 是项目的**超级日**——31 次提交，从早到晚。主题：删掉 LSM 岔路，把架构彻底锚定在 LMDB 正统路线上，然后一口气补齐崩溃恢复、显式事务、COW 写优化、零拷贝读、CRC 跳过。这一天产出了今天代码库 70% 的灵魂。看提交密度就知道，作者这天进入了心流。
+07-30 是项目的**超级日**——31 次提交，从早到晚。主题：删掉 LSM 岔路，把架构彻底锚定在 LMDB 正统路线上，然后一口气补齐崩溃恢复、显式事务、COW 写优化、零拷贝读、CRC 跳过、共享 COW。这一天产出了今天代码库 70% 的灵魂。看提交密度就知道，作者这天进了心流——从早 9 点的 fuzz 框架到晚 9 点的 619 倍优化，一路没停。
 
 ### 提交脉络（按主题分组）
 
 #### 5.1 清算 LSM（2 次）
 
-- **`2cca3aa remove LSM layer`**：10 文件 **−1437 行**。wal/memtable/compactor 全部代码和测试连根删除。注释写得明明白白："consolidate on pure COW B-tree (LMDB-style)"。**LSM 岔路正式终结。**
-- **`9dc184a long-run fuzz`**：带时间预算的长跑模糊（50ms 探针截止 + 2 分钟长跑）。
+- **`2cca3aa remove LSM layer`**：10 文件 **−1437 行**。wal/memtable/compactor 全部代码和测试连根删除。理由写得明明白白：**COW + 原子 meta 切换已经是崩溃安全的（LMDB 就没 WAL），LSM 那层 write-buffer 是半成品**——不在公共 API、没有 WAL 重放、select 还漏了 memtable。撤掉它，回归纯 COW B 树当生产级 LMDB 式引擎。**LSM 岔路正式终结。**
+- **`9dc184a long-run fuzz`**：带时间预算的长跑模糊（50ms 探针截止 + 2 分钟长跑），补强第四纪的 fuzz 框架。
 
 #### 5.2 文件存储升级（2 次）
 
-- **`f6017ee 1TB reserved mmap`**：`file_page_store.zig` 197/−119（整提交 +309/−119，另含 mmap_region_test 112 行）。LMDB 式做法：开库时 `mmap` 一个 **1TB 的 MAP_SHARED 保留区**，文件靠 `ftruncate` 按需增长（稀疏文件，不占实空间）。读者永远不用重新 mmap。
-- **`0a5200c fix meta_index recovery + last_page`**：修 FilePageStore 重开时的 meta 索引恢复和 last_page 追踪 bug。
+- **`f6017ee 1TB reserved mmap`**：`file_page_store.zig` 197/−119（整提交 +309/−119，另含 mmap_region_test 112 行）。LMDB 式做法：开库时 `mmap` 一个 **1TB 的 MAP_SHARED 保留区**（`REGION_SIZE = 1<<40`），文件靠 `ftruncate` 按需增长（稀疏文件，不占实空间）。读者永远不用重新 mmap——文件长到多大都在预留的 1TB 虚拟区内，同一指针就能读到新页，无 SIGBUS（`spike_mmap.zig` 提前验证过）。这套是上一条概念盒详细讲过的“1TB 预留 + 稀疏增长”。
+- **`0a5200c fix meta_index recovery + last_page`**：修 FilePageStore 重开时的**两个 bug**——（1）`meta_index` 重开时总是重置成 0，下次 writeMeta 可能覆盖**活跃（更新）的 meta 页**而不是旧页；现在改成按 sequence 比较选活跃页、meta_index 指向非活跃页。（2）`last_page` 在 meta 里总是 0，FilePageStore 重开时没法恢复 `next_free`，可能**覆盖已有数据页**；现在 writeMeta 把真实的 `next_free - 1` 存进 `last_page`。这俩都是重开即损的硬 bug。
 
-> **为什么 1TB mmap 不爆内存**：mmap 只是保留**虚拟地址空间**，不分配物理内存。只有真正写到的页才落磁盘（稀疏文件）。Linux/macOS 都支持。这是 LMDB "零拷贝 + 无限增长"的秘诀。
+> **为什么 1TB mmap 不爆内存**：mmap 只是保留**虚拟地址空间**，不分配物理内存。只有真正写到的页才落磁盘（稀疏文件）。Linux/macOS 都支持。这是 LMDB “零拷贝 + 无限增长”的秘诀。
 
-#### 5.3 显式事务（3 次）
+#### 5.3 显式事务 + 崩溃安全（3 次，P2/P3/P4 连发）
 
-- **`3830286 explicit LMDB-style transactions`**：db.zig 124/−34（整提交 +304/−34，三文件）。引入 `WriteTxn`（单写者互斥）和 `ReadTxn`（MVCC 快照）。之前只有隐式事务，现在用户能显式控制：`beginWriteTxn` / `commit` / `abort` / `deinit`。
-- **`7406987 durability/crash-recovery tests`**：+218。异步/同步模式（`Options{fsync}`）+ group commit 验证。
-- **`5d0382b crash harness (fork+kill)`**：+281。**关键测试设施**：`fork` 子进程写数据，中途 `kill -9` 模拟崩溃，父进程重开库验证数据完整。还有 meta 损坏 fuzz + 1k key 压力测试。
+这纪的核心是把“崩溃安全”从设计变成**可验证**。三个 commit 像一套组合拳：P2 给 API、P3 给耐久性、P4 给真崩溃测试。
 
-> **fork+kill 崩溃测试**：验证"崩溃安全"最硬核的办法。光单元测试不够——你得真把进程杀掉，看重启后数据对不对。LMDB、SQLite 都有这类测试。
+- **`3830286 explicit LMDB-style transactions`（P2）**：db.zig 124/−34（整提交 +304/−34，三文件）。引入 `WriteTxn`（`beginWriteTxn`/`put`/`delete`/`commit`/`abort`/`deinit`，**单写者互斥**用 `zio.Mutex`，写暂存，commit = applyBatch + meta 切换 + fsync；abort 丢弃暂存、释放锁，`deinit` 未结束自动 abort）和 `ReadTxn`（`beginReadTxn`，**MVCC 快照**——snapshot_root 在 begin 时固定，不阻塞写者）。旧的 `put`/`putBatch`/`delete`/`beginRead`/`endRead` 保留为便捷包装（内部隐式 WriteTxn）。txn_test 覆盖：commit 持久化 / abort 丢弃 / 删除后 commit / 快照隔离 / 2 写 + 2 读并发无死锁。
+
+- **`7406987 durability/crash-recovery tests + async/sync + group-commit`（P3）**：+218。三个任务打包：① crash_recovery_test——commit→reopen 持久化、多次交替提交、**坏一个 meta 页另一个恢复**（双 meta 容错）；② 异步/同步模式——`Db.sync()` 方法 + `Options.fsync`（默认 true=提交即 fsync，false=异步手动 sync）；③ group commit 验证——一个 WriteTxn 攒 N 条 → 一次 applyBatch + 一次 meta 切换 + 一次 fsync（16 条 put 进一个 txn → entryCount=16 全可读，一次提交）。
+
+- **`5d0382b crash harness (fork+kill) + meta-corrupt fuzz + 1k stress`（P4）**：+281。**这天最硬核的测试设施**，四个任务：① **fork+kill 崩溃舱**——子进程干净 commit 后父进程重开看数据；子进程 commit 前**真崩**，验证未提交的丢、已提交的活（COW + 原子 meta 兜底）；② meta 损坏 fuzz——随机字节翻转 meta 页**永不 panic**，要么有效要么 null 优雅退化；③ stress_test——1000 个堆分配 key 分批（100/txn）全可读、reopen 持久；④ bench 更新。
+
+> **fork+kill 崩溃测试**：验证“崩溃安全”最硬核的办法。光单元测试不够——你得真把进程杀掉，看重启后数据对不对。LMDB、SQLite 都有这类测试。cube_db 这套直接 fork 子进程、kill -9，比单纯模拟更接近真实断电。
 
 #### 5.4 COW 写路径优化（1 次，但 +691/−121）
 
-- **`57e18cd COW write path optimization`**：btree.zig **+414/−118**。put 100B **4.2 倍**，put 10KB **2.0 倍**。写路径第一次大规模优化，把 COW 插入的热路径整个重写。
+- **`57e18cd COW write path optimization`**：btree.zig **+414/−118**。put 100B **4.2 倍**（505→121us）、put 10KB **2.0 倍**。写路径第一次大规模优化，分**三阶段**重写热路径：
+  - **Phase 1：applyBatch 上 arena**（writer.zig）——把 `self.allocator` 换成 `ArenaAllocator` 给 btree.insert 的临时分配，**消除每次 put ~145 次 mmap/munmap syscall**，bump-pointer 直推。单这步 put 100B 505→122us（4.1×）。
+  - **Phase 2：分支就地 COW**（btree.zig）——加 `cowBranchNoSplit`：拷贝整页 + 只改 4 字节子指针，**零堆分配**（不分裂的常见路径）；跳过 `Branch.fromPayload` 的 decode/encode，子节点分裂时才回退全 decode 路径。
+  - **Phase 3：叶子就地 COW**（btree.zig）——扫原 payload 找 entry 位置和字节偏移，在**栈缓冲**里拼新页（前半 + 新 entry + 后半），overflow 页写新的、旧的标脏；不分裂时零堆分配，分裂才回退。10KB put 因跳过 overflow value 的 decode/re-encode 而省。
+  - 同提交配 5 个 cow_fast 测试 + 写 `docs/architecture.md`（339 行设计文档，下一个 commit）。**就地 COW 的核心洞察：不分裂是常见路径，给它开一条零分配快路，分裂才走重路。**
 
-#### 5.5 零拷贝读 + 修复（4 次）
+#### 5.5 零拷贝读 + 一个潜伏 bug（4 次）
 
-- **`8010f02 zero-copy getBorrowed`**：btree +74。`ReadTxn.getBorrowed` 直接返回 mmap 指针，零拷贝。
-- **`3a47cd4 ReadTxn 生命周期 fuzz`**：+269。专门 fuzz 读事务的生命周期（开始/结束时序）。
-- **`684be09 crash recovery 测试框架`**：+398。系统化的崩溃恢复测试框架。
-- **`559a214 fix future error 静默丢弃`**：**重要 bug 修复**——`WriteTxn.commit` 里 future 的 error 被吞掉了，修复就 db.zig 一行 `try`；同提交删了临时的 repro_delete_test.zig（-42 行）。
+- **`8010f02 zero-copy getBorrowed`**：btree +74。`ReadTxn.getBorrowed` 对**内联值（≤3800B）真零拷贝**——直接返回指向页 payload 的借用切片，不 `allocator.dupe`；overflow 值（>3800B）返 null，调用方回退 `get()`。MVCC + COW 保证这片切片在 ReadTxn 生命周期内不会被改。配 7 个 zero_copy 测试。
+- **`3a47cd4 ReadTxn 生命周期 fuzz`**：+269。专 fuzz 读事务生命周期：嵌套 ReadTxn（内外层借用切片独立）、多重叠 ReadTxn（不同快照）、并发写/读后快照安全、overflow fallback、混合 inline/overflow、1000 key + 重复 begin/end 周期、`Db.get()` 与 `txn.getBorrowed()` 一致性。
+- **`684be09 crash recovery 测试框架`**：+398。系统化崩溃恢复测试：基础/多轮 reopen（5 轮 write+reopen）、100 key 批量提交后 reopen、fork 式崩溃模拟、250 随机 key 持久化、更新/删除后 reopen。
+- **`559a214 fix future error 静默丢弃`**：**一个潜伏 bug**——`WriteTxn.commit` 只检查了部分 error，**future 里的 `anyerror!void` 被丢掉**，导致 `btree.insert` 返 MapFull 时 `db.put`/`db.delete` **静默返回成功**。修复就 db.zig 一行 `try`；同提交还修了 bench.zig 的 `mapsizeFor` 没算 overflow 页（10KB 值要 ~3 个溢出页/条，原公式太小），删了临时 repro_delete_test.zig（-42 行）。**这个 bug 特别危险：失败被伪装成成功。**
 
 #### 5.6 微批处理 + 读 CRC 跳过 + 共享 COW（3 次，性能三连击）
 
-- **`dcf1ab3 micro-batching / group-commit for db.put/delete`**：db.zig 67 行变动。给便捷 API `db.put`/`db.delete` 加微批处理：攒到阈值自动 flush。
-- **`2d1b69b skip CRC on read path`**：get 100B **35us → 2.8us（12.7 倍）**。读路径不校验 CRC——COW 保证页面不被原地改，信任度高。
-- **`2c156c6 shared COW path for putBatch`**：btree **+410**。putBatch **24.75us → 0.04us（619 倍！）**。批量插入时多个 key 共享同一条 COW 路径，避免重复分配。
+这天下午到晚上，三条性能优化接连落地，数字越打越夸张。
 
-> **619 倍是什么概念**：算法层面的胜利——把"每条 key 独立走一遍 COW 插入"换成"整批一次走完 COW 路径"。后面第七纪会继续在这个方向榨取。
+- **`dcf1ab3 micro-batching / group-commit for db.put/delete`**：db.zig 67 行变动。给便捷 API 加**自动微批处理**：`db.put`/`db.delete` 在 `batch_threshold > 0` 时暂存，到阈值自动 flush；`db.flush()` 强制提交；`db.putDirect`/`deleteDirect` 绕过批处理立即提交；`db.close()` 自动 flush 残留。**关键修**：staging 时**拷贝 key/value 字符串**——调用方的 slice 可能活不到 flush（循环里的栈缓冲会被覆盖）。`putBatch` 仍走直接路径（它本来就是批）。
+
+- **`2d1b69b skip CRC on read path`**：get 100B **35us → 2.8us（12.7 倍）**。加 `readNodePayloadFast()` 跳过 `verifyPageChecksum`——COW 保证页面读时不被改，CRC 只在崩溃恢复/重开时需要，普通遍历不用。get/getBorrowed 走 fast（无 CRC），写路径保留 `readNodePayload`（带 CRC）保安全。这就是上一条概念盒讲的“读跳 CRC”。
+
+- **`2c156c6 shared COW path for putBatch`**：btree **+410**。putBatch **24.75us → 0.04us（619 倍！）**、putBatch 10KB 86.86→0.05us（1737×）。加 `btree.insertBatch`：**一次 B 树遍历插多条**——entries 先排序去重，沿**同一条 COW 路径**应用，只有真正改动的叶子/分支节点才拷到新页。对比旧法（每条 key 独立走一遍 insert，每次都重新遍历+分配）。
+
+> **619 倍是什么概念**：算法层面的胜利——把“每条 key 独立走一遍 COW 插入”换成“整批排序后一次走完 COW 路径，只复制改动节点”。同晚的 benchmark 报告写：**这个数比 LMDB 还快 5.8 倍**（0.04us vs 0.23us），不过那是 MemPageStore/no-fsync 条件，不是持久化场景。后面第七纪会继续在这个方向榨取。
 
 #### 5.7 文档收尾（多次）
 
-`ca06a49`（同步 README，删 LSM/WAL/v1 残留）、`1605086`（写 `docs/architecture.md`，339 行设计文档）、`e5d281d`（基准数据文档）。
+这天的文档提交密度也高：`e5d281d`（基准数据文档，小规模全矩阵 put/putbatch/get/delete/select/compact × 100B/10KB + fuzz 结果）、`ca06a49`（同步 README + usage，删 LSM/WAL/v1 残留、加 txn/1TB-mmap/崩溃恢复、修 file 模式示例）、`1605086`（**写 `docs/architecture.md`，339 行设计文档**——整体架构图 + 页格式 + COW B 树写路径 + MVCC 快照隔离 + freelist + 双 meta 崩溃恢复 + 三阶段写优化 + 模块关系图，对应 57e18cd）、`081edda`（COW opt benchmark 文档）、`3f5493b`（usage + architecture 补 FilePageStore 设计章节）、`2a4205a`/`0dd1465`（测试数 121→142、补 getBorrowed API）。
 
 ### 小结
 
-31 次提交，项目灵魂定型。删 LSM、上 1TB mmap、上显式事务、上崩溃恢复测试、COW 写优化、零拷贝读、CRC 跳过、共享 COW。**今天的架构在这一天基本长成。**
+31 次提交，项目灵魂定型。删 LSM、上 1TB mmap、上显式事务、上崩溃恢复测试（fork+kill 真杀进程）、COW 写优化三阶段（arena→就地分支→就地叶子）、零拷贝读、修静默丢错 bug、CRC 跳过、共享 COW 619 倍。**今天的架构在这一天基本长成，而且每一步都配着测试和基准**——这是项目“先正确再性能、度量驱动、测试护城河”三条主线的集中体现。
 
 ---
 
