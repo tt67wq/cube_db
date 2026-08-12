@@ -227,6 +227,23 @@ const dels = [_]Entry{
 try db.putBatch(&dels);
 ```
 
+范围删除（`deleteRange`）：按 `[min, max)` 半开区间批量删除 key，边界语义与 `select` 完全一致——`null` min/max 表示该侧无界，`(null, null)` 清空全库。内部基于 `select` 迭代器 + tombstone 批量提交实现，micro-batch 下会先 flush 暂存项再删除，保证 pending 的 key 也在删除范围内。
+
+```zig
+// 删除 [b, d)：删 b、c，保留 a、d、e
+try db.deleteRange("b", "d");
+
+// null 边界 = 无界
+try db.deleteRange(null, "c");  // 删所有 < c 的 key
+try db.deleteRange("m", null);  // 删所有 >= m 的 key
+try db.deleteRange(null, null); // 清空全库
+```
+
+- 半开区间 `[min, max)`：`max` 本身不被删除（同 `select`）。
+- 反向/空区间（`min >= max`，均非 null）：no-op 成功，不报错。
+- 对已不存在的 key 幂等：再次删除同一区间仍成功。
+- 删除后 `entryCount()` 相应减少（与单条 `delete` 记账一致）。
+
 ### 3.4 显式事务（LMDB 式）
 
 `put`/`putBatch`/`delete` 是便捷 API（内部包隐式 WriteTxn，立即提交）。需多步原子或 abort 时用显式事务：

@@ -159,6 +159,40 @@ pub const Db = struct {
         for (futures) |*f| try (try f.wait()).value;
     }
 
+    /// Delete all keys k in [min, max) — half-open, same boundary semantics as select.
+    /// null min/max = unbounded (null, null) deletes every key.
+    /// Idempotent on already-missing keys. No-op (success) when range is inverted/empty.
+    pub fn deleteRange(self: *Db, min: ?[]const u8, max: ?[]const u8) !void {
+        // Inverted/empty range → no-op success, no side effects (don't even flush).
+        if (min) |m| {
+            if (max) |mx| {
+                if (btree.cmpKey(m, mx) != .lt) return;
+            }
+        }
+        // Micro-batch: the select iterator reads the committed root only, so pending
+        // staged puts/deletes must be flushed first to be visible (and deletable).
+        try self.flush();
+        // Collect keys in [min, max) — iterator entries are borrowed and next()
+        // invalidates the previous entry, so dupe keys for the tombstone batch.
+        var keys: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (keys.items) |k| self.allocator.free(k);
+            keys.deinit(self.allocator);
+        }
+        var it = try self.select(min, max);
+        defer it.deinit();
+        while (try it.next()) |e| {
+            try keys.append(self.allocator, try self.allocator.dupe(u8, e.key));
+        }
+        if (keys.items.len == 0) return;
+        const entries = try self.allocator.alloc(Entry, keys.items.len);
+        defer self.allocator.free(entries);
+        for (keys.items, 0..) |k, i| {
+            entries[i] = .{ .key = k, .value = "", .tombstone = true };
+        }
+        try self.putBatch(entries);
+    }
+
     // ---- 读路径（默认快照 = 当前 root） ----
 
     pub fn get(self: *Db, key: []const u8) !?[]u8 {
