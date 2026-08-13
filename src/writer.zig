@@ -125,6 +125,9 @@ pub const State = struct {
 
     /// 待回收的脏页（reader 活跃时积累，reader 归零后释放）
     pending_free: std.ArrayList(u32),
+    /// pending_free 互斥锁：串行化写者 append/flush 与末位读者 flush（修复
+    /// ArrayList 并发 mutate 的 UB）。仅末位读者 endRead 走此锁，常见路径不取。
+    pending_free_mu: zio.Mutex,
 
     pub fn init(allocator: std.mem.Allocator, store: PageStore, opts: Options) State {
         return .{
@@ -140,6 +143,7 @@ pub const State = struct {
             .meta_index = 0,
             .reader_count = std.atomic.Value(u32).init(0),
             .pending_free = .empty,
+            .pending_free_mu = .{},
         };
     }
 
@@ -158,11 +162,14 @@ pub const State = struct {
         return self.sequence.load(.acquire);
     }
 
-    /// 结束读事务。若 reader_count 归零，释放所有 pending dirty 页。
+    /// 结束读事务。最后一个读者（prev==1）退出时回收 pending dirty 页。
+    /// 仅末位读者走 flush 分支并取 pending_free_mu（与 applyBatch 的 append/flush
+    /// 互斥，修复 ArrayList 并发 mutate 的 UB）；常见 endRead（prev>1）仅一次
+    /// atomic fetchSub，不加锁、不 flush —— 读者热路径不退化为锁。
     pub fn endRead(self: *State) void {
         const prev = self.reader_count.fetchSub(1, .release);
         if (prev == 1) {
-            // 最后一个读者退出 → 回收所有等待释放的页
+            // 最后一个读者退出 → 回收所有等待释放的页（与写者互斥）
             self.flushPendingFree();
         }
     }
@@ -219,8 +226,11 @@ pub const State = struct {
 
     // ---- 内部 ----
 
-    /// 清理 pending_free：*不*检查 reader_count（由调用方保证安全）
+    /// 清理 pending_free：*不*检查 reader_count（由调用方保证安全）。
+    /// 取 pending_free_mu，串行化写者与末位读者对该列表的 mutate（修复 UB）。
     fn flushPendingFree(self: *State) void {
+        self.pending_free_mu.lockUncancelable();
+        defer self.pending_free_mu.unlock();
         const prof = ProfileStats.enable;
         const t0 = if (prof) ProfileStats.now() else 0;
         for (self.pending_free.items) |pn| {
@@ -240,6 +250,13 @@ pub const State = struct {
 
         const prof = ProfileStats.enable;
         const t0 = if (prof) ProfileStats.now() else 0;
+
+        // 0. grace-period 回收：若此刻无读者，本批开始前积累的脏页均可安全回收
+        //    （均为历史提交 COW 出的旧页，仅被已退出的读者持有）。与读者 endRead 的
+        //    flush 经 pending_free_mu 互斥（单一可同步 mutator）。
+        if (self.reader_count.load(.acquire) == 0) {
+            self.flushPendingFree();
+        }
 
         // 1. 快照当前 root
         const cur_root = self.root.load(.acquire);
@@ -382,10 +399,15 @@ pub const State = struct {
         } // end unordered path
         } // end else (batch.len > 1)
 
-        // 3. 本批脏页进 pending_free（不立即回收，MVCC 安全）
+        // 3. 本批脏页进 pending_free（不立即回收，MVCC 安全）。
+        //    取 pending_free_mu，串行化与末位读者 flush 的并发 mutate（UB 修复）。
         const t_pf0 = if (prof) ProfileStats.now() else 0;
-        for (batch_dirty.items) |pn| {
-            self.pending_free.append(self.allocator, pn) catch {};
+        {
+            self.pending_free_mu.lockUncancelable();
+            defer self.pending_free_mu.unlock();
+            for (batch_dirty.items) |pn| {
+                self.pending_free.append(self.allocator, pn) catch {};
+            }
         }
         if (prof) ProfileStats.txn_pending_free_ns += @intCast(ProfileStats.now() - t_pf0);
 

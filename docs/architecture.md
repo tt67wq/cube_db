@@ -157,7 +157,7 @@ reader_count: Atomic(u32)  // 活跃 ReadTxn 数量
 ```
 
 - `beginReadTxn()` → `reader_count++`
-- `endReadTxn()` → `reader_count--`，若归零则 `flushPendingFree()`
+- `endReadTxn()` → `reader_count--`，若归零（末位读者）则 `flushPendingFree()`。末位读者 flush 取 `pending_free_mu`（与写者 append/flush 互斥，修复并发 mutate ArrayList 的 UB）；常见路径（reader_count>1）仅一次 atomic fetchSub，不加锁、不 flush。
 
 ### 4.2 脏页延迟回收
 
@@ -201,7 +201,7 @@ allocPage():
 
 ### 5.2 页回收时机
 
-- **安全回收**：`reader_count == 0` 时，`flushPendingFree()` 全部释放
+- **安全回收**：`reader_count == 0` 时，`flushPendingFree()` 全部释放。所有 `pending_free` 的 mutate（写者 append/flush、末位读者 flush）经 `pending_free_mu` 串行，单一可同步 mutator。
 - **延迟回收**：reader 活跃时，脏页积累在 `pending_free` 中
 
 ### 5.3 页复用优势
@@ -368,6 +368,9 @@ allocPage():
 | 写路径 | 内存写入 | mmap + 页缓存 |
 | 恢复 | 不支持 | O(1) 双 meta 页恢复 |
 | 适用场景 | 测试/原型 | 生产环境 |
+
+> **并发安全**：MemPageStore 的页为独立堆分配（地址稳定，不随扩容移动），
+> `pages`/`freelist` 的 mutate 经 `freelist_mu` 串行化，使并发写者+读者不崩。
 
 ---
 

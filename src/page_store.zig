@@ -2,6 +2,7 @@
 //! 生产级 FilePageStore（mmap）后续实现；MemPageStore 用于测试。
 const std = @import("std");
 const f2 = @import("format.zig");
+const zio = @import("zio");
 
 /// 数据页起始页号（0=NULL，1=meta0，2=meta1）
 pub const FIRST_DATA_PAGE: u32 = 3;
@@ -64,13 +65,19 @@ pub const PageStore = struct {
 
 // ===== 测试用内存实现 =====
 
-/// 内存 PageStore（测试用）。页数据存在 HashMap 中，freelist 为 ArrayList。
+/// 内存 PageStore（测试用）。页数据为每页独立堆分配（*[PAGE_SIZE]u8），
+/// 页地址在生命期不变 → 读者 readPage 借用的切片不会因扩容悬垂。
 /// 不持久化，不支持跨生命周期恢复。
 pub const MemPageStore = struct {
     allocator: std.mem.Allocator,
-    // slab 页池：按页号索引的 4KB 页数组（ArrayList 几何增长，替代 HashMap 每页 mmap）
-    pages: std.ArrayList([f2.PAGE_SIZE]u8),
+    // slab 页池：按页号索引的页指针数组。ArrayList 本身会扩容（指针移动），
+    // 但每页是独立堆分配，页数据地址稳定 → 读者借用切片不悬垂（修复并发
+    // 写者 allocPage 扩容 ArrayList 导致借用切片悬垂的 SEGV）。
+    pages: std.ArrayList(*[f2.PAGE_SIZE]u8),
     freelist: std.ArrayList(u32),
+    /// pages/freelist 互斥锁：串行化写者 allocPage/writePage/ensurePage 与读者
+    /// readPage（仅护指针数组查找；页数据地址稳定，unlock 后借用切片仍有效）。
+    freelist_mu: zio.Mutex,
     next_free: u32,
     max_pages: u32,
     meta0: [f2.PAGE_SIZE]u8,
@@ -78,19 +85,23 @@ pub const MemPageStore = struct {
     meta_index: u32,
 
     pub fn init(allocator: std.mem.Allocator, mapsize_pages: u32) MemPageStore {
-        return .{
+        const self: MemPageStore = .{
             .allocator = allocator,
             .pages = .empty,
             .freelist = .empty,
+            .freelist_mu = .{},
             .next_free = FIRST_DATA_PAGE,
             .max_pages = mapsize_pages,
             .meta0 = [_]u8{0} ** f2.PAGE_SIZE,
             .meta1 = [_]u8{0} ** f2.PAGE_SIZE,
             .meta_index = 0,
         };
+        // 页按需在 ensurePage 中独立堆分配；页地址稳定 → 读者借用切片不悬垂。
+        return self;
     }
 
     pub fn deinit(self: *MemPageStore) void {
+        for (self.pages.items) |p| self.allocator.destroy(p);
         self.pages.deinit(self.allocator);
         self.freelist.deinit(self.allocator);
     }
@@ -99,25 +110,36 @@ pub const MemPageStore = struct {
         return .{ .ptr = self, .vtable = &mem_vtable };
     }
 
-    /// 确保页数组至少包含 index+1 个页（不足则几何增长，摊销 O(1)）
+    /// 为 index 分配独立页（堆分配，地址稳定）。扩容 pages 指针数组仅移动指针，
+    /// 不移动页数据 → 读者已借用的页切片不悬垂。调用方须持有 mu。
     fn ensurePage(self: *MemPageStore, index: u32) !void {
         if (index < self.pages.items.len) return;
-        const need = @as(usize, index) + 1;
-        try self.pages.appendNTimes(self.allocator, [_]u8{0} ** f2.PAGE_SIZE, need - self.pages.items.len);
+        if (index >= self.max_pages) return error.MapFull;
+        const old_len = self.pages.items.len;
+        try self.pages.appendNTimes(self.allocator, undefined, @as(usize, index) + 1 - old_len);
+        var i: usize = old_len;
+        while (i < self.pages.items.len) : (i += 1) {
+            self.pages.items[i] = try self.allocator.create([f2.PAGE_SIZE]u8);
+            self.pages.items[i].* = [_]u8{0} ** f2.PAGE_SIZE;
+        }
     }
 
     fn vtAllocPage(ptr: *anyopaque) !u32 {
         const self: *MemPageStore = @ptrCast(@alignCast(ptr));
+        self.freelist_mu.lockUncancelable();
+        defer self.freelist_mu.unlock();
         if (self.freelist.items.len > 0) return self.freelist.pop().?;
         const pn = self.next_free;
         if (pn >= self.max_pages) return error.MapFull;
-        self.next_free = pn + 1;
         try self.ensurePage(pn);
+        self.next_free = pn + 1;
         return pn;
     }
 
     fn vtFreePage(ptr: *anyopaque, page_no: u32) void {
         const self: *MemPageStore = @ptrCast(@alignCast(ptr));
+        self.freelist_mu.lockUncancelable();
+        defer self.freelist_mu.unlock();
         self.freelist.append(self.allocator, page_no) catch {};
     }
 
@@ -125,16 +147,21 @@ pub const MemPageStore = struct {
         const self: *MemPageStore = @ptrCast(@alignCast(ptr));
         if (page_no == f2.META_PAGE_0) return &self.meta0;
         if (page_no == f2.META_PAGE_1) return &self.meta1;
+        self.freelist_mu.lockUncancelable();
+        defer self.freelist_mu.unlock();
         if (page_no >= self.pages.items.len) return error.PageNotFound;
-        return &self.pages.items[page_no];
+        // 页数据为独立堆分配，地址稳定；返回的切片在 unlock 后仍有效。
+        return self.pages.items[page_no][0..];
     }
 
     fn vtWritePage(ptr: *anyopaque, page_no: u32) ![]u8 {
         const self: *MemPageStore = @ptrCast(@alignCast(ptr));
         if (page_no == f2.META_PAGE_0) return &self.meta0;
         if (page_no == f2.META_PAGE_1) return &self.meta1;
+        self.freelist_mu.lockUncancelable();
+        defer self.freelist_mu.unlock();
         try self.ensurePage(page_no);
-        return &self.pages.items[page_no];
+        return self.pages.items[page_no][0..];
     }
 
     fn vtReadMeta(ptr: *anyopaque) !?f2.MetaPage {

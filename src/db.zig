@@ -206,6 +206,9 @@ pub const Db = struct {
     }
 
     pub fn compact(self: *Db) !void {
+        // 与 applyBatch 共享 root/sequence/meta 写，须经写互斥串行（避免 meta 交错写）。
+        self.write_mutex.lock() catch return error.LockFailed;
+        defer self.write_mutex.unlock();
         try self.state.compact();
     }
 
