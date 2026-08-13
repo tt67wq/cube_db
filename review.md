@@ -7,7 +7,7 @@
   crashed under parallel runs). Conclusions are static-analysis verdicts; the 20×
   no-crash loop was NOT re-run by this reviewer and remains the tester/conductor gate.
 
-## Verdict: **changes-requested**
+## Verdict: **approve** (changes-requested → approve after c740825)
 
 The fix correctly closes the actual root-cause crash (MemPageStore page-address
 dangling on ArrayList growth) and the pending_free concurrent-mutate UB, with
@@ -155,3 +155,30 @@ a reason to scrap the approach, but they must be addressed before sign-off.
 3. (Optional) F3 comment for consistency.
 
 On F1 + F2 resolution, verdict flips to approve.
+
+## Follow-up: c740825 resolution (changes-requested → approve)
+
+Reviewed follow-up commit `c740825` on `fix/mvcc-race` (delta `f12136a..c740825`).
+Pure static reading only — 20× no-crash loop still not run by this reviewer
+(machine crash constraint); remains the tester/conductor gate.
+
+- **F1 RESOLVED ✅** — `src/page_store.zig:122-128` `ensurePage` now wraps
+  `allocator.create` in a `catch` that destroys slots `[old_len, i)` (exactly
+  the pages successfully allocated+zeroed in this call; the failed slot `i` is
+  *excluded* by the `j < i` bound, so no `destroy` on the `undefined` pointer)
+  and then `shrinkRetainingCapacity(old_len)` drops all undefined tail slots
+  `[i..new_len)`. Verified edge case `old_len == i` (failure on first slot):
+  rollback loop body never executes, shrink to `old_len`, no spurious destroys.
+  Subsequent `deinit` iterates only `[0..old_len)` → no UB. Correct.
+- **F2 RESOLVED ✅** — `docs/architecture.md` adds a note that `vtReadPage`'s
+  `freelist_mu` is test-infra-only (protects the pointer-array lookup against
+  `ensurePage` growth); the production FilePageStore(mmap) read path is
+  lock-free. This documents the carve-out, resolving the contract-tension.
+- **F3 SATISFIED ✅** — optional; the pre-existing comment
+  `// 释放剩余的 pending_free（safe: 写者线程结束，无读者）` (already present
+  at base `6834b7f`, `writer.zig:152`) conveys the teardown post-join /
+  no-concurrent-mutator rationale. Note: c740825's commit message claims a new
+  F3 comment but `src/writer.zig` was not actually modified in that commit;
+  however the substance is already present, so the optional F3 is met.
+
+All required changes addressed. Verdict: **approve**.
