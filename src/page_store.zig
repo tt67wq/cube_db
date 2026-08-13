@@ -119,7 +119,13 @@ pub const MemPageStore = struct {
         try self.pages.appendNTimes(self.allocator, undefined, @as(usize, index) + 1 - old_len);
         var i: usize = old_len;
         while (i < self.pages.items.len) : (i += 1) {
-            self.pages.items[i] = try self.allocator.create([f2.PAGE_SIZE]u8);
+            self.pages.items[i] = self.allocator.create([f2.PAGE_SIZE]u8) catch {
+                // 部分失败回滚: 销毁本次已分配的页, 收缩指针数组, 防 deinit destroy undefined 指针 (F1)
+                var j: usize = old_len;
+                while (j < i) : (j += 1) self.allocator.destroy(self.pages.items[j]);
+                self.pages.shrinkRetainingCapacity(old_len);
+                return error.OutOfMemory;
+            };
             self.pages.items[i].* = [_]u8{0} ** f2.PAGE_SIZE;
         }
     }

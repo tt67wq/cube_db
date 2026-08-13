@@ -371,6 +371,8 @@ allocPage():
 
 > **并发安全**：MemPageStore 的页为独立堆分配（地址稳定，不随扩容移动），
 > `pages`/`freelist` 的 mutate 经 `freelist_mu` 串行化，使并发写者+读者不崩。
+> 注：`vtReadPage` 的 `freelist_mu` 仅为 test-infra 必需（护指针数组查找，防扩容竞态）；
+> 生产 FilePageStore(mmap) 页地址稳定、读者路径无锁，不受此约束。
 
 ---
 
