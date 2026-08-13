@@ -1,4 +1,7 @@
 .pi-subagents
+.claude/           # 团队任务契约共享路径（机器本地，不进 git）
+# 团队任务契约+状态（机器本地，不进 git；.agents/skills/ 除外）
+.agents/tasks/
 *.db
 *.db.compact
 .cache_zig

@@ -1,0 +1,44 @@
+# cube_db CI (Woodpecker) — 推 main / 开 PR 时自动: 装 zig → 准备 zio → 编译 → 全量测试
+# Codeberg 内置 CI: https://docs.codeberg.org/ci/ (在 codeberg.org/ci 激活仓库后生效)
+# 注: 本文件是 Woodpecker 语法, 不是 GitHub Actions。若未来镜像到 GitHub, 用 .github/workflows/ci.yml。
+# 注: Woodpecker 自动 clone 仓库到 workspace, commands 的 cwd 默认 = 仓库根目录。
+
+when:
+  - event: push
+    branch: main
+  - event: pull_request
+
+steps:
+  # 单 step 搞定全部: zig 装进容器层(跨 step 不持久), 所以装完立刻用
+  - name: build-and-test
+    image: debian:bookworm-slim
+    commands:
+      # 1. 基础工具 + 装 zig 0.16.0 (与本地 asdf 版本一致)
+      - apt-get update && apt-get install -y --no-install-recommends curl xz-utils ca-certificates git
+      - curl -fsSL -o /tmp/zig.tar.xz https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
+      - tar -xJf /tmp/zig.tar.xz -C /opt && mv /opt/zig-x86_64-linux-0.16.0 /opt/zig
+      - export PATH="/opt/zig:$PATH" && zig version
+
+      # 2. zio 依赖: build.zig.zon 用 .path = "../zio"(仓库上一级 = workspace 的父目录), CI 上不存在
+      #    固定 commit 保证可复现 (本地验证过的 3aa3423; 升级 zio 时改这里)
+      - git clone --depth 1 https://github.com/lalinsky/zio.git ../zio
+      - git -C ../zio fetch --depth 1 origin 3aa3423 && git -C ../zio checkout 3aa3423
+
+      # 3. 编译检查
+      - zig build -j2 --maxrss 4GB
+
+      # 4. 全量测试 = 项目验收命令 (编译 + 全部 unit/integration tests)
+      #    历史 flaky 的 txn_test.concurrency 竞态已于 2026-08-13 修复 (commit e26931c)
+      #    -j2 + --maxrss 4GB: 单次 zig build test 本地实测峰值 3.2GB(37 个测试二进制
+      #    并行编译), 受限 CI runner 会 OOM, 压并发 + 限内存 (慢但稳)
+      - zig build test -j2 --maxrss 4GB
+
+  # 基准回归检查: 暂不启用。阈值按本机 M1 Pro 校准, Codeberg runner CPU 不同会误报。
+  # 待 bench_baseline 支持 mem-only 模式 + 按机器重校后再加。
+  # - name: bench-baseline
+  #   image: debian:bookworm-slim
+  #   commands:
+  #     - apt-get update && apt-get install -y --no-install-recommends curl xz-utils ca-certificates
+  #     - curl -fsSL -o /tmp/zig.tar.xz https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
+  #     - tar -xJf /tmp/zig.tar.xz -C /opt && mv /opt/zig-x86_64-linux-0.16.0 /opt/zig
+  #     - export PATH="/opt/zig:$PATH" && zig build bench-baseline -Doptimize=ReleaseFast
