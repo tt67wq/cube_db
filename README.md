@@ -44,7 +44,7 @@ defer ms.deinit();
 var db = try Db.open(allocator, ms.store(), .{});
 defer db.close();
 
-// 便捷 API（内部包隐式 WriteTxn，立即提交）
+// Convenience API (implicit WriteTxn under the hood, commits immediately)
 try db.put("hello", "world");
 const v = try db.get("hello");
 defer allocator.free(v.?);
@@ -53,14 +53,14 @@ defer allocator.free(v.?);
 ### Explicit transactions (LMDB-style)
 
 ```zig
-// 写事务：单写者互斥，commit = applyBatch + meta 切换 + fsync；abort 丢弃
+// Write txn: single-writer mutex; commit = applyBatch + meta switch + fsync; abort discards
 var w = try db.beginWriteTxn();
-defer w.deinit(); // 未 commit/abort 时 deinit 自动 abort
+defer w.deinit(); // deinit auto-aborts if not committed/aborted
 try w.put("k", "v");
 try w.delete("old");
-try w.commit(); // 原子提交
+try w.commit(); // atomic commit
 
-// 读事务：MVCC 快照，不阻写者
+// Read txn: MVCC snapshot, does not block writers
 var r = try db.beginReadTxn();
 defer r.end();
 const v = try r.get("k");
@@ -72,56 +72,56 @@ full API, and recipes see **[docs/usage.md](docs/usage.md)**.
 
 ## Benchmark
 
-最新 benchmark 数据见 [`bench/results/`](bench/results/)：
+Latest benchmark data: [`bench/results/`](bench/results/)
 
-| 文档 | 内容 |
+| Doc | Highlight |
 |------|------|
-| [`20260803_ordered_fastpath.md`](bench/results/20260803_ordered_fastpath.md) | 🏆 写路径收官 — 有序 fast path，1M **0.47µs（1.27× LMDB）** |
-| [`20260803_arena_opt.md`](bench/results/20260803_arena_opt.md) | WriteTxn staging arena 化 — putBatch 10K **0.6µs（27× 提升）** |
-| [`20260730_shared_cow.md`](bench/results/20260730_shared_cow.md) | Shared COW path — putBatch 100B **619× 提速，超越 LMDB** |
-| [`20260730_read_crc_skip.md`](bench/results/20260730_read_crc_skip.md) | 读路径 CRC 跳过 — get 100B 13× 提速 |
-| [`20260730_micro_batch.md`](bench/results/20260730_micro_batch.md) | micro-batching / group-commit — put 100B 4.0× 提速 |
-| [`20260730_zero_copy.md`](bench/results/20260730_zero_copy.md) | zero-copy get + bug fix 数据 |
-| [`20260730_cow_opt.md`](bench/results/20260730_cow_opt.md) | COW 写路径优化 — put 100B 4.7× 提速 |
-| [`20260730_bench.md`](bench/results/20260730_bench.md) | 优化前基准数据（small scale 全矩阵） |
-| [`20260727_wal_opt.md`](bench/results/20260727_wal_opt.md) | 历史 WAL 优化（LSM 层，已移除） |
+| [`20260803_ordered_fastpath.md`](bench/results/20260803_ordered_fastpath.md) | 🏆 Write-path finale — ordered fast path, 1M **0.47µs (1.27× LMDB)** |
+| [`20260803_arena_opt.md`](bench/results/20260803_arena_opt.md) | WriteTxn staging arena — putBatch 10K **0.6µs (27× improvement)** |
+| [`20260730_shared_cow.md`](bench/results/20260730_shared_cow.md) | Shared COW path — putBatch 100B **619× faster, beats LMDB** |
+| [`20260730_read_crc_skip.md`](bench/results/20260730_read_crc_skip.md) | Read-path CRC skip — get 100B 13× faster |
+| [`20260730_micro_batch.md`](bench/results/20260730_micro_batch.md) | micro-batching / group-commit — put 100B 4.0× faster |
+| [`20260730_zero_copy.md`](bench/results/20260730_zero_copy.md) | zero-copy get + bug fix data |
+| [`20260730_cow_opt.md`](bench/results/20260730_cow_opt.md) | COW write-path optimization — put 100B 4.7× faster |
+| [`20260730_bench.md`](bench/results/20260730_bench.md) | Pre-optimization baseline (small-scale full matrix) |
+| [`20260727_wal_opt.md`](bench/results/20260727_wal_opt.md) | Legacy WAL optimization (LSM layer, removed) |
 
-> 与 SQLite/RocksDB 对比：[`benchcmp/COMPARISON.md`](benchcmp/COMPARISON.md)
+> vs SQLite/RocksDB: [`benchcmp/COMPARISON.md`](benchcmp/COMPARISON.md)
 
 ## Tests
 
-~200 tests across 25+ modules (auto-discovered), all passing:
+~230 tests across 30+ modules (auto-discovered, grouped into 4 domain files), all passing:
 
 | Module | Tests | File |
 |--------|-------|------|
-| Format | 21 | `tests/format_test.zig` |
-| Page store | 11 | `tests/page_store_test.zig` |
-| B-tree | 13 | `tests/btree_test.zig` |
-| Writer | 8 | `tests/writer_test.zig` |
-| MVCC | 6 | `tests/mvcc_test.zig` |
-| Db API | 11 | `tests/db_test.zig` |
-| Compact | 6 | `tests/compact_test.zig` |
-| Overflow | 6 | `tests/overflow_test.zig` |
-| Transactions | 7 | `tests/txn_test.zig` |
-| mmap region | 4 | `tests/mmap_region_test.zig` |
-| Crash recovery | 5 | `tests/crash_recovery_test.zig` |
-| Crash harness (fork+kill) | 2 | `tests/crash_harness_test.zig` |
-| Stress (1k keys) | 2 | `tests/stress_test.zig` |
-| Tutorial smoke | 5 | `tests/tutorial_smoke_test.zig` |
+| Format | 21 | `tests/core_format/format_test.zig` |
+| Page store | 11 | `tests/core_format/page_store_test.zig` |
+| B-tree | 13 | `tests/btree_storage/btree_test.zig` |
+| Writer | 8 | `tests/txn_writer_db/writer_test.zig` |
+| MVCC | 6 | `tests/txn_writer_db/mvcc_test.zig` |
+| Db API | 11 | `tests/txn_writer_db/db_test.zig` |
+| Compact | 6 | `tests/txn_writer_db/compact_test.zig` |
+| Overflow | 6 | `tests/txn_writer_db/overflow_test.zig` |
+| Transactions | 7 | `tests/txn_writer_db/txn_test.zig` |
+| mmap region | 4 | `tests/core_format/mmap_region_test.zig` |
+| Crash recovery | 5 | `tests/crash_insertbatch_pb/crash_recovery_test.zig` |
+| Crash harness (fork+kill) | 2 | `tests/crash_insertbatch_pb/crash_harness_test.zig` |
+| Stress (1k keys) | 2 | `tests/crash_insertbatch_pb/stress_test.zig` |
+| Tutorial smoke | 5 | `tests/txn_writer_db/tutorial_smoke_test.zig` |
 | Fuzz (probe/api/format/meta-corrupt) | 9 | `tests/fuzz/*` |
-| Zero-copy | 7 | `tests/zero_copy_test.zig` |
-| COW fast path | 5 | `tests/cow_fast_test.zig` |
-| Crash recovery framework | 4 | `tests/crash_recovery_framework.zig` |
-| Group commit | 10 | `tests/group_commit_test.zig` |
-| Group commit ext | 11 | `tests/group_commit_ext_test.zig` |
-| Shared COW | 8 | `tests/shared_cow_test.zig` |
-| putBatch correctness | 4 | `tests/putbatch_correctness_test.zig` |
-| insertBatch overflow | 5 | `tests/insertbatch_overflow_test.zig` |
-| insertBatch capaware | 7 | `tests/insertbatch_capaware_test.zig` |
-| crash putBatch | 5 | `tests/crash_putbatch_test.zig` |
-| **Txn arena** | **7** | `tests/txn_arena_test.zig` |
-| **Txn abort arena** | **4** | `tests/txn_abort_arena_test.zig` |
-| 3-state | 3 | `tests/pb_3state_test.zig` |
+| Zero-copy | 7 | `tests/core_format/zero_copy_test.zig` |
+| COW fast path | 5 | `tests/core_format/cow_fast_test.zig` |
+| Crash recovery framework | 4 | `tests/crash_insertbatch_pb/crash_recovery_framework.zig` |
+| Group commit | 10 | `tests/txn_writer_db/group_commit_test.zig` |
+| Group commit ext | 11 | `tests/txn_writer_db/group_commit_ext_test.zig` |
+| Shared COW | 8 | `tests/btree_storage/shared_cow_test.zig` |
+| putBatch correctness | 4 | `tests/crash_insertbatch_pb/putbatch_correctness_test.zig` |
+| insertBatch overflow | 5 | `tests/crash_insertbatch_pb/insertbatch_overflow_test.zig` |
+| insertBatch capaware | 7 | `tests/crash_insertbatch_pb/insertbatch_capaware_test.zig` |
+| crash putBatch | 5 | `tests/crash_insertbatch_pb/crash_putbatch_test.zig` |
+| **Txn arena** | **7** | `tests/txn_writer_db/txn_arena_test.zig` |
+| **Txn abort arena** | **4** | `tests/txn_writer_db/txn_abort_arena_test.zig` |
+| range delete | 13 | `tests/crash_insertbatch_pb/range_delete_test.zig` |
 
 ```bash
 zig build test test-fuzz        # all unit/integration + fuzz regression
@@ -148,6 +148,14 @@ cube_db/
 │   ├── writer.zig         # Batch apply + MVCC + meta alternation
 │   └── db.zig             # Db handle, WriteTxn, ReadTxn (public API)
 ├── tests/                 # unit + integration tests
+│   ├── btree_storage_test.zig      # aggregator: btree/readtxn/shared-cow
+│   ├── core_format_test.zig        # aggregator: format/page-store/crc/zero-copy
+│   ├── crash_insertbatch_pb_test.zig # aggregator: crash/insertBatch/putBatch
+│   ├── txn_writer_db_test.zig      # aggregator: txn/writer/db/compact/mvcc
+│   ├── btree_storage/              # btree + readtxn-fuzz + shared-cow
+│   ├── core_format/                # format/page-store/crc/zero-copy/cow
+│   ├── crash_insertbatch_pb/       # crash/insertBatch/putBatch/range-delete
+│   ├── txn_writer_db/              # txn/writer/db/compact/mvcc/overflow
 │   └── fuzz/              # fuzz targets (probe/api/format/meta-corrupt + long-run)
 ├── bench/
 │   ├── bench.zig          # Benchmark matrix (put/putbatch/get/delete/select/compact)
