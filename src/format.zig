@@ -250,12 +250,15 @@ pub fn writeFreelistEntries(page: *[PAGE_SIZE]u8, entries: []const u32) void {
 }
 
 /// 从页读 freelist 条目（返回借用 payload 的切片）
-pub fn readFreelistEntries(page: *const [PAGE_SIZE]u8) []const u32 {
+/// 返回 []align(1) const u32：page 是 u8 数组（1 对齐），payload 偏移 24
+/// 不保证 4 对齐，故借用切片声明真实 align(1)，@alignCast 会 Linux panic。
+pub fn readFreelistEntries(page: *const [PAGE_SIZE]u8) []align(1) const u32 {
     const payload = page[PAGE_HEADER_SIZE .. PAGE_SIZE - 4];
     const count = std.mem.readInt(u32, payload[0..4], .little);
     const max = @min(count, @as(u32, @intCast((payload.len - 4) / 4)));
-    // ponytail: payload 起始偏移 24，天然 4 对齐；跳过前 4 字节 count
-    const ptr: [*]const u32 = @ptrCast(@alignCast(payload.ptr));
+    // ponytail: 跳过前 4 字节 count；[*]align(1) const u32 诚实声明对齐，
+    // 允许非对齐 u32 读取（x86/ARM 原生支持），无需 @alignCast 运行时检查
+    const ptr: [*]align(1) const u32 = @ptrCast(payload.ptr);
     return ptr[1..][0..max];
 }
 
