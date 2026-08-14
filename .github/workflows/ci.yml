@@ -13,11 +13,16 @@ jobs:
       # 1. 把你的仓库代码下载到 CI 机器
       - uses: actions/checkout@v4
 
-      # 2. 安装 Zig 0.16.0(与本地 .tool-versions/asdf 一致)
+      # 2. 安装 Zig 0.16.0(与本地 asdf 一致)。
+      #    不用 mlugg/setup-zig: v1 用旧命名 zig-linux-x86_64, Zig 0.16 已改名
+      #    zig-x86_64-linux, 导致全镜像 404/503。直接 curl 下载已验证 URL。
       - name: Install Zig 0.16.0
-        uses: mlugg/setup-zig@v1
-        with:
-          version: 0.16.0
+        run: |
+          curl -fsSL -o /tmp/zig.tar.xz https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
+          sudo tar -xJf /tmp/zig.tar.xz -C /opt
+          sudo mv /opt/zig-x86_64-linux-0.16.0 /opt/zig
+          echo "/opt/zig" >> "$GITHUB_PATH"
+          zig version
 
       # 3. zio 依赖: build.zig.zon 用 .path = "../zio"(兄弟目录),CI 上不存在
       #    所以先把它 clone 到仓库的上一级。固定 commit 保证可复现:
@@ -29,14 +34,14 @@ jobs:
 
       # 4. 编译检查(快,~1min)— 任何模块编译失败这里就红
       - name: Compile (zig build)
-        run: zig build
+        run: zig build -j2 --maxrss 4GB
 
       # 5. 全量测试 = 项目验收命令(编译 + 全部 unit/integration tests)
-      #    已知问题: tests/txn_test.zig 的 concurrency 测试存在真实竞态(间歇 SEGV/ABRT),
-      #    会让本步随机红 —— 这是引擎的 bug,修好前 CI 不能保证稳定。
-      #    修复后去掉本注释。不要用 retry 掩盖它,竞态是真实缺陷。
+      #    历史 flaky 的 txn_test.concurrency 竞态已于 2026-08-13 修复 (e26931c)
+      #    -j2 --maxrss 4GB: 单次 zig build test 本地实测峰值 3.2GB(37 个测试二进制并行编译),
+      #    GitHub runner 约 7GB RAM, 压并发+限内存防 OOM
       - name: Run full test suite
-        run: zig build test
+        run: zig build test -j2 --maxrss 4GB
 
       # 6. 基准回归检查(先注释掉: 阈值按本机 M1 Pro 校准,CI 的 CPU 不同会误报)
       #    待 bench_baseline 支持 mem-only 模式后再启用。
