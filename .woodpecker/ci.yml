@@ -14,7 +14,7 @@ steps:
     image: debian:bookworm-slim
     commands:
       # 1. 基础工具 + 装 zig 0.16.0 (与本地 asdf 版本一致)
-      - apt-get update && apt-get install -y --no-install-recommends curl xz-utils ca-certificates git libc6-dev
+      - apt-get update && apt-get install -y --no-install-recommends curl xz-utils ca-certificates git libc6-dev linux-libc-dev
       - curl -fsSL -o /tmp/zig.tar.xz https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
       - tar -xJf /tmp/zig.tar.xz -C /opt && mv /opt/zig-x86_64-linux-0.16.0 /opt/zig
       - export PATH="/opt/zig:$PATH" && zig version

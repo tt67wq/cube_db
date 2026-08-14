@@ -28,7 +28,7 @@ jobs:
       # 2b. libc 头文件: build.zig 全库 link_libc=true (mmap wrapper @cImport),
       #     ubuntu-latest 只有运行时 libc 无 /usr/include 系统头, 需装 libc6-dev
       - name: Install libc headers (libc6-dev)
-        run: sudo apt-get update && sudo apt-get install -y libc6-dev
+        run: sudo apt-get update && sudo apt-get install -y libc6-dev linux-libc-dev
 
       # 3. zio 依赖: build.zig.zon 用 .path = "../zio"(兄弟目录),CI 上不存在。
       #    完整 clone 再 checkout SHA(不用 --depth 1 + fetch SHA: 远端不暴露
