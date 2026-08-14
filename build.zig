@@ -156,6 +156,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(mmap_pwrite_exe);
+    mmap_pwrite_exe.root_module.link_libc = true; // @cImport sys/mman.h
     const mmap_pwrite_step = b.step("mmap-vs-pwrite", "Discriminating experiment: mmap vs pwrite 100MB (#41)");
     const mmap_pwrite_cmd = b.addRunArtifact(mmap_pwrite_exe);
     mmap_pwrite_step.dependOn(&mmap_pwrite_cmd.step);
@@ -174,6 +175,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(profile_fps_exe);
+    profile_fps_exe.root_module.link_libc = true; // @cImport libc
     const profile_fps_step = b.step("profile-fps", "FPS write path counters (#41)");
     const profile_fps_cmd = b.addRunArtifact(profile_fps_exe);
     profile_fps_step.dependOn(&profile_fps_cmd.step);
@@ -210,6 +212,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(baseline_exe);
+    baseline_exe.root_module.link_libc = true; // @cImport libc
 
     const baseline_step = b.step("bench-baseline", "Check benchmark regression baseline");
     const baseline_cmd = b.addRunArtifact(baseline_exe);
