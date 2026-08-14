@@ -265,7 +265,7 @@ pub fn build(b: *std.Build) void {
     // crc32_hw_test — hardware CRC32 vs software CRC32 consistency tests
     const crc32_hw_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/crc32_hw_test.zig"),
+            .root_source_file = b.path("tests/core_format/crc32_hw_test.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -281,7 +281,7 @@ pub fn build(b: *std.Build) void {
     // zig build test-format 只跑 format 测试
     const format_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/format_test.zig"),
+            .root_source_file = b.path("tests/core_format/format_test.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -297,7 +297,7 @@ pub fn build(b: *std.Build) void {
     // ponytail: zig build test-ps 只跑 page_store 测试
     const ps_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/page_store_test.zig"),
+            .root_source_file = b.path("tests/core_format/page_store_test.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -313,7 +313,7 @@ pub fn build(b: *std.Build) void {
     // slab_page_store_test — MemPageStore slab 页池改造测试
     const slab_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/slab_page_store_test.zig"),
+            .root_source_file = b.path("tests/core_format/slab_page_store_test.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -329,7 +329,7 @@ pub fn build(b: *std.Build) void {
     // ponytail: zig build test-btree 只跑 btree 测试
     const btree_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/btree_test.zig"),
+            .root_source_file = b.path("tests/btree_storage/btree_test.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -345,7 +345,7 @@ pub fn build(b: *std.Build) void {
     // ponytail: zig build test-writer 只跑 writer 测试
     const writer_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/writer_test.zig"),
+            .root_source_file = b.path("tests/txn_writer_db/writer_test.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -361,7 +361,7 @@ pub fn build(b: *std.Build) void {
     // ponytail: zig build test-mvcc 只跑 MVCC 测试
     const mvcc_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/mvcc_test.zig"),
+            .root_source_file = b.path("tests/txn_writer_db/mvcc_test.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -377,7 +377,7 @@ pub fn build(b: *std.Build) void {
     // ponytail: zig build test-db 只跑 db 测试
     const db_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/db_test.zig"),
+            .root_source_file = b.path("tests/txn_writer_db/db_test.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -393,7 +393,7 @@ pub fn build(b: *std.Build) void {
     // txn_arena_test — WriteTxn staging arena 化测试
     const txn_arena_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/txn_arena_test.zig"),
+            .root_source_file = b.path("tests/txn_writer_db/txn_arena_test.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -409,7 +409,7 @@ pub fn build(b: *std.Build) void {
     // ponytail: zig build test-compact 只跑 compact 测试
     const compact_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/compact_test.zig"),
+            .root_source_file = b.path("tests/txn_writer_db/compact_test.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -425,7 +425,7 @@ pub fn build(b: *std.Build) void {
     // ponytail: zig build test-overflow 只跑 overflow 测试
     const overflow_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/overflow_test.zig"),
+            .root_source_file = b.path("tests/txn_writer_db/overflow_test.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
