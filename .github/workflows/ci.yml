@@ -25,13 +25,14 @@ jobs:
           # GITHUB_PATH 只对后续步骤生效, 当前 shell 用全路径验证
           /opt/zig/zig version
 
-      # 3. zio 依赖: build.zig.zon 用 .path = "../zio"(兄弟目录),CI 上不存在
-      #    所以先把它 clone 到仓库的上一级。固定 commit 保证可复现:
-      #    本地验证过的版本是 3aa3423,后续升级 zio 时改这里。
+      # 3. zio 依赖: build.zig.zon 用 .path = "../zio"(兄弟目录),CI 上不存在。
+      #    完整 clone 再 checkout SHA(不用 --depth 1 + fetch SHA: 远端不暴露
+      #    任意 commit 引用, 浅 clone 按名字 fetch SHA 会 404)。固定 3aa3423
+      #    (本地验证过的版本; 升级 zio 时改这里)。
       - name: Clone zio dependency to ../zio
         run: |
-          git clone --depth 1 https://github.com/lalinsky/zio.git ../zio
-          cd ../zio && git fetch --depth 1 origin 3aa3423 && git checkout 3aa3423
+          git clone https://github.com/lalinsky/zio.git ../zio
+          cd ../zio && git checkout 3aa3423
 
       # 4. 编译检查(快,~1min)— 任何模块编译失败这里就红
       - name: Compile (zig build)

@@ -20,9 +20,10 @@ steps:
       - export PATH="/opt/zig:$PATH" && zig version
 
       # 2. zio 依赖: build.zig.zon 用 .path = "../zio"(仓库上一级 = workspace 的父目录), CI 上不存在
-      #    固定 commit 保证可复现 (本地验证过的 3aa3423; 升级 zio 时改这里)
-      - git clone --depth 1 https://github.com/lalinsky/zio.git ../zio
-      - git -C ../zio fetch --depth 1 origin 3aa3423 && git -C ../zio checkout 3aa3423
+      #    完整 clone 再 checkout SHA(不用 --depth 1 + fetch SHA: 远端不暴露任意
+      #    commit 引用, 浅 clone 按名字 fetch SHA 会 404)。固定 3aa3423(本地验证过)。
+      - git clone https://github.com/lalinsky/zio.git ../zio
+      - git -C ../zio checkout 3aa3423
 
       # 3. 编译检查
       - zig build -j2 --maxrss 4GB
