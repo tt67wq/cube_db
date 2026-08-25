@@ -1,0 +1,654 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>cube_db · src/page_store.zig 讲义</title>
+<style>
+:root{
+  --bg:#0f1117; --panel:#171a23; --panel2:#1e2230; --border:#2a2f3f;
+  --fg:#e6e9f0; --muted:#9aa3b5; --accent:#5b9dff; --accent2:#8b6cff;
+  --green:#3ddc84; --red:#ff5c5c; --yellow:#ffd166; --cyan:#4dd0e1;
+  --code:#0d0f14;
+  --mono:"SF Mono","JetBrains Mono","Menlo",Consolas,monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font-family:-apple-system,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+  line-height:1.7;}
+.wrap{max-width:1000px;margin:0 auto;padding:32px 20px 80px;}
+header.hero{border-bottom:1px solid var(--border);padding-bottom:24px;margin-bottom:28px;}
+header.hero h1{font-size:2rem;margin:0 0 6px;}
+header.hero .sub{color:var(--muted);}
+.tag{display:inline-block;padding:2px 10px;border-radius:20px;font-size:.78rem;
+  border:1px solid var(--border);color:var(--muted);margin-right:6px;}
+h2{font-size:1.45rem;margin-top:48px;padding-bottom:8px;border-bottom:1px solid var(--border);}
+h2 .no{color:var(--accent);margin-right:8px;}
+h3{font-size:1.12rem;margin-top:28px;color:var(--cyan);}
+p{color:var(--fg);}
+.muted{color:var(--muted);}
+pre{background:var(--code);border:1px solid var(--border);border-radius:10px;
+  padding:16px 18px;overflow-x:auto;font-family:var(--mono);font-size:.85rem;line-height:1.6;}
+code{font-family:var(--mono);font-size:.85em;background:var(--panel2);
+  padding:1px 6px;border-radius:5px;}
+pre code{background:none;padding:0;}
+.kw{color:var(--accent2);} .ty{color:var(--cyan);} .cm{color:#6b7488;}
+.st{color:var(--green);} .nu{color:var(--yellow);} .fn{color:var(--accent);}
+.note{background:var(--panel);border-left:4px solid var(--accent);border-radius:0 10px 10px 0;
+  padding:12px 16px;margin:18px 0;}
+.note.warn{border-left-color:var(--yellow);}
+.note.danger{border-left-color:var(--red);}
+.note.ok{border-left-color:var(--green);}
+table{border-collapse:collapse;width:100%;margin:16px 0;font-size:.92rem;}
+th,td{border:1px solid var(--border);padding:8px 12px;text-align:left;}
+th{background:var(--panel2);}
+tr:nth-child(even) td{background:var(--panel);}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:18px 22px;margin:18px 0;}
+.flow{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:16px 0;}
+.flow .step{background:var(--panel2);border:1px solid var(--border);border-radius:8px;
+  padding:8px 14px;font-size:.9rem;}
+.flow .arrow{color:var(--accent);font-weight:bold;}
+ul,ol{padding-left:22px;}
+li{margin:4px 0;}
+a{color:var(--accent);}
+section.lecture{scroll-margin-top:16px;}
+footer{margin-top:64px;border-top:1px solid var(--border);padding-top:16px;color:var(--muted);font-size:.85rem;}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <h1>cube_db · <code>src/page_store.zig</code> 讲义</h1>
+  <div class="sub">页 Store 抽象接口 + 内存实现（MemPageStore）逐段精讲</div>
+  <div style="margin-top:12px">
+    <span class="tag">Zig 0.14</span>
+    <span class="tag">COW B-tree 存储引擎</span>
+    <span class="tag">vtable 多态</span>
+    <span class="tag">slab 页池</span>
+  </div>
+</header>
+
+<p class="muted">本讲义由开发团队协作生成。点击侧边目录或直接滚动阅读；代码块附逐行解释。</p>
+
+<section class="lecture">
+<h2><span class="no">第一部分</span>PageStore 抽象层与 VTable 多态接口</h2>
+
+<p><code>src/page_store.zig</code> 的前半部分定义了整个存储引擎的多态入口：<code>PageStore</code> 结构体。
+它是 B-tree（<code>btree.zig</code>）、数据库门面（<code>db.zig</code>）与底层实现（内存版 <code>MemPageStore</code>、
+mmap 文件版 <code>FilePageStore</code>）之间的契约。本部分逐段精讲它的常量、错误集、VTable 形状，
+以及每个方法背后的设计取舍。</p>
+
+<h3>1.1 文件定位与依赖</h3>
+
+<pre><code><span class="cm">//! page_store.zig — 页 Store 接口（vtable）及内存实现（MemPageStore）。</span>
+<span class="cm">//! 生产级 FilePageStore（mmap）后续实现；MemPageStore 用于测试。</span>
+<span class="kw">const</span> std = @import(<span class="st">"std"</span>);
+<span class="kw">const</span> f2 = @import(<span class="st">"format.zig"</span>);
+<span class="kw">const</span> zio = @import(<span class="st">"zio"</span>);</code></pre>
+
+<p>三个导入对应三个关注面：<code>std</code> 是标准库（分配器、切片、测试）；<code>f2</code>（<code>format.zig</code>）
+提供页格式常量与 <code>MetaPage</code> 编解码——它是纯函数模块，<code>page_store.zig</code> 只复用其类型，
+不触碰它的实现细节；<code>zio</code> 提供跨平台同步原语（<code>Mutex</code>），内存实现用它串行化页池访问。</p>
+
+<div class="note"><b>分层意图：</b>本文件同时承载「接口」与「一个具体实现（内存版）」。
+接口（<code>PageStore</code> + <code>VTable</code>）是稳定契约，实现可替换——这是后续
+<code>FilePageStore</code> 能无缝接入的前提。接口与第一个实现同文件，避免空接口先行抽象。</div>
+
+<h3>1.2 常量与错误集</h3>
+
+<pre><code><span class="cm">/// 数据页起始页号（0=NULL，1=meta0，2=meta1）</span>
+<span class="kw">pub const</span> FIRST_DATA_PAGE: <span class="ty">u32</span> = <span class="nu">3</span>;
+
+<span class="cm">/// 错误</span>
+<span class="kw">pub const</span> Error = <span class="kw">error</span>{
+    MapFull,
+    PageNotFound,
+};</code></pre>
+
+<p>页号空间是全局约定：<code>0</code> 是 NULL 页（哨兵），<code>1</code>/<code>2</code> 是双 meta 页（交替写以做崩溃恢复），
+<code>3</code> 起是数据页。<code>FIRST_DATA_PAGE</code> 把这个约定固化成常量，<code>MemPageStore.init</code> 用它初始化
+<code>next_free</code>，确保 bump 分配器跳过保留页。</p>
+
+<table>
+<tr><th>页号</th><th>含义</th><th>谁管理</th></tr>
+<tr><td><code>0</code></td><td>NULL_PAGE（哨兵，表「无后续页」）</td><td><code>format.zig</code> 常量</td></tr>
+<tr><td><code>1</code></td><td>META_PAGE_0（meta 副本 A）</td><td><code>readMeta</code>/<code>writeMeta</code></td></tr>
+<tr><td><code>2</code></td><td>META_PAGE_1（meta 副本 B）</td><td><code>readMeta</code>/<code>writeMeta</code></td></tr>
+<tr><td><code>≥3</code></td><td>数据页（branch/leaf/overflow）</td><td><code>allocPage</code>/<code>freePage</code></td></tr>
+</table>
+
+<p>错误集只有两条，都由分配/读取路径产生：<code>MapFull</code> 表示页号空间耗尽（达到 <code>max_pages</code>，
+mmap 版对应文件区满）；<code>PageNotFound</code> 表示读一个未分配过的页号。注意它们是
+<code>anyerror</code> 体系之外的具名错误，但 VTable 方法签名用 <code>anyerror!T</code>，因此任一具体错误都能透传。</p>
+
+<h3>1.3 PageStore 结构与 VTable</h3>
+
+<pre><code><span class="cm">/// 页 Store 运行时多态接口</span>
+<span class="kw">pub const</span> <span class="ty">PageStore</span> = <span class="kw">struct</span> {
+    ptr: *anyopaque,
+    vtable: *const <span class="ty">VTable</span>,
+
+    <span class="kw">pub const</span> <span class="ty">VTable</span> = <span class="kw">struct</span> {
+        allocPage: *const fn (ptr: *anyopaque) anyerror!<span class="ty">u32</span>,
+        freePage:  *const fn (ptr: *anyopaque, page_no: <span class="ty">u32</span>) <span class="kw">void</span>,
+        readPage:  *const fn (ptr: *anyopaque, page_no: <span class="ty">u32</span>) anyerror![]const <span class="ty">u8</span>,
+        writePage: *const fn (ptr: *anyopaque, page_no: <span class="ty">u32</span>) anyerror![]<span class="ty">u8</span>,
+        readMeta:  *const fn (ptr: *anyopaque) anyerror!?<span class="ty">f2.MetaPage</span>,
+        writeMeta: *const fn (ptr: *anyopaque, meta: *const <span class="ty">f2.MetaPage</span>) anyerror!<span class="kw">void</span>,
+        sync:      *const fn (ptr: *anyopaque) anyerror!<span class="kw">void</span>,
+        mapsize:   *const fn (ptr: *anyopaque) <span class="ty">u64</span>,
+    };</code></pre>
+
+<p><code>PageStore</code> 是经典的两字段 vtable 模式：<code>ptr</code> 是不透明指针（指向具体实现，如
+<code>*MemPageStore</code>），<code>vtable</code> 是指向函数指针表的指针。值类型 <code>PageStore</code> 本身是可拷贝的
+（一个指针 + 一个指针），在调用栈/结构体字段间传递零开销。<code>PageStore</code> 不拥有 <code>ptr</code> 的生命周期——
+调用方保证实现存活期长于所有借用。</p>
+
+<div class="card">
+<p><b>为什么不用 Zig 接口（<code>iface</code>）/trait？</b>Zig 0.14 没有内置 trait 系统，
+<code>*anyopaque</code> + 函数指针表是社区惯用的「手写 vtable」模式，与 C ABI 友好、
+无隐藏分配、可跨实现复用同一份调用胶水。代价是每个实现要手写 8 个 <code>vtXxx</code> 转发函数——
+但每个函数体都是 <code>@ptrCast @alignCast</code> + 转调一行，模板化、低风险。</p>
+</div>
+
+<h3>1.4 八个虚方法逐个拆解</h3>
+
+<table>
+<tr><th>方法</th><th>签名</th><th>语义与设计点</th></tr>
+<tr>
+  <td><code>allocPage</code></td>
+  <td><code>() !u32</code></td>
+  <td>分配一页，返页号。优先从 freelist 回收链取（LIFO，局部性好），退路是 bump <code>next_free</code>。
+      <b>不返页数据</b>——调用方拿到页号后再用 <code>writePage</code> 取可写切片。这是 COW B-tree 写路径的关键：
+      先 copy-on-write 分配新页号，再把旧页内容拷进去改。</td>
+</tr>
+<tr>
+  <td><code>freePage</code></td>
+  <td><code>(page_no) void</code></td>
+  <td>回收页号入 freelist。<b>不释放页数据</b>（内存版页地址稳定要复用，mmap 版页就是文件区段）。
+      不报错——回收一个未分配的页是调用方 bug，但接口选择静默吞掉以简化 COW 回滚路径。</td>
+</tr>
+<tr>
+  <td><code>readPage</code></td>
+  <td><code>(page_no) ![]const u8</code></td>
+  <td>返只读切片，<b>零拷贝</b>。内存版直接借页指针 <code>[0..]</code>；mmap 版借 mmap 区指针。
+      切片生命期绑定到实现（页不被重写/释放前有效）。B-tree 读路径 <code>getBorrowed</code> 依赖此零拷贝。</td>
+</tr>
+<tr>
+  <td><code>writePage</code></td>
+  <td><code>(page_no) ![]u8</code></td>
+  <td>返可写切片。可能触发 <code>ensurePage</code>（内存版按需堆分配新页）。注意是「按页号取可写缓冲」，
+      不是「写入数据」——调用方拿到切片自己 <code>memcpy</code>。</td>
+</tr>
+<tr>
+  <td><code>readMeta</code></td>
+  <td><code>() !?MetaPage</code></td>
+  <td>读双 meta 页，返合法者（或 <code>null</code> 表空库）。委托 <code>f2.readMetaPage(&amp;meta0,&amp;meta1)</code>
+      做交替恢复：<b>校验 CRC + 比对 sequence 取较新合法者</b>。崩溃恢复的核心。</td>
+</tr>
+<tr>
+  <td><code>writeMeta</code></td>
+  <td><code>(*const MetaPage) !void</code></td>
+  <td>交替写 <code>meta0</code>/<code>meta1</code>（<code>meta_index</code> 翻转 0↔1）。写完再翻 index，
+      保证任一时刻总有一份合法旧 meta，崩溃后 <code>readMeta</code> 仍能恢复到上一致点。</td>
+</tr>
+<tr>
+  <td><code>sync</code></td>
+  <td><code>() !void</code></td>
+  <td>刷盘（<code>fsync</code>）。内存版是空操作；mmap 版 <code>msync(MS_SYNC)</code>。
+      事务提交时由 <code>db.zig</code> 调用，保证 meta 写入落盘后才算提交。</td>
+</tr>
+<tr>
+  <td><code>mapsize</code></td>
+  <td><code>() u64</code></td>
+  <td>页数上限。内存版返 <code>max_pages</code>；mmap 版返预留区页数。供 <code>allocPage</code> 判
+      <code>MapFull</code>，也供上层预算容量。</td>
+</tr>
+</table>
+
+<h3>1.5 转发胶水方法</h3>
+
+<pre><code>    <span class="kw">pub fn</span> <span class="fn">allocPage</span>(self: <span class="ty">PageStore</span>) !<span class="ty">u32</span> {
+        <span class="kw">return</span> self.vtable.allocPage(self.ptr);
+    }
+    <span class="kw">pub fn</span> <span class="fn">freePage</span>(self: <span class="ty">PageStore</span>, page_no: <span class="ty">u32</span>) <span class="kw">void</span> {
+        self.vtable.freePage(self.ptr, page_no);
+    }
+    <span class="cm">// ... readPage / writePage / readMeta / writeMeta / sync / mapsize 同形</span>
+    <span class="kw">pub fn</span> <span class="fn">mapsize</span>(self: <span class="ty">PageStore</span>) <span class="ty">u64</span> {
+        <span class="kw">return</span> self.vtable.mapsize(self.ptr);
+    }</code></pre>
+
+<p>这 8 个公共方法是「语法糖」：把 <code>store.vtable.fn(store.ptr, args...)</code> 折叠成
+<code>store.fn(args...)</code>。调用方（<code>btree.zig</code>、<code>db.zig</code>）只见 <code>PageStore</code> 值类型，
+不直接碰 <code>vtable</code>/<code>ptr</code>——实现可替换性就建立在这一层间接上。每个方法体单行透传，
+编译期内联后零额外开销。</p>
+
+<div class="note warn"><b>零拷贝借用的生命期陷阱：</b><code>readPage</code> 返的 <code>[]const u8</code> 借自实现内部缓冲。
+调用方必须确保在下次可能重写/扩容该页的操作前用完。内存版刻意把页做成独立堆分配（地址稳定）
+以缓解此问题（详见第二部分）；mmap 版则因整个区是固定映射、页地址永不变而天然安全。
+B-tree 写路径在分配新页前先把旧页内容拷到栈缓冲，正是为了避免「allocPage 扩容导致借用切片悬垂」。</div>
+
+<h3>1.6 调用方如何拿到一个 PageStore</h3>
+
+<p>接口侧只定义了形状，具体实现的实例化由各实现自己提供。以内存版为例（完整实现见第二部分）：</p>
+
+<pre><code><span class="kw">pub const</span> <span class="ty">MemPageStore</span> = <span class="kw">struct</span> {
+    <span class="cm">// ... 字段略</span>
+    <span class="kw">pub fn</span> <span class="fn">store</span>(self: *<span class="ty">MemPageStore</span>) <span class="ty">PageStore</span> {
+        <span class="kw">return</span> .{ .ptr = self, .vtable = &amp;mem_vtable };
+    }
+};
+
+<span class="kw">const</span> mem_vtable: <span class="ty">PageStore.VTable</span> = .{
+    .allocPage  = MemPageStore.vtAllocPage,
+    .freePage   = MemPageStore.vtFreePage,
+    .readPage   = MemPageStore.vtReadPage,
+    .writePage  = MemPageStore.vtWritePage,
+    .readMeta   = MemPageStore.vtReadMeta,
+    .writeMeta  = MemPageStore.vtWriteMeta,
+    .sync       = MemPageStore.vtSync,
+    .mapsize    = MemPageStore.vtMapSize,
+};</code></pre>
+
+<p><code>store()</code> 把 <code>*MemPageStore</code> 装箱成 <code>PageStore</code>：<code>ptr</code> 指向自实例，
+<code>vtable</code> 指向静态 <code>mem_vtable</code>。<code>mem_vtable</code> 是编译期常量结构体字面量，8 个槽各绑一个
+<code>vtXxx</code> 转发函数。调用 <code>s.allocPage()</code> 最终落到
+<code>MemPageStore.vtAllocPage(ptr)</code> → <code>@ptrCast @alignCast(ptr)</code> → 真实方法。</p>
+
+<div class="flow">
+<span class="step">调用方 <code>s.allocPage()</code></span>
+<span class="arrow">→</span>
+<span class="step">vtable.allocPage(ptr)</span>
+<span class="arrow">→</span>
+<span class="step"><code>vtAllocPage</code> <code>@ptrCast</code></span>
+<span class="arrow">→</span>
+<span class="step"><code>MemPageStore</code> 真实方法</span>
+</div>
+
+<h3>1.7 上层如何使用这个接口</h3>
+
+<p><code>btree.zig</code> 的所有 I/O 都只持有 <code>PageStore</code>（按值传递），对底下是内存还是 mmap 无感知：</p>
+
+<pre><code><span class="cm">// btree.zig</span>
+<span class="kw">const</span> PageStore = ps.PageStore;
+
+<span class="kw">pub fn</span> <span class="fn">readNodePayload</span>(store: <span class="ty">PageStore</span>, page_no: <span class="ty">u32</span>) ![]const <span class="ty">u8</span> {
+    <span class="kw">return</span> store.readPage(page_no);  <span class="cm">// 零拷贝借用</span>
+}
+
+<span class="kw">pub fn</span> <span class="fn">writeNodePage</span>(store: <span class="ty">PageStore</span>, page_no: <span class="ty">u32</span>, ...) !<span class="kw">void</span> {
+    <span class="kw">const</span> page = <span class="kw">try</span> store.writePage(page_no);  <span class="cm">// 取可写切片</span>
+    <span class="cm">// memcpy 节点数据进 page ...</span>
+}</code></pre>
+
+<p><code>db.zig</code> 在打开库时用 <code>readMeta</code> 恢复状态，提交时用 <code>writeMeta</code> + <code>sync</code> 落盘：</p>
+
+<pre><code><span class="cm">// db.zig: open</span>
+<span class="kw">if</span> (<span class="kw">try</span> store.readMeta()) |meta| {
+    <span class="cm">// 恢复 root_page / sequence / freelist ...</span>
+}
+<span class="cm">// db.zig: commit</span>
+<span class="kw">try</span> self.store.writeMeta(&amp;meta);
+<span class="kw">try</span> self.store.sync();  <span class="cm">// 内存版 no-op，mmap 版 msync</span></code></pre>
+
+<h3>1.8 设计取舍小结</h3>
+
+<div class="card">
+<ul>
+<li><b>接口与首实现同文件</b>：避免空接口先行抽象。接口有了，马上跟一个内存实现验证形状可用，再上 mmap 版。</li>
+<li><b>页号作分配句柄，不返页数据</b>：<code>allocPage</code> 只返 <code>u32</code>。写者随后 <code>writePage</code> 取缓冲，
+    读者 <code>readPage</code> 借切片。这样分配与读写解耦，COW B-tree 可「分配→拷旧页→改→原子提交」。</li>
+<li><b>零拷贝借用</b>：<code>readPage</code> 不拷数据。性能靠此，但把生命期管理责任下放到实现（页地址要稳定）和调用方（用完前别重写）。</li>
+<li><b>双 meta 交替写</b>：<code>readMeta</code>/<code>writeMeta</code> 把崩溃恢复下沉到接口层，上层不用关心 meta0 还是 meta1 合法。</li>
+<li><b><code>anyerror</code> 透传</b>：虚方法用 <code>anyerror!T</code>，实现可抛任意错误（<code>MapFull</code>、<code>OutOfMemory</code>、<code>PageNotFound</code>），不需为每种实现定义并集错误集。</li>
+<li><b><code>sync</code> 进接口</b>：把「持久化」作为一等公民。内存版空实现仍要提供，保证调用方代码在两种实现下一致。</li>
+</ul>
+</div>
+
+<div class="note danger"><b>风险点：</b>vtable 是 <code>*const VTable</code>（指针），实现侧 <code>mem_vtable</code> 必须是静态/全局存储
+（这里用文件级 <code>const</code>，进只读段，安全）。若误把它放成栈局部变量再取地址装箱，<code>store()</code> 返回后
+<code>vtable</code> 即成悬垂指针。当前实现正确，但新增实现时须保持「vtable 是编译期常量」这一不变量。</div>
+
+<p class="muted">第一部分到此。下一部分（第二部分）讲解 <code>MemPageStore</code> 的具体实现：slab 页池、freelist、互斥锁、
+以及为修复并发写者借用悬垂而引入的独立堆分配策略。</p>
+</section>
+
+
+<section class="lecture">
+<h2><span class="no">第二部分</span>MemPageStore 内存实现</h2>
+
+<p>上一部分讲解了 <code>PageStore</code> 抽象层与 VTable 多态接口。本部分聚焦其内存实现
+<code>MemPageStore</code>——一个不持久化、专用于测试的页 Store。它完整实现了 VTable 的全部
+七个方法，是我们理解"一个页 Store 需要做什么"的最小可运行范例，也浓缩了生产级
+<code>FilePageStore</code>（mmap）将复用的核心设计：slab 页池、freelist 回收、互斥锁、meta 双页
+交替写，以及 <code>ensurePage</code> 的部分失败回滚。</p>
+
+<div class="card">
+<p><strong>定位：</strong><code>MemPageStore</code> 是"内存里的页仓库"。每个页是一块独立的 4096 字节堆分配，
+按页号索引。它不落盘、不跨进程，生命周期随进程结束。但它精确模拟了真实页 Store 的分配/回收/读写
+语义，因此被 <code>page_store_test.zig</code> 及上层 B-tree 测试大量使用。</p>
+</div>
+
+<h3>结构体与关键字段</h3>
+
+<p>先看 <code>MemPageStore</code> 的字段定义，每个字段都对应一个设计决策：</p>
+
+<pre><code><span class="kw">pub const</span> <span class="ty">MemPageStore</span> = <span class="kw">struct</span> {
+    allocator: <span class="ty">std.mem.Allocator</span>,
+    <span class="cm">// slab 页池：按页号索引的页指针数组</span>
+    pages: <span class="ty">std.ArrayList</span>(*[f2.PAGE_SIZE]<span class="ty">u8</span>),
+    freelist: <span class="ty">std.ArrayList</span>(<span class="ty">u32</span>),
+    <span class="cm">// pages/freelist 互斥锁</span>
+    freelist_mu: <span class="ty">zio.Mutex</span>,
+    next_free: <span class="ty">u32</span>,
+    max_pages: <span class="ty">u32</span>,
+    meta0: [f2.PAGE_SIZE]<span class="ty">u8</span>,
+    meta1: [f2.PAGE_SIZE]<span class="ty">u8</span>,
+    meta_index: <span class="ty">u32</span>,
+};</code></pre>
+
+<table>
+<tr><th>字段</th><th>类型</th><th>作用</th></tr>
+<tr><td><code>pages</code></td><td><code>ArrayList(*[PAGE_SIZE]u8)</code></td><td>slab 页池：页号 → 页指针。指针数组可扩容移动，但每页是独立堆分配，页数据地址稳定</td></tr>
+<tr><td><code>freelist</code></td><td><code>ArrayList(u32)</code></td><td>已回收页号栈（LIFO），<code>allocPage</code> 优先从中取</td></tr>
+<tr><td><code>freelist_mu</code></td><td><code>zio.Mutex</code></td><td>串行化 <code>pages</code>/<code>freelist</code> 的所有读写访问</td></tr>
+<tr><td><code>next_free</code></td><td><code>u32</code></td><td>bump 分配游标，初始值 <code>FIRST_DATA_PAGE = 3</code></td></tr>
+<tr><td><code>max_pages</code></td><td><code>u32</code></td><td>页数上限（对应 <code>mapsize</code>），超限返回 <code>MapFull</code></td></tr>
+<tr><td><code>meta0 / meta1</code></td><td><code>[PAGE_SIZE]u8</code></td><td>两个 meta 页的独立缓冲区，交替写入实现 crash 安全</td></tr>
+<tr><td><code>meta_index</code></td><td><code>u32</code></td><td>下次写哪个 meta（0 或 1），写后翻转</td></tr>
+</table>
+
+<h3>设计要点：为什么每页独立堆分配？</h3>
+
+<div class="note">
+<p><strong>核心设计：</strong><code>pages</code> 是 <code>ArrayList(*[PAGE_SIZE]u8)</code>——存的是<strong>指针</strong>而非内联页数据。
+<code>ArrayList</code> 扩容时会整体搬移元素（指针移动），但每页的堆分配地址不变。这意味着读者通过
+<code>readPage</code> 拿到的 <code>[]const u8</code> 借用切片，即使在 <code>unlock</code> 后另一个写者
+<code>allocPage</code> 触发了 <code>pages</code> 扩容，切片指向的页数据地址仍然有效，不会悬垂。</p>
+</div>
+
+<div class="note danger">
+<p><strong>修复的历史 bug：</strong>若 <code>pages</code> 直接存内联页（<code>ArrayList([PAGE_SIZE]u8)</code>），
+扩容会整体搬移所有页数据，此时已借出的切片立即悬垂 → 并发读写下 SEGV。改为存指针是刻意的修复，
+代码注释明确标注了这一点。这是"地址稳定性优先于访问局部性"的典型取舍。</p>
+</div>
+
+<h3>init / deinit / store</h3>
+
+<p><code>init</code> 初始化各字段，页<strong>按需</strong>在 <code>ensurePage</code> 中分配（不在 init 预分配），
+<code>next_free</code> 从 <code>FIRST_DATA_PAGE = 3</code> 起步，保留页号 0（NULL）、1（meta0）、2（meta1）。</p>
+
+<pre><code><span class="kw">pub fn</span> <span class="fn">init</span>(allocator: <span class="ty">std.mem.Allocator</span>, mapsize_pages: <span class="ty">u32</span>) <span class="ty">MemPageStore</span> {
+    <span class="kw">const</span> self: <span class="ty">MemPageStore</span> = .{
+        .allocator = allocator,
+        .pages = .empty,
+        .freelist = .empty,
+        .freelist_mu = .{},
+        .next_free = <span class="ty">FIRST_DATA_PAGE</span>, <span class="cm">// = 3</span>
+        .max_pages = mapsize_pages,
+        .meta0 = [_]<span class="ty">u8</span>{<span class="nu">0</span>} ** f2.PAGE_SIZE,
+        .meta1 = [_]<span class="ty">u8</span>{<span class="nu">0</span>} ** f2.PAGE_SIZE,
+        .meta_index = <span class="nu">0</span>,
+    };
+    <span class="kw">return</span> self;
+}</code></pre>
+
+<p><code>deinit</code> 遍历 <code>pages</code> 逐个 <code>destroy</code> 每页的堆分配，再释放两个 ArrayList。
+注意这里 <code>ensurePage</code> 的回滚正确性至关重要——若回滚不彻底，<code>pages</code> 中可能残留
+<code>undefined</code> 指针，<code>deinit</code> 的 <code>destroy</code> 会解引用垃圾地址（见下文 F1）。</p>
+
+<pre><code><span class="kw">pub fn</span> <span class="fn">deinit</span>(self: *<span class="ty">MemPageStore</span>) <span class="ty">void</span> {
+    <span class="kw">for</span> (self.pages.items) |p| self.allocator.destroy(p);
+    self.pages.deinit(self.allocator);
+    self.freelist.deinit(self.allocator);
+}
+
+<span class="kw">pub fn</span> <span class="fn">store</span>(self: *<span class="ty">MemPageStore</span>) <span class="ty">PageStore</span> {
+    <span class="kw">return</span> .{ .ptr = self, .vtable = &mem_vtable };
+}</code></pre>
+
+<p><code>store()</code> 构造 <code>PageStore</code> 多态句柄：<code>ptr</code> 指向自身，<code>vtable</code> 指向
+模块级 <code>mem_vtable</code> 常量。上层代码拿到 <code>PageStore</code> 后即可通过统一接口操作，无需知道底层是内存还是文件实现。</p>
+
+<h3>ensurePage：按需分配页 + 部分失败回滚</h3>
+
+<p><code>ensurePage(index)</code> 是 slab 页池的扩容核心，确保 <code>pages</code> 数组覆盖到 <code>index</code>。
+若 <code>index</code> 已在范围内直接返回；否则先用 <code>appendNTimes</code> 扩容指针数组（填 <code>undefined</code>），
+再逐个为空槽堆分配真实页并清零。<strong>调用方必须持有 <code>freelist_mu</code>。</strong></p>
+
+<pre><code><span class="kw">fn</span> <span class="fn">ensurePage</span>(self: *<span class="ty">MemPageStore</span>, index: <span class="ty">u32</span>) !<span class="ty">void</span> {
+    <span class="kw">if</span> (index < self.pages.items.len) <span class="kw">return</span>;
+    <span class="kw">if</span> (index >= self.max_pages) <span class="kw">return error</span>.MapFull;
+    <span class="kw">const</span> old_len = self.pages.items.len;
+    <span class="kw">try</span> self.pages.appendNTimes(self.allocator, <span class="kw">undefined</span>,
+        @<span class="kw">as</span>(<span class="ty">usize</span>, index) + <span class="nu">1</span> - old_len);
+    <span class="kw">var</span> i: <span class="ty">usize</span> = old_len;
+    <span class="kw">while</span> (i < self.pages.items.len) : (i += <span class="nu">1</span>) {
+        self.pages.items[i] = self.allocator.create([f2.PAGE_SIZE]<span class="ty">u8</span>) <span class="kw">catch</span> {
+            <span class="cm">// 部分失败回滚: 销毁本次已分配的页, 收缩指针数组 (F1)</span>
+            <span class="kw">var</span> j: <span class="ty">usize</span> = old_len;
+            <span class="kw">while</span> (j < i) : (j += <span class="nu">1</span>) self.allocator.destroy(self.pages.items[j]);
+            self.pages.shrinkRetainingCapacity(old_len);
+            <span class="kw">return error</span>.OutOfMemory;
+        };
+        self.pages.items[i].* = [_]<span class="ty">u8</span>{<span class="nu">0</span>} ** f2.PAGE_SIZE;
+    }
+}</code></pre>
+
+<div class="note warn">
+<p><strong>部分失败回滚（F1）：</strong>循环中某次 <code>create</code> 失败时，必须销毁 <code>[old_len, i)</code>
+范围内本次已成功分配的页，再用 <code>shrinkRetainingCapacity(old_len)</code> 把指针数组收缩回
+<code>old_len</code>。否则 <code>pages</code> 中会残留 <code>undefined</code> 指针，后续 <code>deinit</code> 的
+<code>destroy</code> 会解引用垃圾地址导致未定义行为。这是"扩容两步走"（先扩数组再填页）必须配套的回滚逻辑。</p>
+</div>
+
+<div class="note">
+<p><strong>为什么先 <code>appendNTimes</code> 再逐个分配？</strong><code>appendNTimes</code> 一次性把指针数组扩到目标长度
+（填 <code>undefined</code> 占位），避免循环内逐个 append 的多次扩容抖动。随后循环只需填值，逻辑清晰。
+代价是 <code>appendNTimes</code> 本身可能 <code>OutOfMemory</code>——但此时尚未分配任何页，无回滚负担，直接传播错误即可。</p>
+</div>
+
+<h3>allocPage / freePage：分配与回收</h3>
+
+<p><code>vtAllocPage</code> 是分配入口，优先从 freelist 取（LIFO 回收的页号），取不到再 bump 分配。
+全程持锁。</p>
+
+<pre><code><span class="kw">fn</span> <span class="fn">vtAllocPage</span>(ptr: *<span class="ty">anyopaque</span>) !<span class="ty">u32</span> {
+    <span class="kw">const</span> self: *<span class="ty">MemPageStore</span> = @ptrCast(@alignCast(ptr));
+    self.freelist_mu.lockUncancelable();
+    <span class="kw">defer</span> self.freelist_mu.unlock();
+    <span class="kw">if</span> (self.freelist.items.len > <span class="nu">0</span>) <span class="kw">return</span> self.freelist.pop().?;
+    <span class="kw">const</span> pn = self.next_free;
+    <span class="kw">if</span> (pn >= self.max_pages) <span class="kw">return error</span>.MapFull;
+    <span class="kw">try</span> self.ensurePage(pn);
+    self.next_free = pn + <span class="nu">1</span>;
+    <span class="kw">return</span> pn;
+}</code></pre>
+
+<div class="flow">
+<span class="step">freelist 非空?</span>
+<span class="arrow">→ 是</span>
+<span class="step">pop() LIFO 取页号</span>
+<span class="arrow">→ 否</span>
+<span class="step">pn = next_free</span>
+<span class="arrow">→</span>
+<span class="step">ensurePage(pn)</span>
+<span class="arrow">→</span>
+<span class="step">next_free++</span>
+</div>
+
+<p><code>vtFreePage</code> 把页号追加到 freelist（LIFO）。<strong>不释放页数据</strong>——页指针仍留在
+<code>pages</code> 中，下次 <code>allocPage</code> 直接复用。append 失败时静默忽略（<code>catch {}</code>），
+因为 freelist 丢失最坏只是页不可复用，不应因回收失败而中断调用方。</p>
+
+<pre><code><span class="kw">fn</span> <span class="fn">vtFreePage</span>(ptr: *<span class="ty">anyopaque</span>, page_no: <span class="ty">u32</span>) <span class="ty">void</span> {
+    <span class="kw">const</span> self: *<span class="ty">MemPageStore</span> = @ptrCast(@alignCast(ptr));
+    self.freelist_mu.lockUncancelable();
+    <span class="kw">defer</span> self.freelist_mu.unlock();
+    self.freelist.append(self.allocator, page_no) <span class="kw">catch</span> {};
+}</code></pre>
+
+<h3>readPage / writePage：页读写与锁粒度</h3>
+
+<p>读写页对 meta 页号（1、2）特判，直接返回 <code>meta0</code>/<code>meta1</code> 缓冲区，不走 <code>pages</code>。
+普通页则持锁后索引 <code>pages</code>。<code>writePage</code> 会先 <code>ensurePage</code> 确保页存在再返回可变切片。</p>
+
+<pre><code><span class="kw">fn</span> <span class="fn">vtReadPage</span>(ptr: *<span class="ty">anyopaque</span>, page_no: <span class="ty">u32</span>) ![]<span class="kw">const</span> <span class="ty">u8</span> {
+    <span class="kw">const</span> self: *<span class="ty">MemPageStore</span> = @ptrCast(@alignCast(ptr));
+    <span class="kw">if</span> (page_no == f2.META_PAGE_0) <span class="kw">return</span> &self.meta0;
+    <span class="kw">if</span> (page_no == f2.META_PAGE_1) <span class="kw">return</span> &self.meta1;
+    self.freelist_mu.lockUncancelable();
+    <span class="kw">defer</span> self.freelist_mu.unlock();
+    <span class="kw">if</span> (page_no >= self.pages.items.len) <span class="kw">return error</span>.PageNotFound;
+    <span class="kw">return</span> self.pages.items[page_no][<span class="nu">0</span>..]; <span class="cm">// 切片在 unlock 后仍有效</span>
+}
+
+<span class="kw">fn</span> <span class="fn">vtWritePage</span>(ptr: *<span class="ty">anyopaque</span>, page_no: <span class="ty">u32</span>) ![]<span class="ty">u8</span> {
+    <span class="kw">const</span> self: *<span class="ty">MemPageStore</span> = @ptrCast(@alignCast(ptr));
+    <span class="kw">if</span> (page_no == f2.META_PAGE_0) <span class="kw">return</span> &self.meta0;
+    <span class="kw">if</span> (page_no == f2.META_PAGE_1) <span class="kw">return</span> &self.meta1;
+    self.freelist_mu.lockUncancelable();
+    <span class="kw">defer</span> self.freelist_mu.unlock();
+    <span class="kw">try</span> self.ensurePage(page_no);
+    <span class="kw">return</span> self.pages.items[page_no][<span class="nu">0</span>..];
+}</code></pre>
+
+<div class="note ok">
+<p><strong>锁粒度精巧：</strong><code>freelist_mu</code> 只保护 <code>pages</code> 指针数组的查找与扩容，<strong>不保护页数据内容</strong>。
+<code>readPage</code> 在锁内取到切片后立即 <code>unlock</code> 返回。因为每页是独立堆分配（地址稳定），
+切片在 <code>unlock</code> 后仍有效。这允许读者在锁外长时间持有切片读数据，写者可并行扩容 <code>pages</code>
+（不会移动已分配页的数据），仅短暂争用指针数组查找。这是地址稳定性设计带来的并发收益。</p>
+</div>
+
+<div class="note warn">
+<p><strong>注意：</strong><code>lockUncancelable</code> 而非 <code>lock</code>——选择不可取消的锁版本，避免在持锁期间
+因取消点导致锁泄漏。<code>defer unlock()</code> 保证异常路径也能释放。这是 Zig 错误传播 + 延迟释放的标准范式。</p>
+</div>
+
+<h3>readMeta / writeMeta：双页交替写（crash 安全）</h3>
+
+<p>meta 页是数据库的"根指针"——存 <code>root_page</code>、<code>sequence</code>、<code>free_head</code> 等关键元信息。
+一旦损坏，整个库不可用。<code>MemPageStore</code> 用两个 meta 页（<code>meta0</code>/<code>meta1</code>）交替写入来保证
+crash 安全：每次写 meta 先写其中一个，下次写另一个，读时取 <code>sequence</code> 大者。</p>
+
+<pre><code><span class="kw">fn</span> <span class="fn">vtReadMeta</span>(ptr: *<span class="ty">anyopaque</span>) !?f2.<span class="ty">MetaPage</span> {
+    <span class="kw">const</span> self: *<span class="ty">MemPageStore</span> = @ptrCast(@alignCast(ptr));
+    <span class="kw">return</span> f2.<span class="fn">readMetaPage</span>(&self.meta0, &self.meta1);
+}
+
+<span class="kw">fn</span> <span class="fn">vtWriteMeta</span>(ptr: *<span class="ty">anyopaque</span>, meta: *<span class="kw">const</span> f2.<span class="ty">MetaPage</span>) !<span class="ty">void</span> {
+    <span class="kw">const</span> self: *<span class="ty">MemPageStore</span> = @ptrCast(@alignCast(ptr));
+    <span class="kw">const</span> page = <span class="kw">if</span> (self.meta_index == <span class="nu">0</span>) &self.meta0 <span class="kw">else</span> &self.meta1;
+    f2.<span class="fn">writeMetaPage</span>(page, meta, self.meta_index);
+    self.meta_index = <span class="nu">1</span> - self.meta_index; <span class="cm">// 翻转 0↔1</span>
+}</code></pre>
+
+<div class="flow">
+<span class="step">meta_index=0 → 写 meta0</span>
+<span class="arrow">→</span>
+<span class="step">meta_index 翻转 → 1</span>
+<span class="arrow">→</span>
+<span class="step">meta_index=1 → 写 meta1</span>
+<span class="arrow">→</span>
+<span class="step">meta_index 翻转 → 0</span>
+<span class="arrow">→ ↻</span>
+</div>
+
+<p><code>readMetaPage</code>（定义在 <code>format.zig</code>）的核心逻辑是：分别尝试从 <code>meta0</code> 和 <code>meta1</code>
+解码，校验 checksum 与 magic/version，取 <code>sequence</code> 更大者返回。若只有一个有效，返回有效的那个；都无效返回 null。</p>
+
+<pre><code><span class="cm">// format.zig 中的读 meta 逻辑</span>
+<span class="kw">pub fn</span> <span class="fn">readMetaPage</span>(page0: *<span class="kw">const</span> [PAGE_SIZE]<span class="ty">u8</span>,
+                    page1: *<span class="kw">const</span> [PAGE_SIZE]<span class="ty">u8</span>) ?<span class="ty">MetaPage</span> {
+    <span class="kw">const</span> m0 = <span class="fn">readMetaPageSingle</span>(page0);
+    <span class="kw">const</span> m1 = <span class="fn">readMetaPageSingle</span>(page1);
+    <span class="kw">if</span> (m0 == <span class="kw">null</span> <span class="kw">and</span> m1 == <span class="kw">null</span>) <span class="kw">return null</span>;
+    <span class="kw">if</span> (m0 == <span class="kw">null</span>) <span class="kw">return</span> m1;
+    <span class="kw">if</span> (m1 == <span class="kw">null</span>) <span class="kw">return</span> m0;
+    <span class="kw">return if</span> (m0.?.sequence >= m1.?.sequence) m0 <span class="kw">else</span> m1;
+}</code></pre>
+
+<div class="note ok">
+<p><strong>crash 安全原理：</strong>假设写 meta0 时崩溃——meta1 仍保留上次完整写入，<code>readMetaPage</code>
+会取到 meta1（meta0 checksum 校验失败返回 null，只剩 m1）。下次写会写 meta1（因为 index 已翻转），覆盖
+那个损坏的旧值……不，交替写保证每次写的是<strong>另一个</strong>页。只要任一页完好且 sequence 最新，
+恢复就能成功。两页轮流牺牲，互为备份。</p>
+</div>
+
+<div class="note warn">
+<p><strong>MemPageStore 的局限：</strong>因为是内存实现，crash 后整个 <code>MemPageStore</code> 随进程消失，
+双页恢复机制在此并无实际意义——它的价值在于<strong>语义对齐</strong>：上层代码用 <code>MemPageStore</code> 测试时，
+meta 读写行为与未来的 <code>FilePageStore</code> 完全一致，测试可无缝迁移。真正的 crash 安全在 <code>FilePageStore</code>
++ mmap + fsync 时才生效。</p>
+</div>
+
+<h3>sync / mapsize：收尾方法</h3>
+
+<p><code>vtSync</code> 是空实现——内存无需 fsync。但它必须存在以满足 VTable 契约，上层调用
+<code>store.sync()</code> 时不会因实现缺失而失败。</p>
+
+<pre><code><span class="kw">fn</span> <span class="fn">vtSync</span>(ptr: *<span class="ty">anyopaque</span>) !<span class="ty">void</span> {
+    _ = ptr; <span class="cm">// 内存实现无需 fsync</span>
+}
+
+<span class="kw">fn</span> <span class="fn">vtMapSize</span>(ptr: *<span class="ty">anyopaque</span>) <span class="ty">u64</span> {
+    <span class="kw">const</span> self: *<span class="ty">MemPageStore</span> = @ptrCast(@alignCast(ptr));
+    <span class="kw">return</span> self.max_pages;
+}</code></pre>
+
+<p><code>vtMapSize</code> 返回 <code>max_pages</code>，即页数上限。上层用此判断是否还有分配空间（对应 mmap
+的 <code>mapsize</code>）。</p>
+
+<h3>mem_vtable：VTable 实例</h3>
+
+<p>模块级常量 <code>mem_vtable</code> 把七个函数指针打包成 <code>PageStore.VTable</code> 结构。
+<code>MemPageStore.store()</code> 返回的 <code>PageStore</code> 即引用此表。这是 Zig 手动多态的标准范式：</p>
+
+<pre><code><span class="kw">const</span> mem_vtable: <span class="ty">PageStore.VTable</span> = .{
+    .allocPage  = MemPageStore.vtAllocPage,
+    .freePage   = MemPageStore.vtFreePage,
+    .readPage   = MemPageStore.vtReadPage,
+    .writePage  = MemPageStore.vtWritePage,
+    .readMeta   = MemPageStore.vtReadMeta,
+    .writeMeta  = MemPageStore.vtWriteMeta,
+    .sync       = MemPageStore.vtSync,
+    .mapsize    = MemPageStore.vtMapSize,
+};</code></pre>
+
+<h3>设计总结与风险清单</h3>
+
+<div class="card">
+<p><strong>设计亮点：</strong></p>
+<ol>
+<li><strong>slab 页池 + 指针数组：</strong>每页独立堆分配保证地址稳定，读者切片不因扩容悬垂，并发读写安全。</li>
+<li><strong>LIFO freelist：</strong>回收页号优先复用，减少 bump 游标增长；不释放页数据，复用零开销。</li>
+<li><strong>锁粒度最小化：</strong>锁只护指针数组查找/扩容，页数据访问在锁外，并发性好。</li>
+<li><strong>meta 双页交替写：</strong>语义对齐 FilePageStore，crash 安全逻辑可测可复用。</li>
+<li><strong>ensurePage 部分失败回滚：</strong>两步扩容配套彻底回滚，杜绝 <code>undefined</code> 指针残留。</li>
+</ol>
+</div>
+
+<table>
+<tr><th>风险点</th><th>说明</th><th>缓解</th></tr>
+<tr><td>freelist append 静默失败</td><td><code>freePage</code> 的 <code>catch {}</code> 丢失回收页号</td><td>最坏只是页不可复用（仍占内存），不影响正确性；deinit 统一释放</td></tr>
+<tr><td>readPage 越界</td><td><code>page_no >= pages.len</code> 返回 <code>PageNotFound</code></td><td>显式边界检查，调用方须处理 error</td></tr>
+<tr><td>MapFull</td><td><code>next_free >= max_pages</code> 或 <code>ensurePage</code> 超限</td><td>上层应预检 <code>mapsize()</code> 或捕获 <code>MapFull</code></td></tr>
+<tr><td>meta_index 无锁</td><td><code>vtWriteMeta</code> 读写 <code>meta_index</code> 未持 <code>freelist_mu</code></td><td>设计上 meta 写由单一 writer 串行调用（上层 <code>db.zig</code> 保证），非并发热点</td></tr>
+<tr><td>不持久化</td><td>进程结束数据全失</td><td>仅用于测试；生产用 <code>FilePageStore</code></td></tr>
+</table>
+
+<p class="muted">MemPageStore 以最小代价完整实现了页 Store 契约。它的每一处设计——指针数组、LIFO freelist、
+锁粒度、meta 双页、回滚——都不是随意的，而是为语义对齐与未来 FilePageStore 复用服务。理解它，就理解了
+cube_db 页存储层的骨架。</p>
+</section>
+
+
+<footer>
+  <p>cube_db — 页 Store 讲义 · 由 herdr 多 agent 团队协作生成（conductor + w1-impl + w1-review）</p>
+</footer>
+
+</div>
+</body>
+</html>
