@@ -1,0 +1,893 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>cube_db · src/file_page_store.zig 讲义</title>
+<style>
+:root{
+  --bg:#0f1117; --panel:#171a23; --panel2:#1e2230; --border:#2a2f3f;
+  --fg:#e6e9f0; --muted:#9aa3b5; --accent:#5b9dff; --accent2:#8b6cff;
+  --green:#3ddc84; --red:#ff5c5c; --yellow:#ffd166; --cyan:#4dd0e1;
+  --code:#0d0f14;
+  --mono:"SF Mono","JetBrains Mono","Menlo",Consolas,monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font-family:-apple-system,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+  line-height:1.7;}
+.wrap{max-width:1000px;margin:0 auto;padding:32px 20px 80px;}
+header.hero{border-bottom:1px solid var(--border);padding-bottom:24px;margin-bottom:28px;}
+header.hero h1{font-size:2rem;margin:0 0 6px;}
+header.hero .sub{color:var(--muted);}
+.tag{display:inline-block;padding:2px 10px;border-radius:20px;font-size:.78rem;
+  border:1px solid var(--border);color:var(--muted);margin-right:6px;}
+h2{font-size:1.45rem;margin-top:48px;padding-bottom:8px;border-bottom:1px solid var(--border);}
+h2 .no{color:var(--accent);margin-right:8px;}
+h3{font-size:1.12rem;margin-top:28px;color:var(--cyan);}
+p{color:var(--fg);}
+.muted{color:var(--muted);}
+pre{background:var(--code);border:1px solid var(--border);border-radius:10px;
+  padding:16px 18px;overflow-x:auto;font-family:var(--mono);font-size:.85rem;line-height:1.6;}
+code{font-family:var(--mono);font-size:.85em;background:var(--panel2);
+  padding:1px 6px;border-radius:5px;}
+pre code{background:none;padding:0;}
+.kw{color:var(--accent2);} .ty{color:var(--cyan);} .cm{color:#6b7488;}
+.st{color:var(--green);} .nu{color:var(--yellow);} .fn{color:var(--accent);}
+.note{background:var(--panel);border-left:4px solid var(--accent);border-radius:0 10px 10px 0;
+  padding:12px 16px;margin:18px 0;}
+.note.warn{border-left-color:var(--yellow);}
+.note.danger{border-left-color:var(--red);}
+.note.ok{border-left-color:var(--green);}
+table{border-collapse:collapse;width:100%;margin:16px 0;font-size:.92rem;}
+th,td{border:1px solid var(--border);padding:8px 12px;text-align:left;}
+th{background:var(--panel2);}
+tr:nth-child(even) td{background:var(--panel);}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:18px 22px;margin:18px 0;}
+.flow{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:16px 0;}
+.flow .step{background:var(--panel2);border:1px solid var(--border);border-radius:8px;
+  padding:8px 14px;font-size:.9rem;}
+.flow .arrow{color:var(--accent);font-weight:bold;}
+ul,ol{padding-left:22px;}
+li{margin:4px 0;}
+a{color:var(--accent);}
+section.lecture{scroll-margin-top:16px;}
+footer{margin-top:64px;border-top:1px solid var(--border);padding-top:16px;color:var(--muted);font-size:.85rem;}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <h1>cube_db · <code>src/file_page_store.zig</code> 讲义</h1>
+  <div class="sub">生产级文件页 Store —— 1TB 预留 mmap 区、按需增长、PageStore 接口实现</div>
+  <div style="margin-top:12px">
+    <span class="tag">Zig 0.16</span>
+    <span class="tag">mmap MAP_SHARED</span>
+    <span class="tag">vtable 多态</span>
+    <span class="tag">崩溃恢复</span>
+    <span class="tag">LMDB 式预留</span>
+  </div>
+</header>
+
+<p class="muted">本讲义由开发团队协作生成。两个部分分别讲解 mmap 预留机制与 PageStore 接口实现；代码块附逐行解释。</p>
+
+<section class="lecture">
+<h2><span class="no">第三部分</span>mmap 预留区与按需增长 + FilePageStore 初始化/生命周期</h2>
+
+<p><code>src/file_page_store.zig</code> 是生产级页 Store。与测试用的 <code>MemPageStore</code>（堆分配页池）不同，
+它把整个数据库视作一个 LMDB 式 1TB 预留 mmap 区：open 时一次性 <code>mmap</code> 占位 1TB 虚拟地址，
+文件按需 <code>ftruncate</code> 增长，读写经同一 mmap 指针、零拷贝。本部分精讲它的预留思想、结构体字段、
+<code>init</code> 初始化与崩溃恢复流程，以及生命周期方法。</p>
+
+<h3>3.1 文件头注释与设计思路</h3>
+
+<pre><code><span class="cm">//! file_page_store.zig — 文件页 Store（LMDB 式 1TB 预留 mmap 区）</span>
+<span class="cm">//!</span>
+<span class="cm">//! open 时 mmap 1TB MAP_SHARED 预留虚拟区（方案 I，spike_mmap.zig 已验证 macOS 可行）。</span>
+<span class="cm">//! 文件按需 ftruncate 增长，reader 经同一 mmap 指针读新数据，无 SIGBUS、无需重 mmap。</span>
+<span class="cm">//! 写路径保留 PageStore 页接口（allocPage/freePage/writePage）；读路径零拷贝直接 mmap 指针。</span>
+<span class="kw">const</span> std = @import(<span class="st">"std"</span>);
+<span class="kw">const</span> f2 = @import(<span class="st">"format.zig"</span>);
+<span class="kw">const</span> ps = @import(<span class="st">"page_store.zig"</span>);
+<span class="kw">const</span> c = @cImport({
+    @cInclude(<span class="st">"sys/mman.h"</span>);
+    @cInclude(<span class="st">"sys/stat.h"</span>);
+    @cInclude(<span class="st">"fcntl.h"</span>);
+    @cInclude(<span class="st">"unistd.h"</span>);
+});
+
+<span class="kw">const</span> PAGE_SIZE = f2.PAGE_SIZE;</code></pre>
+
+<p>四个 C 头各司其职：<code>sys/mman.h</code> 提供 <code>mmap</code>/<code>munmap</code>/<code>MAP_SHARED</code>；
+<code>sys/stat.h</code> 提供 <code>fstat</code> 与 <code>struct stat</code>；<code>fcntl.h</code> 提供 <code>open</code> 与 <code>O_RDWR</code>/<code>O_CREAT</code>；
+<code>unistd.h</code> 提供 <code>close</code>/<code>ftruncate</code>/<code>fsync</code>/<code>unlink</code>。三个 Zig 模块中 <code>ps</code>（page_store.zig）
+提供 <code>PageStore</code> 接口与 <code>FIRST_DATA_PAGE</code>，<code>f2</code> 提供 <code>PAGE_SIZE</code> 与 meta 编解码。</p>
+
+<div class="card">
+<p><b>LMDB 式预留的三个关键点：</b></p>
+<ul>
+<li><b>预留虚拟地址，不预留物理内存/磁盘。</b> 64-bit 进程虚拟地址空间充裕（2⁴⁸ 量级），
+    mmap 1TB 仅占页表项与虚拟区记录，内核按需按页 fault-in 物理页，不实际占用 1TB。</li>
+<li><b>文件按需 <code>ftruncate</code> 增长，mmap 指针永不变。</b> 写新页前 <code>ensureFileGrowth</code> 把文件
+    扩到覆盖该页；已扩区域通过同一 <code>mmap_ptr</code> 立即可见，<b>无需重 mmap</b>、无 SIGBUS。</li>
+<li><b>读路径零拷贝。</b> 读页 = 取 <code>mmap_ptr + page_no*PAGE_SIZE</code> 指针，直接借切片，无 <code>read</code> 系统调用、无内存拷贝。</li>
+</ul>
+</div>
+
+<div class="note warn"><b>平台前提：</b>此设计依赖「文件增长后旧 mmap 指针对新区域可见」。
+<code>MAP_SHARED</code> + 文件 backing 在 Linux/macOS 上成立；某些系统（如旧 mmap 实现需
+<code>MAP_NONBASE</code> 或重 mmap）不保证。文件注释提到「spike_mmap.zig 已验证 macOS 可行」即此意。</div>
+
+<h3>3.2 REGION_SIZE：1TB 预留区常量</h3>
+
+<pre><code><span class="cm">/// 1 TB 预留虚拟区（LMDB 式占位；64-bit 系统虚拟地址空间充裕）</span>
+<span class="kw">pub const</span> REGION_SIZE: <span class="ty">u64</span> = <span class="nu">1</span> &lt;&lt; <span class="nu">40</span>;</code></pre>
+
+<p><code>1 &lt;&lt; 40</code> = 2⁴⁰ 字节 = 1099511627776 B = 1 TiB。按 <code>PAGE_SIZE=4096</code> 折算 = 2²⁸ = 268435456 页（约 2.68 亿页），
+即 <code>mapsize()</code> 返回的上限。这个值是工程取舍：</p>
+
+<table>
+<tr><th>维度</th><th>值</th><th>含义</th></tr>
+<tr><td>字节</td><td>2⁴⁰ = 1 TiB</td><td><code>region_size</code> 字段</td></tr>
+<tr><td>页数上限</td><td>2²⁸ ≈ 2.68 亿</td><td><code>vtMapSize</code> 返回 <code>region_size / PAGE_SIZE</code></td></tr>
+<tr><td>虚拟占用</td><td>仅页表（无物理占）</td><td>内核按需 fault</td></tr>
+<tr><td>磁盘占用</td><td>按已写页数 ×4KB</td><td>稀疏增长，非 1TB 预分配</td></tr>
+</table>
+
+<div class="note ok"><b>为何选 1TB 而非「按需重 mmap 扩区」？</b> 重 mmap（<code>MAP_FIXED</code> 或
+<code>MREMAP</code>）在跨平台/跨进程下复杂且可能移动地址，使所有借用切片悬垂。预留固定 1TB
+让 <code>mmap_ptr</code> 在进程生命期不变——这是 <code>readPage</code> 零拷贝借切片能安全的根本前提。</div>
+
+<h3>3.3 FilePageStore 结构体字段</h3>
+
+<pre><code><span class="kw">pub const</span> <span class="ty">FilePageStore</span> = <span class="kw">struct</span> {
+    allocator: std.mem.Allocator,
+    fd: c_int,
+    region_size: <span class="ty">u64</span>,
+    mmap_ptr: [*]<span class="ty">u8</span>,
+    freelist: std.ArrayList(<span class="ty">u32</span>),
+    next_free: <span class="ty">u32</span>,
+    meta_index: <span class="ty">u32</span>,
+    meta0: [PAGE_SIZE]<span class="ty">u8</span>,
+    meta1: [PAGE_SIZE]<span class="ty">u8</span>,</code></pre>
+
+<table>
+<tr><th>字段</th><th>类型</th><th>含义</th></tr>
+<tr><td><code>allocator</code></td><td><code>Allocator</code></td><td>用于 <code>freelist</code> 增长与 path 复制；页数据不进堆（在 mmap 区）</td></tr>
+<tr><td><code>fd</code></td><td><code>c_int</code></td><td>文件描述符。<code>ftruncate</code>/<code>fsync</code>/<code>close</code> 都经它</td></tr>
+<tr><td><code>region_size</code></td><td><code>u64</code></td><td>预留区字节大小，恒等于 <code>REGION_SIZE</code>；独立字段便于 <code>regionSize()</code></td></tr>
+<tr><td><code>mmap_ptr</code></td><td><code>[*]u8</code></td><td>1TB 区起始指针。<b>不变量</b>：进程生命期内地址恒定</td></tr>
+<tr><td><code>freelist</code></td><td><code>ArrayList(u32)</code></td><td>回收页号 LIFO 链。与 MemPageStore 同形</td></tr>
+<tr><td><code>next_free</code></td><td><code>u32</code></td><td>bump 分配水位。init 时从活跃 meta 的 <code>last_page+1</code> 恢复</td></tr>
+<tr><td><code>meta_index</code></td><td><code>u32</code></td><td>下次写哪页 meta（0/1）。交替写以崩溃安全</td></tr>
+<tr><td><code>meta0</code>/<code>meta1</code></td><td><code>[PAGE_SIZE]u8</code></td><td>meta 双缓冲（进程内副本）。写时先改缓冲，再 <code>flushMetaBuffer</code> 刷到 mmap 区</td></tr>
+</table>
+
+<div class="note"><b>为什么 meta 要进程内缓冲副本？</b> mmap 区是文件视图，写 meta 前要在缓冲里
+<code>writeMetaPage</code>（编页头 + payload + CRC），再整页 <code>@memcpy</code> 刷到 mmap 区。这样 meta 的 CRC、
+页头一次性写入文件视图，避免「半写页」被 <code>readMetaPage</code> 当作合法页读到中间态。也方便 <code>vtReadMeta</code>
+先 <code>@memcpy</code> 同步缓冲再解码（reader 可能在跨进程被改写）。</div>
+
+<h3>3.4 init：open + ftruncate 初始页 + mmap + meta 恢复</h3>
+
+<p><code>init</code> 是本文件最复杂的方法，分四阶段：</p>
+
+<div class="flow">
+<span class="step">① open 文件</span>
+<span class="arrow">→</span>
+<span class="step">② ftruncate 到 ≥3 页</span>
+<span class="arrow">→</span>
+<span class="step">③ mmap 1TB MAP_SHARED</span>
+<span class="arrow">→</span>
+<span class="step">④ 加载 meta + 恢复 index/next_free</span>
+</div>
+
+<h4>① open 文件（O_RDWR | O_CREAT, 0644）</h4>
+
+<pre><code><span class="kw">pub fn</span> <span class="fn">init</span>(allocator: std.mem.Allocator, path: []const <span class="ty">u8</span>) !<span class="ty">FilePageStore</span> {
+    <span class="kw">const</span> path_z = <span class="kw">try</span> allocator.dupeZ(u8, path);
+    <span class="kw">defer</span> allocator.free(path_z);
+    <span class="kw">const</span> fd = c.open(path_z, @as(c_int, c.O_RDWR | c.O_CREAT), @as(c.mode_t, <span class="nu">0o644</span>));
+    <span class="kw">if</span> (fd &lt; <span class="nu">0</span>) <span class="kw">return error</span>.OpenFailed;</code></pre>
+
+<p>路径要先 <code>dupeZ</code> 成 NUL 终止的 C 字符串（<code>c.open</code> 要 <code>[*:0]const u8</code>）。
+<code>O_RDWR | O_CREAT</code> 表示读写打开、不存在则建；<code>0o644</code> 权限。fd&lt;0 即失败。</p>
+
+<h4>② ftruncate 到至少覆盖 meta0 + meta1（3 页）</h4>
+
+<pre><code>    <span class="kw">var</span> st: c.struct_stat = undefined;
+    <span class="kw">if</span> (c.fstat(fd, &amp;st) != <span class="nu">0</span>) {
+        _ = c.close(fd);
+        <span class="kw">return error</span>.FstatFailed;
+    }
+    <span class="kw">const</span> min_size: <span class="ty">u64</span> = @as(<span class="ty">u64</span>, ps.FIRST_DATA_PAGE) * PAGE_SIZE;  <span class="cm">// 3*4096</span>
+    <span class="kw">if</span> (@as(<span class="ty">u64</span>, @intCast(st.st_size)) &lt; min_size) {
+        <span class="kw">if</span> (c.ftruncate(fd, @as(c.off_t, @intCast(min_size))) != <span class="nu">0</span>) {
+            _ = c.close(fd);
+            <span class="kw">return error</span>.TruncateFailed;
+        }
+    }</code></pre>
+
+<p>页号 0=NULL、1=meta0、2=meta1、3 起数据页（<code>FIRST_DATA_PAGE=3</code>）。无论新库旧库，
+文件至少要 3 页（12288 字节）才能承载双 meta。fstat 看当前大小，不够就 ftruncate 扩到 <code>min_size</code>。
+每条失败路径都先 <code>close(fd)</code> 再返错，防 fd 泄漏。</p>
+
+<h4>③ mmap 1TB MAP_SHARED 预留区</h4>
+
+<pre><code>    <span class="kw">const</span> ptr = c.mmap(
+        null, REGION_SIZE,
+        @as(c_int, c.PROT_READ) | @as(c_int, c.PROT_WRITE),
+        @as(c_int, c.MAP_SHARED), fd, <span class="nu">0</span>);
+    <span class="kw">if</span> (ptr == c.MAP_FAILED) {
+        _ = c.close(fd);
+        <span class="kw">return error</span>.MapFailed;
+    }</code></pre>
+
+<p><code>MAP_SHARED</code> 意味着写经页缓存写回文件（非 <code>MAP_PRIVATE</code> 的 COW）；<code>PROT_READ|PROT_WRITE</code> 双向可访问。
+<code>offset=0</code> 从文件头映射。返 <code>MAP_FAILED</code> 即失败（关 fd 后返 <code>MapFailed</code>）。成功后
+<code>mmap_ptr</code> 指向这 1TB 区——<b>此后进程生命期不动</b>。</p>
+
+<div class="note warn"><b>MAP_SHARED 的写语义：</b> 写 mmap 区不是立即落盘，而是脏化页缓存，由内核写回线程
+或 <code>fsync</code> 刷盘。事务提交时 <code>vtSync</code> 调 <code>fsync(fd)</code> 强制页缓存写回——这是
+「mmap 写 + fsync 持久化」组合的语义边界。崩溃在 <code>fsync</code> 前 → 数据可能丢，靠 meta 交替写恢复一致性。</div>
+
+<h4>④ 加载 meta 缓冲 + 恢复 meta_index 与 next_free</h4>
+
+<pre><code>    <span class="kw">var</span> fps: <span class="ty">FilePageStore</span> = .{
+        .allocator = allocator, .fd = fd, .region_size = REGION_SIZE,
+        .mmap_ptr = @ptrCast(ptr), .freelist = .empty,
+        .next_free = ps.FIRST_DATA_PAGE, .meta_index = <span class="nu">0</span>,
+        .meta0 = [_]<span class="ty">u8</span>{<span class="nu">0</span>} ** PAGE_SIZE, .meta1 = [_]<span class="ty">u8</span>{<span class="nu">0</span>} ** PAGE_SIZE,
+    };
+
+    <span class="cm">// 从 mmap 区加载 meta 缓冲区</span>
+    @memcpy(fps.meta0[<span class="nu">0</span>..PAGE_SIZE], fps.pagePtr(f2.META_PAGE_0)[<span class="nu">0</span>..PAGE_SIZE]);
+    @memcpy(fps.meta1[<span class="nu">0</span>..PAGE_SIZE], fps.pagePtr(f2.META_PAGE_1)[<span class="nu">0</span>..PAGE_SIZE]);</code></pre>
+
+<p>先把 mmap 区第 1、2 页（meta0/meta1 的文件视图）拷进进程内缓冲 <code>meta0</code>/<code>meta1</code>。
+之后所有 meta 读写都走缓冲，避免反复直接碰 mmap 区的半页中间态。<code>pagePtr</code> 见 3.5 节。</p>
+
+<pre><code>    <span class="kw">const</span> m0 = f2.readMetaPageSingle(&amp;fps.meta0);  <span class="cm">// 校验 CRC + 解码，无效返 null</span>
+    <span class="kw">const</span> m1 = f2.readMetaPageSingle(&amp;fps.meta1);
+    <span class="kw">if</span> (m0 != null <span class="kw">and</span> m1 != null) {
+        <span class="kw">if</span> (m0.?.sequence &gt;= m1.?.sequence) {
+            fps.meta_index = <span class="nu">1</span>;                       <span class="cm">// meta0 活跃，下次写 meta1</span>
+            fps.next_free = @max(fps.next_free, m0.?.last_page + <span class="nu">1</span>);
+        } <span class="kw">else</span> {
+            fps.meta_index = <span class="nu">0</span>;                       <span class="cm">// meta1 活跃，下次写 meta0</span>
+            fps.next_free = @max(fps.next_free, m1.?.last_page + <span class="nu">1</span>);
+        }
+    } <span class="kw">else if</span> (m0 != null) {
+        fps.meta_index = <span class="nu">1</span>;                           <span class="cm">// 仅 meta0 合法，下次写 meta1</span>
+        fps.next_free = @max(fps.next_free, m0.?.last_page + <span class="nu">1</span>);
+    } <span class="kw">else if</span> (m1 != null) {
+        fps.meta_index = <span class="nu">0</span>;                           <span class="cm">// 仅 meta1 合法，下次写 meta0</span>
+        fps.next_free = @max(fps.next_free, m1.?.last_page + <span class="nu">1</span>);
+    }
+    <span class="cm">// else: 都 null（fresh DB），meta_index 保持 0，next_free 保持 FIRST_DATA_PAGE</span>
+    <span class="kw">return</span> fps;</code></pre>
+
+<p>这是 reopen 的崩溃恢复核心。四种情形：</p>
+
+<table>
+<tr><th>meta0</th><th>meta1</th><th>活跃判定</th><th>meta_index（下次写哪页）</th><th>next_free</th></tr>
+<tr><td>合法</td><td>合法</td><td>sequence 较大者活跃</td><td>指向<b>非活跃</b>页（覆盖旧者）</td><td><code>max(FIRST_DATA_PAGE, 活跃.last_page+1)</code></td></tr>
+<tr><td>合法</td><td>无效</td><td>meta0 活跃</td><td>1（下次写 meta1）</td><td><code>max(..., m0.last_page+1)</code></td></tr>
+<tr><td>无效</td><td>合法</td><td>meta1 活跃</td><td>0（下次写 meta0）</td><td><code>max(..., m1.last_page+1)</code></td></tr>
+<tr><td>无效</td><td>无效</td><td>fresh DB</td><td>0</td><td><code>FIRST_DATA_PAGE</code></td></tr>
+</table>
+
+<div class="note ok"><b>交替写的恢复逻辑：</b> 活跃 meta 是最近一次成功写入且通过 CRC 校验的那页。
+<code>meta_index</code> 总指向<b>下一该写的另一页</b>——即覆盖较旧/无效的那页，保留较新合法页不动。
+这样任一时刻 <code>vtWriteMeta</code> 之前，磁盘上总有一份合法旧 meta；若写中途崩溃，下次 <code>init</code>
+读到的仍是上次合法页（CRC 保护 + sequence 比较），一致性得以维持。</div>
+
+<div class="note warn"><b><code>next_free</code> 恢复的 <code>max</code> 防护：</b> 用 <code>@max(FIRST_DATA_PAGE, last_page+1)</code>
+而非直接 <code>last_page+1</code>，防活跃 meta 的 <code>last_page</code> 因某种原因小于 <code>FIRST_DATA_PAGE-1</code>
+（如手动写入的脏 meta）导致 <code>next_free</code> 倒退覆盖保留页。最低水位锁死在 <code>FIRST_DATA_PAGE</code>。</div>
+
+<h3>3.5 页指针寻址：pagePtr</h3>
+
+<pre><code><span class="kw">fn</span> <span class="fn">pagePtr</span>(self: *<span class="ty">FilePageStore</span>, page_no: <span class="ty">u32</span>) [*]<span class="ty">u8</span> {
+    <span class="kw">return</span> self.mmap_ptr + @as(<span class="ty">usize</span>, @intCast(page_no)) * PAGE_SIZE;
+}</code></pre>
+
+<p>这是整个文件页 Store 的寻址基石：<b>页号是文件偏移的 PAGE_SIZE 倍数</b>，<code>pagePtr(n) = mmap_ptr + n*4096</code>。
+没有任何查找表、没有间接层——页号到地址是纯算术。这让 <code>readPage</code>/<code>writePage</code> 是 O(1) 且零拷贝。</p>
+
+<div class="card">
+<p><b>与 MemPageStore 的寻址对比：</b></p>
+<ul>
+<li>MemPageStore：<code>pagePtr</code> = 在 <code>pages.items[page_no]</code> 里查独立堆分配的页指针（两次间接 + 边界检查）。</li>
+<li>FilePageStore：<code>pagePtr</code> = <code>mmap_ptr + page_no*PAGE_SIZE</code>（一次加法），页地址在预留区内连续。</li>
+</ul>
+<p>预留 mmap 的根本收益即在此：把「按页号查页」从一次指针数组访问降为一次偏移算术，
+且所有页共享一个稳定基地址——借用切片永不悬垂。</p>
+</div>
+
+<h3>3.6 生命周期方法：deinit / regionSize / store</h3>
+
+<pre><code><span class="kw">pub fn</span> <span class="fn">deinit</span>(self: *<span class="ty">FilePageStore</span>) <span class="kw">void</span> {
+    _ = c.munmap(@ptrCast(self.mmap_ptr), REGION_SIZE);
+    _ = c.close(self.fd);
+    self.freelist.deinit(self.allocator);
+}
+
+<span class="kw">pub fn</span> <span class="fn">regionSize</span>(self: *const <span class="ty">FilePageStore</span>) <span class="ty">u64</span> {
+    <span class="kw">return</span> self.region_size;
+}
+
+<span class="kw">pub fn</span> <span class="fn">store</span>(self: *<span class="ty">FilePageStore</span>) ps.<span class="ty">PageStore</span> {
+    <span class="kw">return</span> .{ .ptr = self, .vtable = &amp;file_vtable };
+}</code></pre>
+
+<p><code>deinit</code> 三步：<code>munmap</code> 释放 1TB 虚拟区映射、<code>close</code> 关 fd、<code>freelist.deinit</code> 释放回收链。
+<b>注意 deinit 不刷 meta 也不 fsync</b>——持久化是 <code>vtWriteMeta</code>+<code>vtSync</code> 的职责，deinit 只回收资源；
+若调用方在 deinit 前未 commit，已写但未 sync 的数据可能丢（符合事务语义）。</p>
+
+<p><code>store()</code> 把 <code>*FilePageStore</code> 装箱成 <code>ps.PageStore</code>：<code>ptr=self</code>，<code>vtable=&amp;file_vtable</code>。
+<code>file_vtable</code> 是模块级 <code>const</code>（第二部分详述），进只读段，生命周期安全——这与
+<code>MemPageStore</code> 的 <code>mem_vtable</code> 同形。之后上层（btree/db）只持 <code>PageStore</code> 值，对底层是内存还是文件无感知。</p>
+
+<h3>3.7 flushMetaBuffer：缓冲刷盘（mmap 区）</h3>
+
+<pre><code><span class="kw">fn</span> <span class="fn">flushMetaBuffer</span>(self: *<span class="ty">FilePageStore</span>, page_no: <span class="ty">u32</span>) <span class="kw">void</span> {
+    <span class="kw">const</span> buf = <span class="kw">if</span> (page_no == f2.META_PAGE_0) &amp;self.meta0 <span class="kw">else</span> &amp;self.meta1;
+    <span class="kw">const</span> dst = self.pagePtr(page_no);
+    @memcpy(dst[<span class="nu">0</span>..PAGE_SIZE], buf[<span class="nu">0</span>..PAGE_SIZE]);
+}</code></pre>
+
+<p><code>vtWriteMeta</code> 先在缓冲里 <code>f2.writeMetaPage</code>（编页头+payload+CRC），再调本方法把整页 4KB
+<code>@memcpy</code> 到 mmap 区对应页。整页一次性写，配合 <code>MAP_SHARED</code> 脏化页缓存、再 <code>fsync</code> 落盘。
+这样磁盘上要么是旧完整页、要么是新完整页，不会出现半页（页尾 CRC 还没算的中间态）——这是
+<code>readMetaPageSingle</code> 能用 CRC 区分合法/无效页的物理保证。</p>
+
+<h3>3.8 ensureFileGrowth：按需 ftruncate</h3>
+
+<pre><code><span class="kw">fn</span> <span class="fn">ensureFileGrowth</span>(self: *<span class="ty">FilePageStore</span>, page_no: <span class="ty">u32</span>) !<span class="kw">void</span> {
+    <span class="kw">const</span> t0 = <span class="kw">if</span> (FpsCounters.enable) FpsCounters.now() <span class="kw">else</span> <span class="nu">0</span>;
+    <span class="kw">const</span> needed: <span class="ty">u64</span> = (@as(<span class="ty">u64</span>, page_no) + <span class="nu">1</span>) * PAGE_SIZE;
+    <span class="kw">var</span> st: c.struct_stat = undefined;
+    <span class="kw">if</span> (c.fstat(self.fd, &amp;st) != <span class="nu">0</span>) <span class="kw">return error</span>.FstatFailed;
+    <span class="kw">if</span> (FpsCounters.enable) FpsCounters.fstat_calls += <span class="nu">1</span>;
+    <span class="kw">if</span> (@as(<span class="ty">u64</span>, @intCast(st.st_size)) &lt; needed) {
+        <span class="kw">if</span> (c.ftruncate(self.fd, @as(c.off_t, @intCast(needed))) != <span class="nu">0</span>)
+            <span class="kw">return error</span>.TruncateFailed;
+        <span class="kw">if</span> (FpsCounters.enable) FpsCounters.ftruncate_calls += <span class="nu">1</span>;
+    }
+    <span class="kw">if</span> (FpsCounters.enable) FpsCounters.ensure_growth_ns += @intCast(FpsCounters.now() - t0);
+}</code></pre>
+
+<p><code>vtAllocPage</code>/<code>vtWritePage</code> 在分配/写新页前调用。逻辑：算出覆盖 <code>page_no</code>（含整页）所需字节
+<code>(page_no+1)*PAGE_SIZE</code>，<code>fstat</code> 查当前文件大小，不够就 <code>ftruncate</code> 扩到 <code>needed</code>。</p>
+
+<div class="note"><b>为何每次写都要 fstat？</b> ftruncate 是幂等的（文件已够大时再调一次也安全），
+但每次写都 ftruncate 会产生不必要的系统调用。fstat 先查、只在确实不够时才 ftruncate，减少写路径的系统调用。
+代价是 fstat 本身也是一次 syscall——对极热路径，可考虑缓存文件大小（但需处理跨进程并发增长，当前选保守 fstat）。</div>
+
+<div class="note warn"><b>稀疏文件与空间：</b> <code>ftruncate</code> 扩的是文件<b>逻辑大小</b>，不立即占物理空间——
+内核在写时才分配物理块。故一个 1TB 预留映射 + 按需 ftruncate 的库，实际磁盘占用 ≈ 已写页数 × 4KB。
+但若文件系统不支持稀疏文件（极少见），ftruncate 会预分配全量空间——这是平台前提之一。</div>
+
+<p><code>FpsCounters</code> 计数只在 <code>enable=true</code> 时累加（profile 开关），生产热路径 <code>enable=false</code> 时分支被
+<code>if (false)</code> 优化掉，零开销。第二部分会详述 FpsCounters 全貌。</p>
+
+<h3>3.9 初始化/生命周期全景</h3>
+
+<div class="flow">
+<span class="step"><code>init</code>: open</span>
+<span class="arrow">→</span>
+<span class="step">ftruncate≥3 页</span>
+<span class="arrow">→</span>
+<span class="step">mmap 1TB</span>
+<span class="arrow">→</span>
+<span class="step">加载 meta 缓冲</span>
+<span class="arrow">→</span>
+<span class="step">恢复 index/next_free</span>
+<span class="arrow">→</span>
+<span class="step"><code>store()</code> 装箱</span>
+</div>
+<div class="flow">
+<span class="step">运行期: <code>vtWriteMeta</code>→<code>flushMetaBuffer</code>→<code>vtSync</code>(fsync)</span>
+<span class="arrow">→</span>
+<span class="step">写数据页: <code>vtWritePage</code>→<code>ensureFileGrowth</code></span>
+</div>
+<div class="flow">
+<span class="step"><code>deinit</code>: munmap + close + freelist.deinit</span>
+</div>
+
+<div class="note danger"><b>生命周期风险：</b>
+<ul>
+<li><code>mmap_ptr</code> 在 <code>munmap</code>（<code>deinit</code>）后失效。任何在 <code>deinit</code> 后仍持 <code>readPage</code> 借用切片的调用方都会访问已解除映射的地址 → 段错误。调用方须保证借用短于 <code>deinit</code>。</li>
+<li><code>file_vtable</code> 是模块级 <code>const</code>，生命周期 = 进程，安全；但若误把实例 <code>store()</code> 返回值在实例 <code>deinit</code> 后再用，<code>ptr</code> 即悬垂。当前接口设计假定实例存活长于所有借用。</li>
+</ul>
+</div>
+
+<p class="muted">第三部分到此。下一部分（第四部分）讲解 8 个 vtable 函数的实现、meta 交替写的崩溃安全细节、
+<code>file_vtable</code> 定义、以及与 <code>MemPageStore</code> 的对比。</p>
+</section>
+
+
+<section class="lecture">
+<h2><span class="no">第四部分</span>PageStore 接口实现 · meta 崩溃恢复 · 与 MemPageStore 对比</h2>
+
+<p>上一部分讲解了 <code>MemPageStore</code> 的内存实现。本部分聚焦 <code>FilePageStore</code> 如何实现
+<code>PageStore</code> 抽象层定义的全部八个 vtable 方法，以及它相对于内存实现独有的能力：基于 mmap 的
+零拷贝读写、meta 双页交替写的崩溃安全保证、以及 <code>fsync</code> 持久化语义。最后将两者并排对比，
+厘清相同骨架与分叉路径。</p>
+
+<div class="card">
+<p><strong>本部分核心命题：</strong><code>FilePageStore</code> 与 <code>MemPageStore</code> 共享相同的分配骨架
+（bump 游标 + LIFO freelist）和 meta 双页交替写策略，但底层存储范式根本不同——前者读写经 mmap 指针
+直接操作页缓存（零拷贝），后者读写经独立堆分配页副本。这决定了它们的并发模型、持久化能力、crash 恢复
+是否真正生效。</p>
+</div>
+
+<h3>file_vtable：模块级静态 VTable</h3>
+
+<p>与 <code>MemPageStore</code> 完全对称，<code>FilePageStore</code> 也通过模块级常量定义 vtable。
+<code>file_vtable</code> 是一个 <code>const</code> 声明，存储在二进制的数据段（静态存储期），生命周期
+不随任何 <code>FilePageStore</code> 实例的创建与销毁而变化。</p>
+
+<pre><code><span class="kw">const</span> file_vtable: ps.<span class="ty">PageStore.VTable</span> = .{
+    .allocPage  = FilePageStore.vtAllocPage,
+    .freePage   = FilePageStore.vtFreePage,
+    .readPage   = FilePageStore.vtReadPage,
+    .writePage  = FilePageStore.vtWritePage,
+    .readMeta   = FilePageStore.vtReadMeta,
+    .writeMeta  = FilePageStore.vtWriteMeta,
+    .sync       = FilePageStore.vtSync,
+    .mapsize    = FilePageStore.vtMapSize,
+};</code></pre>
+
+<div class="note">
+<p><strong>静态存储不变量：</strong>因为 <code>file_vtable</code> 是模块级 <code>const</code>，其地址在编译期
+固定。<code>store()</code> 方法返回的 <code>PageStore</code> 句柄中 <code>vtable</code> 字段指向这个固定地址。
+只要进程存活，vtable 就有效——上层代码可以安全持有 <code>PageStore</code> 句柄而无需担心 vtable 悬垂。
+这与 <code>MemPageStore</code> 的 <code>mem_vtable</code> 设计完全一致，是 Zig 手动多态的标准范式。</p>
+</div>
+
+<pre><code><span class="kw">pub fn</span> <span class="fn">store</span>(self: *<span class="ty">FilePageStore</span>) ps.<span class="ty">PageStore</span> {
+    <span class="kw">return</span> .{ .ptr = self, .vtable = &file_vtable };
+}</code></pre>
+
+<p><code>store()</code> 把 <code>self</code> 指针和 <code>&file_vtable</code> 打包成 <code>PageStore</code> 多态句柄。
+调用方拿到句柄后，所有方法调用经 vtable 间接分发到 <code>FilePageStore</code> 的具体实现。注意 <code>ptr</code>
+是 <code>*anyopaque</code>，每个 vtable 函数入口需 <code>@ptrCast(@alignCast(ptr))</code> 还原为
+<code>*FilePageStore</code>。</p>
+
+<h3>pagePtr：mmap 寻址基础</h3>
+
+<p>几乎所有 vtable 方法的读写都依赖 <code>pagePtr</code> 这个简单的地址计算函数。它是理解整个读写路径的基石：</p>
+
+<pre><code><span class="kw">fn</span> <span class="fn">pagePtr</span>(self: *<span class="ty">FilePageStore</span>, page_no: <span class="ty">u32</span>) [*]<span class="ty">u8</span> {
+    <span class="kw">return</span> self.mmap_ptr + @<span class="kw">as</span>(<span class="ty">usize</span>, @intCast(page_no)) * PAGE_SIZE;
+}</code></pre>
+
+<p>页号到文件偏移的映射极简：<code>偏移 = page_no × PAGE_SIZE</code>。<code>mmap_ptr</code> 是 1TB 预留区的基地址，
+<code>pagePtr(n)</code> 返回 <code>mmap_ptr + n*4096</code>。页号 0 是 NULL 页（文件偏移 0），页号 1 是 meta0，
+页号 2 是 meta1，页号 3 起是数据页。这种线性映射意味着<strong>不需要任何索引结构</strong>就能定位任意页——
+地址计算 O(1)，比 <code>MemPageStore</code> 的 ArrayList 索引更直接（后者需确保数组已扩容到该索引）。</p>
+
+<div class="note warn">
+<p><strong>越界检查不在 pagePtr 内：</strong><code>pagePtr</code> 不做边界检查，调用方必须自行校验
+<code>page_no * PAGE_SIZE < region_size</code>。各 vtable 方法在调用 <code>pagePtr</code> 前都有显式的
+越界判断（返回 <code>MapFull</code> 或 <code>PageNotFound</code>）。这是性能取舍——热路径省一个分支。</p>
+</div>
+
+<h3>vtAllocPage / vtFreePage：分配与回收</h3>
+
+<p><code>vtAllocPage</code> 与 <code>MemPageStore</code> 版本逻辑结构相同：先 freelist 取（LIFO），取不到再
+bump 分配。但有两个关键差异：<strong>无锁</strong>（FilePageStore 设计为单写者模型）和
+<strong>ensureFileGrowth</strong>（按需 ftruncate 扩展文件）。</p>
+
+<pre><code><span class="kw">fn</span> <span class="fn">vtAllocPage</span>(ptr: *<span class="ty">anyopaque</span>) !<span class="ty">u32</span> {
+    <span class="kw">const</span> self: *<span class="ty">FilePageStore</span> = @ptrCast(@alignCast(ptr));
+    <span class="kw">const</span> t0 = <span class="kw">if</span> (FpsCounters.enable) FpsCounters.now() <span class="kw">else</span> <span class="nu">0</span>;
+    <span class="kw">if</span> (FpsCounters.enable) FpsCounters.alloc_page_calls += <span class="nu">1</span>;
+    <span class="kw">if</span> (self.freelist.items.len > <span class="nu">0</span>) <span class="kw">return</span> self.freelist.pop().?;
+    <span class="kw">const</span> pn = self.next_free;
+    <span class="kw">if</span> (@<span class="kw">as</span>(<span class="ty">u64</span>, pn) * PAGE_SIZE >= self.region_size) <span class="kw">return error</span>.MapFull;
+    <span class="kw">try</span> self.ensureFileGrowth(pn);
+    self.next_free = pn + <span class="nu">1</span>;
+    <span class="kw">if</span> (FpsCounters.enable) FpsCounters.alloc_page_ns += @intCast(FpsCounters.now() - t0);
+    <span class="kw">return</span> pn;
+}</code></pre>
+
+<div class="flow">
+<span class="step">freelist 非空?</span>
+<span class="arrow">→ 是</span>
+<span class="step">pop() LIFO</span>
+<span class="arrow">→ 否</span>
+<span class="step">pn = next_free</span>
+<span class="arrow">→</span>
+<span class="step">越界? → MapFull</span>
+<span class="arrow">→</span>
+<span class="step">ensureFileGrowth(pn)</span>
+<span class="arrow">→</span>
+<span class="step">next_free++</span>
+</div>
+
+<p>与 <code>MemPageStore</code> 的对比要点：</p>
+<ul>
+<li><strong>无锁：</strong><code>MemPageStore</code> 用 <code>freelist_mu</code> 串行化分配/回收/读；
+<code>FilePageStore</code> 无锁。设计前提是上层（<code>db.zig</code>）保证单一写者串行调用 allocPage/freePage/writePage。</li>
+<li><strong>无 ensurePage 的回滚问题：</strong><code>MemPageStore</code> 的 <code>ensurePage</code> 需两步扩容（先扩指针数组再逐页堆分配），有部分失败回滚负担；<code>FilePageStore</code> 的 <code>ensureFileGrowth</code> 只调一次 <code>ftruncate</code>，要么成功要么直接返回错误，无中间态。</li>
+<li><strong>上限判断不同：</strong><code>MemPageStore</code> 比较 <code>pn >= max_pages</code>（页数上限）；
+<code>FilePageStore</code> 比较 <code>pn * PAGE_SIZE >= region_size</code>（字节偏移到 1TB 预留区上限）。</li>
+</ul>
+
+<p><code>vtFreePage</code> 与内存版完全一致：追加页号到 freelist（LIFO），<code>catch {}</code> 静默处理 OOM。
+页数据不被释放——mmap 区的页永远"存在"（虚拟地址已预留），freelist 只是记录可复用的页号。</p>
+
+<pre><code><span class="kw">fn</span> <span class="fn">vtFreePage</span>(ptr: *<span class="ty">anyopaque</span>, page_no: <span class="ty">u32</span>) <span class="ty">void</span> {
+    <span class="kw">const</span> self: *<span class="ty">FilePageStore</span> = @ptrCast(@alignCast(ptr));
+    <span class="kw">if</span> (FpsCounters.enable) FpsCounters.free_page_calls += <span class="nu">1</span>;
+    self.freelist.append(self.allocator, page_no) <span class="kw">catch</span> {};
+}</code></pre>
+
+<h3>vtReadPage / vtWritePage：零拷贝 mmap 读写</h3>
+
+<p>这是 <code>FilePageStore</code> 与 <code>MemPageStore</code> 最本质的区别所在。读写页对 meta 页号（1、2）
+特判直接返回缓冲区，普通页经 <code>pagePtr</code> 返回 mmap 指针切片。</p>
+
+<pre><code><span class="kw">fn</span> <span class="fn">vtReadPage</span>(ptr: *<span class="ty">anyopaque</span>, page_no: <span class="ty">u32</span>) ![]<span class="kw">const</span> <span class="ty">u8</span> {
+    <span class="kw">const</span> self: *<span class="ty">FilePageStore</span> = @ptrCast(@alignCast(ptr));
+    <span class="kw">if</span> (FpsCounters.enable) FpsCounters.read_page_calls += <span class="nu">1</span>;
+    <span class="kw">if</span> (page_no == f2.META_PAGE_0) <span class="kw">return</span> &self.meta0;
+    <span class="kw">if</span> (page_no == f2.META_PAGE_1) <span class="kw">return</span> &self.meta1;
+    <span class="kw">if</span> (@<span class="kw">as</span>(<span class="ty">u64</span>, page_no) * PAGE_SIZE >= self.region_size) <span class="kw">return error</span>.PageNotFound;
+    <span class="kw">return</span> self.<span class="fn">pagePtr</span>(page_no)[<span class="nu">0</span>..PAGE_SIZE];
+}
+
+<span class="kw">fn</span> <span class="fn">vtWritePage</span>(ptr: *<span class="ty">anyopaque</span>, page_no: <span class="ty">u32</span>) ![]<span class="ty">u8</span> {
+    <span class="kw">const</span> self: *<span class="ty">FilePageStore</span> = @ptrCast(@alignCast(ptr));
+    <span class="kw">const</span> t0 = <span class="kw">if</span> (FpsCounters.enable) FpsCounters.now() <span class="kw">else</span> <span class="nu">0</span>;
+    <span class="kw">if</span> (FpsCounters.enable) FpsCounters.write_page_calls += <span class="nu">1</span>;
+    <span class="kw">if</span> (page_no == f2.META_PAGE_0) <span class="kw">return</span> &self.meta0;
+    <span class="kw">if</span> (page_no == f2.META_PAGE_1) <span class="kw">return</span> &self.meta1;
+    <span class="kw">if</span> (@<span class="kw">as</span>(<span class="ty">u64</span>, page_no) * PAGE_SIZE >= self.region_size) <span class="kw">return error</span>.MapFull;
+    <span class="kw">try</span> self.<span class="fn">ensureFileGrowth</span>(page_no);
+    <span class="kw">if</span> (FpsCounters.enable) FpsCounters.write_page_ns += @intCast(FpsCounters.now() - t0);
+    <span class="kw">return</span> self.<span class="fn">pagePtr</span>(page_no)[<span class="nu">0</span>..PAGE_SIZE];
+}</code></pre>
+
+<div class="note ok">
+<p><strong>零拷贝读：</strong><code>vtReadPage</code> 返回的 <code>[]const u8</code> 直接指向 mmap 预留区中的
+<code>mmap_ptr + page_no*PAGE_SIZE</code>。读操作不经任何内存拷贝——内核将文件页按需调入页缓存（page cache），
+用户态直接通过虚拟地址访问。对比 <code>MemPageStore</code> 返回 <code>pages.items[page_no][0..]</code>
+（也是零拷贝——返回堆分配页的指针切片），两者都是零拷贝语义，但物理来源不同：mmap 区 vs 独立堆分配。</p>
+</div>
+
+<div class="note">
+<p><strong>写路径的 MAP_SHARED 语义：</strong><code>vtWritePage</code> 返回 mmap 区的可变切片 <code>[]u8</code>。
+调用方写入此切片时，修改直接作用于内核页缓存（因为 mmap 用了 <code>MAP_SHARED</code>）。内核会在后续将脏页
+异步刷回磁盘。若需强制持久化，调用 <code>vtSync</code>（<code>fsync</code>）。这与 <code>MemPageStore</code>
+写入堆分配页的语义截然不同——后者的写只存在于进程内存，进程退出即消失。</p>
+</div>
+
+<p><code>vtWritePage</code> 在返回指针前调 <code>ensureFileGrowth(page_no)</code>——确保文件已 <code>ftruncate</code>
+到覆盖该页。若文件尚未增长到 <code>page_no</code> 对应偏移，mmap 读取该区域会触发 <code>SIGBUS</code>。
+<code>ensureFileGrowth</code> 是防御此崩溃的关键。</p>
+
+<table>
+<tr><th>维度</th><th>FilePageStore.readPage</th><th>MemPageStore.readPage</th></tr>
+<tr><td>返回指针来源</td><td>mmap 预留区 <code>mmap_ptr + offset</code></td><td>堆分配页 <code>pages.items[n]</code></td></tr>
+<tr><td>拷贝开销</td><td>零拷贝（内核页缓存直接映射）</td><td>零拷贝（返回堆页指针切片）</td></tr>
+<tr><td>持久性</td><td>写经 MAP_SHARED 落盘，进程重启可恢复</td><td>纯内存，进程退出即消失</td></tr>
+<tr><td>并发安全</td><td>无锁，依赖单写者模型</td><td><code>freelist_mu</code> 护指针数组</td></tr>
+<tr><td>越界错误</td><td><code>PageNotFound</code>（偏移 ≥ region_size）</td><td><code>PageNotFound</code>（页号 ≥ pages.len）</td></tr>
+</table>
+
+<h3>vtWriteMeta：崩溃安全的核心——override + 交替写</h3>
+
+<p><code>vtWriteMeta</code> 是整个 PageStore 接口中逻辑最精妙的方法。它做了三件事：(1) override
+<code>last_page</code> 为实际已分配页的最大值；(2) 交替写 meta0/meta1；(3) 刷缓冲区到 mmap 区并翻转
+<code>meta_index</code>。</p>
+
+<pre><code><span class="kw">fn</span> <span class="fn">vtWriteMeta</span>(ptr: *<span class="ty">anyopaque</span>, meta: *<span class="kw">const</span> f2.<span class="ty">MetaPage</span>) !<span class="ty">void</span> {
+    <span class="kw">const</span> self: *<span class="ty">FilePageStore</span> = @ptrCast(@alignCast(ptr));
+    <span class="cm">// 1. Override last_page 为实际最高已分配页号</span>
+    <span class="kw">var</span> meta_copy = meta.*;
+    <span class="kw">if</span> (self.next_free > ps.FIRST_DATA_PAGE) {
+        meta_copy.last_page = self.next_free - <span class="nu">1</span>;
+    } <span class="kw">else</span> {
+        meta_copy.last_page = <span class="nu">0</span>;
+    }
+    <span class="cm">// 2. 选交替页（与当前活跃页相反）</span>
+    <span class="kw">const</span> page = <span class="kw">if</span> (self.meta_index == <span class="nu">0</span>) &self.meta0 <span class="kw">else</span> &self.meta1;
+    <span class="kw">const</span> page_no = <span class="kw">if</span> (self.meta_index == <span class="nu">0</span>) f2.META_PAGE_0 <span class="kw">else</span> f2.META_PAGE_1;
+    f2.<span class="fn">writeMetaPage</span>(page, &meta_copy, self.meta_index);
+    <span class="cm">// 3. 刷到 mmap 区 + 翻转 index</span>
+    self.<span class="fn">flushMetaBuffer</span>(page_no);
+    self.meta_index = <span class="nu">1</span> - self.meta_index;
+}</code></pre>
+
+<div class="note warn">
+<p><strong>为什么 override last_page？</strong>调用方传入的 <code>meta</code> 中的 <code>last_page</code>
+可能不是最新值——上层 B-tree 层可能在写 meta 前不知道 <code>FilePageStore</code> 内部分配了多少页。
+<code>FilePageStore</code> 用自身权威的 <code>next_free - 1</code>（当前已分配的最高页号）覆盖它，保证
+reopen 时 <code>init</code> 能正确恢复 <code>next_free</code>（恢复逻辑是 <code>next_free = max(next_free, last_page + 1)</code>）。
+若不 override，reopen 后 <code>next_free</code> 可能小于实际已分配页号，导致已用页被错误覆盖（数据损坏）。</p>
+</div>
+
+<div class="note danger">
+<p><strong>不 override 的后果：</strong>假设已分配到页号 100（<code>next_free = 101</code>），但调用方传入
+<code>meta.last_page = 50</code>。写 meta 后崩溃。reopen 时 <code>init</code> 读到 <code>last_page = 50</code>，
+恢复 <code>next_free = 51</code>。下次 <code>allocPage</code> 返回页号 51——但页号 51–100 可能仍在使用中
+（属于 B-tree 节点），被覆盖 → <strong>数据库损坏</strong>。override 是防此问题的硬保障。</p>
+</div>
+
+<p><code>flushMetaBuffer</code> 把内存缓冲区 <code>meta0</code>/<code>meta1</code> 拷贝回 mmap 区对应的文件位置，
+使写入对后续 <code>readMeta</code> 及 reopen 可见：</p>
+
+<pre><code><span class="kw">fn</span> <span class="fn">flushMetaBuffer</span>(self: *<span class="ty">FilePageStore</span>, page_no: <span class="ty">u32</span>) <span class="ty">void</span> {
+    <span class="kw">const</span> buf = <span class="kw">if</span> (page_no == f2.META_PAGE_0) &self.meta0 <span class="kw">else</span> &self.meta1;
+    <span class="kw">const</span> dst = self.<span class="fn">pagePtr</span>(page_no);
+    @<span class="fn">memcpy</span>(dst[<span class="nu">0</span>..PAGE_SIZE], buf[<span class="nu">0</span>..PAGE_SIZE]);
+}</code></pre>
+
+<div class="flow">
+<span class="step">meta_index=0 → 写 meta0</span>
+<span class="arrow">→</span>
+<span class="step">flushMetaBuffer(META_PAGE_0)</span>
+<span class="arrow">→</span>
+<span class="step">meta_index 翻转 → 1</span>
+<span class="arrow">→</span>
+<span class="step">meta_index=1 → 写 meta1</span>
+<span class="arrow">→</span>
+<span class="step">flushMetaBuffer(META_PAGE_1)</span>
+<span class="arrow">→</span>
+<span class="step">meta_index 翻转 → 0</span>
+<span class="arrow">→ ↻</span>
+</div>
+
+<div class="note ok">
+<p><strong>崩溃安全原理（与 MemPageStore 对比）：</strong>交替写保证：写 meta0 时若崩溃（写入未完成或
+checksum 失败），meta1 仍保留上次完整写入的有效状态。reopen 时 <code>init</code> 分别校验两页 checksum
+与 magic/version，取 <code>sequence</code> 大者——损坏的那页 checksum 校验失败返回 <code>null</code>，
+自动回退到完好的那页。这是 LMDB 式的原子性策略：不做事务日志，而是靠"写新页 + 翻转指针"的写时复制
+保证 meta 原子切换。<code>MemPageStore</code> 的 <code>vtWriteMeta</code> 逻辑完全相同（交替写 + 翻转），
+但因为没有持久化，crash 后两页同时消失，恢复逻辑实际不生效——它只是为了语义对齐和测试可迁移性。</p>
+</div>
+
+<p><strong>init 中的 meta 恢复逻辑</strong>（在上一部分详细讲解过，此处补充其与 writeMeta 的闭环关系）：</p>
+
+<pre><code><span class="cm">// init 中：从 mmap 区加载两页缓冲区，再判定活跃页</span>
+<span class="kw">const</span> m0 = f2.<span class="fn">readMetaPageSingle</span>(&fps.meta0);
+<span class="kw">const</span> m1 = f2.<span class="fn">readMetaPageSingle</span>(&fps.meta1);
+<span class="kw">if</span> (m0 != <span class="kw">null</span> <span class="kw">and</span> m1 != <span class="kw">null</span>) {
+    <span class="kw">if</span> (m0.?.sequence >= m1.?.sequence) {
+        fps.meta_index = <span class="nu">1</span>;  <span class="cm">// meta0 活跃，下次写 meta1</span>
+        fps.next_free = @<span class="fn">max</span>(fps.next_free, m0.?.last_page + <span class="nu">1</span>);
+    } <span class="kw">else</span> {
+        fps.meta_index = <span class="nu">0</span>;  <span class="cm">// meta1 活跃，下次写 meta0</span>
+        fps.next_free = @<span class="fn">max</span>(fps.next_free, m1.?.last_page + <span class="nu">1</span>);
+    }
+} <span class="kw">else if</span> (m0 != <span class="kw">null</span>) {
+    fps.meta_index = <span class="nu">1</span>;  <span class="cm">// 仅 meta0 有效，下次写 meta1</span>
+    fps.next_free = @<span class="fn">max</span>(fps.next_free, m0.?.last_page + <span class="nu">1</span>);
+} <span class="kw">else if</span> (m1 != <span class="kw">null</span>) {
+    fps.meta_index = <span class="nu">0</span>;  <span class="cm">// 仅 meta1 有效，下次写 meta0</span>
+    fps.next_free = @<span class="fn">max</span>(fps.next_free, m1.?.last_page + <span class="nu">1</span>);
+}
+<span class="cm">// else: fresh DB，meta_index=0, next_free=FIRST_DATA_PAGE</span></code></pre>
+
+<div class="note">
+<p><strong>writeMeta 与 init 的闭环：</strong><code>vtWriteMeta</code> 写 meta0 后翻转 <code>meta_index</code> 为 1，
+下次写 meta1。reopen 时 <code>init</code> 读到 meta0 的 <code>sequence</code> 更大（因为它是最后写入的），
+于是设 <code>meta_index = 1</code>（下次写 meta1）——正好与写入时的翻转方向一致。这个闭环保证：无论在哪一刻
+崩溃，reopen 后 <code>meta_index</code> 总是指向"该被覆盖的旧页"，不会覆盖刚写入的最新页。这就是交替写的
+原子性保证——无需 fsync meta 即可保证逻辑正确（fsync 只影响物理持久化时机）。</p>
+</div>
+
+<h3>vtReadMeta：从 mmap 同步再读</h3>
+
+<p><code>vtReadMeta</code> 有一个 <code>MemPageStore</code> 版本没有的关键步骤：先从 mmap 区把两个 meta 页
+<code>@memcpy</code> 回内存缓冲区，再调 <code>readMetaPage</code> 解码。</p>
+
+<pre><code><span class="kw">fn</span> <span class="fn">vtReadMeta</span>(ptr: *<span class="ty">anyopaque</span>) !?f2.<span class="ty">MetaPage</span> {
+    <span class="kw">const</span> self: *<span class="ty">FilePageStore</span> = @ptrCast(@alignCast(ptr));
+    <span class="cm">// 先从 mmap 区同步到缓冲区，再读</span>
+    @<span class="fn">memcpy</span>(self.meta0[<span class="nu">0</span>..PAGE_SIZE], self.<span class="fn">pagePtr</span>(f2.META_PAGE_0)[<span class="nu">0</span>..PAGE_SIZE]);
+    @<span class="fn">memcpy</span>(self.meta1[<span class="nu">0</span>..PAGE_SIZE], self.<span class="fn">pagePtr</span>(f2.META_PAGE_1)[<span class="nu">0</span>..PAGE_SIZE]);
+    <span class="kw">return</span> f2.<span class="fn">readMetaPage</span>(&self.meta0, &self.meta1);
+}</code></pre>
+
+<div class="note warn">
+<p><strong>为什么先 memcpy？</strong>注释说"reader 可能跨进程写"。在 <code>MAP_SHARED</code> 下，另一个进程
+可能通过自己的 mmap 映射同一文件并写了 meta 页。此时 <code>self.meta0</code>/<code>meta1</code> 内存缓冲区
+可能还是旧值（上次 <code>init</code> 或 <code>writeMeta</code> 时的快照）。<code>vtReadMeta</code> 每次都从
+mmap 区重新同步，保证读到最新值。对比 <code>MemPageStore</code> 的 <code>vtReadMeta</code> 直接读自身缓冲区
+（无跨进程场景，缓冲区即唯一真相）——这是文件实现独有的"缓冲区 vs mmap 区一致性"问题。</p>
+</div>
+
+<p>对比 <code>MemPageStore</code> 版本——一行就完事，因为缓冲区就是数据本体：</p>
+
+<pre><code><span class="cm">// MemPageStore: 直接读缓冲区（无 mmap 同步需求）</span>
+<span class="kw">fn</span> <span class="fn">vtReadMeta</span>(ptr: *<span class="ty">anyopaque</span>) !?f2.<span class="ty">MetaPage</span> {
+    <span class="kw">const</span> self: *<span class="ty">MemPageStore</span> = @ptrCast(@alignCast(ptr));
+    <span class="kw">return</span> f2.<span class="fn">readMetaPage</span>(&self.meta0, &self.meta1);
+}</code></pre>
+
+<h3>vtSync / vtMapSize：持久化与容量</h3>
+
+<p><code>vtSync</code> 调 <code>fsync(fd)</code> 强制将内核页缓存中的脏页刷回磁盘。这是 <code>FilePageStore</code>
+独有的持久化能力——<code>MemPageStore</code> 的 <code>vtSync</code> 是空实现。</p>
+
+<pre><code><span class="kw">fn</span> <span class="fn">vtSync</span>(ptr: *<span class="ty">anyopaque</span>) !<span class="ty">void</span> {
+    <span class="kw">const</span> self: *<span class="ty">FilePageStore</span> = @ptrCast(@alignCast(ptr));
+    <span class="kw">if</span> (c.fsync(self.fd) != <span class="nu">0</span>) <span class="kw">return error</span>.SyncFailed;
+}
+
+<span class="kw">fn</span> <span class="fn">vtMapSize</span>(ptr: *<span class="ty">anyopaque</span>) <span class="ty">u64</span> {
+    <span class="kw">const</span> self: *<span class="ty">FilePageStore</span> = @ptrCast(@alignCast(ptr));
+    <span class="kw">return</span> self.region_size / PAGE_SIZE;
+}</code></pre>
+
+<div class="note">
+<p><strong>fsync 语义链：</strong>写路径经 <code>MAP_SHARED</code> mmap → 写入直接作用于内核页缓存 →
+内核异步刷回磁盘（时间不确定） → <code>fsync(fd)</code> 强制同步刷盘并等待完成 → 返回后数据物理持久化。
+若不调 <code>sync</code>，进程正常退出时内核也会刷盘，但若崩溃/断电则可能丢数据。<code>sync</code> 是
+上层控制持久化时序的接口。注意 <code>fsync</code> 只刷已 <code>ftruncate</code> 到的文件范围内的脏页。</p>
+</div>
+
+<p><code>vtMapSize</code> 返回 <code>region_size / PAGE_SIZE</code>——即 1TB 预留区可容纳的页数
+（<code>2^40 / 4096 = 2^28 = 268,435,456</code> 页）。对比 <code>MemPageStore</code> 返回
+<code>max_pages</code>（构造时指定的页数上限）。两者语义一致——都是"还能分配多少页"的上限参考。</p>
+
+<h3>FpsCounters：写路径 profile 计数器</h3>
+
+<p><code>FpsCounters</code> 是一组模块级 <code>pub var</code> 计数器，用 <code>enable</code> 布尔开关控制。
+当 <code>enable = false</code>（默认）时，各 vtable 函数中 <code>if (FpsCounters.enable)</code> 分支
+不会被编译进热路径（Zig 编译器优化掉常假分支）。</p>
+
+<pre><code><span class="kw">pub const</span> <span class="ty">FpsCounters</span> = <span class="kw">struct</span> {
+    <span class="kw">pub var</span> enable: <span class="ty">bool</span> = <span class="kw">false</span>;
+    <span class="kw">pub var</span> write_page_calls: <span class="ty">u64</span> = <span class="nu">0</span>;
+    <span class="kw">pub var</span> alloc_page_calls: <span class="ty">u64</span> = <span class="nu">0</span>;
+    <span class="kw">pub var</span> free_page_calls: <span class="ty">u64</span> = <span class="nu">0</span>;
+    <span class="kw">pub var</span> read_page_calls: <span class="ty">u64</span> = <span class="nu">0</span>;
+    <span class="kw">pub var</span> fstat_calls: <span class="ty">u64</span> = <span class="nu">0</span>;
+    <span class="kw">pub var</span> ftruncate_calls: <span class="ty">u64</span> = <span class="nu">0</span>;
+    <span class="kw">pub var</span> write_page_ns: <span class="ty">u64</span> = <span class="nu">0</span>;
+    <span class="kw">pub var</span> alloc_page_ns: <span class="ty">u64</span> = <span class="nu">0</span>;
+    <span class="kw">pub var</span> ensure_growth_ns: <span class="ty">u64</span> = <span class="nu">0</span>;
+
+    <span class="kw">pub fn</span> <span class="fn">reset</span>() <span class="ty">void</span> { <span class="cm">/* 全部清零 */</span> }
+    <span class="kw">pub fn</span> <span class="fn">now</span>() <span class="ty">i64</span> { <span class="cm">/* clock_gettime MONOTONIC */</span> }
+};</code></pre>
+
+<table>
+<tr><th>计数器</th><th>用途</th></tr>
+<tr><td><code>write_page_calls / write_page_ns</code></td><td>写页调用次数与累计耗时，量化写路径开销</td></tr>
+<tr><td><code>alloc_page_calls / alloc_page_ns</code></td><td>分配页次数与耗时（含 ensureFileGrowth）</td></tr>
+<tr><td><code>ensure_growth_ns</code></td><td>ftruncate + fstat 累计耗时，定位文件增长瓶颈</td></tr>
+<tr><td><code>fstat_calls / ftruncate_calls</code></td><td>系统调用次数，评估是否过度调用</td></tr>
+<tr><td><code>read_page_calls / free_page_calls</code></td><td>读页与回收页次数</td></tr>
+</table>
+
+<div class="note">
+<p><strong>定位与设计：</strong>注释明确标注"#41 FPS 写路径计数器（profile 开关，不进生产热路径）"。
+<code>enable</code> 默认 <code>false</code>，生产编译时所有 <code>if (FpsCounters.enable)</code> 分支
+被优化掉——热路径零开销。开发/调试时设 <code>FpsCounters.enable = true</code> 即可开启计时。
+<code>now()</code> 用 <code>clock_gettime(MONOTONIC)</code> 取纳秒级时间戳，<code>reset()</code> 清零全部计数器
+用于基准测试前重置。这是典型的"条件编译式 profile hook"——比 <code>#ifdef</code> 更优雅，靠语言层常量折叠
+实现零开销。</p>
+</div>
+
+<h3>FilePageStore vs MemPageStore：全面对比</h3>
+
+<table>
+<tr><th>维度</th><th>FilePageStore</th><th>MemPageStore</th></tr>
+<tr><td>存储后端</td><td>mmap MAP_SHARED 1TB 预留区 → 文件</td><td>每页独立堆分配（slab 页池）</td></tr>
+<tr><td>持久化</td><td>是（fsync 刷盘）</td><td>否（进程退出即消失）</td></tr>
+<tr><td>readPage 实现</td><td>返回 <code>mmap_ptr + offset</code> 切片</td><td>返回 <code>pages.items[n][0..]</code></td></tr>
+<tr><td>writePage 实现</td><td>返回 mmap 可变切片，写经页缓存</td><td>返回堆页可变切片，写经内存</td></tr>
+<tr><td>分配骨架</td><td>bump (<code>next_free</code>) + LIFO freelist</td><td>完全相同</td></tr>
+<tr><td>页增长</td><td><code>ensureFileGrowth</code> → <code>ftruncate</code></td><td><code>ensurePage</code> → 堆分配（两步+回滚）</td></tr>
+<tr><td>锁</td><td>无锁（单写者模型）</td><td><code>freelist_mu</code> 串行化</td></tr>
+<tr><td>meta writeMeta</td><td>override last_page + 交替写 + flushMetaBuffer</td><td>交替写（无 override、无 flush）</td></tr>
+<tr><td>meta readMeta</td><td>先 memcpy 从 mmap 同步，再读</td><td>直接读缓冲区</td></tr>
+<tr><td>crash 恢复</td><td><strong>真正生效</strong>（reopen init 恢复 meta_index + next_free）</td><td>语义对齐（crash 后内存全失）</td></tr>
+<tr><td>sync</td><td><code>fsync(fd)</code></td><td>空实现</td></tr>
+<tr><td>mapsize</td><td><code>region_size / PAGE_SIZE</code>（2^28 页）</td><td><code>max_pages</code>（构造指定）</td></tr>
+<tr><td>profile 计数器</td><td>FpsCounters（enable 开关）</td><td>无</td></tr>
+</table>
+
+<div class="card">
+<p><strong>相同骨架：</strong>两者共享 bump + LIFO freelist 分配模型、meta 双页交替写策略、meta 页特判
+（直接返回缓冲区）、以及完全一致的 VTable 契约。这意味着上层 B-tree 代码可以无差别地通过
+<code>PageStore</code> 接口操作两者——测试用 <code>MemPageStore</code>，生产用 <code>FilePageStore</code>，
+代码零改动。</p>
+</div>
+
+<div class="note ok">
+<p><strong>分叉点总结：</strong>四处分叉定义了文件实现的本质——(1) <strong>读写后端</strong>从堆分配变为
+mmap 指针，引入零拷贝和页缓存语义；(2) <strong>页增长</strong>从堆分配变为 ftruncate，消除两步回滚负担
+但引入系统调用开销；(3) <strong>meta readMeta</strong>多了 mmap→缓冲区的同步步骤，解决跨进程一致性；
+(4) <strong>meta writeMeta</strong>多了 last_page override 和 flushMetaBuffer，保证 reopen 恢复正确性。
+这四处分叉都不是随意的——每一处都直接服务于"持久化 + crash 安全"这一文件实现的核心目标。</p>
+</div>
+
+<h3>末尾两个 test 的意义</h3>
+
+<p>源码末尾有两个内联测试，分别验证 <code>FilePageStore</code> 最核心的两个行为契约：</p>
+
+<pre><code><span class="kw">test</span> <span class="st">"file_page_store: 1TB region reserved on open"</span> {
+    <span class="kw">const</span> allocator = std.testing.allocator;
+    <span class="kw">const</span> path = <span class="st">".fps_region_test.db"</span>;
+    <span class="kw">defer</span> <span class="fn">unlinkPath</span>(path);
+    <span class="kw">var</span> fps = <span class="kw">try</span> <span class="ty">FilePageStore</span>.<span class="fn">init</span>(allocator, path);
+    <span class="kw">defer</span> fps.<span class="fn">deinit</span>();
+    <span class="kw">try</span> std.testing.<span class="fn">expect</span>(fps.<span class="fn">regionSize</span>() >= (<span class="nu">1</span> &lt;&lt; <span class="nu">40</span>));
+}</code></pre>
+
+<div class="note">
+<p><strong>测试一：1TB 预留验证。</strong>验证 <code>init</code> 后 <code>regionSize()</code> 至少 1TB
+（<code>2^40</code> 字节）。这确认了 mmap 预留区确实映射成功——若 <code>mmap</code> 返回 <code>MAP_FAILED</code>，
+<code>init</code> 会返回 <code>error.MapFailed</code>，测试会直接 fail（<code>try</code> 传播错误）。
+<code>defer unlinkPath</code> 清理测试文件，避免残留。</p>
+</div>
+
+<pre><code><span class="kw">test</span> <span class="st">"file_page_store: alloc grows file, read-back visible"</span> {
+    <span class="kw">const</span> allocator = std.testing.allocator;
+    <span class="kw">const</span> path = <span class="st">".fps_grow_test.db"</span>;
+    <span class="kw">defer</span> <span class="fn">unlinkPath</span>(path);
+    <span class="kw">var</span> fps = <span class="kw">try</span> <span class="ty">FilePageStore</span>.<span class="fn">init</span>(allocator, path);
+    <span class="kw">defer</span> fps.<span class="fn">deinit</span>();
+    <span class="kw">const</span> s = fps.<span class="fn">store</span>();
+    <span class="kw">const</span> pn = <span class="kw">try</span> s.<span class="fn">allocPage</span>();
+    <span class="kw">const</span> w = <span class="kw">try</span> s.<span class="fn">writePage</span>(pn);
+    @<span class="fn">memcpy</span>(w[<span class="nu">0</span>..<span class="nu">4</span>], <span class="st">"ABCD"</span>);
+    <span class="kw">const</span> r = <span class="kw">try</span> s.<span class="fn">readPage</span>(pn);
+    <span class="kw">try</span> std.testing.<span class="fn">expectEqualStrings</span>(<span class="st">"ABCD"</span>, r[<span class="nu">0</span>..<span class="nu">4</span>]);
+}</code></pre>
+
+<div class="note ok">
+<p><strong>测试二：alloc + write + read 回环。</strong>这是最核心的端到端验证——<code>allocPage</code> 分配
+（触发 <code>ensureFileGrowth</code> 扩展文件），<code>writePage</code> 返回 mmap 可变切片并写入
+<code>"ABCD"</code>，<code>readPage</code> 读回同一页验证内容一致。这同时验证了：(1) 分配后文件确实增长
+（否则读会 SIGBUS）；(2) 经 mmap 写入的数据对经 mmap 的读取可见（MAP_SHARED 语义）；(3) writePage 和
+readPage 返回的指针指向同一物理位置（<code>mmap_ptr + pn*PAGE_SIZE</code>）。<code>unlinkPath</code> 是辅助函数，
+把 Zig 切片路径转为 C 字符串后调 <code>unlink</code> 清理文件。</p>
+</div>
+
+<h3>风险清单与设计总结</h3>
+
+<table>
+<tr><th>风险点</th><th>说明</th><th>缓解</th></tr>
+<tr><td>未调 sync 即崩溃</td><td>fsync 前脏页仅在页缓存，断电丢失</td><td>上层在关键 checkpoint 调 <code>store.sync()</code></td></tr>
+<tr><td>meta 写未 fsync</td><td>writeMeta 只 flush 到 mmap（页缓存），未 fsync</td><td>交替写保证逻辑原子性；物理持久化由上层 sync 统一刷</td></tr>
+<tr><td>无锁并发写</td><td>多写者并发调 allocPage/writePage 会竞态</td><td>设计为单写者模型，上层 db.zig 串行化</td></tr>
+<tr><td>freelist append 静默失败</td><td>与 MemPageStore 相同的 <code>catch {}</code></td><td>最坏页不可复用（不影响正确性）</td></tr>
+<tr><td>ensureFileGrowth 重复 fstat</td><td>每次 allocPage/writePage 都 fstat 查文件大小</td><td>FpsCounters.fstat_calls 可量化；后续可缓存 st_size</td></tr>
+<tr><td>1TB 预留区虚拟空间</td><td>占 1TB 虚拟地址空间（不占物理内存）</td><td>64-bit 系统虚拟空间充裕（LMDB 验证）</td></tr>
+</table>
+
+<div class="card">
+<p><strong>设计亮点：</strong></p>
+<ol>
+<li><strong>mmap 零拷贝：</strong>读写经同一 mmap 指针，无内存拷贝，内核页缓存直接映射用户虚拟地址。</li>
+<li><strong>1TB 预留 + 按需增长：</strong>虚拟地址一次性预留 1TB，文件按需 ftruncate，无需 remap。</li>
+<li><strong>meta 交替写 + last_page override：</strong>双页交替写保证逻辑原子性，override 保证 reopen 恢复正确。</li>
+<li><strong>与 MemPageStore 语义对齐：</strong>共享 VTable 契约，上层代码零改动切换实现。</li>
+<li><strong>FpsCounters 零开销 profile：</strong>常量折叠实现开关，生产热路径无额外指令。</li>
+</ol>
+</div>
+
+<p class="muted">FilePageStore 以 mmap MAP_SHARED 为基底，在 MemPageStore 的分配骨架上叠加了零拷贝读写、
+按需文件增长、meta 同步与 override、fsync 持久化四层能力。它的每一处设计都服务于持久化与 crash 安全——
+这正是它从"测试用内存 Store"升级为"生产级文件 Store"的核心价值。理解这四层叠加，就理解了 cube_db 页存储层
+从内存到文件的完整演进路径。</p>
+</section>
+
+
+<footer>
+  <p>cube_db — file_page_store 讲义 · 由 herdr 多 agent 团队协作生成（conductor + w1-impl + w1-review）</p>
+</footer>
+
+</div>
+</body>
+</html>
