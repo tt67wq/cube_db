@@ -391,3 +391,7 @@ test "format: computePageChecksum is deterministic" {
     const cs2 = f2.computePageChecksum(&page);
     try std.testing.expectEqual(cs1, cs2);
 }
+// T-3: freelist 溢出测试接入（comptime import，test-format 会跑这些 test）
+comptime {
+    _ = @import("freelist_overflow_test.zig");
+}
