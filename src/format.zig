@@ -207,7 +207,7 @@ pub fn writeMetaPage(page: *[PAGE_SIZE]u8, meta: *const MetaPage, index: u32) vo
     setPageChecksum(page, computePageChecksum(page));
 }
 
-/// 从单页缓冲区读 meta（不校验 meta 页类型，返回 null 如果 checksum 不匹配或 magic/version 不对）
+/// 从单页缓冲区读 meta（校验 checksum / page_type / magic+version，任一不过返回 null）
 pub fn readMetaPageSingle(page: *const [PAGE_SIZE]u8) ?MetaPage {
     if (!verifyPageChecksum(page)) return null;
     const hdr = decodePageHeader(page[0..PAGE_HEADER_SIZE]);

@@ -1,0 +1,80 @@
+/* cube_db 讲义共享样式 — 提取自三份 HTML 的共用 <style> */
+:root{
+  --bg:#0f1117; --panel:#171a23; --panel2:#1e2230; --border:#2a2f3f;
+  --fg:#e6e9f0; --muted:#9aa3b5; --accent:#5b9dff; --accent2:#8b6cff;
+  --green:#3ddc84; --red:#ff5c5c; --yellow:#ffd166; --cyan:#4dd0e1;
+  --code:#0d0f14;
+  --mono:"SF Mono","JetBrains Mono","Menlo",Consolas,monospace;
+}
+html{scroll-behavior:smooth;}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font-family:-apple-system,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+  line-height:1.7;}
+.wrap{max-width:1000px;margin:0 auto;padding:32px 20px 80px;}
+header.hero{border-bottom:1px solid var(--border);padding-bottom:24px;margin-bottom:28px;}
+header.hero h1{font-size:2rem;margin:0 0 6px;}
+header.hero .sub{color:var(--muted);}
+.tag{display:inline-block;padding:2px 10px;border-radius:20px;font-size:.78rem;
+  border:1px solid var(--border);color:var(--muted);margin-right:6px;}
+h2{font-size:1.45rem;margin-top:48px;padding-bottom:8px;border-bottom:1px solid var(--border);}
+h2 .no{color:var(--accent);margin-right:8px;}
+h3{font-size:1.12rem;margin-top:28px;color:var(--cyan);}
+p{color:var(--fg);}
+.muted{color:var(--muted);}
+pre{background:var(--code);border:1px solid var(--border);border-radius:10px;
+  padding:16px 18px;overflow-x:auto;font-family:var(--mono);font-size:.85rem;line-height:1.6;}
+code{font-family:var(--mono);font-size:.85em;background:var(--panel2);
+  padding:1px 6px;border-radius:5px;}
+pre code{background:none;padding:0;}
+.kw{color:var(--accent2);} .ty{color:var(--cyan);} .cm{color:#8b95a8;}
+.st{color:var(--green);} .nu{color:var(--yellow);} .fn{color:var(--accent);}
+.note{background:var(--panel);border-left:4px solid var(--accent);border-radius:0 10px 10px 0;
+  padding:12px 16px;margin:18px 0;}
+.note.warn{border-left-color:var(--yellow);}
+.note.danger{border-left-color:var(--red);}
+.note.ok{border-left-color:var(--green);}
+table{border-collapse:collapse;width:100%;margin:16px 0;font-size:.92rem;}
+th,td{border:1px solid var(--border);padding:8px 12px;text-align:left;}
+th{background:var(--panel2);}
+tr:nth-child(even) td{background:var(--panel);}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:18px 22px;margin:18px 0;}
+.flow{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:16px 0;}
+.flow .step{background:var(--panel2);border:1px solid var(--border);border-radius:8px;
+  padding:8px 14px;font-size:.9rem;}
+.flow .arrow{color:var(--accent);font-weight:bold;}
+ul,ol{padding-left:22px;}
+li{margin:4px 0;}
+a{color:var(--accent);}
+/* ---------- 章节导航 ---------- */
+.sidenav{position:fixed;top:0;left:0;bottom:0;width:250px;background:var(--panel);
+  border-right:1px solid var(--border);padding:22px 0;overflow-y:auto;z-index:50;}
+.sidenav h4{margin:0 20px 4px;font-size:.8rem;letter-spacing:.08em;color:var(--muted);
+  text-transform:uppercase;padding-bottom:10px;border-bottom:1px solid var(--border);}
+.sidenav ul{list-style:none;margin:0;padding:0;}
+.sidenav li{margin:0;}
+.sidenav .part a{display:block;padding:9px 20px;font-size:.88rem;font-weight:600;color:var(--accent);
+  border-left:3px solid transparent;}
+.sidenav .part a:hover{background:var(--panel2);}
+.sidenav .sub a{display:block;padding:5px 20px 5px 38px;font-size:.8rem;color:var(--muted);
+  border-left:3px solid transparent;}
+.sidenav .sub a:hover{color:var(--fg);background:var(--panel2);}
+.sidenav .part + .sub{margin-top:2px;}
+.sidenav::-webkit-scrollbar{width:8px;}
+.sidenav::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px;}
+.sidenav-toggle{display:none;}
+@media (min-width:1260px){
+  .wrap{margin-left:250px;}
+}
+@media (max-width:1259px){
+  .sidenav{transform:translateX(-100%);transition:transform .25s ease;box-shadow:2px 0 16px rgba(0,0,0,.4);}
+  .sidenav.open{transform:translateX(0);}
+  .sidenav-toggle{display:block;position:fixed;top:14px;left:14px;z-index:60;
+    background:var(--panel2);border:1px solid var(--border);color:var(--fg);
+    border-radius:8px;padding:7px 12px;cursor:pointer;font-size:.85rem;}
+  .wrap{padding-top:56px;}
+  body.sidenav-open .wrap{pointer-events:none;opacity:.6;}
+}
+section.lecture{scroll-margin-top:16px;}
+footer{margin-top:64px;border-top:1px solid var(--border);padding-top:16px;color:var(--muted);font-size:.85rem;}
+a:focus-visible,button:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px;}

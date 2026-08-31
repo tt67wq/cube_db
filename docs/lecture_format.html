@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>cube_db · src/format.zig 讲义</title>
+<link rel="stylesheet" href="lecture.css">
+</head>
+<body>
+<button class="sidenav-toggle" id="navToggle" aria-label="目录" aria-expanded="false">☰ 目录</button>
+<nav class="sidenav" id="sidenav" aria-label="章节导航">
+  <h4>目录 · 章节导航</h4>
+  <ul>
+    <li class="part"><a href="#part1">第一部分 · 页格式与编解码基础</a></li>
+    <li class="sub"><a href="#s11">1.1 文件头与设计理念</a></li>
+    <li class="sub"><a href="#s12">1.2 常量全集</a></li>
+    <li class="sub"><a href="#s13">1.3 页头结构 PageHeader</a></li>
+    <li class="sub"><a href="#s14">1.4 页头编解码</a></li>
+    <li class="sub"><a href="#s15">1.5 整页 CRC 校验</a></li>
+    <li class="part"><a href="#part2">第二部分 · meta 与 freelist 编解码</a></li>
+    <li class="sub"><a href="#s21">2.1 MetaPage 结构与 payload</a></li>
+    <li class="sub"><a href="#s22">2.2 meta 页写入与交替写</a></li>
+    <li class="sub"><a href="#s23">2.3 meta 读取与崩溃恢复</a></li>
+    <li class="sub"><a href="#s24">2.4 freelist 页编解码</a></li>
+    <li class="sub"><a href="#s25">2.5 对齐陷阱与测试集</a></li>
+    <li class="sub"><a href="#s26">2.6 系统全貌与风险约束</a></li>
+  </ul>
+</nav>
+<main class="wrap">
+
+<header class="hero">
+  <h1>cube_db · <code>src/format.zig</code> 讲义</h1>
+  <div class="sub">v2 页格式层 —— 页头 / meta / freelist / CRC 的纯函数编解码，无 IO</div>
+  <div style="margin-top:12px">
+    <span class="tag">Zig 0.16</span>
+    <span class="tag">PAGE_SIZE=4096</span>
+    <span class="tag">定长小端编码</span>
+    <span class="tag">CRC32 硬件加速</span>
+    <span class="tag">meta 交替写</span>
+  </div>
+</header>
+
+<p class="muted">本讲义由开发团队协作生成。两个部分分别讲解页格式基础编解码与 meta/freelist 的崩溃安全设计；代码块附逐行解释。format.zig 是 cube_db 最底层的格式层 —— <code>page_store.zig</code>（PageStore 抽象）与 <code>file_page_store.zig</code>（mmap 文件 Store）都构建在它之上。</p>
+
+<section class="lecture" id="part1">
+<h2><span class="no">第一部分</span>页格式与编解码基础</h2>
+
+<p><code>src/format.zig</code> 是 cube_db 的「页格式层」：它定义了一页（4096 字节）在磁盘/内存里的<b>物理布局</b>，
+以及把页头、meta、freelist 这些结构化数据编码成字节、再从字节解码回结构体的<b>纯函数</b>。它不碰任何 IO——
+不 open 文件、不 mmap、不读写内存，所有函数都是「给字节进、给结构出」或反之。上层的
+<code>page_store.zig</code> 与 <code>file_page_store.zig</code> 通过 <code>@import("format.zig")</code>
+（别名 <code>f2</code>）调用它。</p>
+
+<h3 id="s11">1.1 文件头与设计理念</h3>
+
+<pre><code><span class="cm">//! format.zig — v2 页格式常量与编解码（页头、meta、freelist、CRC）</span>
+<span class="cm">//! 纯函数模块，无 IO。PAGE_SIZE=4096，固定页头 24B，页尾 4B CRC。</span>
+<span class="kw">const</span> std = @import(<span class="st">"std"</span>);
+
+<span class="kw">pub const</span> PAGE_SIZE: <span class="ty">usize</span> = <span class="nu">4096</span>;
+<span class="kw">pub const</span> PAGE_HEADER_SIZE: <span class="ty">usize</span> = <span class="nu">24</span>;</code></pre>
+
+<p>文件头三行即点明了设计核心：<b>纯函数、无 IO</b>。整个模块只做「数据 ↔ 字节」的转换，不做任何持久化或内存分配。
+这意味着它可被 <code>MemPageStore</code>（堆页）与 <code>FilePageStore</code>（mmap 页）<b>无差别复用</b>——
+无论页物理落在哪，格式层只关心「这一页 4096 字节怎么排」。</p>
+
+<p>一页的固定布局：<b>前 24 字节是页头</b>，<b>尾 4 字节是 CRC 校验和</b>，中间 <code>4096-24-4=4068</code> 字节是各页类型的 payload 区。
+这个「页头 + payload + 页尾 CRC」的三段式是贯穿全部页类型的统一骨架：</p>
+
+<div class="flow">
+<span class="step">页头 24B</span>
+<span class="arrow">→</span>
+<span class="step">payload 区 4068B（内容随页类型而异）</span>
+<span class="arrow">→</span>
+<span class="step">CRC 4B</span>
+</div>
+<p class="muted">每页 4096 字节 = 24B 页头 + 4068B payload + 4B CRC</p>
+
+<div class="card">
+<p><b>为什么页尾放 CRC 而不是页头内？</b> 页尾 CRC 覆盖整页（含页头与 payload）——这样页头的 <code>page_type</code>、
+<code>page_no</code> 等字段本身也受校验保护，任何一字节损坏都能被检出。若 CRC 放页头内，就无法覆盖页头自身。
+这是「校验和覆盖全页」的设计，与 FilePageStore 的崩溃恢复直接相关：半写页的页尾 CRC 尚未写完，读时校验必然失败，
+从而被识别为无效页。</p>
+</div>
+
+<h3 id="s12">1.2 常量全集</h3>
+
+<pre><code><span class="cm">/// 页类型</span>
+<span class="kw">pub const</span> PAGE_TYPE_FREE: <span class="ty">u8</span> = <span class="nu">0</span>;
+<span class="kw">pub const</span> PAGE_TYPE_META: <span class="ty">u8</span> = <span class="nu">1</span>;
+<span class="kw">pub const</span> PAGE_TYPE_BRANCH: <span class="ty">u8</span> = <span class="nu">2</span>;
+<span class="kw">pub const</span> PAGE_TYPE_LEAF: <span class="ty">u8</span> = <span class="nu">3</span>;
+<span class="kw">pub const</span> PAGE_TYPE_OVERFLOW: <span class="ty">u8</span> = <span class="nu">4</span>;
+
+<span class="cm">/// 特殊页号</span>
+<span class="kw">pub const</span> NULL_PAGE: <span class="ty">u32</span> = <span class="nu">0</span>;
+<span class="kw">pub const</span> META_PAGE_0: <span class="ty">u32</span> = <span class="nu">1</span>;
+<span class="kw">pub const</span> META_PAGE_1: <span class="ty">u32</span> = <span class="nu">2</span>;
+
+<span class="kw">pub const</span> MAGIC_V2: <span class="ty">u32</span> = <span class="nu">0x4355_4232</span>; <span class="cm">// "CUB2"</span>
+<span class="kw">pub const</span> META_PAGE_PAYLOAD_SIZE: <span class="ty">usize</span> = <span class="nu">58</span>;</code></pre>
+
+<table>
+<tr><th>常量</th><th>值</th><th>含义</th></tr>
+<tr><td><code>PAGE_TYPE_FREE</code></td><td>0</td><td>空闲页（freelist 链节点）</td></tr>
+<tr><td><code>PAGE_TYPE_META</code></td><td>1</td><td>meta 页（页 1 / 页 2）</td></tr>
+<tr><td><code>PAGE_TYPE_BRANCH</code></td><td>2</td><td>B-tree 内部/分支节点页</td></tr>
+<tr><td><code>PAGE_TYPE_LEAF</code></td><td>3</td><td>B-tree 叶子节点页</td></tr>
+<tr><td><code>PAGE_TYPE_OVERFLOW</code></td><td>4</td><td>溢出页（大值续页）</td></tr>
+<tr><td><code>NULL_PAGE</code></td><td>0</td><td>空指针哨兵，不映射任何物理页</td></tr>
+<tr><td><code>META_PAGE_0/1</code></td><td>1 / 2</td><td>双 meta 页（交替写，崩溃安全）</td></tr>
+<tr><td><code>MAGIC_V2</code></td><td>0x43554232</td><td>"CUB2" 魔数，标识 v2 格式</td></tr>
+<tr><td><code>META_PAGE_PAYLOAD_SIZE</code></td><td>58</td><td>meta payload 固定字节数</td></tr>
+</table>
+
+<div class="note" role="note">💡 说明 <b>页号约定：</b>页号 0 是 <code>NULL_PAGE</code>（哨兵，不做任何页分配）；页号 1、2 固定给双 meta 页；
+页号 3 起（<code>FIRST_DATA_PAGE</code>，在 page_store.zig 定义）才是数据页。文件开头至少要有 3 页（12288 字节）
+才能承载两个 meta —— 这正是 <code>FilePageStore.init</code> 先 <code>ftruncate</code> 到 3 页的原因。</div>
+
+<div class="note ok" role="note">✅ 提示 <b>页类型枚举编码：</b>页类型用 <code>u8</code> 而非 enum，是为了磁盘布局的<b>确定性</b>。
+裸 <code>u8</code> 保证磁盘上这一字节恒为 1 字节、值域固定，不依赖 enum 的 tag type（<code>@intFromEnum</code> 的底层整型）
+推断或任何布局重排——任何平台、任何编译配置下字节完全一致。这是格式层的硬约束。</div>
+
+<h3 id="s13">1.3 页头结构 PageHeader</h3>
+
+<pre><code><span class="cm">/// 页头（每个页前 24 字节）</span>
+<span class="kw">pub const</span> <span class="ty">PageHeader</span> = <span class="kw">struct</span> {
+    page_no: <span class="ty">u32</span>,
+    page_type: <span class="ty">u8</span>,
+    gen: <span class="ty">u64</span>,
+    nkeys: <span class="ty">u16</span>,
+    free_next: <span class="ty">u32</span>, <span class="cm">// freelist 链下一页；非 free 页为 0</span>
+};</code></pre>
+
+<table>
+<tr><th>字段</th><th>类型</th><th>字节</th><th>含义</th></tr>
+<tr><td><code>page_no</code></td><td><code>u32</code></td><td>4</td><td>本页页号（自我标识，用于一致性校验）</td></tr>
+<tr><td><code>page_type</code></td><td><code>u8</code></td><td>1</td><td>页类型（上表 0-4）</td></tr>
+<tr><td><code>gen</code></td><td><code>u64</code></td><td>8</td><td>代/序列号（meta 页存 meta.sequence）</td></tr>
+<tr><td><code>nkeys</code></td><td><code>u16</code></td><td>2</td><td>键数（B-tree 节点用；meta/free 页为 0）</td></tr>
+<tr><td><code>free_next</code></td><td><code>u32</code></td><td>4</td><td>freelist 链下一页；非 free 页恒为 0</td></tr>
+<tr><td colspan="2"><code>padding</code></td><td>5</td><td>填充对齐到 24B</td></tr>
+</table>
+
+<p><code>4+1+8+2+4 = 19</code> 字节，加上 5 字节 padding 恰好 <code>PAGE_HEADER_SIZE = 24</code>。
+页头字段按字节偏移逐个编解码，<b>不依赖结构体内存布局</b>——即使结构体有 padding，编码时也只写声明的字段字节。</p>
+
+<div class="note" role="note">💡 说明 <b>gen 字段的复用：</b><code>gen</code> 是通用「代」字段。在 meta 页它存 <code>meta.sequence</code>
+（序列号，见 2.2 节），用于双页交替时比较新旧；在其他页类型它可作为代际/版本标记。一个字段多种语义，靠
+<code>page_type</code> 区分——这是紧凑页头的设计取向。</div>
+
+<h3 id="s14">1.4 页头编解码</h3>
+
+<pre><code>comptime {
+    std.debug.assert(PAGE_HEADER_SIZE == 24);
+}
+
+<span class="kw">pub fn</span> <span class="fn">encodePageHeader</span>(buf: []<span class="ty">u8</span>, h: *<span class="kw">const</span> <span class="ty">PageHeader</span>) <span class="kw">void</span> {
+    std.debug.assert(buf.len >= PAGE_HEADER_SIZE);
+    <span class="kw">var</span> pos: <span class="ty">usize</span> = <span class="nu">0</span>;
+    std.mem.writeInt(u32, buf[pos..][0..4], h.page_no, .little);
+    pos += <span class="nu">4</span>;
+    buf[pos] = h.page_type;
+    pos += <span class="nu">1</span>;
+    std.mem.writeInt(u64, buf[pos..][0..8], h.gen, .little);
+    pos += <span class="nu">8</span>;
+    std.mem.writeInt(u16, buf[pos..][0..2], h.nkeys, .little);
+    pos += <span class="nu">2</span>;
+    std.mem.writeInt(u32, buf[pos..][0..4], h.free_next, .little);
+    pos += <span class="nu">4</span>;
+    <span class="cm">// padding 5 bytes (leave as is)</span>
+}</code></pre>
+
+<p><code>encodePageHeader</code> 用一个游标 <code>pos</code> 顺序写入五个字段，全部用 <code>std.mem.writeInt</code>
+显式指定<b>小端序（<code>.little</code>）</b>。要点：</p>
+
+<ul>
+<li><b>字节序显式化：</b>不依赖主机字节序（大端/小端），统一写小端，保证跨平台磁盘文件可移植。</li>
+<li><b>定长编码：</b>每个字段字节数固定，无变长、无对齐 padding 参与——读回时按同样偏移解析即可。</li>
+<li><b>padding 不写：</b>末尾 5 字节「leave as is」，编码方不负责清零（调用方通常已 <code>@memset</code> 整页）。</li>
+</ul>
+
+<pre><code><span class="kw">pub fn</span> <span class="fn">decodePageHeader</span>(buf: []<span class="kw">const</span> <span class="ty">u8</span>) <span class="ty">PageHeader</span> {
+    std.debug.assert(buf.len >= PAGE_HEADER_SIZE);
+    <span class="kw">var</span> pos: <span class="ty">usize</span> = <span class="nu">0</span>;
+    <span class="kw">const</span> page_no = std.mem.readInt(u32, buf[pos..][0..4], .little);
+    pos += <span class="nu">4</span>;
+    <span class="kw">const</span> page_type = buf[pos];
+    pos += <span class="nu">1</span>;
+    <span class="kw">const</span> gen = std.mem.readInt(u64, buf[pos..][0..8], .little);
+    pos += <span class="nu">8</span>;
+    <span class="kw">const</span> nkeys = std.mem.readInt(u16, buf[pos..][0..2], .little);
+    pos += <span class="nu">2</span>;
+    <span class="kw">const</span> free_next = std.mem.readInt(u32, buf[pos..][0..4], .little);
+    <span class="kw">return</span> .{
+        .page_no = page_no, .page_type = page_type, .gen = gen,
+        .nkeys = nkeys, .free_next = free_next,
+    };
+}</code></pre>
+
+<p>解码是编码的镜像：同一套偏移游标，用 <code>readInt</code> 读回各字段。encode/decode 严格对称是格式层的<b>铁律</b>——
+任何一边多写/少读一字节都会导致后续字段错位。这也是为什么有 §2.5 的 roundtrip 测试兜底。</p>
+
+<h3 id="s15">1.5 整页 CRC 校验</h3>
+
+<p>CRC 是本模块性能最敏感的部分，因为<b>每次读写页都要计算/校验</b>。cube_db 用「硬件加速优先，软件兜底」的策略：
+ARM64 走内联汇编的 CRC32 指令，其他平台（含 x86_64）走软件表驱动。关键前提是<b>两边多项式一致、结果逐位相同</b>。</p>
+
+<pre><code><span class="kw">const</span> builtin = @import(<span class="st">"builtin"</span>);
+<span class="kw">const</span> crc32_hw = @import(<span class="st">"crc32_hw.zig"</span>);
+
+<span class="cm">/// 计算整页 CRC32（覆盖 bytes [0..PAGE_SIZE-4)）</span>
+<span class="cm">/// ARM64 使用硬件 CRC32 指令，其他平台走软件表驱动</span>
+<span class="kw">pub fn</span> <span class="fn">computePageChecksum</span>(page: *<span class="kw">const</span> [PAGE_SIZE]<span class="ty">u8</span>) <span class="ty">u32</span> {
+    <span class="kw">return</span> <span class="kw">switch</span> (builtin.cpu.arch) {
+        .aarch64, .aarch64_be => crc32_hw.computePageChecksumHw(page),
+        <span class="kw">else</span> => computePageChecksumSw(page),
+    };
+}
+
+<span class="cm">/// 软件路径（表驱动 CRC32）</span>
+<span class="kw">pub fn</span> <span class="fn">computePageChecksumSw</span>(page: *<span class="kw">const</span> [PAGE_SIZE]<span class="ty">u8</span>) <span class="ty">u32</span> {
+    <span class="kw">var</span> crc = Crc32.init();
+    crc.update(page[<span class="nu">0</span> .. PAGE_SIZE - <span class="nu">4</span>]);
+    <span class="kw">return</span> crc.final();
+}</code></pre>
+
+<p><code>computePageChecksum</code> 在编译期（<code>comptime switch</code> on <code>builtin.cpu.arch</code>）决定走哪条路径：
+aarch64 系用硬件，其余用软件。注意它只覆盖 <code>[0..PAGE_SIZE-4)</code> —— <b>最后 4 字节（CRC 本身）不算入校验</b>，
+这是 CRC 防自我矛盾的标准做法。</p>
+
+<pre><code><span class="cm">/// 写入校验和到页尾</span>
+<span class="kw">pub fn</span> <span class="fn">setPageChecksum</span>(page: *[PAGE_SIZE]<span class="ty">u8</span>, cs: <span class="ty">u32</span>) <span class="kw">void</span> {
+    std.mem.writeInt(u32, page[PAGE_SIZE - <span class="nu">4</span> ..][0..4], cs, .little);
+}
+
+<span class="cm">/// 验证整页校验和</span>
+<span class="kw">pub fn</span> <span class="fn">verifyPageChecksum</span>(page: *<span class="kw">const</span> [PAGE_SIZE]<span class="ty">u8</span>) <span class="ty">bool</span> {
+    <span class="kw">const</span> stored = std.mem.readInt(u32, page[PAGE_SIZE - <span class="nu">4</span> ..][0..4], .little);
+    <span class="kw">const</span> computed = computePageChecksum(page);
+    <span class="kw">return</span> stored == computed;
+}</code></pre>
+
+<p><code>setPageChecksum</code> 把 CRC 写进页尾 4 字节；<code>verifyPageChecksum</code> 读出存储值与重算值比对。
+两者配合完成「写页尾带 CRC、读页校验 CRC」的闭环。任何一字节损坏（含页头）都会让 <code>computed != stored</code>。</p>
+
+<div class="note ok" role="note">✅ 提示 <b>ARM64 硬件 CRC 细节（见 crc32_hw.zig）：</b>ARMv8 的 <code>crc32x/crc32w/crc32h/crc32b</code> 指令使用与
+<code>std.hash.crc.Crc32</code> 相同的 IEEE 802.3 多项式（<code>0x04C11DB7</code>，反射 <code>0xEDB88320</code>），
+故结果与软件路径<b>逐位一致</b>。硬件实现分层处理：先以 64 字节为步长循环（每步内联 8 × <code>crc32x</code>），再用一个独立
+<code>while</code> 循环处理剩余的 8 字节块，最后补齐 4B/2B/1B 余量。<b>x86_64 不用 SSE4.2 的 crc32</b>——因为那是 Castagnoli 多项式
+（CRC-32C），与 IEEE 多项式不同，会破坏跨平台一致性，所以 x86 一律走软件。这是「一致性优先于性能」的取舍。</div>
+
+<div class="note warn" role="note">⚠️ 注意 <b>init/final 语义：</b>标准 CRC32 的 init 是 <code>0xFFFFFFFF</code>、final 异或 <code>0xFFFFFFFF</code>。
+硬件代码里 <code>crc = init ^ 0xFFFFFFFF</code> 开头、<code>crc ^ 0xFFFFFFFF</code> 结尾，正是为对齐标准 CRC32 的
+init/final 约定（见 crc32_hw.crc32HwArm64）。任何一边忘记这两个异或，结果都会与软件路径不一致。</div>
+
+<p class="muted">第一部分到此。第二部分深入 meta 与 freelist 这两种「结构性」页的编解码，以及它们如何支撑崩溃安全。</p>
+</section>
+
+
+<section class="lecture" id="part2">
+<h2><span class="no">第二部分</span>meta 与 freelist 编解码</h2>
+
+<p>第一部分处理的是「每个页都有的公共页头」；第二部分处理两种承载<b>数据库元数据</b>的页：meta 页（数据库全局状态）
+与 freelist 页（空闲页链）。这两者是崩溃恢复与页复用机制的核心，其编解码策略也与普通页头有本质不同——</p>
+
+<div class="card">
+<p><strong>本部分核心命题：</strong>meta 页通过「双页交替写 + sequence 取大」实现崩溃安全；freelist 页通过页头
+<code>free_next</code> 串联成链、在 payload 区存 <code>u32</code> 页号数组。前者依赖 CRC 的「整页原子性」，
+后者必须小心处理<b>非对齐访问</b>与<b>借用切片的对齐声明</b>。</p>
+</div>
+
+<h3 id="s21">2.1 MetaPage 结构与 payload</h3>
+
+<pre><code><span class="cm">/// meta page 内容（编码在 payload 区）</span>
+<span class="kw">pub const</span> <span class="ty">MetaPage</span> = <span class="kw">struct</span> {
+    magic: <span class="ty">u32</span>,
+    version: <span class="ty">u16</span>,
+    mapsize: <span class="ty">u64</span>,
+    sequence: <span class="ty">u64</span>,
+    root_page: <span class="ty">u32</span>,
+    entry_count: <span class="ty">u64</span>,
+    byte_size: <span class="ty">u64</span>,
+    free_head: <span class="ty">u32</span>,
+    free_count: <span class="ty">u64</span>,
+    last_page: <span class="ty">u32</span>,
+};</code></pre>
+
+<table>
+<tr><th>字段</th><th>类型</th><th>含义</th></tr>
+<tr><td><code>magic</code></td><td><code>u32</code></td><td>魔数，须等于 <code>MAGIC_V2</code>（"CUB2"）</td></tr>
+<tr><td><code>version</code></td><td><code>u16</code></td><td>格式版本，须为 2</td></tr>
+<tr><td><code>mapsize</code></td><td><code>u64</code></td><td>映射区大小（页存储容量）</td></tr>
+<tr><td><code>sequence</code></td><td><code>u64</code></td><td>递增序列号，双页交替写时判定新旧</td></tr>
+<tr><td><code>root_page</code></td><td><code>u32</code></td><td>B-tree 根页页号</td></tr>
+<tr><td><code>entry_count</code></td><td><code>u64</code></td><td>键值对总数</td></tr>
+<tr><td><code>byte_size</code></td><td><code>u64</code></td><td>数据库字节大小</td></tr>
+<tr><td><code>free_head</code></td><td><code>u32</code></td><td>freelist 链头页号</td></tr>
+<tr><td><code>free_count</code></td><td><code>u64</code></td><td>空闲页总数</td></tr>
+<tr><td><code>last_page</code></td><td><code>u32</code></td><td>已分配的最高页号（reopen 恢复 next_free 用）</td></tr>
+</table>
+
+<p>meta 是所有「数据库全局状态」的唯一权威存储：根页、条目数、字节数、freelist 链头、分配水位。它编码在
+meta 页的 payload 区（偏移 24 之后），而不是页头——因为字段多、需要 CRC 保护且要能独立编解码。</p>
+
+<p>payload 总字节数 <code>4+2+8+8+4+8+8+4+8+4 = 58</code>，正是 <code>META_PAGE_PAYLOAD_SIZE</code>。
+<code>encodeMetaPayload</code> / <code>decodeMetaPayload</code> 与页头编解码<b>同构</b>：游标 + 小端 <code>writeInt/readInt</code>，
+逐字段定长读写，对称编解码。区别只在字段更多（10 个）、且 payload 区是「页内切片
+<code>page[PAGE_HEADER_SIZE .. PAGE_SIZE-4]</code>」而非独立缓冲区——因此编码前需 <code>@memset</code> 清零以保证未用区确定：
+</p>
+
+<pre><code><span class="kw">pub fn</span> <span class="fn">encodeMetaPayload</span>(buf: []<span class="ty">u8</span>, meta: *<span class="kw">const</span> <span class="ty">MetaPage</span>) <span class="kw">void</span> {
+    <span class="kw">var</span> pos: <span class="ty">usize</span> = <span class="nu">0</span>;
+    std.mem.writeInt(u32, buf[pos..][0..4], meta.magic, .little);      <span class="cm">// +4</span>
+    pos += <span class="nu">4</span>;
+    std.mem.writeInt(u16, buf[pos..][0..2], meta.version, .little);    <span class="cm">// +2</span>
+    pos += <span class="nu">2</span>;
+    std.mem.writeInt(u64, buf[pos..][0..8], meta.mapsize, .little);    <span class="cm">// +8</span>
+    pos += <span class="nu">8</span>;
+    <span class="cm">// ... sequence / root_page / entry_count / byte_size / free_head / free_count ...</span>
+    std.mem.writeInt(u32, buf[pos..][0..4], meta.last_page, .little); <span class="cm">// 末字段</span>
+}
+
+<span class="kw">pub fn</span> <span class="fn">decodeMetaPayload</span>(buf: []<span class="kw">const</span> <span class="ty">u8</span>) <span class="ty">MetaPage</span> { <span class="cm">/* 与 encode 严格对称 */</span> }</code></pre>
+
+<p><code>decodeMetaPayload</code> 完全镜像编码顺序读回，故不再逐行展开——其对称性由 §2.5 的
+「meta page roundtrip」测试兜底。</p>
+
+<div class="note" role="note">💡 说明 <b>isValidMeta：</b></div>
+
+<pre><code><span class="kw">pub fn</span> <span class="fn">isValidMeta</span>(meta: <span class="ty">MetaPage</span>) <span class="ty">bool</span> {
+    <span class="kw">return</span> meta.magic == MAGIC_V2 <span class="kw">and</span> meta.version == 2;
+}</code></pre>
+
+<p><code>isValidMeta</code> 是 meta 的「语义合法性」检查：魔数匹配且版本为 2。它与 CRC 校验是<b>两道独立防线</b>——
+CRC 防物理损坏（字节被改写），isValidMeta 防格式不兼容（例如新版本程序读到旧版本 meta）。只有两道都过，
+meta 才算「合法」。这与 FilePageStore 里 <code>readMetaPageSingle</code> 先验 CRC、再验 type、再验 isValidMeta 的链路一致。</p>
+
+<h3 id="s22">2.2 meta 页写入与交替写</h3>
+
+<pre><code><span class="cm">/// 将 meta 写入 page 缓冲区（page 索引 0 或 1 → 页号 1 或 2）</span>
+<span class="kw">pub fn</span> <span class="fn">writeMetaPage</span>(page: *[PAGE_SIZE]<span class="ty">u8</span>, meta: *<span class="kw">const</span> <span class="ty">MetaPage</span>, index: <span class="ty">u32</span>) <span class="kw">void</span> {
+    std.debug.assert(index == <span class="nu">0</span> <span class="kw">or</span> index == <span class="nu">1</span>);
+    <span class="kw">const</span> page_no = <span class="kw">if</span> (index == <span class="nu">0</span>) META_PAGE_0 <span class="kw">else</span> META_PAGE_1;
+    <span class="cm">// 写页头</span>
+    <span class="kw">const</span> hdr = <span class="ty">PageHeader</span>{
+        .page_no = page_no, .page_type = PAGE_TYPE_META,
+        .gen = meta.sequence, .nkeys = <span class="nu">0</span>, .free_next = <span class="nu">0</span>,
+    };
+    encodePageHeader(page[<span class="nu">0</span>..PAGE_HEADER_SIZE], &amp;hdr);
+    <span class="cm">// 写 meta payload</span>
+    @memset(page[PAGE_HEADER_SIZE .. PAGE_SIZE - <span class="nu">4</span>], <span class="nu">0</span>);
+    encodeMetaPayload(page[PAGE_HEADER_SIZE .. PAGE_SIZE - <span class="nu">4</span>], meta);
+    <span class="cm">// 写校验和</span>
+    setPageChecksum(page, computePageChecksum(page));
+}</code></pre>
+
+<p><code>writeMetaPage</code> 把一份 <code>MetaPage</code> 完整写进一个 meta 页缓冲，分三步：</p>
+
+<ol>
+<li><b>写页头：</b>复用 <code>encodePageHeader</code>，<code>page_type = PAGE_TYPE_META</code>，并把 <code>meta.sequence</code> 塞进
+<code>gen</code> 字段——这样读 meta 页时从页头就能直接拿到序列号，无需解码 payload。</li>
+<li><b>写 payload：</b>先 <code>@memset</code> 整块 payload 清零（保证 padding/未用区确定），再 <code>encodeMetaPayload</code> 编码。</li>
+<li><b>写 CRC：</b><code>setPageChecksum</code> 在页尾写入覆盖整页的校验和。</li>
+</ol>
+
+<div class="flow">
+<span class="step">index=0 → 页号 1 (META_PAGE_0)</span>
+<span class="arrow">↕</span>
+<span class="step">index=1 → 页号 2 (META_PAGE_1)</span>
+</div>
+<p class="muted">交替写：本次写 index，下次写 1-index，循环往复</p>
+
+<div class="note ok" role="note">✅ 提示 <b>整页原子性（崩溃安全的地基）：</b><code>writeMetaPage</code> 是「写一整页 + 末尾补 CRC」。
+对 file_page_store 而言，这一页通过 <code>flushMetaBuffer</code> 一次性 <code>@memcpy</code> 到 mmap 区——单次内存拷贝、
+崩溃窗口极小；即使中途被 kill 产生半写，读时 <code>readMetaPageSingle</code> 的 CRC 校验也会检出下半页无效、自动回退到
+另一页（mmap 区已是「旧完整页 + 新完整页」的交替布局）。这就是 <code>readMetaPageSingle</code> 能用 CRC 区分合法/无效页的
+<b>保证</b>。注意 <code>@memcpy</code> 保证的是一次内存拷贝的原子可见性，磁盘<b>物理持久化</b>仍依赖后续
+<code>fsync</code>/页缓存刷新——这正是 <code>vtSync</code> 与上层事务时序的职责。若是 MemPageStore（纯内存），
+交替写不产生持久化意义，但逻辑结构与文件版完全对齐，便于测试可迁移。</div>
+
+<h3 id="s23">2.3 meta 读取与崩溃恢复</h3>
+
+<pre><code><span class="cm">/// 从单页缓冲区读 meta（校验 checksum / page_type / magic+version，任一不过返回 null）</span>
+<span class="kw">pub fn</span> <span class="fn">readMetaPageSingle</span>(page: *<span class="kw">const</span> [PAGE_SIZE]<span class="ty">u8</span>) ?<span class="ty">MetaPage</span> {
+    <span class="kw">if</span> (!verifyPageChecksum(page)) <span class="kw">return</span> null;
+    <span class="kw">const</span> hdr = decodePageHeader(page[<span class="nu">0</span>..PAGE_HEADER_SIZE]);
+    <span class="kw">if</span> (hdr.page_type != PAGE_TYPE_META) <span class="kw">return</span> null;
+    <span class="kw">const</span> meta = decodeMetaPayload(page[PAGE_HEADER_SIZE .. PAGE_SIZE - <span class="nu">4</span>]);
+    <span class="kw">if</span> (!isValidMeta(meta)) <span class="kw">return</span> null;
+    <span class="kw">return</span> meta;
+}
+
+<span class="cm">/// 从两个 meta page 读取，取 sequence 大者（crash 安全）</span>
+<span class="kw">pub fn</span> <span class="fn">readMetaPage</span>(page0: *<span class="kw">const</span> [PAGE_SIZE]<span class="ty">u8</span>, page1: *<span class="kw">const</span> [PAGE_SIZE]<span class="ty">u8</span>) ?<span class="ty">MetaPage</span> {
+    <span class="kw">const</span> m0 = readMetaPageSingle(page0);
+    <span class="kw">const</span> m1 = readMetaPageSingle(page1);
+    <span class="kw">if</span> (m0 == null <span class="kw">and</span> m1 == null) <span class="kw">return</span> null;
+    <span class="kw">if</span> (m0 == null) <span class="kw">return</span> m1;
+    <span class="kw">if</span> (m1 == null) <span class="kw">return</span> m0;
+    <span class="kw">return</span> <span class="kw">if</span> (m0.?.sequence >= m1.?.sequence) m0 <span class="kw">else</span> m1;
+}</code></pre>
+
+<p><code>readMetaPageSingle</code> 对<b>单页</b>做三道防线：① CRC 校验失败 → null；② 页头 <code>page_type</code> 非 META → null；
+③ <code>isValidMeta</code>（magic+version）不过 → null。任一不过即判定该页无效。</p>
+
+<div class="note" role="note">💡 说明 <b>注释与代码的一份小纠错：</b>本讲义在 code review 时发现，源码 <code>format.zig</code> 中
+<code>readMetaPageSingle</code> 的注释曾写「不校验 meta 页类型」，但函数体实际做了 <code>page_type</code> 检查（即上面的防线 ②）——
+注释与代码矛盾。源码注释已顺手修正为本函数实际的三道防线语义，本讲义也随之更新，正文均以函数体真实逻辑为准（三道防线）。</div>
+
+<p><code>readMetaPage</code> 对<b>双页</b>做崩溃恢复：两页都有效则取 <code>sequence</code> 大者（最新写入的那页），
+一页无效则回退到另一页。这是 LMDB 式的原子切换策略——不做事务日志，靠「写新页 + 取新页」保证 meta 原子性。</p>
+
+<div class="card">
+<p><b>崩溃场景推演：</b></p>
+<ul>
+<li><b>写 meta0 途中崩溃：</b>meta0 半写，CRC 不匹配 → <code>readMetaPageSingle(meta0)=null</code>，
+    回退到上次完整写入的 meta1（其 sequence 较小但完整）。数据一致性保持。</li>
+<li><b>meta0 写完、meta1 是旧值：</b>meta0.sequence &gt; meta1.sequence，取 meta0（最新）。</li>
+<li><b>双页均完好：</b>取 sequence 大者，正确指向最近提交。</li>
+<li><b>全新库（双页皆无效）：</b>返回 null，上层按 fresh DB 初始化。</li>
+</ul>
+</div>
+
+<div class="note warn" role="note">⚠️ 注意 <b>与 FilePageStore 的闭环：</b>format 层只负责「读双页取大」；而「下次写哪页」由
+<code>FilePageStore.meta_index</code> 维护（写 meta0 后翻转为 1）。reopen 时 <code>init</code> 用
+<code>readMetaPageSingle</code> 逐页判定、选 sequence 大者为活跃页，并把 <code>meta_index</code> 指向被覆盖的旧页——
+格式层提供判据，存储层维护状态机，二者协作构成完整崩溃恢复。</div>
+
+<h3 id="s24">2.4 freelist 页编解码</h3>
+
+<p>freelist 是空闲页的回收复用链：空闲页的 payload 区存一个 <code>u32</code> 页号数组（可复用的页号），
+页头 <code>free_next</code> 指向链上下一页。这样空闲页自身即存储、无额外索引结构。</p>
+
+<pre><code><span class="cm">/// 空闲页的 payload 区存储 u32 页号数组，后续扩展</span>
+<span class="cm">/// 写入 freelist 条目到页（覆盖 payload 区）</span>
+<span class="kw">pub fn</span> <span class="fn">writeFreelistEntries</span>(page: *[PAGE_SIZE]<span class="ty">u8</span>, entries: []<span class="kw">const</span> <span class="ty">u32</span>) <span class="kw">void</span> {
+    <span class="kw">const</span> payload = page[PAGE_HEADER_SIZE .. PAGE_SIZE - <span class="nu">4</span>];
+    <span class="cm">// 前 4 字节存条目数</span>
+    std.mem.writeInt(u32, payload[<span class="nu">0</span>..<span class="nu">4</span>], @intCast(entries.len), .little);
+    <span class="kw">var</span> pos: <span class="ty">usize</span> = <span class="nu">4</span>;
+    <span class="kw">for</span> (entries) |e| {
+        <span class="kw">if</span> (pos + <span class="nu">4</span> &gt; payload.len) <span class="kw">break</span>;
+        std.mem.writeInt(u32, payload[pos..][0..4], e, .little);
+        pos += <span class="nu">4</span>;
+    }
+    <span class="cm">// 剩余 payload 区清零</span>
+    <span class="kw">if</span> (pos &lt; payload.len) { @memset(payload[pos..], <span class="nu">0</span>); }
+    <span class="cm">// 更新页校验和</span>
+    setPageChecksum(page, computePageChecksum(page));
+}</code></pre>
+
+<p><code>writeFreelistEntries</code> 把 <code>u32</code> 页号数组写进 freelist 页 payload：前 4 字节存条目数
+<code>count</code>，随后按 4 字节一个页号顺序写入，剩余区域清零，末尾补 CRC。<code>pos+4 &gt; payload.len</code>
+的边界检查防止越界（最坏截断，不影响正确性）。</p>
+
+<pre><code><span class="cm">/// 从页读 freelist 条目（返回借用 payload 的切片）</span>
+<span class="cm">/// 返回 []align(1) const u32：page 是 u8 数组（1 对齐），payload 偏移 24</span>
+<span class="cm">/// 类型层面只保证 1 对齐，故借用切片诚实声明 []align(1) const u32，</span>
+<span class="cm">/// 避免用 @alignCast 强行提升对齐（debug 下会 panic，release 下是 UB）。</span>
+<span class="kw">pub fn</span> <span class="fn">readFreelistEntries</span>(page: *<span class="kw">const</span> [PAGE_SIZE]<span class="ty">u8</span>) []align(<span class="nu">1</span>) <span class="kw">const</span> <span class="ty">u32</span> {
+    <span class="kw">const</span> payload = page[PAGE_HEADER_SIZE .. PAGE_SIZE - <span class="nu">4</span>];
+    <span class="kw">const</span> count = std.mem.readInt(u32, payload[<span class="nu">0</span>..<span class="nu">4</span>], .little);
+    <span class="kw">const</span> max = @min(count, @as(<span class="ty">u32</span>, @intCast((payload.len - <span class="nu">4</span>) / <span class="nu">4</span>)));
+    <span class="cm">// 跳过前 4 字节 count 后，[]align(1) const u32 诚实声明对齐，</span>
+    <span class="cm">// 允许非对齐 u32 读取（x86/ARM 原生支持），无需 @alignCast 运行时检查</span>
+    <span class="kw">const</span> ptr: [*]align(<span class="nu">1</span>) <span class="kw">const</span> <span class="ty">u32</span> = @ptrCast(payload.ptr);
+    <span class="kw">return</span> ptr[<span class="nu">1</span>..][0..max];
+}</code></pre>
+
+<div class="note danger" role="alert">🔴 危险 <b>对齐陷阱（历史 bug，commit d043687）：</b>从<b>类型系统层面</b>看，<code>page</code> 是
+<code>[PAGE_SIZE]u8</code>（1 对齐），<code>payload.ptr</code> 是 <code>[*]u8</code>——编译器无法证明其中的 u32 是 4 对齐的。
+若改用 <code>@alignCast</code> 把返回类型提升到 4 对齐，在 debug/fast 构建下会触发 alignment panic，release 下则是
+<b>未定义行为（UB）</b>——因为实际地址只保证 1 字节对齐。当前代码刻意用 <code>@ptrCast</code>（不做运行时对齐检查）配
+<b>诚实声明</b>的 <code>[]align(1) const u32</code>——告诉编译器这些 u32 只保证 1 字节对齐，由 CPU 原生支持非对齐读取
+（x86/ARM 均支持），编译期不再生成对齐检查。这也是「用类型系统表达真实不变量，而非靠运行时断言硬扛」的范例。</div>
+
+<h3 id="s25">2.5 对齐陷阱与测试集</h3>
+
+<p>format.zig 末尾是一组内联测试（<code>test "..."</code>），覆盖模块的全部核心契约。它们既是回归保障，
+也是本讲义讲解的「可运行证明」：</p>
+
+<table>
+<tr><th>测试</th><th>验证点</th></tr>
+<tr><td><code>format: page header roundtrip</code></td><td>页头 encode→decode 逐字段一致（roundtrip 对称性）</td></tr>
+<tr><td><code>format: meta page roundtrip</code></td><td>meta payload encode→decode 逐字段一致</td></tr>
+<tr><td><code>format: page checksum verification</code></td><td>CRC 写入后可验证通过；翻转一字节后验证失败（篡改检出）</td></tr>
+<tr><td><code>format: meta alternation — take larger sequence</code></td><td>双页都合法时，<code>readMetaPage</code> 取 sequence 大者</td></tr>
+<tr><td><code>format: meta alternation — one corrupt, take other</code></td><td>一页损坏时回退到完好页（崩溃恢复）</td></tr>
+<tr><td><code>format: freelist page chain</code></td><td>freelist 页写读回环 + 页头 free_next 串联成链（100→200→300）</td></tr>
+</table>
+
+<div class="note ok" role="note">✅ 提示 <b>测试即契约：</b>「roundtrip」测试把 encode 输出喂给 decode，验证逐字段相等——任何编解码不对称
+（漏字段、偏移错）都会被立刻抓住。「checksum」测试验证 CRC 的篡改检出能力。「alternation」两个测试则直接
+编码了崩溃恢复的两条核心规则：取大者、坏者回退。这些测试让 format 层能放心地被上层两个 PageStore 依赖。</div>
+
+<h3 id="s26">format.zig 在系统全貌中的位置</h3>
+
+<div class="flow">
+<span class="step"><code>format.zig</code> 页格式层（本讲义）</span>
+<span class="arrow">↑ 依赖</span>
+<span class="step"><code>page_store.zig</code> PageStore 抽象 + MemPageStore</span>
+<span class="arrow">↑ 依赖</span>
+<span class="step"><code>file_page_store.zig</code> mmap 文件 Store</span>
+<span class="arrow">↑ 依赖</span>
+<span class="step"><code>btree.zig</code> / <code>writer.zig</code> / <code>db.zig</code> 上层</span>
+</div>
+
+<div class="card">
+<p><strong>设计亮点：</strong></p>
+<ol>
+<li><strong>纯函数、无 IO：</strong>只做「数据 ↔ 字节」，可被内存/文件两种 Store 无差别复用。</li>
+<li><strong>定长小端编码：</strong>逐字段 <code>writeInt/readInt</code>，跨平台字节一致，无对齐依赖。</li>
+<li><strong>CRC 覆盖整页 + 硬件加速：</strong>ARM64 走指令、x86 走软件，多项式一致保证结果逐位相同。</li>
+<li><strong>meta 双页交替写：</strong>sequence 取大 + 坏页回退，LMDB 式无日志崩溃安全。</li>
+<li><strong>诚实对齐声明：</strong><code>[]align(1) const u32</code> 表达真实不变量，避开 @alignCast panic。</li>
+</ol>
+</div>
+
+<div class="note warn" role="note">⚠️ 注意 <b>风险与约束：</b>
+<ul>
+<li><b>格式不可变：</b>一旦线上库写入，页头/ meta / CRC 布局即冻结。改版需引入新 magic/version 并做迁移，不能原地改布局。</li>
+<li><b>CRC 仅检出、不纠错：</b>CRC32 检测力强但非纠错码，检测到损坏只能丢弃/报错，无法恢复数据。</li>
+<li><b>非对齐读取依赖 CPU：</b><code>[]align(1) u32</code> 的读取依赖目标架构原生支持非对齐访问（x86/ARM 均支持）；理论上有架构不支持，则需显式字节拼接。</li>
+<li><b>freelist 边界截断：</b>写入时 <code>pos+4 &gt; payload.len</code> 只是 break 截断，若条目数超载会静默丢弃尾部条目——当前设计中条目数远小于容量，属可接受上限。</li>
+</ul>
+</div>
+
+<p class="muted">format.zig 以「定长、小端、CRC 兜底」为基底，用纯函数把页头、meta、freelist 这三种结构编码成确定性的字节布局。
+它不关心页存哪、怎么持久化，只保证「写进去的能原样读回来，坏掉的能被检出」。这一层稳定了，上层两个 PageStore 与 B-tree 才能在其上安全构建。</p>
+</section>
+
+
+<footer>
+  <p>cube_db — format.zig 讲义 · 由 herdr 多 agent 团队协作生成（conductor + impl + review）</p>
+</footer>
+
+</main>
+<script src="lecture.js"></script>
+</body>
+</html>
