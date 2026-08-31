@@ -390,6 +390,21 @@ pub fn build(b: *std.Build) void {
     const db_test_step = b.step("test-db", "Run db tests only");
     db_test_step.dependOn(&run_db_test.step);
 
+    // closed_state_test — applyBatch closed 分支测试（T-4）
+    const closed_state_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/txn_writer_db/closed_state_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    const run_closed_state_test = b.addRunArtifact(closed_state_test);
+    db_test_step.dependOn(&run_closed_state_test.step);
+
     // txn_arena_test — WriteTxn staging arena 化测试
     const txn_arena_test = b.addTest(.{
         .root_module = b.createModule(.{
