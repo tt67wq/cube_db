@@ -15,4 +15,5 @@ comptime {
     _ = @import("txn_writer_db/group_commit_ext_test.zig");
     _ = @import("txn_writer_db/tutorial_smoke_test.zig");
     _ = @import("txn_writer_db/closed_state_test.zig");
+    _ = @import("txn_writer_db/read_txn_borrowed_test.zig");
 }

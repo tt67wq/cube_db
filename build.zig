@@ -405,6 +405,21 @@ pub fn build(b: *std.Build) void {
     const run_closed_state_test = b.addRunArtifact(closed_state_test);
     db_test_step.dependOn(&run_closed_state_test.step);
 
+    // read_txn_borrowed_test — getBorrowed 公开 API 测试（T-7）
+    const read_txn_borrowed_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/txn_writer_db/read_txn_borrowed_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    const run_read_txn_borrowed_test = b.addRunArtifact(read_txn_borrowed_test);
+    db_test_step.dependOn(&run_read_txn_borrowed_test.step);
+
     // txn_arena_test — WriteTxn staging arena 化测试
     const txn_arena_test = b.addTest(.{
         .root_module = b.createModule(.{
