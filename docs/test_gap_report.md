@@ -1,0 +1,116 @@
+# 测试套件建设综合报告
+
+> 由 `w1-pi1`（T-1：core_format + btree_storage + bench）和 `w1-droid1`（T-2：txn_writer_db + crash_insertbatch_pb + fuzz）并行分析，conductor 交叉比对汇总。两份报告在方向上一致、无矛盾结论。
+>
+> 生成日期：2026-08-31
+> 原始报告：`w1-pi1` 分支 commit `cc94ed7`（`docs/test_gap_T1.md`）、`w1-droid1` 分支 commit `59abf5c`（`docs/test_gap_T2.md`）
+
+---
+
+## 一、P0 必补缺口（共 14 项，按风险排序）
+
+### 持久化信任边界错误路径（全零覆盖）
+
+| # | 位置 | 缺口 | 建议文件 | 验收 |
+|---|---|---|---|---|
+| 1 | `src/file_page_store.zig:162` | `ensureFileGrowth` 的 fstat/ftruncate/fsync 失败路径无测试 | `tests/core_format/file_page_store_error_test.zig` | `zig build test-ps` |
+| 2 | `src/file_page_store.zig:225` | `vtWriteMeta` 的 last_page 覆盖 + meta 交替逻辑 reopen 后未断言字段值 | `tests/core_format/file_page_store_meta_test.zig` | `zig build test-ps` |
+| 3 | `src/file_page_store.zig:243` | `vtSync` 的 `error.SyncFailed` 未测 | 同 #1 文件 | `zig build test-ps` |
+
+### B-tree 反序列化信任边界（全靠黑盒间接覆盖）
+
+| # | 位置 | 缺口 | 建议文件 | 验收 |
+|---|---|---|---|---|
+| 4 | `src/btree.zig:39` | `readNodePayload` CRC 损坏→`error.CorruptCrc` 零直接测试 | `tests/btree_storage/btree_corrupt_page_test.zig` | `zig build test-btree` |
+| 5 | `src/btree.zig:217` | `decodeLeafPayload` 6 处 `error.Truncated` 零测试 | `tests/btree_storage/btree_decode_corrupt_test.zig` | `zig build test-btree` |
+| 6 | `src/btree.zig:286` | `decodeBranchPayload` 多处 `error.Truncated`/CorruptCrc 零测试 | 同 #5 | `zig build test-btree` |
+| 7 | `src/btree.zig:75-150` | 溢出页链（多页 50KB+/100KB+）无专门断言；`freeOverflowPages` 静默吞错未测 | `tests/btree_storage/btree_overflow_chain_test.zig` | `zig build test-btree` |
+
+### 事务/并发语义缺口
+
+| # | 位置 | 缺口 | 建议文件 | 验收 |
+|---|---|---|---|---|
+| 8 | `src/db.zig:141` | `Db.putBatch` 锁失败→`error.LockFailed` 半应用语义零覆盖 | `tests/txn_writer_db/lock_failure_test.zig` | `zig build test-db` |
+| 9 | `src/writer.zig:261` | `applyBatch` closed 分支（Db.close 后并发写）零测试，高危 UB | `tests/txn_writer_db/closed_state_test.zig` | `zig build test-db` |
+| 10 | `src/writer.zig:169` | `State.endRead` 末位读者与写者 flush 互斥，仅单线程顺序测过，无真实多线程并发验证 | `tests/txn_writer_db/mvcc_concurrent_flush_test.zig` | `zig build test-db` |
+| 11 | `src/db.zig:347` | `ReadTxn.getBorrowed` 公开零拷贝 API，整个测试套件零调用 | `tests/txn_writer_db/read_txn_borrowed_test.zig` | `zig build test-db` |
+
+### 崩溃恢复 + format 一致性
+
+| # | 位置 | 缺口 | 建议文件 | 验收 |
+|---|---|---|---|---|
+| 12 | `src/writer.zig:300` | **meta 写入中途崩溃**（writeMeta 后 sync 前 kill）未覆盖，LMDB 式双 meta 核心安全点 | `tests/crash_insertbatch_pb/crash_meta_midwrite_test.zig` | `zig build test-crash`（需新建 step） |
+| 13 | `src/format.zig:234/255` | `writeFreelistEntries` 溢出静默丢弃 + `readFreelistEntries` 超量 count 钳制，写入端 count 与读回不一致是真实 bug 风险 | `tests/core_format/freelist_overflow_test.zig` | `zig build test-format` |
+| 14 | `src/db.zig:210` | `Db.compact` 锁失败路径从未触发（仅单线程直调） | `tests/txn_writer_db/compact_concurrent_test.zig` | `zig build test-db` |
+
+---
+
+## 二、P1 应补缺口（13 项，摘要）
+
+- **OOM 回滚**：`src/page_store.zig:119` `ensurePage` appendNTimes 失败回滚未测；`src/writer.zig:281` `pending_free.append catch {}` 静默泄漏脏页
+- **free 校验缺失**：`page_store.zig:135` / `file_page_store.zig:190` freePage 接受任意 page_no，无越界/重复 free 检查
+- **btree 热路径**：`readNodePayloadFast`（跳 CRC）与 full 读一致性未测；`encodeLeafPayload` 满 leaf 边界；`Iterator.next` 中途 CorruptCrc 行为未定义；`cmpKey` 空键/前缀边界无直接测试
+- **compact 语义弱断言**：`compact_test.zig:62` 注释说"dirt 应减少"但只断言 `v=="v2"`，名实不符
+- **deleteRange 并发**：`db.zig:165` flush 后 select 不持锁，并发写者可在迭代中插入导致遗漏
+- **applyBatch 单条 vs 多条**：`writer.zig:245` 单条 fast path 跳过 sort/dedup，overwrite 时 count_delta 一致性未对比
+- **close flush 失败**：`db.zig:55` `flush() catch {}` 静默吞错，pending entries 已 free 未提交语义未验证
+- **fuzz 缺口**：putBatch / deleteRange / select 迭代器 / ReadTxn 快照隔离均无 fuzz；corpus 全空（4 目录只含 .gitkeep）；long-run 只跑 format decode 不跑 API
+- **bench 缺口**：FilePageStore 只有 put/get bench，缺 delete/select/compact 维度
+
+---
+
+## 三、P2 可选优化（6 项）
+
+- `bench_baseline.zig` 绝对 ns 阈值随机器漂移，建议改相对回归
+- bench/ 全用 cwd 硬编码 `.db` 路径，多 worktree 并发互踩
+- `crc32_hw.zig` ARM64 asm 路径在非 ARM64 CI 永远走 fallback，建议加 `aarch64` cross target
+- `format.zig` sequence u64 回绕边界（低优先）
+- `pb_fps_ordered/scale_test.zig` 零断言纯 print，名不副实（是 bench 不是 test）
+- `ProfileStats` 14 个计数器全未测（低优先）
+
+---
+
+## 四、现有质量观察（共性结论）
+
+### 弱断言热点
+
+- `compact_test.zig:62` 名实不符（注释 vs 断言不匹配）
+- `txn_test.zig:108` 并发测试断言密度过低（只查 err==null + 一个 key）
+- `pb_fps_*_test.zig` 零断言
+- `mmap_region_test.zig:26` `>=` 允许退化
+
+### flaky 风险
+
+- `crash_putbatch_test.zig:88` fork+kill 200ms 硬编码延迟，慢 CI 上子进程可能未开始写就被 kill
+- `insertbatch_overflow_test.zig:155` MemPageStore 申请 ~1.1TB 堆（误用 mmap 参数），16GB 机器 OOM
+- `stress_test.zig:54` 1TB mmap 预留区在 `vm.overcommit_memory=0` 的 Linux 上 mmap 失败
+- bench/ 全用 cwd 硬编码路径，并行互踩
+- `bench_baseline.zig` 自承 Zig 0.16.0 并行测试有 SEGV 竞争
+
+### 间接覆盖盲区
+
+btree.zig 的 encode/decode 全系列无直接单元测试，100% 靠 put/get 黑盒间接。建议加 round-trip property test。
+
+### 强项
+
+crc32_hw_test（15 test）+ crc_regression_test（6 test）是本仓库测试质量最高的模块。
+
+---
+
+## 五、优先级建议
+
+如果只补一批，按"风险×实现成本"推荐这 5 个先做：
+
+1. **#13 freelist 溢出**（可能是真实 bug，1 个文件即可钉死）
+2. **#9 applyBatch closed 分支**（高危 UB，测试成本低）
+3. **#4-6 btree decode 损坏页**（信任边界，3 个合并到 1 个文件）
+4. **#12 meta 写入中途崩溃**（崩溃安全核心，但实现成本高，需 fork harness）
+5. **#11 getBorrowed**（公开 API 零覆盖，测试最简单）
+
+---
+
+## 附：原始分析报告位置
+
+- T-1（core_format + btree_storage + bench）：`w1-pi1` 分支 `cc94ed7`，文件 `docs/test_gap_T1.md`
+- T-2（txn_writer_db + crash_insertbatch_pb + fuzz）：`w1-droid1` 分支 `59abf5c`，文件 `docs/test_gap_T2.md`
+- 任务契约：`.agents/tasks/T-1/task.md`、`.agents/tasks/T-2/task.md`
