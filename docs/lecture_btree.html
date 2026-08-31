@@ -1,0 +1,898 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>cube_db · src/btree.zig 讲义</title>
+<link rel="stylesheet" href="lecture.css">
+</head>
+<body>
+<button class="sidenav-toggle" id="navToggle" aria-label="目录" aria-expanded="false">☰ 目录</button>
+<nav class="sidenav" id="sidenav" aria-label="章节导航">
+  <h4>目录 · 章节导航</h4>
+  <ul>
+    <li class="part"><a href="#part1">第一部分 · 模块定位与 COW B-tree 骨架</a></li>
+    <li class="sub"><a href="#s11">1.1 文件定位与依赖</a></li>
+    <li class="sub"><a href="#s12">1.2 关键常量：容量上下限与节点种类</a></li>
+    <li class="sub"><a href="#s13">1.3 核心数据类型与 COW 总体思路</a></li>
+    <li class="sub"><a href="#s14">1.4 页 I/O 辅助三件套</a></li>
+    <li class="part"><a href="#part2">第二部分 · Leaf 节点编码与溢出页</a></li>
+    <li class="sub"><a href="#s21">2.1 LeafEntry 与内联上限</a></li>
+    <li class="sub"><a href="#s22">2.2 溢出页链：写/读/回收</a></li>
+    <li class="sub"><a href="#s23">2.3 leafPayloadSize：容量预估</a></li>
+    <li class="sub"><a href="#s24">2.4 encodeLeafPayload：字节布局</a></li>
+    <li class="sub"><a href="#s25">2.5 decodeLeafPayload：防御性解码</a></li>
+    <li class="part"><a href="#part3">第三部分 · Branch 节点编码与内存表示</a></li>
+    <li class="sub"><a href="#s31">3.1 branchPayloadSize / encode / decode</a></li>
+    <li class="sub"><a href="#s32">3.2 Leaf / Branch 内存表示与 fromPayload</a></li>
+    <li class="part"><a href="#part4">第四部分 · 读取路径：get / getBorrowed</a></li>
+    <li class="sub"><a href="#s41">4.1 getBorrowed：零拷贝热路径</a></li>
+    <li class="sub"><a href="#s42">4.2 get 与 findInLeaf：溢出与 tombstone</a></li>
+    <li class="sub"><a href="#s43">4.3 findInBranchPayload：原页二分</a></li>
+    <li class="part"><a href="#part5">第五部分 · 插入（COW）：快路径与分裂</a></li>
+    <li class="sub"><a href="#s51">5.1 insert 入口与 root 分裂</a></li>
+    <li class="sub"><a href="#s52">5.2 insertIntoLeaf：栈缓冲 patch</a></li>
+    <li class="sub"><a href="#s53">5.3 cowBranchNoSplit：4 字节 patch</a></li>
+    <li class="sub"><a href="#s54">5.4 insertIntoBranch：递归 + 快/慢路径</a></li>
+    <li class="part"><a href="#part6">第六部分 · 批量插入与设计取舍</a></li>
+    <li class="sub"><a href="#s61">6.1 insertBatch 路由</a></li>
+    <li class="sub"><a href="#s62">6.2 insertBatchIntoLeaf：O(n+m) 归并</a></li>
+    <li class="sub"><a href="#s63">6.3 bulk-load 与多级 branch 构建</a></li>
+    <li class="sub"><a href="#s64">6.4 设计要点与风险清单</a></li>
+  </ul>
+</nav>
+<main class="wrap">
+
+<header class="hero">
+  <h1>cube_db · <code>src/btree.zig</code> 讲义</h1>
+  <div class="sub">页号 COW B-tree（v2，page-based）逐段精讲：节点编码 / 溢出页 / 读写 / 插入与批量插入 / 设计取舍</div>
+  <div style="margin-top:12px">
+    <span class="tag">Zig 0.16</span>
+    <span class="tag">COW B-tree</span>
+    <span class="tag">u32 页号寻址</span>
+    <span class="tag">溢出页链</span>
+    <span class="tag">零拷贝借用</span>
+  </div>
+</header>
+
+<p class="muted">本讲义逐段精讲 <code>src/btree.zig</code>（约 72KB，页号 COW B-tree v2）。代码标识符、函数名保持原文；
+讲解为中文。点击侧边目录或直接滚动阅读。</p>
+
+<section class="lecture" id="part1">
+<h2><span class="no">第一部分</span>模块定位与 COW B-tree 骨架</h2>
+
+<p><code>src/btree.zig</code> 是 cube_db 的索引核心——一个<strong>页号寻址、写时复制（Copy-On-Write, COW）</strong>
+的 B+ 树。与 v1 相同算法，但节点寻址用 <code>u32</code> 页号、I/O 走 <code>PageStore</code> 抽象、固定页大小
+（<code>PAGE_SIZE = 4096</code>），分支子指针为 <code>u32</code>。脏页收集到 caller 的 <code>ArrayList(u32)</code>，
+由上层（<code>db.zig</code> 事务）统一回收或提交。</p>
+
+<h3 id="s11">1.1 文件定位与依赖</h3>
+
+<pre><code><span class="cm">//! btree.zig — 页号 COW B-tree（v2，page-based）</span>
+<span class="cm">//! 与 v1 btree.zig 相同算法，但节点寻址用 u32 页号，I/O 走 PageStore，</span>
+<span class="cm">//! 固定页大小，分支子指针为 u32。脏页收集到 caller 的 ArrayList。</span>
+<span class="kw">const</span> std = @import(<span class="st">"std"</span>);
+<span class="kw">const</span> f2 = @import(<span class="st">"format.zig"</span>);
+<span class="kw">const</span> ps = @import(<span class="st">"page_store.zig"</span>);
+
+<span class="kw">const</span> <span class="ty">PageStore</span> = ps.<span class="ty">PageStore</span>;</code></pre>
+
+<p>三个导入各司其职：<code>std</code> 是标准库（分配器、切片、<code>ArrayList</code>）；<code>f2</code>（<code>format.zig</code>）
+提供页格式常量与页头/CRC 编解码——<code>PAGE_SIZE</code>、<code>PAGE_HEADER_SIZE = 24</code>、<code>PageHeader</code>、
+<code>verifyPageChecksum</code>/<code>computePageChecksum</code>/<code>setPageChecksum</code>、
+<code>PAGE_TYPE_LEAF/BRANCH/OVERFLOW</code>；<code>ps</code>（<code>page_store.zig</code>）提供
+<code>PageStore</code> 多态接口（<code>readPage</code>/<code>writePage</code>/<code>allocPage</code> 等）。
+<code>btree.zig</code> 只依赖这两个模块，不直接碰文件 I/O 或 mmap。</p>
+
+<div class="note" role="note">💡 说明 <b>COW 含义：</b>写入永不修改既有页——而是分配新页、拷贝旧页内容、在新页上改、
+把新页号向上回报。旧页标记为 dirty 由 caller 回收。读者因此可零拷贝借用页缓冲：COW 保证被读的旧页
+在其生命期内内容不变。这是 <code>getBorrowed</code> 零拷贝与并发安全的基础。</div>
+
+<h3 id="s12">1.2 关键常量：容量上下限与节点种类</h3>
+
+<pre><code><span class="kw">pub const</span> NULL_ROOT: <span class="ty">u32</span> = <span class="nu">0</span>;
+<span class="kw">pub const</span> LEAF_MAX_ENTRIES: <span class="ty">usize</span> = <span class="nu">32</span>;
+<span class="kw">pub const</span> LEAF_MIN_ENTRIES: <span class="ty">usize</span> = LEAF_MAX_ENTRIES / <span class="nu">2</span>;
+<span class="kw">pub const</span> BRANCH_MAX_CHILDREN: <span class="ty">usize</span> = <span class="nu">64</span>;
+<span class="kw">pub const</span> BRANCH_MIN_CHILDREN: <span class="ty">usize</span> = BRANCH_MAX_CHILDREN / <span class="nu">2</span>;
+
+<span class="kw">const</span> LEAF_KIND: <span class="ty">u8</span> = <span class="nu">2</span>;
+<span class="kw">const</span> BRANCH_KIND: <span class="ty">u8</span> = <span class="nu">1</span>;</code></pre>
+
+<table>
+<tr><th>常量</th><th>值</th><th>含义</th></tr>
+<tr><td><code>NULL_ROOT</code></td><td><code>0</code></td><td>空树哨兵。<code>insert</code>/<code>get</code> 见此值即知树未初始化，走首叶创建/返 null</td></tr>
+<tr><td><code>LEAF_MAX_ENTRIES</code></td><td><code>32</code></td><td>单叶最多 entry 数，超限触发分裂。<code>LEAF_MIN_ENTRIES = 16</code> 为下限（预留借用/合并用，当前实现未做强收缩）</td></tr>
+<tr><td><code>BRANCH_MAX_CHILDREN</code></td><td><code>64</code></td><td>单 branch 最多子指针数，超限分裂。<code>BRANCH_MIN_CHILDREN = 32</code></td></tr>
+<tr><td><code>LEAF_KIND</code> / <code>BRANCH_KIND</code></td><td><code>2</code> / <code>1</code></td><td>payload 首字节节点种类标记，读路径据此分流 leaf / branch</td></tr>
+</table>
+
+<div class="note warn" role="note">⚠️ 注意 <b>容量选型：</b>叶 32 entry、branch 64 children 是 4KB 页下的经验值——
+变长 key/value 的实际占用由 <code>leafPayloadSize</code> 动态算，<code>LEAF_MAX_ENTRIES</code> 只卡条数上限。
+若单条 value 极大（&gt; <code>MAX_INLINE_VALUE</code>），走溢出页，不影响条数计数。</div>
+
+<h3 id="s13">1.3 核心数据类型与 COW 总体思路</h3>
+
+<pre><code><span class="kw">pub const</span> <span class="ty">LeafEntry</span> = <span class="kw">struct</span> {
+    tombstone: <span class="ty">bool</span>,
+    key: []const <span class="ty">u8</span>,
+    value: []const <span class="ty">u8</span>,
+};
+
+<span class="kw">pub const</span> <span class="ty">WriteResult</span> = <span class="kw">struct</span> {
+    new_root: <span class="ty">u32</span>,
+    live_delta: <span class="ty">i64</span>,
+    count_delta: <span class="ty">i64</span>,
+};
+
+<span class="kw">pub fn</span> <span class="fn">cmpKey</span>(a: []const <span class="ty">u8</span>, b: []const <span class="ty">u8</span>) std.math.<span class="ty">Order</span> {
+    <span class="kw">return</span> std.mem.<span class="fn">order</span>(<span class="ty">u8</span>, a, b);
+}</code></pre>
+
+<p><code>LeafEntry</code> 是上层传入的逻辑 entry：<code>tombstone</code> 表删除标记（COW 不物理删，留墓碑），
+<code>key</code>/<code>value</code> 为字节切片。<code>WriteResult</code> 是写操作的回报：新 root 页号、
+本次活字节数变化（<code>live_delta</code>，用于 <code>byte_size</code> 统计）、条目数变化（<code>count_delta</code>）。
+<code>cmpKey</code> 是纯字节字典序比较，全树统一用它。</p>
+
+<div class="card">
+<p><b>COW 写入数据流（单条 insert）：</b></p>
+<ol>
+<li><code>insert</code> 读 root payload 判 leaf/branch。</li>
+<li>递归 <code>insertIntoLeaf</code> / <code>insertIntoBranch</code>：沿途把旧页加入 <code>dirty</code>。</li>
+<li>到达目标叶：拷旧页到栈缓冲 → patch 新 entry → <code>allocPage</code> 新页 → <code>writeNodePage</code> 写入。</li>
+<li>若叶条数超 <code>LEAF_MAX_ENTRIES</code>：分裂成左右两叶，返 <code>split_key</code> + <code>split_right</code>。</li>
+<li>父 branch：若子未分裂，<code>cowBranchNoSplit</code> 仅拷页 + patch 4 字节子指针；若分裂，decode/encode 重排。</li>
+<li>root 分裂：建新 branch root，指向左右子树。</li>
+<li>返回 <code>WriteResult{ new_root, live_delta, count_delta }</code>，caller 据此更新 meta。</li>
+</ol>
+</div>
+
+<h3 id="s14">1.4 页 I/O 辅助三件套</h3>
+
+<p>三个函数封装"页 → payload"与"payload → 页"的转换，是所有读写路径的入口：</p>
+
+<pre><code><span class="cm">/// 从页读节点 payload（借用页缓冲，不拷贝）</span>
+<span class="kw">pub fn</span> <span class="fn">readNodePayload</span>(store: <span class="ty">PageStore</span>, page_no: <span class="ty">u32</span>) ![]const <span class="ty">u8</span> {
+    <span class="kw">const</span> page = <span class="kw">try</span> store.<span class="fn">readPage</span>(page_no);
+    <span class="kw">const</span> arr: *const [f2.PAGE_SIZE]<span class="ty">u8</span> = @ptrCast(page.ptr);
+    <span class="kw">if</span> (!f2.<span class="fn">verifyPageChecksum</span>(arr)) <span class="kw">return error</span>.CorruptCrc;
+    <span class="kw">return</span> page[f2.PAGE_HEADER_SIZE .. f2.PAGE_SIZE - <span class="nu">4</span>];
+}
+
+<span class="cm">/// Fast read: skip CRC verification for hot read path.</span>
+<span class="cm">/// COW guarantees pages are never modified while being read,</span>
+<span class="cm">/// so CRC check is only needed on crash recovery / reopen.</span>
+<span class="kw">pub fn</span> <span class="fn">readNodePayloadFast</span>(store: <span class="ty">PageStore</span>, page_no: <span class="ty">u32</span>) ![]const <span class="ty">u8</span> {
+    <span class="kw">const</span> page = <span class="kw">try</span> store.<span class="fn">readPage</span>(page_no);
+    <span class="kw">return</span> page[f2.PAGE_HEADER_SIZE .. f2.PAGE_SIZE - <span class="nu">4</span>];
+}
+
+<span class="cm">/// 写节点页（页头 + payload + CRC）</span>
+<span class="kw">pub fn</span> <span class="fn">writeNodePage</span>(store: <span class="ty">PageStore</span>, page_no: <span class="ty">u32</span>, page_type: <span class="ty">u8</span>, nkeys: <span class="ty">u16</span>, payload: []const <span class="ty">u8</span>) !<span class="kw">void</span> {
+    <span class="kw">const</span> page = <span class="kw">try</span> store.<span class="fn">writePage</span>(page_no);
+    <span class="kw">const</span> arr: *[f2.PAGE_SIZE]<span class="ty">u8</span> = @ptrCast(page.ptr);
+    <span class="kw">const</span> hdr = f2.<span class="ty">PageHeader</span>{
+        .page_no = page_no,
+        .page_type = page_type,
+        .gen = <span class="nu">0</span>,
+        .nkeys = nkeys,
+        .free_next = <span class="nu">0</span>,
+    };
+    f2.<span class="fn">encodePageHeader</span>(page[<span class="nu">0</span>..f2.PAGE_HEADER_SIZE], &amp;hdr);
+    @memcpy(page[f2.PAGE_HEADER_SIZE ..][<span class="nu">0</span>..payload.len], payload);
+    <span class="kw">const</span> remaining = f2.PAGE_SIZE - f2.PAGE_HEADER_SIZE - <span class="nu">4</span> - payload.len;
+    <span class="kw">if</span> (remaining > <span class="nu">0</span>) @memset(page[f2.PAGE_HEADER_SIZE + payload.len .. f2.PAGE_SIZE - <span class="nu">4</span>], <span class="nu">0</span>);
+    f2.<span class="fn">setPageChecksum</span>(arr, f2.<span class="fn">computePageChecksum</span>(arr));
+}</code></pre>
+
+<p>payload 区是 <code>[PAGE_HEADER_SIZE .. PAGE_SIZE-4)</code>——页头 24B 在前，页尾 4B CRC 在后，
+中间 <code>4096 - 24 - 4 = 4068</code> 字节是节点 payload。<code>readNodePayload</code> 带 CRC 校验（用于
+崩溃恢复/重开），<code>readNodePayloadFast</code> 跳过 CRC（COW 保证运行时页不被改写，热读路径免校验省 CPU）。</p>
+
+<table>
+<tr><th>页头字段</th><th>类型</th><th>说明</th></tr>
+<tr><td><code>page_no</code></td><td><code>u32</code></td><td>页号，little-endian（<code>encodePageHeader</code> 写法）</td></tr>
+<tr><td><code>page_type</code></td><td><code>u8</code></td><td><code>PAGE_TYPE_LEAF=3</code> / <code>BRANCH=2</code> / <code>OVERFLOW=4</code></td></tr>
+<tr><td><code>gen</code></td><td><code>u64</code></td><td>代际号，当前固定 <code>0</code>（预留）</td></tr>
+<tr><td><code>nkeys</code></td><td><code>u16</code></td><td>节点 entry/child 数，little-endian</td></tr>
+<tr><td><code>free_next</code></td><td><code>u32</code></td><td>溢出页链下一页号（溢出页用）；普通节点为 0</td></tr>
+</table>
+
+<div class="note ok" role="note">✅ 提示 <b>注意 payload 首字节即节点 kind：</b><code>LEAF_KIND=2</code> / <code>BRANCH_KIND=1</code>
+写在 payload[0]。读路径 <code>payload[0] == LEAF_KIND</code> 即可分流，无需读页头 <code>page_type</code>——
+这是 <code>getBorrowed</code> / <code>findInBranchPayload</code> 零解码分流的依据。</div>
+
+<p class="muted">第一部分到此。下面进入节点编码：先 Leaf（含溢出页），再 Branch。</p>
+</section>
+
+
+<section class="lecture" id="part2">
+<h2><span class="no">第二部分</span>Leaf 节点编码与溢出页</h2>
+
+<p>Leaf 节点存储有序的 key-value entry。变长 value 可能超过单页内联上限，此时走溢出页链。
+本部分精讲 <code>LeafEntry</code> / <code>DecodedLeafEntry</code>、溢出页机制、<code>leafPayloadSize</code> /
+<code>encodeLeafPayload</code> / <code>decodeLeafPayload</code> 的字节布局与端序约定。</p>
+
+<h3 id="s21">2.1 LeafEntry 与内联上限</h3>
+
+<pre><code><span class="cm">/// 最大内联值大小（留余量给页头和多个 entry）</span>
+<span class="kw">pub const</span> MAX_INLINE_VALUE: <span class="ty">usize</span> = <span class="nu">3800</span>;
+
+<span class="cm">/// 溢出页最多可存 payload 字节数</span>
+<span class="kw">const</span> OVERFLOW_PAYLOAD: <span class="ty">usize</span> = f2.PAGE_SIZE - f2.PAGE_HEADER_SIZE - <span class="nu">4</span>;
+
+<span class="cm">/// flags: 1 = 溢出页</span>
+<span class="kw">const</span> LEAF_FLAG_OVERFLOW: <span class="ty">u8</span> = <span class="nu">1</span>;</code></pre>
+
+<p><code>MAX_INLINE_VALUE = 3800</code> 是内联阈值：value ≤ 3800 字节直接放 leaf payload，&gt; 3800 走溢出页。
+这个值给页头、entry 元数据（每条至少 10 字节开销）和多条 entry 留了余量，避免单条大 value 把叶撑爆。
+<code>OVERFLOW_PAYLOAD = 4068</code> 是单个溢出页能存的数据字节（页头 24B + CRC 4B 之外全可用）。</p>
+
+<pre><code><span class="kw">pub const</span> <span class="ty">DecodedLeafEntry</span> = <span class="kw">struct</span> {
+    tombstone: <span class="ty">bool</span>,
+    key: []const <span class="ty">u8</span>,
+    value: []const <span class="ty">u8</span>,   <span class="cm">// 内联：指向 payload 切片；溢出：4 字节页号</span>
+    flags: <span class="ty">u8</span>,
+    vlen: <span class="ty">u32</span>,       <span class="cm">// 原始 value 长度（溢出时 = 完整 value 字节数）</span>
+};
+
+<span class="kw">fn</span> <span class="fn">needsOverflow</span>(entry: <span class="ty">LeafEntry</span>) <span class="ty">bool</span> {
+    <span class="kw">return</span> entry.value.len > MAX_INLINE_VALUE;
+}</code></pre>
+
+<div class="note warn" role="note">⚠️ 注意 <b>DecodedLeafEntry.value 的二义性：</b>内联时 <code>value</code> 是 payload 内的字节切片；
+溢出时 <code>value</code> 是 4 字节的<strong>页号字节</strong>（不是真实 value）。调用方必须再查 <code>flags</code>：
+若 <code>flags &amp; LEAF_FLAG_OVERFLOW</code>，要把这 4 字节读成 <code>u32</code> 页号再去溢出页链取真实值。
+<code>Leaf.fromPayload</code> 和 <code>findInLeaf</code> 都做了这个分支。</div>
+
+<h3 id="s22">2.2 溢出页链：写/读/回收</h3>
+
+<p>溢出页是一条由 <code>free_next</code> 串起来的单向链表。每个溢出页页头 <code>page_type = PAGE_TYPE_OVERFLOW</code>，
+payload 区存 value 的一个 chunk（最多 <code>OVERFLOW_PAYLOAD</code> 字节），<code>free_next</code> 指向下一页。</p>
+
+<pre><code><span class="cm">/// 写值到溢出页链，返首页号</span>
+<span class="cm">/// ponytail: MVP 无 nkeys 更新，链靠 free_next</span>
+<span class="kw">fn</span> <span class="fn">writeOverflowPages</span>(store: <span class="ty">PageStore</span>, value: []const <span class="ty">u8</span>) !<span class="ty">u32</span> {
+    <span class="kw">var</span> remaining = value.len;
+    <span class="kw">var</span> offset: <span class="ty">usize</span> = <span class="nu">0</span>;
+    <span class="kw">var</span> first_page: <span class="ty">u32</span> = <span class="nu">0</span>;
+    <span class="kw">var</span> prev_page: <span class="ty">u32</span> = <span class="nu">0</span>;
+    <span class="kw">while</span> (remaining > <span class="nu">0</span>) {
+        <span class="kw">const</span> page_no = <span class="kw">try</span> store.<span class="fn">allocPage</span>();
+        <span class="kw">const</span> page = <span class="kw">try</span> store.<span class="fn">writePage</span>(page_no);
+        <span class="kw">const</span> arr: *[f2.PAGE_SIZE]<span class="ty">u8</span> = @ptrCast(page.ptr);
+        <span class="kw">const</span> chunk = @min(remaining, OVERFLOW_PAYLOAD);
+        <span class="cm">// ... 填页头(PAGE_TYPE_OVERFLOW) + memcpy chunk + 清零余量 + CRC ...</span>
+        <span class="kw">if</span> (first_page == <span class="nu">0</span>) {
+            first_page = page_no;
+        } <span class="kw">else</span> {
+            <span class="cm">// 链接前页 → 本页：回写 prev 的 free_next</span>
+            <span class="kw">const</span> prev = <span class="kw">try</span> store.<span class="fn">writePage</span>(prev_page);
+            <span class="kw">var</span> prev_hdr = f2.<span class="fn">decodePageHeader</span>(prev[<span class="nu">0</span>..f2.PAGE_HEADER_SIZE]);
+            prev_hdr.free_next = page_no;
+            f2.<span class="fn">encodePageHeader</span>(prev[<span class="nu">0</span>..f2.PAGE_HEADER_SIZE], &amp;prev_hdr);
+            f2.<span class="fn">setPageChecksum</span>(prev_arr, f2.<span class="fn">computePageChecksum</span>(prev_arr));
+        }
+        prev_page = page_no;
+        remaining -= chunk;
+        offset += chunk;
+    }
+    <span class="kw">return</span> first_page;
+}</code></pre>
+
+<div class="flow">
+<span class="step">value &gt; 3800B</span>
+<span class="arrow">→</span>
+<span class="step">allocPage 首页</span>
+<span class="arrow">→</span>
+<span class="step">写 chunk1（≤4068B）</span>
+<span class="arrow">→</span>
+<span class="step">有剩余? allocPage 次页</span>
+<span class="arrow">→</span>
+<span class="step">回写首页 free_next=次页</span>
+<span class="arrow">→ ↻</span>
+<span class="step">返首页号</span>
+</div>
+
+<p><code>readOverflowValue</code> 沿 <code>free_next</code> 链逐页 <code>readNodePayload</code>（带 CRC），
+拼接成完整 value（调用方 free）。<code>freeOverflowPages</code> 遍历链把各页号加入 <code>dirty</code> 列表，
+由 caller 回收——注意它 <code>readPage</code> 失败即 <code>return</code>（链断裂静默终止，避免崩溃）。</p>
+
+<pre><code><span class="kw">fn</span> <span class="fn">readOverflowValue</span>(allocator: std.mem.<span class="ty">Allocator</span>, store: <span class="ty">PageStore</span>, first_page: <span class="ty">u32</span>, vlen: <span class="ty">u32</span>) ![]<span class="ty">u8</span> {
+    <span class="kw">const</span> result = <span class="kw">try</span> allocator.<span class="fn">alloc</span>(<span class="ty">u8</span>, vlen);
+    <span class="kw">var</span> offset: <span class="ty">usize</span> = <span class="nu">0</span>;
+    <span class="kw">var</span> cur = first_page;
+    <span class="kw">while</span> (cur != <span class="nu">0</span> <span class="kw">and</span> offset < vlen) {
+        <span class="kw">const</span> payload = <span class="kw">try</span> <span class="fn">readNodePayload</span>(store, cur);
+        <span class="kw">const</span> chunk = @min(vlen - offset, payload.len);
+        @memcpy(result[offset..][<span class="nu">0</span>..chunk], payload[<span class="nu">0</span>..chunk]);
+        offset += chunk;
+        <span class="kw">const</span> page = <span class="kw">try</span> store.<span class="fn">readPage</span>(cur);
+        <span class="kw">const</span> hdr = f2.<span class="fn">decodePageHeader</span>(page[<span class="nu">0</span>..f2.PAGE_HEADER_SIZE]);
+        cur = hdr.free_next;
+    }
+    <span class="kw">return</span> result;
+}</code></pre>
+
+<div class="note warn" role="note">⚠️ 注意 <b>链遍历用带 CRC 的 readNodePayload：</b>溢出页链是跨页结构，任一页损坏都会导致
+value 截断。读取走 <code>readNodePayload</code>（CRC 校验）而非 Fast 版，保证损坏可被 <code>CorruptCrc</code>
+错误捕获。热路径 <code>getBorrowed</code> 对溢出值直接返 null，迫使调用方走 <code>get</code> 走这条安全路径。</div>
+
+<h3 id="s23">2.3 leafPayloadSize：容量预估</h3>
+
+<pre><code><span class="kw">pub fn</span> <span class="fn">leafPayloadSize</span>(entries: []const <span class="ty">LeafEntry</span>) <span class="ty">usize</span> {
+    <span class="kw">var</span> n: <span class="ty">usize</span> = <span class="nu">1</span> + <span class="nu">2</span>;  <span class="cm">// kind(1) + count(2)</span>
+    <span class="kw">for</span> (entries) |e| {
+        <span class="cm">// tombstone(1) + klen(4) + key + vlen(4) + flags(1) + value</span>
+        <span class="kw">const</span> value_sz = <span class="kw">if</span> (e.value.len > MAX_INLINE_VALUE) @as(<span class="ty">usize</span>, <span class="nu">4</span>) <span class="kw">else</span> e.value.len;
+        n += <span class="nu">1</span> + <span class="nu">4</span> + e.key.len + <span class="nu">4</span> + <span class="nu">1</span> + value_sz;
+    }
+    <span class="kw">return</span> n;
+}</code></pre>
+
+<p>每条 entry 开销：<code>tombstone(1) + klen(4) + key + vlen(4) + flags(1) + value</code> = 10 字节元数据 + key + value。
+溢出 entry 的 value 字段只占 4 字节（页号），不是完整 value。这个函数用于写前预估 payload 大小，
+确保不超过 <code>PAGE_SIZE - PAGE_HEADER_SIZE - 4 = 4068</code>。</p>
+
+<h3 id="s24">2.4 encodeLeafPayload：字节布局</h3>
+
+<pre><code><span class="kw">pub fn</span> <span class="fn">encodeLeafPayload</span>(buf: []<span class="ty">u8</span>, entries: []const <span class="ty">LeafEntry</span>, store: <span class="ty">PageStore</span>, dirty: *std.<span class="ty">ArrayList</span>(<span class="ty">u32</span>)) !<span class="ty">usize</span> {
+    _ = dirty;
+    <span class="kw">var</span> pos: <span class="ty">usize</span> = <span class="nu">0</span>;
+    buf[pos] = LEAF_KIND;            pos += <span class="nu">1</span>;
+    std.mem.<span class="fn">writeInt</span>(<span class="ty">u16</span>, buf[pos..][<span class="nu">0</span>..<span class="nu">2</span>], @intCast(entries.len), .big); pos += <span class="nu">2</span>;
+    <span class="kw">for</span> (entries) |e| {
+        <span class="kw">const</span> is_ov = e.value.len > MAX_INLINE_VALUE;
+        buf[pos] = <span class="kw">if</span> (e.tombstone) @as(<span class="ty">u8</span>, <span class="nu">1</span>) <span class="kw">else</span> <span class="nu">0</span>; pos += <span class="nu">1</span>;
+        std.mem.<span class="fn">writeInt</span>(<span class="ty">u32</span>, buf[pos..][<span class="nu">0</span>..<span class="nu">4</span>], @intCast(e.key.len), .big); pos += <span class="nu">4</span>;
+        @memcpy(buf[pos..][<span class="nu">0</span>..e.key.len], e.key); pos += e.key.len;
+        std.mem.<span class="fn">writeInt</span>(<span class="ty">u32</span>, buf[pos..][<span class="nu">0</span>..<span class="nu">4</span>], @intCast(e.value.len), .big); pos += <span class="nu">4</span>;
+        <span class="kw">if</span> (is_ov) {
+            buf[pos] = LEAF_FLAG_OVERFLOW; pos += <span class="nu">1</span>;
+            <span class="kw">const</span> ov_page = <span class="kw">try</span> <span class="fn">writeOverflowPages</span>(store, e.value);
+            std.mem.<span class="fn">writeInt</span>(<span class="ty">u32</span>, buf[pos..][<span class="nu">0</span>..<span class="nu">4</span>], ov_page, .little);  <span class="cm">// ← little!</span>
+            pos += <span class="nu">4</span>;
+        } <span class="kw">else</span> {
+            buf[pos] = <span class="nu">0</span>; pos += <span class="nu">1</span>;
+            @memcpy(buf[pos..][<span class="nu">0</span>..e.value.len], e.value); pos += e.value.len;
+        }
+    }
+    <span class="kw">return</span> pos;
+}</code></pre>
+
+<div class="note danger" role="alert">🔴 危险 <b>端序不一致（关键陷阱）：</b>leaf payload 里 <b>count / klen / vlen 用 big-endian</b>，
+但 <b>溢出页号用 little-endian</b>！<code>encodeLeafPayload</code> 写页号用 <code>.little</code>，
+<code>decodeLeafPayload</code> / <code>findInLeaf</code> 读页号也用 <code>.little</code>。这与页头
+（<code>encodePageHeader</code> 全 little）不同——leaf 内的长度字段是 big，唯页号字段是 little。
+改代码时务必保持读写端序配对，否则页号错读导致整树错乱。</div>
+
+<p>字节布局总览（单条 entry）：</p>
+
+<pre><code>┌──────┬───────┬──────┬───────┬─────┬───────┬───────┬───────────────┐
+│ kind │ count │ tomb │ klen  │ key │ vlen  │ flags │ value         │
+│  1B  │  2B   │  1B  │  4B   │ ..  │  4B   │  1B   │ 内联=VL / 溢出=4B页号│
+│  BE? │  BE   │  -   │  BE   │ raw │  BE   │  -    │ 溢出=LE       │
+└──────┴───────┴──────┴───────┴─────┴───────┴───────┴───────────────┘
+<span class="cm">kind=LEAF_KIND(2); BE=big-endian; LE=little-endian; raw=原始字节</span></code></pre>
+
+<h3 id="s25">2.5 decodeLeafPayload：防御性解码</h3>
+
+<pre><code><span class="kw">pub fn</span> <span class="fn">decodeLeafPayload</span>(payload: []const <span class="ty">u8</span>, entries_out: []<span class="ty">DecodedLeafEntry</span>) !<span class="kw">void</span> {
+    <span class="kw">if</span> (payload.len < <span class="nu">3</span>) <span class="kw">return error</span>.Truncated;
+    <span class="kw">if</span> (payload[<span class="nu">0</span>] != LEAF_KIND) <span class="kw">return error</span>.CorruptCrc;
+    <span class="kw">const</span> count = std.mem.<span class="fn">readInt</span>(<span class="ty">u16</span>, payload[<span class="nu">1</span>..<span class="nu">3</span>], .big);
+    <span class="kw">if</span> (entries_out.len < count) <span class="kw">return error</span>.Truncated;
+    <span class="kw">var</span> pos: <span class="ty">usize</span> = <span class="nu">3</span>;
+    <span class="kw">for</span> (payload, <span class="nu">0</span>..) |_, i| {
+        <span class="kw">if</span> (i >= count) <span class="kw">break</span>;
+        <span class="kw">if</span> (pos + <span class="nu">1</span> + <span class="nu">4</span> > payload.len) <span class="kw">return error</span>.Truncated;
+        <span class="cm">// ... 逐字段读，每步都查 pos+x > payload.len ...</span>
+        <span class="kw">if</span> (flags &amp; LEAF_FLAG_OVERFLOW != <span class="nu">0</span>) {
+            <span class="kw">if</span> (pos + <span class="nu">4</span> > payload.len) <span class="kw">return error</span>.Truncated;
+            <span class="kw">const</span> ov_page = payload[pos..pos+<span class="nu">4</span>]; pos += <span class="nu">4</span>;
+            entries_out[i] = .{ ..., .value = ov_page, ... };
+        } <span class="kw">else</span> {
+            <span class="kw">if</span> (pos + vlen > payload.len) <span class="kw">return error</span>.Truncated;
+            <span class="kw">const</span> value = payload[pos .. pos + vlen]; pos += vlen;
+            entries_out[i] = .{ ..., .value = value, ... };
+        }
+    }
+}</code></pre>
+
+<p>每个字段读取前都做 <code>pos + N > payload.len</code> 边界检查，越界返 <code>error.Truncated</code>。
+kind 字节不匹配返 <code>error.CorruptCrc</code>（复用此错误名表"页内容非法"）。这种防御性解码确保
+损坏页不会导致越界读——配合 <code>readNodePayload</code> 的 CRC 校验，构成两层防护。</p>
+
+<div class="note ok" role="note">✅ 提示 <b>解码零拷贝：</b><code>decodeLeafPayload</code> 返回的 <code>key</code>/<code>value</code> 是
+<strong>指向 payload 的切片</strong>，不分配堆。<code>Leaf.fromPayload</code> 才会 <code>dupe</code> 到堆——
+因为 fromPayload 的 leaf 要在 payload 生命期外存活。这种分层让纯解码可复用于只读扫描。</div>
+
+<p class="muted">第二部分到此。下一部分讲 Branch 编码与 Leaf/Branch 的内存表示。</p>
+</section>
+
+
+<section class="lecture" id="part3">
+<h2><span class="no">第三部分</span>Branch 节点编码与内存表示</h2>
+
+<p>Branch 节点存 N-1 个 key 和 N 个 <code>u32</code> 子指针。子指针是页号，指向下层 branch 或 leaf。
+本部分讲 branch 字节布局，以及 <code>Leaf</code> / <code>Branch</code> 结构体如何把 payload 转成可操作内存表示。</p>
+
+<h3 id="s31">3.1 branchPayloadSize / encode / decode</h3>
+
+<pre><code><span class="kw">pub fn</span> <span class="fn">branchPayloadSize</span>(keys: []const []const <span class="ty">u8</span>, children: []const <span class="ty">u32</span>) <span class="ty">usize</span> {
+    <span class="kw">var</span> n: <span class="ty">usize</span> = <span class="nu">1</span> + <span class="nu">2</span>;  <span class="cm">// kind + count</span>
+    <span class="kw">for</span> (keys) |k| n += <span class="nu">4</span> + k.len;
+    n += <span class="nu">4</span> * children.len;
+    <span class="kw">return</span> n;
+}
+
+<span class="kw">pub fn</span> <span class="fn">encodeBranchPayload</span>(buf: []<span class="ty">u8</span>, keys: []const []const <span class="ty">u8</span>, children: []const <span class="ty">u32</span>) <span class="ty">usize</span> {
+    <span class="cm">// assert children.len >= 2, keys.len == children.len - 1</span>
+    buf[pos] = BRANCH_KIND; pos += <span class="nu">1</span>;
+    std.mem.<span class="fn">writeInt</span>(<span class="ty">u16</span>, buf[pos..][<span class="nu">0</span>..<span class="nu">2</span>], @intCast(children.len), .big); pos += <span class="nu">2</span>;
+    <span class="kw">for</span> (keys) |k| {  <span class="cm">// keys 区：klen(4,BE) + key</span>
+        std.mem.<span class="fn">writeInt</span>(<span class="ty">u32</span>, buf[pos..][<span class="nu">0</span>..<span class="nu">4</span>], @intCast(k.len), .big); pos += <span class="nu">4</span>;
+        @memcpy(buf[pos..][<span class="nu">0</span>..k.len], k); pos += k.len;
+    }
+    <span class="kw">for</span> (children) |c| {  <span class="cm">// children 区：u32(4,BE) 连续</span>
+        std.mem.<span class="fn">writeInt</span>(<span class="ty">u32</span>, buf[pos..][<span class="nu">0</span>..<span class="nu">4</span>], c, .big); pos += <span class="nu">4</span>;
+    }
+}</code></pre>
+
+<p>branch 布局：<code>kind(1) + count(2,BE)</code> 头，接着 <strong>keys 区</strong>（每个 <code>klen(4,BE)+key</code>），
+最后 <strong>children 区</strong>（<code>count</code> 个 <code>u32</code> 连续，big-endian）。注意 branch 的 children
+全用 big-endian，<strong>与 leaf 的溢出页号 little-endian 不同</strong>——这是端序约定的又一处不一致，改代码须留意。</p>
+
+<pre><code>┌──────┬───────┬─────────────────────┬────────────────────┐
+│ kind │ count │   keys 区           │  children 区       │
+│  1B  │  2B   │ [klen(4,BE)+key]*   │ [u32(4,BE)]*count  │
+└──────┴───────┴─────────────────────┴────────────────────┘
+<span class="cm">count = children 数 = keys 数 + 1</span></code></pre>
+
+<div class="note" role="note">💡 说明 <b>children 区连续的好处：</b>children 是定长 <code>u32</code> 数组，连续存放。
+<code>findChildIdxAndOffset</code> 算出 children 区起始字节偏移后，<code>cowBranchNoSplit</code> 可直接
+<code>pos + child_idx * 4</code> 定位某子指针字节，patch 4 字节即完成 COW——无需 decode 整个 branch。</div>
+
+<h3 id="s32">3.2 Leaf / Branch 内存表示与 fromPayload</h3>
+
+<p><code>Leaf</code> / <code>Branch</code> 是<strong>堆拥有</strong>的内存表示：key/value/child 都 <code>dupe</code> 到堆，
+脱离 payload 生命期。<code>fromPayload</code> 解码 + 堆拷贝，<code>deinit</code> 释放。</p>
+
+<pre><code><span class="kw">pub const</span> <span class="ty">Leaf</span> = <span class="kw">struct</span> {
+    entries: []<span class="ty">LeafEntry</span>,
+    allocator: std.mem.<span class="ty">Allocator</span>,
+
+    <span class="kw">pub fn</span> <span class="fn">fromPayload</span>(allocator, store, payload, dirty) !<span class="ty">Leaf</span> {
+        <span class="cm">// decode → 遍历 dec_slice</span>
+        <span class="kw">for</span> (dec_slice, <span class="nu">0</span>..) |d, i| {
+            <span class="kw">if</span> (d.flags &amp; LEAF_FLAG_OVERFLOW != <span class="nu">0</span>) {
+                <span class="kw">const</span> ov_page = std.mem.<span class="fn">readInt</span>(<span class="ty">u32</span>, d.value[<span class="nu">0</span>..<span class="nu">4</span>], .little);
+                <span class="fn">freeOverflowPages</span>(store, ov_page, dirty, allocator);  <span class="cm">// 旧溢出页入 dirty</span>
+                <span class="kw">const</span> full_val = <span class="kw">try</span> <span class="fn">readOverflowValue</span>(allocator, store, ov_page, d.vlen);
+                entries[i] = .{ .tombstone = d.tombstone, .key = <span class="kw">try</span> allocator.<span class="fn">dupe</span>(<span class="ty">u8</span>, d.key), .value = full_val };
+            } <span class="kw">else</span> {
+                entries[i] = .{ ..., .value = <span class="kw">try</span> allocator.<span class="fn">dupe</span>(<span class="ty">u8</span>, d.value) };
+            }
+        }
+    }
+
+    <span class="kw">pub fn</span> <span class="fn">findPos</span>(self, key) <span class="ty">usize</span> {  <span class="cm">// 二分找插入位置</span>
+        <span class="kw">var</span> lo: <span class="ty">usize</span> = <span class="nu">0</span>; <span class="kw">var</span> hi = self.entries.len;
+        <span class="kw">while</span> (lo < hi) {
+            <span class="kw">const</span> mid = lo + (hi - lo) / <span class="nu">2</span>;
+            <span class="kw">switch</span> (<span class="fn">cmpKey</span>(self.entries[mid].key, key)) {
+                .lt => lo = mid + <span class="nu">1</span>,
+                .eq, .gt => hi = mid,
+            }
+        }
+        <span class="kw">return</span> lo;
+    }
+};
+
+<span class="kw">pub const</span> <span class="ty">Branch</span> = <span class="kw">struct</span> {
+    keys: [][]<span class="ty">u8</span>,
+    children: []<span class="ty">u32</span>,
+    <span class="cm">// fromPayload: decode → dupe keys → copy children</span>
+    <span class="kw">pub fn</span> <span class="fn">findChild</span>(self, key) <span class="ty">usize</span> {  <span class="cm">// 找 key 应走哪个子</span>
+        <span class="cm">// keys[mid] < key → 走右；keys[mid] >= key → 走左</span>
+    }
+};</code></pre>
+
+<div class="note warn" role="note">⚠️ 注意 <b>fromPayload 的副作用——旧溢出页入 dirty：</b><code>Leaf.fromPayload</code> 在解码溢出 entry 时
+会调 <code>freeOverflowPages</code> 把旧溢出页加入 <code>dirty</code>。因为 COW 写入会用新溢出页替换旧的，
+旧链必须回收。<code>insertIntoLeafSplit</code> / <code>insertBatchIntoLeaf</code> 走此路径，caller 的 dirty 列表
+负责最终 <code>freePage</code>。</div>
+
+<p class="muted">第三部分到此。下一部分讲读取路径 <code>get</code> / <code>getBorrowed</code>。</p>
+</section>
+
+
+<section class="lecture" id="part4">
+<h2><span class="no">第四部分</span>读取路径：get / getBorrowed</h2>
+
+<p>读路径分两档：<code>getBorrowed</code> 零拷贝借用页缓冲（内联值热路径），<code>get</code> 堆拷贝（溢出值 / 需独立生命期）。
+两者共享 <code>findInBranchPayload</code> 做原页二分下沉，区别只在叶层处理。</p>
+
+<h3 id="s41">4.1 getBorrowed：零拷贝热路径</h3>
+
+<pre><code><span class="kw">pub fn</span> <span class="fn">getBorrowed</span>(store: <span class="ty">PageStore</span>, root: <span class="ty">u32</span>, key: []const <span class="ty">u8</span>) !?[]const <span class="ty">u8</span> {
+    <span class="kw">if</span> (root == NULL_ROOT) <span class="kw">return null</span>;
+    <span class="kw">var</span> cur = root;
+    <span class="kw">var</span> depth: <span class="ty">u32</span> = <span class="nu">0</span>;
+    <span class="kw">while</span> (depth < <span class="nu">1000</span>) : (depth += <span class="nu">1</span>) {
+        <span class="kw">const</span> payload = <span class="kw">try</span> <span class="fn">readNodePayloadFast</span>(store, cur);  <span class="cm">// 跳 CRC</span>
+        <span class="kw">if</span> (payload[<span class="nu">0</span>] == LEAF_KIND) <span class="kw">return</span> <span class="fn">findInLeafBorrowed</span>(payload, key);
+        <span class="kw">else</span> cur = <span class="kw">try</span> <span class="fn">findInBranchPayload</span>(payload, key);
+    }
+    <span class="kw">return error</span>.Truncated;
+}</code></pre>
+
+<p><code>getBorrowed</code> 从 root 下沉：branch 层调 <code>findInBranchPayload</code> 取下一层页号，
+到 leaf 层调 <code>findInLeafBorrowed</code>。全程 <code>readNodePayloadFast</code>（跳 CRC，COW 保证安全），
+返回的切片直接指向页缓冲——零堆分配。<code>depth &lt; 1000</code> 是防环保护。</p>
+
+<div class="flow">
+<span class="step">root</span>
+<span class="arrow">→</span>
+<span class="step">readNodePayloadFast</span>
+<span class="arrow">→</span>
+<span class="step">payload[0]==LEAF?</span>
+<span class="arrow">→ 是</span>
+<span class="step">findInLeafBorrowed → 返借用切片</span>
+<span class="arrow">→ 否</span>
+<span class="step">findInBranchPayload → cur=child</span>
+<span class="arrow">→ ↻</span>
+</div>
+
+<pre><code><span class="kw">fn</span> <span class="fn">findInLeafBorrowed</span>(payload, key) !?[]const <span class="ty">u8</span> {
+    <span class="cm">// 逐条扫描，cmpKey 分流：</span>
+    .lt => { pos += value_sz; <span class="kw">continue</span>; }  <span class="cm">// 跳过</span>
+    .eq => {
+        <span class="kw">if</span> (tombstone) <span class="kw">return null</span>;       <span class="cm">// 墓碑 = 不存在</span>
+        <span class="kw">if</span> (flags &amp; LEAF_FLAG_OVERFLOW != <span class="nu">0</span>) <span class="kw">return null</span>;  <span class="cm">// 溢出 → 信号</span>
+        <span class="kw">return</span> payload[pos .. pos + vlen];   <span class="cm">// ← 借用切片</span>
+    }
+    .gt => <span class="kw">return null</span>;  <span class="cm">// 越过插入点，key 不存在</span>
+}</code></pre>
+
+<div class="note danger" role="alert">🔴 危险 <b>getBorrowed 对溢出值返 null：</b>这是<strong>信号</strong>不是"不存在"。
+<code>findInLeafBorrowed</code> 遇溢出 entry 无法返借用切片（值跨多页），返 null 让调用方改走 <code>get</code>。
+调用方若不区分"墓碑 null / 越界 null / 溢出 null"，会误判溢出值为不存在。正确用法：
+<code>getBorrowed</code> 返 null 时若需确认，再调 <code>get</code>。</div>
+
+<h3 id="s42">4.2 get 与 findInLeaf：溢出与 tombstone</h3>
+
+<pre><code><span class="kw">pub fn</span> <span class="fn">get</span>(allocator, store, root, key) !?[]<span class="ty">u8</span> {
+    <span class="cm">// 同 getBorrowed 下沉，但叶层调 findInLeaf（堆拷贝）</span>
+}
+
+<span class="kw">fn</span> <span class="fn">findInLeaf</span>(allocator, store, payload, key) !?[]<span class="ty">u8</span> {
+    .eq => {
+        <span class="kw">if</span> (tombstone) <span class="kw">return null</span>;
+        <span class="kw">if</span> (flags &amp; LEAF_FLAG_OVERFLOW != <span class="nu">0</span>) {
+            <span class="kw">const</span> ov_page = std.mem.<span class="fn">readInt</span>(<span class="ty">u32</span>, payload[pos..][<span class="nu">0</span>..<span class="nu">4</span>], .little);
+            <span class="kw">return</span> <span class="kw">try</span> <span class="fn">readOverflowValue</span>(allocator, store, ov_page, @intCast(vlen));
+        }
+        <span class="kw">return</span> <span class="kw">try</span> allocator.<span class="fn">dupe</span>(<span class="ty">u8</span>, payload[pos .. pos + vlen]);  <span class="cm">// 堆拷贝</span>
+    }
+}</code></pre>
+
+<p><code>get</code> 是 <code>getBorrowed</code> 的"完整版"：内联值 <code>allocator.dupe</code> 堆拷贝，
+溢出值 <code>readOverflowValue</code> 拼链。返回的 <code>[]u8</code> 由调用方 <code>free</code>。
+墓碑一律返 null——墓碑是 COW 删除留下的逻辑删除标记，读路径视为不存在。</p>
+
+<h3 id="s43">4.3 findInBranchPayload：原页二分</h3>
+
+<pre><code><span class="kw">fn</span> <span class="fn">findInBranchPayload</span>(payload, key) !<span class="ty">u32</span> {
+    <span class="kw">const</span> count = std.mem.<span class="fn">readInt</span>(<span class="ty">u16</span>, payload[<span class="nu">1</span>..<span class="nu">3</span>], .big);
+    <span class="kw">var</span> pos: <span class="ty">usize</span> = <span class="nu">3</span>;
+    <span class="kw">var</span> child_idx: <span class="ty">usize</span> = <span class="nu">0</span>;
+    <span class="kw">var</span> found = <span class="kw">false</span>;
+    <span class="kw">var</span> i: <span class="ty">usize</span> = <span class="nu">0</span>;
+    <span class="kw">while</span> (i + <span class="nu">1</span> < count) : (i += <span class="nu">1</span>) {
+        <span class="cm">// 读 klen + key，逐 key 比较</span>
+        <span class="kw">if</span> (!found <span class="kw">and</span> <span class="fn">cmpKey</span>(ek, key) == .gt) { child_idx = i; found = <span class="kw">true</span>; }
+    }
+    <span class="kw">if</span> (!found) child_idx = count - <span class="nu">1</span>;  <span class="cm">// key >= 所有 keys → 走最右子</span>
+    <span class="kw">return</span> std.mem.<span class="fn">readInt</span>(<span class="ty">u32</span>, payload[pos + child_idx * <span class="nu">4</span> ..][<span class="nu">0</span>..<span class="nu">4</span>], .big);
+}</code></pre>
+
+<p>这是<strong>线性扫描</strong>找第一个 <code>key &gt; ek</code> 的位置（虽名为二分下沉，实为顺序遍历 keys 区）。
+keys 区扫完后 <code>pos</code> 落在 children 区起点，<code>pos + child_idx*4</code> 定位目标子指针。
+越界检查 <code>pos + 4*count &gt; payload.len</code> 防 <code>Truncated</code>。</p>
+
+<div class="note" role="note">💡 说明 <b>getBorrowed 的生命期保证：</b>返回的切片借自 <code>readNodePayloadFast</code> 的页缓冲。
+COW 保证旧页不被改写（写者分配新页），因此切片在调用方使用期间有效——前提是底层 <code>PageStore</code>
+实现保证页地址稳定（内存版每页独立堆分配，见 <code>page_store.zig</code> 讲义）。</div>
+
+<p class="muted">第四部分到此。下一部分讲写路径——单条 insert 的 COW 实现。</p>
+</section>
+
+
+<section class="lecture" id="part5">
+<h2><span class="no">第五部分</span>插入（COW）：快路径与分裂</h2>
+
+<p>单条 <code>insert</code> 是 COW B-tree 的写路径核心。它分两层：叶层 <code>insertIntoLeaf</code>（快路径 patch /
+慢路径分裂），branch 层 <code>insertIntoBranch</code>（递归 + <code>cowBranchNoSplit</code> 快路径 / decode-encode 慢路径）。
+本部分逐个拆解。</p>
+
+<h3 id="s51">5.1 insert 入口与 root 分裂</h3>
+
+<pre><code><span class="kw">pub fn</span> <span class="fn">insert</span>(allocator, store, root, key, value, tombstone, dirty) !<span class="ty">WriteResult</span> {
+    <span class="kw">if</span> (root == NULL_ROOT) {
+        <span class="cm">// 空树：建首个 leaf，写一条 entry</span>
+        <span class="kw">const</span> new_page = <span class="kw">try</span> store.<span class="fn">allocPage</span>();
+        <span class="cm">// encodeLeafPayload + writeNodePage(LEAF)</span>
+        <span class="kw">return</span> .{ .new_root = new_page, ... };
+    }
+    <span class="kw">const</span> payload = <span class="kw">try</span> <span class="fn">readNodePayload</span>(store, root);
+    <span class="kw">const</span> is_leaf = payload[<span class="nu">0</span>] == LEAF_KIND;
+    <span class="kw">const</span> sub = <span class="kw">if</span> (is_leaf)
+        <span class="kw">try</span> <span class="fn">insertIntoLeaf</span>(...)
+    <span class="kw">else</span>
+        <span class="kw">try</span> <span class="fn">insertIntoBranch</span>(...);
+
+    <span class="kw">if</span> (sub.split_key) |sk| {
+        <span class="cm">// root 分裂：建新 branch root，指向 sub.new_child 与 sub.split_right</span>
+        <span class="kw">var</span> keys = .{sk};
+        <span class="kw">var</span> children = .{ sub.new_child, sub.split_right };
+        <span class="cm">// allocPage + encodeBranchPayload + writeNodePage(BRANCH)</span>
+        <span class="kw">return</span> .{ .new_root = new_page, ... };
+    }
+    <span class="kw">return</span> .{ .new_root = sub.new_child, ... };
+}</code></pre>
+
+<p><code>insert</code> 读 root payload 判 leaf/branch，调对应插入函数。<code>InsertSub</code> 结构体是子层回报：
+<code>new_child</code>（新页号）、可选 <code>split_key</code> + <code>split_right</code>（分裂时）、<code>live_delta</code> /
+<code>count_delta</code>。root 分裂时建新 branch root——这是树长高的唯一时机。</p>
+
+<pre><code><span class="kw">const</span> <span class="ty">InsertSub</span> = <span class="kw">struct</span> {
+    new_child: <span class="ty">u32</span>,
+    split_key: ?[]<span class="ty">u8</span> = <span class="kw">null</span>,
+    split_right: <span class="ty">u32</span> = <span class="nu">0</span>,
+    live_delta: <span class="ty">i64</span> = <span class="nu">0</span>,
+    count_delta: <span class="ty">i64</span> = <span class="nu">0</span>,
+};</code></pre>
+
+<h3 id="s52">5.2 insertIntoLeaf：栈缓冲 patch</h3>
+
+<p><code>insertIntoLeaf</code> 是叶层 COW 核心。它分两条路：<strong>快路径</strong>（条数未超限，栈缓冲 patch 新 entry）
+和<strong>慢路径</strong>（超限，调 <code>insertIntoLeafSplit</code> decode/分裂/encode）。</p>
+
+<pre><code><span class="kw">fn</span> <span class="fn">insertIntoLeaf</span>(store, allocator, page_no, key, value, tombstone, dirty) !<span class="ty">InsertSub</span> {
+    <span class="cm">// ① 拷旧页到栈缓冲 — allocPage 可能触发 HashMap resize 使 readPage 切片失效</span>
+    <span class="kw">const</span> old_page = <span class="kw">try</span> store.<span class="fn">readPage</span>(page_no);
+    <span class="kw">var</span> old_page_buf: [f2.PAGE_SIZE]<span class="ty">u8</span> = <span class="kw">undefined</span>;
+    @memcpy(&amp;old_page_buf, old_page[<span class="nu">0</span>..f2.PAGE_SIZE]);
+    <span class="kw">const</span> old_payload = old_page_buf[f2.PAGE_HEADER_SIZE .. f2.PAGE_SIZE - <span class="nu">4</span>];
+
+    <span class="cm">// ② 扫描 old_payload 找插入位置 + 记录 entry_start/entry_end/entries_end</span>
+    <span class="cm">//    同时记录 old entry 元信息（tombstone/vlen/is_overflow/overflow_page）</span>
+    <span class="cm">// ③ 算 live_delta / count_delta（覆盖时减旧、加新）</span>
+    <span class="cm">// ④ 若旧 entry 是溢出，freeOverflowPages 旧链入 dirty</span>
+
+    <span class="kw">const</span> new_count: <span class="ty">u16</span> = <span class="kw">if</span> (found) old_count <span class="kw">else</span> old_count + <span class="nu">1</span>;
+    dirty.<span class="fn">append</span>(allocator, page_no) <span class="kw">catch</span> {};  <span class="cm">// 旧页入 dirty</span>
+
+    <span class="kw">if</span> (new_count > LEAF_MAX_ENTRIES) {
+        <span class="kw">return</span> <span class="fn">insertIntoLeafSplit</span>(store, allocator, old_page_buf[<span class="nu">0</span>..], ...);
+    }
+
+    <span class="cm">// ⑤ 快路径：栈缓冲拼新 payload（header + before + 新 entry + after）</span>
+    <span class="kw">var</span> new_payload: [f2.PAGE_SIZE - f2.PAGE_HEADER_SIZE - <span class="nu">4</span>]<span class="ty">u8</span> = <span class="kw">undefined</span>;
+    <span class="cm">// ⑥ allocPage + writeNodePage(LEAF) 写入</span>
+    <span class="kw">return</span> .{ .new_child = new_page, .live_delta, .count_delta };
+}</code></pre>
+
+<div class="note danger" role="alert">🔴 危险 <b>栈缓冲拷贝的关键理由：</b>注释明确——<code>allocPage</code> 可能触发底层
+<code>HashMap</code> resize，使此前 <code>readPage</code> 返回的借用切片<strong>悬垂</strong>。因此必须先把整页
+<code>@memcpy</code> 到栈 <code>old_page_buf</code>，后续所有扫描/拷贝都基于栈缓冲，<code>allocPage</code> 之后才安全。
+<code>cowBranchNoSplit</code> 同此模式。这是 COW 写路径的<strong>不变量</strong>：用旧页数据前先拷离页缓冲。</div>
+
+<div class="note warn" role="note">⚠️ 注意 <b>live_delta 计算：</b>覆盖时减去旧 entry 大小 <code>old_key_len + old_val_sz + 9</code>
+（9 = 1 tombstone + 4 klen + 4 vlen；注意 flags 1 字节已计入 9？实际公式 <code>key.len + value.len + 9</code>，
+9 含 tombstone/klen/vlen/flags 共 10？源码写作 +9，遵循源码）。新增则只加 <code>key.len + value.len + 9</code>。
+tombstone 的 value 按 0 长度计。count_delta：活→墓 -1，墓→活 +1，新增活 +1。</div>
+
+<p>慢路径 <code>insertIntoLeafSplit</code>：decode 旧叶为内存 <code>Leaf</code> → 应用 insert/overwrite →
+对半分裂成左右两叶 → <code>encodeLeafPayload</code> + <code>writeNodePage</code> 各写一页 → 返
+<code>split_key = right_entries[0].key</code>。</p>
+
+<h3 id="s53">5.3 cowBranchNoSplit：4 字节 patch</h3>
+
+<pre><code><span class="kw">fn</span> <span class="fn">cowBranchNoSplit</span>(store, old_page_no, child_idx, children_offset, new_child) !<span class="ty">u32</span> {
+    <span class="cm">// 拷旧页到栈（防 allocPage resize 悬垂）</span>
+    <span class="kw">const</span> old_page = <span class="kw">try</span> store.<span class="fn">readPage</span>(old_page_no);
+    <span class="kw">var</span> page_copy: [f2.PAGE_SIZE]<span class="ty">u8</span> = <span class="kw">undefined</span>;
+    @memcpy(&amp;page_copy, old_page[<span class="nu">0</span>..f2.PAGE_SIZE]);
+
+    <span class="kw">const</span> new_page_no = <span class="kw">try</span> store.<span class="fn">allocPage</span>();
+    <span class="kw">const</span> new_page = <span class="kw">try</span> store.<span class="fn">writePage</span>(new_page_no);
+    @memcpy(new_page[<span class="nu">0</span>..f2.PAGE_SIZE], &amp;page_copy);  <span class="cm">// 整页拷</span>
+
+    std.mem.<span class="fn">writeInt</span>(<span class="ty">u32</span>, new_page[<span class="nu">0</span>..<span class="nu">4</span>], new_page_no, .little);  <span class="cm">// 改页头 page_no</span>
+    <span class="cm">// patch 子指针（big-endian）</span>
+    <span class="kw">const</span> off = f2.PAGE_HEADER_SIZE + children_offset + child_idx * <span class="nu">4</span>;
+    std.mem.<span class="fn">writeInt</span>(<span class="ty">u32</span>, new_page[off..][<span class="nu">0</span>..<span class="nu">4</span>], new_child, .big);
+    f2.<span class="fn">setPageChecksum</span>(arr, f2.<span class="fn">computePageChecksum</span>(arr));
+    <span class="kw">return</span> new_page_no;
+}</code></pre>
+
+<p>这是 branch 快路径：子未分裂时，无需 decode/encode 整个 branch——整页拷贝 + 改页头 page_no + patch
+4 字节子指针 + 重算 CRC。零堆分配。<code>findChildIdxAndOffset</code> 预先算出 <code>child_idx</code> 和
+<code>children_offset</code>（children 区起始偏移），<code>cowBranchNoSplit</code> 直接用。</p>
+
+<h3 id="s54">5.4 insertIntoBranch：递归 + 快/慢路径</h3>
+
+<pre><code><span class="kw">fn</span> <span class="fn">insertIntoBranch</span>(store, allocator, page_no, key, value, tombstone, dirty) !<span class="ty">InsertSub</span> {
+    <span class="kw">const</span> payload = <span class="kw">try</span> <span class="fn">readNodePayload</span>(store, page_no);
+    <span class="kw">const</span> loc = <span class="kw">try</span> <span class="fn">findChildIdxAndOffset</span>(payload, key);  <span class="cm">// 找子 + offset</span>
+
+    <span class="cm">// 判子是 leaf/branch，递归插入</span>
+    <span class="kw">const</span> child_is_leaf = ...;
+    <span class="kw">const</span> sub = <span class="kw">if</span> (child_is_leaf)
+        <span class="kw">try</span> <span class="fn">insertIntoLeaf</span>(store, allocator, loc.child, ...)
+    <span class="kw">else</span>
+        <span class="kw">try</span> <span class="fn">insertIntoBranch</span>(store, allocator, loc.child, ...);
+
+    dirty.<span class="fn">append</span>(allocator, page_no) <span class="kw">catch</span> {};
+
+    <span class="kw">if</span> (sub.split_key == <span class="kw">null</span>) {
+        <span class="cm">// ① 快路径：子未分裂 → cowBranchNoSplit</span>
+        <span class="kw">const</span> new_page = <span class="kw">try</span> <span class="fn">cowBranchNoSplit</span>(store, page_no, loc.idx, loc.children_offset, sub.new_child);
+        <span class="kw">return</span> .{ .new_child = new_page, ... };
+    }
+
+    <span class="cm">// ② 慢路径：子分裂 → 重读 payload（递归可能 allocPage 使旧 payload 失效）</span>
+    <span class="kw">const</span> fresh_payload = <span class="kw">try</span> <span class="fn">readNodePayload</span>(store, page_no);
+    <span class="kw">var</span> branch = <span class="kw">try</span> <span class="ty">Branch</span>.<span class="fn">fromPayload</span>(allocator, fresh_payload);
+    <span class="kw">defer</span> branch.<span class="fn">deinit</span>();
+    <span class="cm">// 替换 child[ci] = new_child，插入 split_key + split_right at ci</span>
+    <span class="cm">// 若超 BRANCH_MAX_CHILDREN → 分裂 branch，返 up_key + right_page</span>
+}</code></pre>
+
+<div class="note warn" role="note">⚠️ 注意 <b>慢路径重读 payload：</b>注释明说"recursive insert may have allocated pages,
+invalidating the earlier borrowed slice"。慢路径不复用开头读的 <code>payload</code>，而是 <code>readNodePayload</code>
+重读一份再 decode。这与快路径 <code>cowBranchNoSplit</code> 的栈拷贝是同一问题的两种应对：
+快路径在 allocPage 前就拷走整页，慢路径在 allocPage 后重读。</div>
+
+<p>branch 分裂：取 <code>mid = keys.len/2</code>，<code>up_key = keys[mid]</code> 上提，左右两半各成一页。
+<code>up_key</code> 是右子最小 key，上提到父节点作分隔键。</p>
+
+<p class="muted">第五部分到此。下一部分讲批量插入与整体设计取舍。</p>
+</section>
+
+
+<section class="lecture" id="part6">
+<h2><span class="no">第六部分</span>批量插入与设计取舍</h2>
+
+<p>批量插入 <code>insertBatch</code> 接受<strong>已排序</strong>的 entry 列表，沿 B-tree 路径一次遍历，
+同一叶范围内的 entry 只复制一次页。这是单条 <code>insert</code> 的"向量化"优化。</p>
+
+<h3 id="s61">6.1 insertBatch 路由</h3>
+
+<pre><code><span class="kw">pub fn</span> <span class="fn">insertBatch</span>(allocator, store, root, entries, dirty) !<span class="ty">WriteResult</span> {
+    <span class="kw">if</span> (entries.len == <span class="nu">0</span>) <span class="kw">return</span> .{ .new_root = root, ... };
+    <span class="kw">if</span> (root == NULL_ROOT) <span class="kw">return</span> <span class="fn">insertBatchFresh</span>(allocator, store, entries, dirty);
+
+    <span class="kw">const</span> payload = <span class="kw">try</span> <span class="fn">readNodePayloadFast</span>(store, root);
+    <span class="kw">const</span> is_leaf = payload[<span class="nu">0</span>] == LEAF_KIND;
+    <span class="kw">const</span> sub = <span class="kw">if</span> (is_leaf)
+        <span class="kw">try</span> <span class="fn">insertBatchIntoLeaf</span>(...)
+    <span class="kw">else</span>
+        <span class="kw">try</span> <span class="fn">insertBatchIntoBranch</span>(...);
+
+    <span class="kw">if</span> (sub.split_key) |sk| { <span class="cm">/* 建 new root branch */</span> }
+    <span class="kw">return</span> .{ .new_root = sub.new_child, ... };
+}</code></pre>
+
+<p>三条路径：<code>insertBatchFresh</code>（空树）、<code>insertBatchIntoLeaf</code>（root 是叶）、
+<code>insertBatchIntoBranch</code>（root 是 branch）。root 分裂逻辑与单条 <code>insert</code> 相同。</p>
+
+<h3 id="s62">6.2 insertBatchIntoLeaf：O(n+m) 归并</h3>
+
+<pre><code><span class="kw">fn</span> <span class="fn">insertBatchIntoLeaf</span>(store, allocator, page_no, entries, dirty) !<span class="ty">InsertSub</span> {
+    <span class="cm">// 拷旧页 → Leaf.fromPayload（旧溢出页入 dirty）</span>
+    <span class="kw">var</span> leaf = <span class="kw">try</span> <span class="ty">Leaf</span>.<span class="fn">fromPayload</span>(allocator, store, old_payload, dirty);
+    <span class="kw">defer</span> leaf.<span class="fn">deinit</span>();
+
+    <span class="kw">const</span> merged = <span class="kw">try</span> allocator.<span class="fn">alloc</span>(<span class="ty">LeafEntry</span>, leaf.entries.len + entries.len);
+    <span class="kw">var</span> oi: <span class="ty">usize</span> = <span class="nu">0</span>;  <span class="cm">// 旧叶游标</span>
+    <span class="kw">var</span> bi: <span class="ty">usize</span> = <span class="nu">0</span>;  <span class="cm">// 批量游标</span>
+    <span class="kw">while</span> (oi < leaf.entries.len <span class="kw">and</span> bi < entries.len) {
+        <span class="kw">switch</span> (<span class="fn">cmpKey</span>(old_e.key, new_e.key)) {
+            .lt => { merged[mi] = old_e; oi += <span class="nu">1</span>; }      <span class="cm">// 旧小，保留旧</span>
+            .gt => { <span class="cm">/* 新 entry 插入 */</span> bi += <span class="nu">1</span>; }
+            .eq => { <span class="cm">/* 覆盖：批量赢（last-write-wins）</span>
+                     <span class="cm">释放旧 key/value，替换 leaf.entries[oi] 防 deinit 双释放 */</span>
+                     oi += <span class="nu">1</span>; bi += <span class="nu">1</span>; }
+        }
+    }
+    <span class="cm">// 收尾：剩余旧 / 剩余新</span>
+
+    <span class="kw">if</span> (merged_entries.len <= LEAF_MAX_ENTRIES) {
+        <span class="cm">// 单叶容纳：encodeLeafPayload + writeNodePage</span>
+    } <span class="kw">else</span> {
+        <span class="cm">// 多叶：chunk 成 LEAF_MAX_ENTRIES 一组，建叶页 + branch 树</span>
+    }
+}</code></pre>
+
+<div class="note ok" role="note">✅ 提示 <b>O(n+m) 归并：</b>旧叶条目与批量条目都已排序，双游标归并一遍即可产出合并结果。
+同 key 取批量条目（<strong>last-write-wins</strong>）——这是批量插入的语义约定，调用方须保证 entries 已按 key 升序排好。</div>
+
+<div class="note danger" role="alert">🔴 危险 <b>覆盖时防 deinit 双释放：</b>eq 分支释放旧 entry 的 key/value 后，
+<code>leaf.deinit</code> 会再次 <code>free</code> 同一指针 → double-free。解法：释放后把
+<code>leaf.entries[oi]</code> 替换成空切片 <code>&amp;[_]u8{}</code>，让 deinit 释放空切片（no-op）。
+这是所有权管理的精细点——<code>Leaf</code> 拥有 entries 内存，归并时转移所有权须同步置空旧引用。</div>
+
+<h3 id="s63">6.3 bulk-load 与多级 branch 构建</h3>
+
+<p>批量条目超单叶容量时，走 <code>insertBatchSplitLeaves</code> / <code>insertBatchFresh</code> 的 bulk-load：
+按 <code>LEAF_MAX_ENTRIES</code> 切块建叶页，再用 <code>BRANCH_MAX_CHILDREN</code> 切块逐层建 branch。</p>
+
+<pre><code><span class="cm">// insertBatchSplitLeaves / insertBatchIntoLeaf 多叶路径</span>
+<span class="kw">var</span> pos: <span class="ty">usize</span> = <span class="nu">0</span>;
+<span class="kw">while</span> (pos < entries.len) {
+    <span class="kw">const</span> chunk_len = @min(LEAF_MAX_ENTRIES, entries.len - pos);
+    <span class="cm">// encodeLeafPayload(chunk) + writeNodePage(LEAF) → leaf_pages.append</span>
+    <span class="cm">// split_keys.append(entries[pos+chunk_len].key)  // 下一段首 key 作分隔</span>
+    pos += chunk_len;
+}
+<span class="cm">// 多级 branch：current_pages/current_keys 逐层压缩</span>
+<span class="kw">while</span> (current_pages.len > BRANCH_MAX_CHILDREN) {
+    <span class="cm">// 按 BRANCH_MAX_CHILDREN 切块建 branch，level_pages_a/b 交替复用</span>
+    <span class="cm">// split_key = current_keys[i + chunk_len - 1]</span>
+}
+<span class="cm">// 最终 root branch</span></code></pre>
+
+<div class="note warn" role="note">⚠️ 注意 <b>level_pages_a/b 交替复用：</b>多级 branch 构建用两个 <code>ArrayList</code>（a/b）
+交替作下一层的输入/输出。<code>defer</code> 在函数级释放——若在 while 体内 <code>defer</code>，下一轮读
+<code>current_pages</code> 时已被释放（use-after-free）。因此 a/b 声明在 while 外，<code>clearRetainingCapacity</code>
+复用容量。注释明确标注了这个陷阱。</div>
+
+<h3 id="s64">6.4 设计要点与风险清单</h3>
+
+<div class="card">
+<p><strong>设计要点：</strong></p>
+<ul>
+<li><b>COW 保证借用生命期：</b>写者永不改既有页，读者零拷贝借页缓冲。写路径用栈拷贝规避 allocPage 触发的 HashMap resize 悬垂。</li>
+<li><b>脏页外挂 caller：</b>写路径不直接 <code>freePage</code>，旧页号收集到 caller 的 <code>ArrayList(u32)</code>，由事务层统一回收。解耦写入与回收。</li>
+<li><b>快/慢路径分层：</b>叶层 patch vs 分裂；branch 层 <code>cowBranchNoSplit</code> 4 字节 patch vs decode-encode。常见无分裂情形走快路径零堆分配。</li>
+<li><b>溢出页链：</b>大 value 走 <code>free_next</code> 单向链，叶内只存 4 字节首页号。读时拼链，覆盖时旧链入 dirty。</li>
+<li><b>批量归并 O(n+m)：</b>已排序批量与已排序叶条目双游标归并，last-write-wins，避免逐条 COW 重复拷页。</li>
+<li><b>防御性越界检查：</b>每个 decode 步骤 <code>pos + N &gt; payload.len</code> 查 <code>Truncated</code>，kind 字节查 <code>CorruptCrc</code>，<code>@min(count, ...)</code> 卡上限。</li>
+</ul>
+</div>
+
+<table>
+<tr><th>风险点</th><th>说明</th><th>缓解/注意</th></tr>
+<tr><td>端序不一致</td><td>leaf 长度字段 big、溢出页号 little；branch children 全 big；页头全 little</td><td>改代码须读写配对，勿混用。已用注释标注关键处</td></tr>
+<tr><td>allocPage resize 悬垂</td><td><code>readPage</code> 借用切片在 <code>allocPage</code> 触发 HashMap resize 后失效</td><td>写路径先 <code>@memcpy</code> 整页到栈缓冲；慢路径重读 fresh payload</td></tr>
+<tr><td>getBorrowed 溢出返 null</td><td>溢出值无法借用，返 null 信号；调用方若不区分会误判不存在</td><td>需确认时改调 <code>get</code>；或文档约定 null 即"不可借用/不存在"</td></tr>
+<tr><td>DecodedLeafEntry.value 二义</td><td>溢出时 value 是 4 字节页号字节，非真实值</td><td>必查 <code>flags &amp; LEAF_FLAG_OVERFLOW</code> 分流</td></tr>
+<tr><td>批量覆盖 double-free</td><td>eq 分支释放旧 entry 后 <code>leaf.deinit</code> 再释放</td><td>释放后置 <code>leaf.entries[oi]</code> 为空切片</td></tr>
+<tr><td>level_pages defer 陷阱</td><td>while 内 defer 会在下一轮 use-after-free</td><td>a/b 声明在 while 外，<code>clearRetainingCapacity</code> 复用</td></tr>
+<tr><td>freeOverflowPages 静默终止</td><td>链断裂时 <code>readPage</code> 失败即 return，后续页不回收</td><td>最坏泄漏页号（不回收），不破坏一致性；caller dirty 列表兜底</td></tr>
+<tr><td>depth &lt; 1000 防环</td><td>若页内容损坏形成环，下沉会死循环</td><td>硬上限 1000 层，超限返 <code>Truncated</code></td></tr>
+<tr><td>墓碑不物理删</td><td>删除留 tombstone，长期累积空间膨胀</td><td>需上层 compaction 清理；当前 MVP 未实现</td></tr>
+</table>
+
+<div class="note ok" role="note">✅ 提示 <b>整体评价：</b><code>btree.zig</code> 用约 72KB 代码实现了完整的页号 COW B+ 树——
+节点编码自洽（leaf/branch/overflow 三种页型）、读写路径分层（快路径 patch / 慢路径 decode-encode）、
+批量插入向量化（O(n+m) 归并 + bulk-load 多级 branch）。风险集中在端序约定与借用生命期，均有注释标注。
+作为 cube_db 的索引核心，它把 COW 的不变量（不改既有页、脏页外挂、栈拷贝防悬垂）贯彻到每条写路径。</div>
+
+<p class="muted">第六部分到此。本讲义覆盖 <code>src/btree.zig</code> 全部公开函数与关键内部函数：
+常量与类型、页 I/O 三件套、leaf/branch 编解码、溢出页链、get/getBorrowed 读路径、
+insert 单条 COW（快/慢路径 + root 分裂）、insertBatch 批量（归并 + bulk-load）、设计取舍与风险清单。</p>
+</section>
+
+
+<footer>
+  <p>cube_db — <code>src/btree.zig</code> 讲义 · 页号 COW B-tree（v2，page-based）逐段精讲</p>
+</footer>
+
+</main>
+<script src="lecture.js"></script>
+</body>
+</html>
