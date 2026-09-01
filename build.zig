@@ -528,6 +528,21 @@ pub fn build(b: *std.Build) void {
     const run_delete_range_concurrent_test = b.addRunArtifact(delete_range_concurrent_test);
     db_test_step.dependOn(&run_delete_range_concurrent_test.step);
 
+    // applybatch_single_vs_multi_test — applyBatch 单条 vs 多条一致性测试（T-21）
+    const applybatch_single_vs_multi_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/txn_writer_db/applybatch_single_vs_multi_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    const run_applybatch_single_vs_multi_test = b.addRunArtifact(applybatch_single_vs_multi_test);
+    db_test_step.dependOn(&run_applybatch_single_vs_multi_test.step);
+
     // Once fixed, add `test-fuzz-coverage` with `-ffuzz` for coverage-guided fuzzing.
     // CI: `zig build test-fuzz` = determinant regression + smoke (~2s total).
     const fuzz_probe = b.addTest(.{
