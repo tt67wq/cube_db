@@ -450,6 +450,21 @@ pub fn build(b: *std.Build) void {
     const run_close_flush_failure_test = b.addRunArtifact(close_flush_failure_test);
     db_test_step.dependOn(&run_close_flush_failure_test.step);
 
+    // compact_strong_assert_test — compact 强断言测试（T-22）
+    const compact_strong_assert_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/txn_writer_db/compact_strong_assert_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    const run_compact_strong_assert_test = b.addRunArtifact(compact_strong_assert_test);
+    db_test_step.dependOn(&run_compact_strong_assert_test.step);
+
     // txn_arena_test — WriteTxn staging arena 化测试
     const txn_arena_test = b.addTest(.{
         .root_module = b.createModule(.{
