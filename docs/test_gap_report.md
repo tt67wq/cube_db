@@ -10,7 +10,7 @@
 
 | 优先级 | 总数 | ✅ 已完成 | ❌ 未开始 |
 |---|---|---|---|
-| P0 必补 | 14 | 7 | 7 |
+| P0 必补 | 14 | 8 | 6 |
 | P1 应补 | 13 | 0 | 13 |
 | P2 可选 | 6 | 0 | 6 |
 
@@ -43,7 +43,7 @@
 |---|---|---|---|---|---|
 | 8 | ✅ 已完成 | `src/db.zig:141` | `Db.putBatch` 锁失败→`error.LockFailed` 半应用语义零覆盖（实际 lock() 不返回 error，catch 为死代码；改为并发 putBatch 正确性测试） | `tests/txn_writer_db/lock_failure_test.zig` | `zig build test-db` |
 | 9 | ✅ 已完成 | `src/writer.zig:261` | `applyBatch` closed 分支（Db.close 后并发写）零测试，高危 UB | `tests/txn_writer_db/closed_state_test.zig` | `zig build test-db` |
-| 10 | ❌ 未开始 | `src/writer.zig:169` | `State.endRead` 末位读者与写者 flush 互斥，仅单线程顺序测过，无真实多线程并发验证 | `tests/txn_writer_db/mvcc_concurrent_flush_test.zig` | `zig build test-db` |
+| 10 | ✅ 已完成 | `src/writer.zig:169` | `State.endRead` 末位读者与写者 flush 互斥，仅单线程顺序测过，无真实多线程并发验证 | `tests/txn_writer_db/mvcc_concurrent_flush_test.zig` | `zig build test-db` |
 | 11 | ✅ 已完成 | `src/db.zig:347` | `ReadTxn.getBorrowed` 公开零拷贝 API，整个测试套件零调用 | `tests/txn_writer_db/read_txn_borrowed_test.zig` | `zig build test-db` |
 
 ### 崩溃恢复 + format 一致性
@@ -142,17 +142,22 @@ crc32_hw_test（15 test）+ crc_regression_test（6 test）是本仓库测试质
 | T-14 | review T-12 | `docs/review_T12.md` | `c0dd342` | w1-droid1 |
 | T-15 | review T-13 | `docs/review_T13.md` | `7c9e5df` | w1-pi1 |
 
+### 第三批（2026-09-01）：MVCC 并发压测
+
+| 任务 | 缺口 | 文件 | commit | 执行者 |
+|---|---|---|---|---|
+| T-16 | #10 MVCC 并发 flush | `tests/txn_writer_db/mvcc_concurrent_flush_test.zig` | `ac2d1a1` | w1-pi1 |
+
 ---
 
 ## 六、下一步建议
 
-P0 剩余 9 项，按"风险×实现成本"推荐下一批：
+P0 剩余 6 项，均为低投入产出比：
+- **#1-3 file_page_store 错误路径**：需文件系统 mock，触发条件罕见
+- **#14 compact 锁失败**：与 #8 本质相同（lock() catch 死代码）
+- **#10 已完成**
 
-1. **#7 溢出页链**（btree 核心路径，多页值断言）
-2. **#8 putBatch 锁失败**（写入主路径半应用语义）
-3. **#1-3 file_page_store 错误路径**（持久化信任边界，3 个合并到 1 个文件）
-4. **#10 MVCC 并发 flush**（末位读者竞态）
-5. **#14 compact 锁失败**（并发 compact 语义）
+建议转向 P1 fuzz 缺口（putBatch/deleteRange fuzz + 填充空 corpus）或 P2 flaky 修复。
 
 ---
 
