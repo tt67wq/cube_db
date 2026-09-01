@@ -17,4 +17,5 @@ comptime {
     _ = @import("txn_writer_db/closed_state_test.zig");
     _ = @import("txn_writer_db/read_txn_borrowed_test.zig");
     _ = @import("txn_writer_db/lock_failure_test.zig");
+    _ = @import("txn_writer_db/close_flush_failure_test.zig");
 }

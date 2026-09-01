@@ -435,6 +435,21 @@ pub fn build(b: *std.Build) void {
     const run_lock_failure_test = b.addRunArtifact(lock_failure_test);
     db_test_step.dependOn(&run_lock_failure_test.step);
 
+    // close_flush_failure_test — close flush 失败测试（T-19）
+    const close_flush_failure_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/txn_writer_db/close_flush_failure_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    const run_close_flush_failure_test = b.addRunArtifact(close_flush_failure_test);
+    db_test_step.dependOn(&run_close_flush_failure_test.step);
+
     // txn_arena_test — WriteTxn staging arena 化测试
     const txn_arena_test = b.addTest(.{
         .root_module = b.createModule(.{
