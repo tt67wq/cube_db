@@ -513,6 +513,21 @@ pub fn build(b: *std.Build) void {
     const run_mvcc_concurrent_flush_test = b.addRunArtifact(mvcc_concurrent_flush_test);
     db_test_step.dependOn(&run_mvcc_concurrent_flush_test.step);
 
+    // delete_range_concurrent_test — deleteRange 并发测试（T-20）
+    const delete_range_concurrent_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/txn_writer_db/delete_range_concurrent_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    const run_delete_range_concurrent_test = b.addRunArtifact(delete_range_concurrent_test);
+    db_test_step.dependOn(&run_delete_range_concurrent_test.step);
+
     // Once fixed, add `test-fuzz-coverage` with `-ffuzz` for coverage-guided fuzzing.
     // CI: `zig build test-fuzz` = determinant regression + smoke (~2s total).
     const fuzz_probe = b.addTest(.{
