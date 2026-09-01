@@ -338,7 +338,8 @@ test "btree: insert returns WriteResult with correct live_delta and count_delta"
     try std.testing.expectEqual(@as(i64, 0), wr4.count_delta);
     try std.testing.expectEqual(@as(i64, 0), wr4.live_delta);
 }
-// T-5: btree decode 损坏页测试接入（comptime import，test-btree 会跑这些 test）
+// T-5/T-8: 测试接入（comptime import，test-btree 会跑这些 test）
 comptime {
     _ = @import("btree_decode_corrupt_test.zig");
+    _ = @import("endian_consistency_test.zig");
 }
