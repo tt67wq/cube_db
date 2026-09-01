@@ -523,6 +523,32 @@ pub fn build(b: *std.Build) void {
     });
     const run_fuzz_api = b.addRunArtifact(fuzz_api);
 
+    const fuzz_api_batch = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/fuzz/api_batch_fuzz_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    const run_fuzz_api_batch = b.addRunArtifact(fuzz_api_batch);
+
+    const fuzz_range_delete = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/fuzz/range_delete_fuzz_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    const run_fuzz_range_delete = b.addRunArtifact(fuzz_range_delete);
+
     const fuzz_format = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/fuzz/format_fuzz_test.zig"),
@@ -567,6 +593,8 @@ pub fn build(b: *std.Build) void {
     const fuzz_step = b.step("test-fuzz", "Run fuzz corpus replay tests (deterministic)");
     fuzz_step.dependOn(&run_fuzz_probe.step);
     fuzz_step.dependOn(&run_fuzz_api.step);
+    fuzz_step.dependOn(&run_fuzz_api_batch.step);
+    fuzz_step.dependOn(&run_fuzz_range_delete.step);
     fuzz_step.dependOn(&run_fuzz_format.step);
     fuzz_step.dependOn(&run_fuzz_meta.step);
 }
