@@ -178,17 +178,17 @@ pub fn encodeLeafPayload(buf: []u8, entries: []const LeafEntry, store: PageStore
     var pos: usize = 0;
     buf[pos] = LEAF_KIND;
     pos += 1;
-    std.mem.writeInt(u16, buf[pos..][0..2], @intCast(entries.len), .big);
+    std.mem.writeInt(u16, buf[pos..][0..2], @intCast(entries.len), .little);
     pos += 2;
     for (entries) |e| {
         const is_ov = e.value.len > MAX_INLINE_VALUE;
         buf[pos] = if (e.tombstone) @as(u8, 1) else 0;
         pos += 1;
-        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(e.key.len), .big);
+        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(e.key.len), .little);
         pos += 4;
         @memcpy(buf[pos..][0..e.key.len], e.key);
         pos += e.key.len;
-        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(e.value.len), .big);
+        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(e.value.len), .little);
         pos += 4;
         if (is_ov) {
             buf[pos] = LEAF_FLAG_OVERFLOW;
@@ -217,7 +217,7 @@ pub const DecodedLeafEntry = struct {
 pub fn decodeLeafPayload(payload: []const u8, entries_out: []DecodedLeafEntry) !void {
     if (payload.len < 3) return error.Truncated;
     if (payload[0] != LEAF_KIND) return error.CorruptCrc;
-    const count = std.mem.readInt(u16, payload[1..3], .big);
+    const count = std.mem.readInt(u16, payload[1..3], .little);
     if (entries_out.len < count) return error.Truncated;
     var pos: usize = 3;
     for (payload, 0..) |_, i| {
@@ -225,13 +225,13 @@ pub fn decodeLeafPayload(payload: []const u8, entries_out: []DecodedLeafEntry) !
         if (pos + 1 + 4 > payload.len) return error.Truncated;
         const tombstone = payload[pos] == 1;
         pos += 1;
-        const klen = std.mem.readInt(u32, payload[pos..][0..4], .big);
+        const klen = std.mem.readInt(u32, payload[pos..][0..4], .little);
         pos += 4;
         if (pos + klen > payload.len) return error.Truncated;
         const key = payload[pos .. pos + klen];
         pos += klen;
         if (pos + 4 > payload.len) return error.Truncated;
-        const vlen = std.mem.readInt(u32, payload[pos..][0..4], .big);
+        const vlen = std.mem.readInt(u32, payload[pos..][0..4], .little);
         pos += 4;
         if (pos + 1 > payload.len) return error.Truncated;
         const flags = payload[pos];
@@ -268,16 +268,16 @@ pub fn encodeBranchPayload(buf: []u8, keys: []const []const u8, children: []cons
     var pos: usize = 0;
     buf[pos] = BRANCH_KIND;
     pos += 1;
-    std.mem.writeInt(u16, buf[pos..][0..2], @intCast(children.len), .big);
+    std.mem.writeInt(u16, buf[pos..][0..2], @intCast(children.len), .little);
     pos += 2;
     for (keys) |k| {
-        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(k.len), .big);
+        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(k.len), .little);
         pos += 4;
         @memcpy(buf[pos..][0..k.len], k);
         pos += k.len;
     }
     for (children) |c| {
-        std.mem.writeInt(u32, buf[pos..][0..4], c, .big);
+        std.mem.writeInt(u32, buf[pos..][0..4], c, .little);
         pos += 4;
     }
     return need;
@@ -286,14 +286,14 @@ pub fn encodeBranchPayload(buf: []u8, keys: []const []const u8, children: []cons
 pub fn decodeBranchPayload(payload: []const u8, keys_out: [][]const u8, children_out: []u32) !void {
     if (payload.len < 3) return error.Truncated;
     if (payload[0] != BRANCH_KIND) return error.CorruptCrc;
-    const count = std.mem.readInt(u16, payload[1..3], .big);
+    const count = std.mem.readInt(u16, payload[1..3], .little);
     if (keys_out.len < count - 1) return error.Truncated;
     if (children_out.len < count) return error.Truncated;
     var pos: usize = 3;
     var i: usize = 0;
     while (i < count - 1) : (i += 1) {
         if (pos + 4 > payload.len) return error.Truncated;
-        const klen = std.mem.readInt(u32, payload[pos..][0..4], .big);
+        const klen = std.mem.readInt(u32, payload[pos..][0..4], .little);
         pos += 4;
         if (pos + klen > payload.len) return error.Truncated;
         keys_out[i] = payload[pos .. pos + klen];
@@ -302,7 +302,7 @@ pub fn decodeBranchPayload(payload: []const u8, keys_out: [][]const u8, children
     if (pos + 4 * count > payload.len) return error.Truncated;
     var j: usize = 0;
     while (j < count) : (j += 1) {
-        children_out[j] = std.mem.readInt(u32, payload[pos..][0..4], .big);
+        children_out[j] = std.mem.readInt(u32, payload[pos..][0..4], .little);
         pos += 4;
     }
 }
@@ -331,7 +331,7 @@ pub const Leaf = struct {
         const count = blk: {
             if (payload.len < 3) return error.Truncated;
             if (payload[0] != LEAF_KIND) return error.CorruptCrc;
-            break :blk std.mem.readInt(u16, payload[1..3], .big);
+            break :blk std.mem.readInt(u16, payload[1..3], .little);
         };
         const dec_slice = try allocator.alloc(DecodedLeafEntry, count);
         defer allocator.free(dec_slice);
@@ -394,7 +394,7 @@ pub const Branch = struct {
         const count = blk: {
             if (payload.len < 3) return error.Truncated;
             if (payload[0] != BRANCH_KIND) return error.CorruptCrc;
-            break :blk std.mem.readInt(u16, payload[1..3], .big);
+            break :blk std.mem.readInt(u16, payload[1..3], .little);
         };
         const keys_tmp = try allocator.alloc([]const u8, count - 1);
         defer allocator.free(keys_tmp);
@@ -453,20 +453,20 @@ pub fn getBorrowed(store: PageStore, root: u32, key: []const u8) !?[]const u8 {
 fn findInLeafBorrowed(payload: []const u8, key: []const u8) !?[]const u8 {
     if (payload.len < 3) return error.Truncated;
     if (payload[0] != LEAF_KIND) return error.CorruptCrc;
-    const count = std.mem.readInt(u16, payload[1..3], .big);
+    const count = std.mem.readInt(u16, payload[1..3], .little);
     var pos: usize = 3;
     var i: usize = 0;
     while (i < count) : (i += 1) {
         if (pos + 1 + 4 > payload.len) return error.Truncated;
         const tombstone = payload[pos] == 1;
         pos += 1;
-        const klen = std.mem.readInt(u32, payload[pos..][0..4], .big);
+        const klen = std.mem.readInt(u32, payload[pos..][0..4], .little);
         pos += 4;
         if (pos + klen > payload.len) return error.Truncated;
         const ek = payload[pos .. pos + klen];
         pos += klen;
         if (pos + 4 > payload.len) return error.Truncated;
-        const vlen = std.mem.readInt(u32, payload[pos..][0..4], .big);
+        const vlen = std.mem.readInt(u32, payload[pos..][0..4], .little);
         pos += 4;
         if (pos + 1 > payload.len) return error.Truncated;
         const flags = payload[pos];
@@ -518,20 +518,20 @@ pub fn get(allocator: std.mem.Allocator, store: PageStore, root: u32, key: []con
 fn findInLeaf(allocator: std.mem.Allocator, store: PageStore, payload: []const u8, key: []const u8) !?[]u8 {
     if (payload.len < 3) return error.Truncated;
     if (payload[0] != LEAF_KIND) return error.CorruptCrc;
-    const count = std.mem.readInt(u16, payload[1..3], .big);
+    const count = std.mem.readInt(u16, payload[1..3], .little);
     var pos: usize = 3;
     var i: usize = 0;
     while (i < count) : (i += 1) {
         if (pos + 1 + 4 > payload.len) return error.Truncated;
         const tombstone = payload[pos] == 1;
         pos += 1;
-        const klen = std.mem.readInt(u32, payload[pos..][0..4], .big);
+        const klen = std.mem.readInt(u32, payload[pos..][0..4], .little);
         pos += 4;
         if (pos + klen > payload.len) return error.Truncated;
         const ek = payload[pos .. pos + klen];
         pos += klen;
         if (pos + 4 > payload.len) return error.Truncated;
-        const vlen = std.mem.readInt(u32, payload[pos..][0..4], .big);
+        const vlen = std.mem.readInt(u32, payload[pos..][0..4], .little);
         pos += 4;
         if (pos + 1 > payload.len) return error.Truncated;
         const flags = payload[pos];
@@ -567,14 +567,14 @@ fn findInLeaf(allocator: std.mem.Allocator, store: PageStore, payload: []const u
 fn findInBranchPayload(payload: []const u8, key: []const u8) !u32 {
     if (payload.len < 3) return error.Truncated;
     if (payload[0] != BRANCH_KIND) return error.CorruptCrc;
-    const count = std.mem.readInt(u16, payload[1..3], .big);
+    const count = std.mem.readInt(u16, payload[1..3], .little);
     var pos: usize = 3;
     var child_idx: usize = 0;
     var found = false;
     var i: usize = 0;
     while (i + 1 < count) : (i += 1) {
         if (pos + 4 > payload.len) return error.Truncated;
-        const klen = std.mem.readInt(u32, payload[pos..][0..4], .big);
+        const klen = std.mem.readInt(u32, payload[pos..][0..4], .little);
         pos += 4;
         if (pos + klen > payload.len) return error.Truncated;
         const ek = payload[pos .. pos + klen];
@@ -587,7 +587,7 @@ fn findInBranchPayload(payload: []const u8, key: []const u8) !u32 {
     if (!found) child_idx = count - 1;
     // children 区：keys 区结束后
     if (pos + 4 * count > payload.len) return error.Truncated;
-    return std.mem.readInt(u32, payload[pos + child_idx * 4 ..][0..4], .big);
+    return std.mem.readInt(u32, payload[pos + child_idx * 4 ..][0..4], .little);
 }
 
 // ===== insert（COW） =====
@@ -610,14 +610,14 @@ fn findChildIdxAndOffset(payload: []const u8, key: []const u8) !struct {
 } {
     if (payload.len < 3) return error.Truncated;
     if (payload[0] != BRANCH_KIND) return error.CorruptCrc;
-    const count = std.mem.readInt(u16, payload[1..3], .big);
+    const count = std.mem.readInt(u16, payload[1..3], .little);
     var pos: usize = 3;
     var child_idx: usize = 0;
     var found = false;
     var i: usize = 0;
     while (i + 1 < count) : (i += 1) {
         if (pos + 4 > payload.len) return error.Truncated;
-        const klen = std.mem.readInt(u32, payload[pos..][0..4], .big);
+        const klen = std.mem.readInt(u32, payload[pos..][0..4], .little);
         pos += 4;
         if (pos + klen > payload.len) return error.Truncated;
         const ek = payload[pos .. pos + klen];
@@ -630,7 +630,7 @@ fn findChildIdxAndOffset(payload: []const u8, key: []const u8) !struct {
     if (!found) child_idx = count - 1;
     // pos is now at children section start
     if (pos + 4 * count > payload.len) return error.Truncated;
-    const child = std.mem.readInt(u32, payload[pos + child_idx * 4 ..][0..4], .big);
+    const child = std.mem.readInt(u32, payload[pos + child_idx * 4 ..][0..4], .little);
     return .{ .idx = child_idx, .child = child, .children_offset = pos };
 }
 
@@ -659,9 +659,9 @@ fn cowBranchNoSplit(
     // Update page_no in header (first 4 bytes, little-endian)
     std.mem.writeInt(u32, new_page[0..4], new_page_no, .little);
 
-    // Patch child pointer (big-endian, as encoded by encodeBranchPayload)
+    // Patch child pointer (little-endian, as encoded by encodeBranchPayload)
     const child_byte_offset = f2.PAGE_HEADER_SIZE + children_offset + child_idx * 4;
-    std.mem.writeInt(u32, new_page[child_byte_offset..][0..4], new_child, .big);
+    std.mem.writeInt(u32, new_page[child_byte_offset..][0..4], new_child, .little);
 
     // Recompute checksum
     const arr: *[f2.PAGE_SIZE]u8 = @ptrCast(new_page.ptr);
@@ -690,7 +690,7 @@ fn insertIntoLeaf(
     // byte offset after entry end, old entry metadata (for live_delta/count_delta).
     if (old_payload.len < 3) return error.Truncated;
     if (old_payload[0] != LEAF_KIND) return error.CorruptCrc;
-    const old_count = std.mem.readInt(u16, old_payload[1..3], .big);
+    const old_count = std.mem.readInt(u16, old_payload[1..3], .little);
 
     var pos: usize = 3;
     var entry_idx: usize = 0;
@@ -711,13 +711,13 @@ fn insertIntoLeaf(
         const start = pos;
         const ts = old_payload[pos] == 1;
         pos += 1;
-        const klen = std.mem.readInt(u32, old_payload[pos..][0..4], .big);
+        const klen = std.mem.readInt(u32, old_payload[pos..][0..4], .little);
         pos += 4;
         if (pos + klen > old_payload.len) return error.Truncated;
         const ek = old_payload[pos .. pos + klen];
         pos += klen;
         if (pos + 4 > old_payload.len) return error.Truncated;
-        const vlen = std.mem.readInt(u32, old_payload[pos..][0..4], .big);
+        const vlen = std.mem.readInt(u32, old_payload[pos..][0..4], .little);
         pos += 4;
         if (pos + 1 > old_payload.len) return error.Truncated;
         const flags = old_payload[pos];
@@ -751,12 +751,12 @@ fn insertIntoLeaf(
             while (i < old_count) : (i += 1) {
                 if (pos + 1 + 4 > old_payload.len) return error.Truncated;
                 pos += 1;
-                const klen2 = std.mem.readInt(u32, old_payload[pos..][0..4], .big);
+                const klen2 = std.mem.readInt(u32, old_payload[pos..][0..4], .little);
                 pos += 4;
                 if (pos + klen2 > old_payload.len) return error.Truncated;
                 pos += klen2;
                 if (pos + 4 > old_payload.len) return error.Truncated;
-                const vlen2 = std.mem.readInt(u32, old_payload[pos..][0..4], .big);
+                const vlen2 = std.mem.readInt(u32, old_payload[pos..][0..4], .little);
                 pos += 4;
                 if (pos + 1 > old_payload.len) return error.Truncated;
                 const flags2 = old_payload[pos];
@@ -782,12 +782,12 @@ fn insertIntoLeaf(
             while (i < old_count) : (i += 1) {
                 if (pos + 1 + 4 > old_payload.len) return error.Truncated;
                 pos += 1;
-                const klen2 = std.mem.readInt(u32, old_payload[pos..][0..4], .big);
+                const klen2 = std.mem.readInt(u32, old_payload[pos..][0..4], .little);
                 pos += 4;
                 if (pos + klen2 > old_payload.len) return error.Truncated;
                 pos += klen2;
                 if (pos + 4 > old_payload.len) return error.Truncated;
-                const vlen2 = std.mem.readInt(u32, old_payload[pos..][0..4], .big);
+                const vlen2 = std.mem.readInt(u32, old_payload[pos..][0..4], .little);
                 pos += 4;
                 if (pos + 1 > old_payload.len) return error.Truncated;
                 const flags2 = old_payload[pos];
@@ -854,7 +854,7 @@ fn insertIntoLeaf(
     // Header
     new_payload[wpos] = LEAF_KIND;
     wpos += 1;
-    std.mem.writeInt(u16, new_payload[wpos..][0..2], new_count, .big);
+    std.mem.writeInt(u16, new_payload[wpos..][0..2], new_count, .little);
     wpos += 2;
 
     // Copy entries before the insert/overwrite position
@@ -867,12 +867,12 @@ fn insertIntoLeaf(
     // Write new entry
     new_payload[wpos] = if (tombstone) @as(u8, 1) else 0;
     wpos += 1;
-    std.mem.writeInt(u32, new_payload[wpos..][0..4], @intCast(key.len), .big);
+    std.mem.writeInt(u32, new_payload[wpos..][0..4], @intCast(key.len), .little);
     wpos += 4;
     @memcpy(new_payload[wpos..][0..key.len], key);
     wpos += key.len;
     const val_len: u32 = if (tombstone) 0 else @intCast(value.len);
-    std.mem.writeInt(u32, new_payload[wpos..][0..4], val_len, .big);
+    std.mem.writeInt(u32, new_payload[wpos..][0..4], val_len, .little);
     wpos += 4;
     if (!tombstone and value.len > MAX_INLINE_VALUE) {
         // Overflow
