@@ -211,7 +211,7 @@
 
 <p>Leaf 节点存储有序的 key-value entry。变长 value 可能超过单页内联上限，此时走溢出页链。
 本部分精讲 <code>LeafEntry</code> / <code>DecodedLeafEntry</code>、溢出页机制、<code>leafPayloadSize</code> /
-<code>encodeLeafPayload</code> / <code>decodeLeafPayload</code> 的字节布局与端序约定。</p>
+<code>encodeLeafPayload</code> / <code>decodeLeafPayload</code> 的字节布局与端序约定（全 little-endian）。</p>
 
 <h3 id="s21">2.1 LeafEntry 与内联上限</h3>
 
@@ -340,17 +340,17 @@ value 截断。读取走 <code>readNodePayload</code>（CRC 校验）而非 Fast
     _ = dirty;
     <span class="kw">var</span> pos: <span class="ty">usize</span> = <span class="nu">0</span>;
     buf[pos] = LEAF_KIND;            pos += <span class="nu">1</span>;
-    std.mem.<span class="fn">writeInt</span>(<span class="ty">u16</span>, buf[pos..][<span class="nu">0</span>..<span class="nu">2</span>], @intCast(entries.len), .big); pos += <span class="nu">2</span>;
+    std.mem.<span class="fn">writeInt</span>(<span class="ty">u16</span>, buf[pos..][<span class="nu">0</span>..<span class="nu">2</span>], @intCast(entries.len), .little); pos += <span class="nu">2</span>;
     <span class="kw">for</span> (entries) |e| {
         <span class="kw">const</span> is_ov = e.value.len > MAX_INLINE_VALUE;
         buf[pos] = <span class="kw">if</span> (e.tombstone) @as(<span class="ty">u8</span>, <span class="nu">1</span>) <span class="kw">else</span> <span class="nu">0</span>; pos += <span class="nu">1</span>;
-        std.mem.<span class="fn">writeInt</span>(<span class="ty">u32</span>, buf[pos..][<span class="nu">0</span>..<span class="nu">4</span>], @intCast(e.key.len), .big); pos += <span class="nu">4</span>;
+        std.mem.<span class="fn">writeInt</span>(<span class="ty">u32</span>, buf[pos..][<span class="nu">0</span>..<span class="nu">4</span>], @intCast(e.key.len), .little); pos += <span class="nu">4</span>;
         @memcpy(buf[pos..][<span class="nu">0</span>..e.key.len], e.key); pos += e.key.len;
-        std.mem.<span class="fn">writeInt</span>(<span class="ty">u32</span>, buf[pos..][<span class="nu">0</span>..<span class="nu">4</span>], @intCast(e.value.len), .big); pos += <span class="nu">4</span>;
+        std.mem.<span class="fn">writeInt</span>(<span class="ty">u32</span>, buf[pos..][<span class="nu">0</span>..<span class="nu">4</span>], @intCast(e.value.len), .little); pos += <span class="nu">4</span>;
         <span class="kw">if</span> (is_ov) {
             buf[pos] = LEAF_FLAG_OVERFLOW; pos += <span class="nu">1</span>;
             <span class="kw">const</span> ov_page = <span class="kw">try</span> <span class="fn">writeOverflowPages</span>(store, e.value);
-            std.mem.<span class="fn">writeInt</span>(<span class="ty">u32</span>, buf[pos..][<span class="nu">0</span>..<span class="nu">4</span>], ov_page, .little);  <span class="cm">// ← little!</span>
+            std.mem.<span class="fn">writeInt</span>(<span class="ty">u32</span>, buf[pos..][<span class="nu">0</span>..<span class="nu">4</span>], ov_page, .little);  <span class="cm">// ← 全 little 统一</span>
             pos += <span class="nu">4</span>;
         } <span class="kw">else</span> {
             buf[pos] = <span class="nu">0</span>; pos += <span class="nu">1</span>;
@@ -360,27 +360,25 @@ value 截断。读取走 <code>readNodePayload</code>（CRC 校验）而非 Fast
     <span class="kw">return</span> pos;
 }</code></pre>
 
-<div class="note danger" role="alert">🔴 危险 <b>端序不一致（关键陷阱）：</b>leaf payload 里 <b>count / klen / vlen 用 big-endian</b>，
-但 <b>溢出页号用 little-endian</b>！<code>encodeLeafPayload</code> 写页号用 <code>.little</code>，
-<code>decodeLeafPayload</code> / <code>findInLeaf</code> 读页号也用 <code>.little</code>。这与页头
-（<code>encodePageHeader</code> 全 little）不同——leaf 内的长度字段是 big，唯页号字段是 little。
-改代码时务必保持读写端序配对，否则页号错读导致整树错乱。</div>
+<div class="note" role="note">💡 说明 <b>端序统一为 little-endian：</b>leaf payload 的所有多字节字段
+（count / klen / vlen / 溢出页号）均使用 <code>.little</code>。与页头（<code>encodePageHeader</code> 全 little）、
+meta、CRC、freelist 一致——全文件统一 little-endian，无端序混用。</div>
 
 <p>字节布局总览（单条 entry）：</p>
 
 <pre><code>┌──────┬───────┬──────┬───────┬─────┬───────┬───────┬───────────────┐
 │ kind │ count │ tomb │ klen  │ key │ vlen  │ flags │ value         │
 │  1B  │  2B   │  1B  │  4B   │ ..  │  4B   │  1B   │ 内联=VL / 溢出=4B页号│
-│  BE? │  BE   │  -   │  BE   │ raw │  BE   │  -    │ 溢出=LE       │
+│  -   │  LE   │  -   │  LE   │ raw │  LE   │  -    │ 溢出=LE       │
 └──────┴───────┴──────┴───────┴─────┴───────┴───────┴───────────────┘
-<span class="cm">kind=LEAF_KIND(2); BE=big-endian; LE=little-endian; raw=原始字节</span></code></pre>
+<span class="cm">kind=LEAF_KIND(2); LE=little-endian; raw=原始字节</span></code></pre>
 
 <h3 id="s25">2.5 decodeLeafPayload：防御性解码</h3>
 
 <pre><code><span class="kw">pub fn</span> <span class="fn">decodeLeafPayload</span>(payload: []const <span class="ty">u8</span>, entries_out: []<span class="ty">DecodedLeafEntry</span>) !<span class="kw">void</span> {
     <span class="kw">if</span> (payload.len < <span class="nu">3</span>) <span class="kw">return error</span>.Truncated;
     <span class="kw">if</span> (payload[<span class="nu">0</span>] != LEAF_KIND) <span class="kw">return error</span>.CorruptCrc;
-    <span class="kw">const</span> count = std.mem.<span class="fn">readInt</span>(<span class="ty">u16</span>, payload[<span class="nu">1</span>..<span class="nu">3</span>], .big);
+    <span class="kw">const</span> count = std.mem.<span class="fn">readInt</span>(<span class="ty">u16</span>, payload[<span class="nu">1</span>..<span class="nu">3</span>], .little);
     <span class="kw">if</span> (entries_out.len < count) <span class="kw">return error</span>.Truncated;
     <span class="kw">var</span> pos: <span class="ty">usize</span> = <span class="nu">3</span>;
     <span class="kw">for</span> (payload, <span class="nu">0</span>..) |_, i| {
@@ -429,23 +427,23 @@ kind 字节不匹配返 <code>error.CorruptCrc</code>（复用此错误名表"�
 <span class="kw">pub fn</span> <span class="fn">encodeBranchPayload</span>(buf: []<span class="ty">u8</span>, keys: []const []const <span class="ty">u8</span>, children: []const <span class="ty">u32</span>) <span class="ty">usize</span> {
     <span class="cm">// assert children.len >= 2, keys.len == children.len - 1</span>
     buf[pos] = BRANCH_KIND; pos += <span class="nu">1</span>;
-    std.mem.<span class="fn">writeInt</span>(<span class="ty">u16</span>, buf[pos..][<span class="nu">0</span>..<span class="nu">2</span>], @intCast(children.len), .big); pos += <span class="nu">2</span>;
-    <span class="kw">for</span> (keys) |k| {  <span class="cm">// keys 区：klen(4,BE) + key</span>
-        std.mem.<span class="fn">writeInt</span>(<span class="ty">u32</span>, buf[pos..][<span class="nu">0</span>..<span class="nu">4</span>], @intCast(k.len), .big); pos += <span class="nu">4</span>;
+    std.mem.<span class="fn">writeInt</span>(<span class="ty">u16</span>, buf[pos..][<span class="nu">0</span>..<span class="nu">2</span>], @intCast(children.len), .little); pos += <span class="nu">2</span>;
+    <span class="kw">for</span> (keys) |k| {  <span class="cm">// keys 区：klen(4,LE) + key</span>
+        std.mem.<span class="fn">writeInt</span>(<span class="ty">u32</span>, buf[pos..][<span class="nu">0</span>..<span class="nu">4</span>], @intCast(k.len), .little); pos += <span class="nu">4</span>;
         @memcpy(buf[pos..][<span class="nu">0</span>..k.len], k); pos += k.len;
     }
-    <span class="kw">for</span> (children) |c| {  <span class="cm">// children 区：u32(4,BE) 连续</span>
-        std.mem.<span class="fn">writeInt</span>(<span class="ty">u32</span>, buf[pos..][<span class="nu">0</span>..<span class="nu">4</span>], c, .big); pos += <span class="nu">4</span>;
+    <span class="kw">for</span> (children) |c| {  <span class="cm">// children 区：u32(4,LE) 连续</span>
+        std.mem.<span class="fn">writeInt</span>(<span class="ty">u32</span>, buf[pos..][<span class="nu">0</span>..<span class="nu">4</span>], c, .little); pos += <span class="nu">4</span>;
     }
 }</code></pre>
 
-<p>branch 布局：<code>kind(1) + count(2,BE)</code> 头，接着 <strong>keys 区</strong>（每个 <code>klen(4,BE)+key</code>），
-最后 <strong>children 区</strong>（<code>count</code> 个 <code>u32</code> 连续，big-endian）。注意 branch 的 children
-全用 big-endian，<strong>与 leaf 的溢出页号 little-endian 不同</strong>——这是端序约定的又一处不一致，改代码须留意。</p>
+<p>branch 布局：<code>kind(1) + count(2,LE)</code> 头，接着 <strong>keys 区</strong>（每个 <code>klen(4,LE)+key</code>），
+最后 <strong>children 区</strong>（<code>count</code> 个 <code>u32</code> 连续，little-endian）。branch 的 children
+全用 little-endian，<strong>与页头/meta/溢出页号一致</strong>——全文件端序统一为 little-endian。</p>
 
 <pre><code>┌──────┬───────┬─────────────────────┬────────────────────┐
 │ kind │ count │   keys 区           │  children 区       │
-│  1B  │  2B   │ [klen(4,BE)+key]*   │ [u32(4,BE)]*count  │
+│  1B  │  2B   │ [klen(4,LE)+key]*   │ [u32(4,LE)]*count  │
 └──────┴───────┴─────────────────────┴────────────────────┘
 <span class="cm">count = children 数 = keys 数 + 1</span></code></pre>
 
@@ -584,7 +582,7 @@ kind 字节不匹配返 <code>error.CorruptCrc</code>（复用此错误名表"�
 <h3 id="s43">4.3 findInBranchPayload：原页二分</h3>
 
 <pre><code><span class="kw">fn</span> <span class="fn">findInBranchPayload</span>(payload, key) !<span class="ty">u32</span> {
-    <span class="kw">const</span> count = std.mem.<span class="fn">readInt</span>(<span class="ty">u16</span>, payload[<span class="nu">1</span>..<span class="nu">3</span>], .big);
+    <span class="kw">const</span> count = std.mem.<span class="fn">readInt</span>(<span class="ty">u16</span>, payload[<span class="nu">1</span>..<span class="nu">3</span>], .little);
     <span class="kw">var</span> pos: <span class="ty">usize</span> = <span class="nu">3</span>;
     <span class="kw">var</span> child_idx: <span class="ty">usize</span> = <span class="nu">0</span>;
     <span class="kw">var</span> found = <span class="kw">false</span>;
@@ -594,7 +592,7 @@ kind 字节不匹配返 <code>error.CorruptCrc</code>（复用此错误名表"�
         <span class="kw">if</span> (!found <span class="kw">and</span> <span class="fn">cmpKey</span>(ek, key) == .gt) { child_idx = i; found = <span class="kw">true</span>; }
     }
     <span class="kw">if</span> (!found) child_idx = count - <span class="nu">1</span>;  <span class="cm">// key >= 所有 keys → 走最右子</span>
-    <span class="kw">return</span> std.mem.<span class="fn">readInt</span>(<span class="ty">u32</span>, payload[pos + child_idx * <span class="nu">4</span> ..][<span class="nu">0</span>..<span class="nu">4</span>], .big);
+    <span class="kw">return</span> std.mem.<span class="fn">readInt</span>(<span class="ty">u32</span>, payload[pos + child_idx * <span class="nu">4</span> ..][<span class="nu">0</span>..<span class="nu">4</span>], .little);
 }</code></pre>
 
 <p>这是<strong>线性扫描</strong>找第一个 <code>key &gt; ek</code> 的位置（虽名为二分下沉，实为顺序遍历 keys 区）。
@@ -711,9 +709,9 @@ tombstone 的 value 按 0 长度计。count_delta：活→墓 -1，墓→活 +1�
     @memcpy(new_page[<span class="nu">0</span>..f2.PAGE_SIZE], &amp;page_copy);  <span class="cm">// 整页拷</span>
 
     std.mem.<span class="fn">writeInt</span>(<span class="ty">u32</span>, new_page[<span class="nu">0</span>..<span class="nu">4</span>], new_page_no, .little);  <span class="cm">// 改页头 page_no</span>
-    <span class="cm">// patch 子指针（big-endian）</span>
+    <span class="cm">// patch 子指针（little-endian）</span>
     <span class="kw">const</span> off = f2.PAGE_HEADER_SIZE + children_offset + child_idx * <span class="nu">4</span>;
-    std.mem.<span class="fn">writeInt</span>(<span class="ty">u32</span>, new_page[off..][<span class="nu">0</span>..<span class="nu">4</span>], new_child, .big);
+    std.mem.<span class="fn">writeInt</span>(<span class="ty">u32</span>, new_page[off..][<span class="nu">0</span>..<span class="nu">4</span>], new_child, .little);
     f2.<span class="fn">setPageChecksum</span>(arr, f2.<span class="fn">computePageChecksum</span>(arr));
     <span class="kw">return</span> new_page_no;
 }</code></pre>
@@ -866,7 +864,7 @@ invalidating the earlier borrowed slice"。慢路径不复用开头读的 <code>
 
 <table>
 <tr><th>风险点</th><th>说明</th><th>缓解/注意</th></tr>
-<tr><td>端序不一致</td><td>leaf 长度字段 big、溢出页号 little；branch children 全 big；页头全 little</td><td>改代码须读写配对，勿混用。已用注释标注关键处</td></tr>
+<tr><td>端序统一（全 little-endian）</td><td>leaf/branch/溢出页号/页头/meta/CRC 全部 little-endian</td><td>无端序混用风险。T-9 统一后读写一致</td></tr>
 <tr><td>allocPage resize 悬垂</td><td><code>readPage</code> 借用切片在 <code>allocPage</code> 触发 HashMap resize 后失效</td><td>写路径先 <code>@memcpy</code> 整页到栈缓冲；慢路径重读 fresh payload</td></tr>
 <tr><td>getBorrowed 溢出返 null</td><td>溢出值无法借用，返 null 信号；调用方若不区分会误判不存在</td><td>需确认时改调 <code>get</code>；或文档约定 null 即"不可借用/不存在"</td></tr>
 <tr><td>DecodedLeafEntry.value 二义</td><td>溢出时 value 是 4 字节页号字节，非真实值</td><td>必查 <code>flags &amp; LEAF_FLAG_OVERFLOW</code> 分流</td></tr>
@@ -879,7 +877,7 @@ invalidating the earlier borrowed slice"。慢路径不复用开头读的 <code>
 
 <div class="note ok" role="note">✅ 提示 <b>整体评价：</b><code>btree.zig</code> 用约 72KB 代码实现了完整的页号 COW B+ 树——
 节点编码自洽（leaf/branch/overflow 三种页型）、读写路径分层（快路径 patch / 慢路径 decode-encode）、
-批量插入向量化（O(n+m) 归并 + bulk-load 多级 branch）。风险集中在端序约定与借用生命期，均有注释标注。
+批量插入向量化（O(n+m) 归并 + bulk-load 多级 branch）。风险集中在借用生命期，均有注释标注。
 作为 cube_db 的索引核心，它把 COW 的不变量（不改既有页、脏页外挂、栈拷贝防悬垂）贯彻到每条写路径。</div>
 
 <p class="muted">第六部分到此。本讲义覆盖 <code>src/btree.zig</code> 全部公开函数与关键内部函数：
