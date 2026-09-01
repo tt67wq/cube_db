@@ -10,7 +10,7 @@
 
 | 优先级 | 总数 | ✅ 已完成 | ❌ 未开始 |
 |---|---|---|---|
-| P0 必补 | 14 | 5 | 9 |
+| P0 必补 | 14 | 7 | 7 |
 | P1 应补 | 13 | 0 | 13 |
 | P2 可选 | 6 | 0 | 6 |
 
@@ -35,13 +35,13 @@
 | 4 | ✅ 已完成 | `src/btree.zig:39` | `readNodePayload` CRC 损坏→`error.CorruptCrc` 零直接测试 | `tests/btree_storage/btree_decode_corrupt_test.zig` | `zig build test-btree` |
 | 5 | ✅ 已完成 | `src/btree.zig:217` | `decodeLeafPayload` 6 处 `error.Truncated` 零测试 | 同 #4（合并到 btree_decode_corrupt_test.zig） | `zig build test-btree` |
 | 6 | ✅ 已完成 | `src/btree.zig:286` | `decodeBranchPayload` 多处 `error.Truncated`/CorruptCrc 零测试 | 同 #4（合并到 btree_decode_corrupt_test.zig） | `zig build test-btree` |
-| 7 | ❌ 未开始 | `src/btree.zig:75-150` | 溢出页链（多页 50KB+/100KB+）无专门断言；`freeOverflowPages` 静默吞错未测 | `tests/btree_storage/btree_overflow_chain_test.zig` | `zig build test-btree` |
+| 7 | ✅ 已完成 | `src/btree.zig:75-150` | 溢出页链（多页 50KB+/100KB+）无专门断言；`freeOverflowPages` 静默吞错未测 | `tests/btree_storage/btree_overflow_chain_test.zig` | `zig build test-btree` |
 
 ### 事务/并发语义缺口
 
 | # | 状态 | 位置 | 缺口 | 建议文件 | 验收 |
 |---|---|---|---|---|---|
-| 8 | ❌ 未开始 | `src/db.zig:141` | `Db.putBatch` 锁失败→`error.LockFailed` 半应用语义零覆盖 | `tests/txn_writer_db/lock_failure_test.zig` | `zig build test-db` |
+| 8 | ✅ 已完成 | `src/db.zig:141` | `Db.putBatch` 锁失败→`error.LockFailed` 半应用语义零覆盖（实际 lock() 不返回 error，catch 为死代码；改为并发 putBatch 正确性测试） | `tests/txn_writer_db/lock_failure_test.zig` | `zig build test-db` |
 | 9 | ✅ 已完成 | `src/writer.zig:261` | `applyBatch` closed 分支（Db.close 后并发写）零测试，高危 UB | `tests/txn_writer_db/closed_state_test.zig` | `zig build test-db` |
 | 10 | ❌ 未开始 | `src/writer.zig:169` | `State.endRead` 末位读者与写者 flush 互斥，仅单线程顺序测过，无真实多线程并发验证 | `tests/txn_writer_db/mvcc_concurrent_flush_test.zig` | `zig build test-db` |
 | 11 | ✅ 已完成 | `src/db.zig:347` | `ReadTxn.getBorrowed` 公开零拷贝 API，整个测试套件零调用 | `tests/txn_writer_db/read_txn_borrowed_test.zig` | `zig build test-db` |
@@ -132,6 +132,15 @@ crc32_hw_test（15 test）+ crc_regression_test（6 test）是本仓库测试质
 | T-9 | TDD 绿：37 处 `.big`→`.little` | `src/btree.zig` | `93da04d` | w1-pi1 |
 | T-10 | review 通过 verdict=approve | `docs/review_T9.md` | `6827c63` | w1-droid1 |
 | T-11 | 讲义端序说明同步 | `docs/lecture_btree.html` | `9d3c5a2` | w1-droid1 |
+
+### 第二批（2026-09-01）：2 个 P0 缺口 + 交叉 review
+
+| 任务 | 缺口 | 文件 | commit | 执行者 |
+|---|---|---|---|---|
+| T-12 | #7 溢出页链 | `tests/btree_storage/btree_overflow_chain_test.zig` | `897e358` | w1-pi1 |
+| T-13 | #8 putBatch 锁失败 | `tests/txn_writer_db/lock_failure_test.zig` | `eced317` | w1-droid1 |
+| T-14 | review T-12 | `docs/review_T12.md` | `c0dd342` | w1-droid1 |
+| T-15 | review T-13 | `docs/review_T13.md` | `7c9e5df` | w1-pi1 |
 
 ---
 
