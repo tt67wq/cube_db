@@ -483,6 +483,21 @@ pub fn build(b: *std.Build) void {
     const overflow_test_step = b.step("test-overflow", "Run overflow tests only");
     overflow_test_step.dependOn(&run_overflow_test.step);
 
+    // mvcc_concurrent_flush_test — MVCC 并发 flush 压测（T-16）
+    const mvcc_concurrent_flush_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/txn_writer_db/mvcc_concurrent_flush_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    const run_mvcc_concurrent_flush_test = b.addRunArtifact(mvcc_concurrent_flush_test);
+    db_test_step.dependOn(&run_mvcc_concurrent_flush_test.step);
+
     // Once fixed, add `test-fuzz-coverage` with `-ffuzz` for coverage-guided fuzzing.
     // CI: `zig build test-fuzz` = determinant regression + smoke (~2s total).
     const fuzz_probe = b.addTest(.{
