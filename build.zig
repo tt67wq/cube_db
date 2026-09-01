@@ -420,6 +420,21 @@ pub fn build(b: *std.Build) void {
     const run_read_txn_borrowed_test = b.addRunArtifact(read_txn_borrowed_test);
     db_test_step.dependOn(&run_read_txn_borrowed_test.step);
 
+    // lock_failure_test — putBatch 锁失败 / 并发正确性测试（T-13）
+    const lock_failure_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/txn_writer_db/lock_failure_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    const run_lock_failure_test = b.addRunArtifact(lock_failure_test);
+    db_test_step.dependOn(&run_lock_failure_test.step);
+
     // txn_arena_test — WriteTxn staging arena 化测试
     const txn_arena_test = b.addTest(.{
         .root_module = b.createModule(.{
