@@ -11,7 +11,7 @@
 | 优先级 | 总数 | ✅ 已完成 | ❌ 未开始 |
 |---|---|---|---|
 | P0 必补 | 14 | 8 | 6 |
-| P1 应补 | 13 | 4 | 9 |
+| P1 应补 | 13 | 6 | 7 |
 | P2 可选 | 6 | 0 | 6 |
 
 > 额外完成（报告外）：端序统一重构（T-8 测试 + T-9 源码 37 处 `.big`→`.little` + T-10 review + T-11 讲义更新），消除 btree payload 端序混用陷阱。
@@ -63,9 +63,9 @@
 | 1 | ❌ 未开始 | **OOM 回滚**：`src/page_store.zig:119` `ensurePage` appendNTimes 失败回滚未测；`src/writer.zig:281` `pending_free.append catch {}` 静默泄漏脏页 |
 | 2 | ❌ 未开始 | **free 校验缺失**：`page_store.zig:135` / `file_page_store.zig:190` freePage 接受任意 page_no，无越界/重复 free 检查 |
 | 3 | ✅ 已完成 | **btree 热路径**：`readNodePayloadFast`（跳 CRC）与 full 读一致性未测；`encodeLeafPayload` 满 leaf 边界；`Iterator.next` 中途 CorruptCrc 行为未定义；`cmpKey` 空键/前缀边界无直接测试 → 已补 readNodePayloadFast 一致性 |
-| 4 | ❌ 未开始 | **compact 语义弱断言**：`compact_test.zig:62` 注释说"dirt 应减少"但只断言 `v=="v2"`，名实不符 |
+| 4 | ✅ 已完成 | **compact 语义弱断言**：`compact_test.zig:62` 注释说"dirt 应减少"但只断言 `v=="v2"`，名实不符 → 已补强断言文件 |
 | 5 | ✅ 已完成 | **deleteRange 并发**：`db.zig:165` flush 后 select 不持锁，并发写者可在迭代中插入导致遗漏 |
-| 6 | ❌ 未开始 | **applyBatch 单条 vs 多条**：`writer.zig:245` 单条 fast path 跳过 sort/dedup，overwrite 时 count_delta 一致性未对比 |
+| 6 | ✅ 已完成 | **applyBatch 单条 vs 多条**：`writer.zig:245` 单条 fast path 跳过 sort/dedup，overwrite 时 count_delta 一致性未对比 → 已补单条 vs 多条一致性测试 |
 | 7 | ✅ 已完成 | **close flush 失败**：`db.zig:55` `flush() catch {}` 静默吞错，pending entries 已 free 未提交语义未验证 |
 | 8 | ✅ 已完成 | **fuzz 缺口**：putBatch / deleteRange / select 迭代器 / ReadTxn 快照隔离均无 fuzz；corpus 全空（4 目录只含 .gitkeep）；long-run 只跑 format decode 不跑 API → 已补 putBatch fuzz + deleteRange fuzz + 填充 corpus |
 | 9 | ❌ 未开始 | **bench 缺口**：FilePageStore 只有 put/get bench，缺 delete/select/compact 维度 |
@@ -157,17 +157,24 @@ crc32_hw_test（15 test）+ crc_regression_test（6 test）是本仓库测试质
 | T-19 | P1#7 close flush 失败 | `tests/txn_writer_db/close_flush_failure_test.zig` | `3da8a19` | w1-droid1 |
 | T-20 | P1#5 deleteRange 并发 | `tests/txn_writer_db/delete_range_concurrent_test.zig` | `351d5fe` | w1-pi1 |
 
+### 第五批（2026-09-01）：2 个 P1 剩余高价值缺口
+
+| 任务 | 缺口 | 文件 | commit | 执行者 |
+|---|---|---|---|---|
+| T-21 | P1#6 applyBatch 单条 vs 多条一致性 | `tests/txn_writer_db/applybatch_single_vs_multi_test.zig` | `6049749` | w1-pi1 |
+| T-22 | P1#4 compact 弱断言修复 | `tests/txn_writer_db/compact_strong_assert_test.zig` | `8c8ceae` | w1-droid1 |
+
 ---
 
 ## 六、下一步建议
 
 P0 剩余 6 项（#1-3 file_page_store 错误路径、#14 compact 锁失败），均为低投入产出比。
-P1 剩余 9 项，其中高价值的 fuzz/readNodePayloadFast/close flush/deleteRange 并发已完成。
+P1 剩余 7 项，高价值项已全部覆盖。剩余多为 OOM/越界 free 等需 mock 的场景。
 
 建议转向：
-- **P1 剩余**：#6 applyBatch 单条 vs 多条一致性、#4 compact 弱断言修复
 - **P2 flaky 修复**：`insertbatch_overflow_test.zig` 1.1TB OOM、`stress_test.zig` 1TB mmap、bench 硬编码路径
 - **fuzz 增强**：long-run 跑 API fuzz（目前只跑 format decode）
+- **P1 剩余**：#1-2 OOM 回滚、#2 free 越界校验（需 mock 成本较高）
 
 ---
 
