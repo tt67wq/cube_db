@@ -25,7 +25,6 @@ fn currentBaseline() MetricList {
         .{ .name = "put 100B", .store = "mem", .value_ns = 123721, .threshold_pct = 25, .note = "MemPageStore, 5K keys, 重校(dupe 假设)" },
         .{ .name = "putBatch 100B", .store = "mem", .value_ns = 13240, .threshold_pct = 25, .note = "MemPageStore, 30 keys(快路径), 重校(旧值=1-key bug)" },
         .{ .name = "get 100B", .store = "mem", .value_ns = 2907, .threshold_pct = 15, .note = "MemPageStore, 5K keys, A/B 确认无回归" },
-        .{ .name = "getBorrowed 100B", .store = "mem", .value_ns = 352, .threshold_pct = 15, .note = "MemPageStore, 5K keys" },
         .{ .name = "delete 100B", .store = "mem", .value_ns = 117093, .threshold_pct = 25, .note = "MemPageStore, 5K keys, 重校(dupe 假设)" },
         .{ .name = "put 100B", .store = "file-fsync", .value_ns = 167499, .threshold_pct = 20, .note = "FilePageStore+fsync, 1K keys, 重校" },
         .{ .name = "putBatch 100B", .store = "file-fsync", .value_ns = 15233, .threshold_pct = 25, .note = "FilePageStore+fsync, 30 keys, 重校(旧值=1-key bug)" },
@@ -106,14 +105,6 @@ fn runMemBench(name: []const u8, allocator: std.mem.Allocator, n: usize) !u64 {
                 const idx = rnd.uintLessThan(usize, n);
                 const k = try fmtKey(&kbuf, idx);
                 if (try db.get(k)) |val| allocator.free(val);
-            }
-        } else if (std.mem.eql(u8, name, "getBorrowed 100B")) {
-            var txn = try db.beginReadTxn();
-            defer txn.end();
-            for (0..n) |_| {
-                const idx = rnd.uintLessThan(usize, n);
-                const k = try fmtKey(&kbuf, idx);
-                _ = try txn.getBorrowed(k);
             }
         } else if (std.mem.eql(u8, name, "delete 100B")) {
             for (0..n) |idx| {

@@ -125,7 +125,7 @@ var db = try Db.open(allocator, fps.store(), .{});
 defer db.close();
 ```
 
-### 3.2 读：get / getBorrowed
+### 3.2 读：get
 
 ```zig
 const v = try db.get("hello");
@@ -142,25 +142,7 @@ if (v) |value| {
 - get 无锁、无 fsync，读原子 root 快照。
 - **读路径优化**：跳过 CRC 校验，get 100B ~2.7µs（接近 LMDB 级）
 
-**Zero-copy 读（ReadTxn）：**
-
-```zig
-var r = try db.beginReadTxn();
-defer r.end();
-const v = try r.getBorrowed("hello");
-if (v) |value| {
-    // value 是借用切片，指向页缓冲区
-    // 在 ReadTxn 生命周期内有效，无需 free
-    std.debug.print("hello = {s}\n", .{value});
-} else {
-    std.debug.print("(missing)\n", .{});
-}
-```
-
-- `getBorrowed` 返回 `?[]const u8`：指向页 payload 的借用切片
-- **无需 `free`**，但必须在 `ReadTxn.end()` 前使用
-- 溢出值（>3800B）返回 `null`，需 fallback 到 `get()`
-- 比 `get` 快 ~3.5×（消除 `allocator.dupe` 开销）
+> **迁移说明**：零拷贝 borrowed 读 API（Db 层与 ReadTxn 层）已于 T-23 移除 — 其 null 返回值存在多义性（溢出值 / 墓碑 / 不存在三种语义不可区分）。读取统一用 `get()` / `ReadTxn.get()`。
 
 ### 3.3 写：put / putBatch / delete / flush
 

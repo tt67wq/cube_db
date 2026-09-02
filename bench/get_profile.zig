@@ -72,18 +72,6 @@ pub fn main() !void {
         }
         const avg_get = @as(f64, @floatFromInt(total_get_ns)) / @as(f64, @floatFromInt(trials * ops_per_trial));
 
-        var total_borrow_ns: i64 = 0;
-        for (0..trials) |_| {
-            var txn = try db.beginReadTxn();
-            defer txn.end();
-            const start = monoNs();
-            for (0..ops_per_trial) |i| {
-                _ = try txn.getBorrowed(keys[i]);
-            }
-            total_borrow_ns += monoNs() - start;
-        }
-        const avg_borrow = @as(f64, @floatFromInt(total_borrow_ns)) / @as(f64, @floatFromInt(trials * ops_per_trial));
-
         var txn_create_ns: i64 = 0;
         for (0..trials) |_| {
             const start = monoNs();
@@ -109,30 +97,18 @@ pub fn main() !void {
         const avg_page = @as(f64, @floatFromInt(page_read_ns)) / @as(f64, @floatFromInt(trials * ops_per_trial));
 
         const ag = @as(u64, @intFromFloat(avg_get));
-        const ab = @as(u64, @intFromFloat(avg_borrow));
         const at = @as(u64, @intFromFloat(avg_txn));
         const ap = @as(u64, @intFromFloat(avg_page));
 
         std.debug.print("  get (with dupe):       {d:>8} ns/op  ({d:>5} us)\n", .{ ag, ag / 1000 });
-        std.debug.print("  getBorrowed (no dupe): {d:>8} ns/op  ({d:>5} us)\n", .{ ab, ab / 1000 });
         std.debug.print("  ReadTxn create:        {d:>8} ns/op\n", .{at});
         std.debug.print("  readNodePayload:       {d:>8} ns/op\n", .{ap});
 
-        const dupe_overhead = avg_get - avg_borrow;
-        const traversal_overhead = avg_borrow - avg_txn;
         const est_depth = btreeDepth(cfg.n);
         const page_read_total = avg_page * est_depth;
-        const cmp_overhead = traversal_overhead - page_read_total;
-
-        const do_ns = @as(u64, @intFromFloat(dupe_overhead));
         const pr_ns = @as(u64, @intFromFloat(page_read_total));
-        const co_ns = @as(u64, @intFromFloat(@max(0, cmp_overhead)));
 
-        std.debug.print("\n  估计分解（getBorrowed {d}ns 基准）：\n", .{ab});
-        std.debug.print("    读事务创建:     {d:>7} ns ({d:>3}%)\n", .{ at, pct(avg_txn, avg_borrow) });
-        std.debug.print("    页面读取({d:.0}层): {d:>7} ns ({d:>3}%)\n", .{ est_depth, pr_ns, pct(page_read_total, avg_borrow) });
-        std.debug.print("    key 比较/遍历:   {d:>7} ns ({d:>3}%)\n", .{ co_ns, pct(@max(0, cmp_overhead), avg_borrow) });
-        std.debug.print("    dupe 分配:       {d:>7} ns ({d:>3}%)\n", .{ do_ns, pct(dupe_overhead, avg_get) });
+        std.debug.print("\n  估计：树深 {d:.0} 层，页面读取合计 ~{d} ns（get 的 {d}%，其余为 key 比较 + dupe 分配，无法进一步拆分）\n", .{ est_depth, pr_ns, pct(page_read_total, avg_get) });
         std.debug.print("  二分查找预期: 线性扫描 O(n) 占 key 比较的主要部分，改为二分后预计可减半\n", .{});
     }
 }

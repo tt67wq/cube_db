@@ -1,5 +1,5 @@
 //! binary_search_test.zig — TDD: binary search optimization for read path
-//! Tests that get/getBorrowed return correct results after switching
+//! Tests that get returns correct results after switching
 //! from linear scan to binary search in leaf/branch lookup.
 //! Also tests optional CRC skip for read path performance.
 const std = @import("std");
@@ -59,7 +59,7 @@ test "bsearch: get on full leaf (32 entries)" {
     try std.testing.expectEqual(@as(?[]u8, null), miss3);
 }
 
-test "bsearch: getBorrowed on multi-level tree (depth 3+)" {
+test "bsearch: get on multi-level tree (depth 3+)" {
     var ms = newStore();
     defer ms.deinit();
     const s = ms.store();
@@ -78,15 +78,16 @@ test "bsearch: getBorrowed on multi-level tree (depth 3+)" {
     for (checks) |idx| {
         var kbuf: [16]u8 = undefined;
         const k = try std.fmt.bufPrint(&kbuf, "k{d:0>6}", .{idx});
-        const v = try btree.getBorrowed(s, root, k);
+        const v = try btree.get(std.testing.allocator, s, root, k);
         try std.testing.expect(v != null);
         try std.testing.expectEqualStrings("v", v.?);
+        std.testing.allocator.free(v.?);
     }
     // Misses
-    const miss = try btree.getBorrowed(s, root, "k999999");
-    try std.testing.expectEqual(@as(?[]const u8, null), miss);
-    const miss2 = try btree.getBorrowed(s, root, "a");
-    try std.testing.expectEqual(@as(?[]const u8, null), miss2);
+    const miss = try btree.get(std.testing.allocator, s, root, "k999999");
+    try std.testing.expectEqual(@as(?[]u8, null), miss);
+    const miss2 = try btree.get(std.testing.allocator, s, root, "a");
+    try std.testing.expectEqual(@as(?[]u8, null), miss2);
 }
 
 test "bsearch: first and last key in leaf" {

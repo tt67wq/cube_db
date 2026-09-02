@@ -11,6 +11,5 @@ comptime {
     _ = @import("core_format/crc_regression_test.zig");
     _ = @import("core_format/mmap_region_test.zig");
     _ = @import("core_format/binary_search_test.zig");
-    _ = @import("core_format/zero_copy_test.zig");
     _ = @import("core_format/cow_fast_test.zig");
 }

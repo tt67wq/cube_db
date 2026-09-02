@@ -4,6 +4,5 @@
 
 comptime {
     _ = @import("btree_storage/btree_test.zig");
-    _ = @import("btree_storage/readtxn_fuzz.zig");
     _ = @import("btree_storage/shared_cow_test.zig");
 }
