@@ -44,7 +44,7 @@
 | 8 | ✅ 已完成 | `src/db.zig:141` | `Db.putBatch` 锁失败→`error.LockFailed` 半应用语义零覆盖（实际 lock() 不返回 error，catch 为死代码；改为并发 putBatch 正确性测试） | `tests/txn_writer_db/lock_failure_test.zig` | `zig build test-db` |
 | 9 | ✅ 已完成 | `src/writer.zig:261` | `applyBatch` closed 分支（Db.close 后并发写）零测试，高危 UB | `tests/txn_writer_db/closed_state_test.zig` | `zig build test-db` |
 | 10 | ✅ 已完成 | `src/writer.zig:169` | `State.endRead` 末位读者与写者 flush 互斥，仅单线程顺序测过，无真实多线程并发验证 | `tests/txn_writer_db/mvcc_concurrent_flush_test.zig` | `zig build test-db` |
-| 11 | ✅ 已完成 | `src/db.zig:347` | `ReadTxn.getBorrowed` 公开零拷贝 API，整个测试套件零调用 | `tests/txn_writer_db/read_txn_borrowed_test.zig` | `zig build test-db` |
+| 11 | ☑️ 已随 API 移除 | `src/db.zig:347`（原位置） | `ReadTxn.getBorrowed` 公开零拷贝 API，整个测试套件零调用——T-23（`f759b30`）确认生产代码零调用者后整体删除（null 三义性：溢出/墓碑/不存在不可区分），读取统一 `get()`；T-7 测试文件随之删除 | ~~`tests/txn_writer_db/read_txn_borrowed_test.zig`~~ | — |
 
 ### 崩溃恢复 + format 一致性
 
