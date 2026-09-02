@@ -660,16 +660,37 @@ COW 保证旧页不被改写（写者分配新页），因此切片在调用方�
     <span class="kw">return</span> .{ .new_root = sub.new_child, ... };
 }</code></pre>
 
+<div class="mermaid">
+flowchart TD
+    S["insert(root, key, value, tombstone, dirty)"] --> C0{"root == NULL_ROOT ?"}
+    C0 -- "是" --> L0["① 空树路径<br/>建首个 leaf 页<br/>new_root = new_page"]
+    C0 -- "否" --> R["② 读 root payload<br/>payload[0] 判类型"]
+    R -- "叶" --> LF["insertIntoLeaf<br/>§5.2"]
+    R -- "branch" --> BR["insertIntoBranch 递归<br/>§5.4"]
+    LF --> C2{"④ sub.split_key != null ?"}
+    BR --> C2
+    C2 -- "否" --> F["快路径<br/>new_root = sub.new_child"]
+    C2 -- "是" --> RS["root 分裂<br/>建新 branch root（见 ④）"]
+</div>
+
 <h4>① 空树路径：root == NULL_ROOT，从零建第一个 leaf</h4>
 
 <p><code>NULL_ROOT = 0</code>（btree.zig:10）是 root 的空哨兵——页号 0 永不被分配
-（meta 页占 1/2，数据页从 <code>FIRST_DATA_PAGE=3</code> 起），所以 0 可以放心当“树不存在”用。
-此路没有任何旧页可 patch——patch 快路径的前提是“有一页旧数据可拷贝后局部改写”（§5.2/§5.3），
-空树无从谈起，于是直接走通用编码路径：构造单 entry 数组 → <code>leafPayloadSize</code>（§2.3）
-预估字节数 → 栈缓冲上 <code>encodeLeafPayload</code>（§2.4）→
-<code>writeNodePage(LEAF, nkeys=1)</code>（§1.4）。与 <code>insertIntoLeafSplit</code> 慢路径、
-bulk-load 用的是同一套编码器：字节布局、CRC、补零、溢出页链（value 超 <code>MAX_INLINE_VALUE</code>=3800 时
-<code>encodeLeafPayload</code> 内部自动 <code>writeOverflowPages</code>，§2.2）全部单点维护，空树不搞特殊。</p>
+（meta 页占 1/2，数据页从 <code>FIRST_DATA_PAGE=3</code> 起），所以 0 可以放心当“树不存在”用。</p>
+
+<p>此路没有任何旧页可 patch——patch 快路径的前提是“有一页旧数据可拷贝后局部改写”（§5.2/§5.3），
+空树无从谈起。于是直接走通用编码路径，四步：</p>
+
+<ol>
+<li>构造单 entry 数组（key/value 先 <code>allocator.dupe</code>）；</li>
+<li><code>leafPayloadSize</code>（§2.3）预估字节数；</li>
+<li>栈缓冲上 <code>encodeLeafPayload</code>（§2.4）——value 超 <code>MAX_INLINE_VALUE</code>=3800 时
+内部自动 <code>writeOverflowPages</code>（§2.2）；</li>
+<li><code>writeNodePage(LEAF, nkeys=1)</code>（§1.4）。</li>
+</ol>
+
+<p>与 <code>insertIntoLeafSplit</code> 慢路径、bulk-load 用的是同一套编码器：字节布局、CRC、补零、
+溢出页链全部单点维护，空树不搞特殊。</p>
 
 <p>两个统计口径与 §5.2 完全一致：</p>
 
@@ -700,10 +721,15 @@ tombstone 的 value 落盘时按空串处理（dupe 时直接换成 <code>""</co
 <p>那 <code>insert</code> 为何不拷？因为它对这份借用的<strong>全部使用发生在任何分配之前</strong>：
 <code>payload[0] == LEAF_KIND</code> 读一个字节（LEAF_KIND=2 / BRANCH_KIND=1，§1.4 提示框），
 拿到 is_leaf 后就把 payload 抛在脑后——递归返回后无论走 root 分裂还是快路径，用的都是
-<code>sub</code> 里的页号与指针，不再触碰这份借用。同一个悬垂问题，三种应对：
-<strong>即弃</strong>（本节，读一个字节就撒手）、<strong>先拷</strong>（§5.2/§5.3，要跨 allocPage
-用整页数据）、<strong>重读</strong>（§5.4 慢路径，递归后再 <code>readNodePayload</code> 一份
-fresh_payload）。</p>
+<code>sub</code> 里的页号与指针，不再触碰这份借用。</p>
+
+<p>同一个悬垂问题，三种应对：</p>
+
+<ul>
+<li><strong>即弃</strong>（本节）：读一个字节就撒手；</li>
+<li><strong>先拷</strong>（§5.2/§5.3）：要跨 allocPage 用整页数据，先 <code>@memcpy</code> 到栈缓冲；</li>
+<li><strong>重读</strong>（§5.4 慢路径）：递归后再 <code>readNodePayload</code> 一份 fresh_payload。</li>
+</ul>
 
 <h4>③ InsertSub 回报协议：五个字段与“未分裂”快路径</h4>
 
@@ -747,6 +773,18 @@ btree.zig:974，源码注释“key pointers transferred to new_keys”），由 
 insertIntoBranch 自身再分裂（§5.4）。此时 insert 在入口处造一个新 branch root
 （btree.zig:1077-1092）：</p>
 
+<div class="mermaid">
+flowchart LR
+    subgraph B4["分裂前：root 是满叶（33 条 &gt; 32）"]
+        OLD["root (leaf)<br/>33 entries"]
+    end
+    subgraph AF["分裂后：树高 +1"]
+        NR["new root (branch)<br/>keys = {sk}，nkeys = 2"] --> LC["children[0] = new_child (leaf)<br/>原 root COW 后的新顶<br/>key 均 &lt; sk"]
+        NR --> RC["children[1] = split_right (leaf)<br/>key ≥ sk（sk 本身存这里）"]
+    end
+    OLD -. "insertIntoLeafSplit 对半分裂" .-> AF
+</div>
+
 <ul>
 <li><code>keys = { sk }</code>，<code>children = { sub.new_child, sub.split_right }</code>——
 新 root 恰好是最小合法 branch：1 key + 2 children。<code>encodeBranchPayload</code> 的
@@ -783,12 +821,24 @@ payload 首字节 kind 是 <code>LEAF_KIND=2 / BRANCH_KIND=1</code>，页头 pag
 
 <h4>⑤ delta 冒泡：从叶层到 WriteResult</h4>
 
-<p><code>live_delta / count_delta</code> 只在叶层产生（§5.2 第③步：覆盖减旧加新、新增只加新；
-即使转慢路径，insertIntoLeafSplit 也是把算好的 delta 作为参数带入、原样填进返回值）。
-中间层 insertIntoBranch 不做任何加工——<code>const live_delta = sub.live_delta;</code> 抄一遍，
-快慢两条路径的返回值填的都是这两个局部变量。insert 入口再把它们包进
-<code>WriteResult{ new_root, live_delta, count_delta }</code>：root 分裂路径本身不产生统计变化
-（分隔键、新建 branch 页都不计入 live 口径），纯透传。</p>
+<div class="mermaid">
+flowchart LR
+    LF["叶层<br/>insertIntoLeaf / Split<br/>唯一计算点"] -->|"原样透传"| BR["branch 层<br/>insertIntoBranch<br/>只抄写不加工"]
+    BR --> WR["insert 入口<br/>打包 WriteResult"]
+    WR --> AB["writer.applyBatch<br/>batch_entry_delta += count_delta<br/>batch_byte_delta += live_delta"]
+    AB --> MP["事务末尾写 MetaPage<br/>entry_count / byte_size"]
+</div>
+
+<p><code>live_delta / count_delta</code> 的旅程只有三站：</p>
+
+<ul>
+<li><strong>叶层产生</strong>（§5.2 第③步）：覆盖减旧加新、新增只加新；即使转慢路径，
+insertIntoLeafSplit 也是把算好的 delta 作为参数带入、原样填进返回值；</li>
+<li><strong>branch 层透传</strong>：insertIntoBranch 不做任何加工——
+<code>const live_delta = sub.live_delta;</code> 抄一遍，快慢两条路径的返回值填的都是这两个局部变量；</li>
+<li><strong>入口打包</strong>：insert 把它们包进 <code>WriteResult{ new_root, live_delta, count_delta }</code>——
+root 分裂路径本身不产生统计变化（分隔键、新建 branch 页都不计入 live 口径），纯透传。</li>
+</ul>
 
 <p>真正的消费方在 Db 层：writer.zig 的 applyBatch 对每个 <code>WriteResult</code> 做
 <code>batch_entry_delta += wr.count_delta; batch_byte_delta += wr.live_delta;</code>，
@@ -825,6 +875,17 @@ payload 首字节 kind 是 <code>LEAF_KIND=2 / BRANCH_KIND=1</code>，页头 pag
     <span class="cm">// ⑥ allocPage + writeNodePage(LEAF) 写入</span>
     <span class="kw">return</span> .{ .new_child = new_page, .live_delta, .count_delta };
 }</code></pre>
+
+<div class="mermaid">
+flowchart TD
+    A["① 拷旧页到栈缓冲<br/>防 allocPage resize 悬垂"] --> B["② 扫描定位三个游标<br/>③ 算 delta　④ 旧溢出链入 dirty"]
+    B --> D{"new_count &gt; LEAF_MAX_ENTRIES (32) ?"}
+    D -- "否：快路径" --> E["⑤ 栈缓冲三段拼接<br/>header + 前段 + 新 entry + 后段"]
+    E --> G["⑥ allocPage + writeNodePage(LEAF)"]
+    D -- "是：慢路径" --> H["insertIntoLeafSplit<br/>decode → 应用 → 对半分裂 → 各写一页"]
+    G --> R["返回 InsertSub{ new_child, delta }<br/>split_key = null"]
+    H --> R2["返回 split_key = 右叶首 key"]
+</div>
 
 <h4>① 为什么先拷整页到栈缓冲</h4>
 
@@ -904,12 +965,14 @@ old_payload[尾部区间 .. entries_end]</code>。尾部区间的起点取决于
 <code>@memcpy</code> 后半段（区间起点按覆盖/插入二选一，终点恒为 <code>entries_end</code>）。</li>
 </ul>
 
-<p>一个值得点破的细节：快路径<strong>从不校验拼接后的总字节数是否放得下</strong>——它只数条数
-（≤ <code>LEAF_MAX_ENTRIES</code> = 32）。而 32 条本身并不保证装进一页：每条固定开销 10B
-（ts+klen+vlen+flags）加 key，若 key 较长（如每条约 127B），32 条就能超过 payload 区容量
-4068B，此时 <code>@memcpy</code> 会越出 <code>new_payload</code> 边界。当前靠调用方约束兜住
-（§6.4 风险清单可对照）；批量路径 <code>insertBatchIntoLeaf</code>（§6.2）则改用
-<code>leafPayloadSize</code>(§2.3) 显式预估字节数，无此问题。</p>
+<p><strong>一个值得点破的细节：快路径从不校验拼接后的总字节数是否放得下</strong>——它只数条数
+（≤ <code>LEAF_MAX_ENTRIES</code> = 32）。</p>
+
+<p>但 32 条并不保证装进一页：每条固定开销 10B（ts+klen+vlen+flags）加 key，若 key 较长
+（如每条约 127B），32 条就能超过 payload 区容量 4068B，此时 <code>@memcpy</code> 会越出
+<code>new_payload</code> 边界。当前靠调用方约束兜住（§6.4 风险清单可对照）；
+批量路径 <code>insertBatchIntoLeaf</code>（§6.2）则改用 <code>leafPayloadSize</code>（§2.3）
+显式预估字节数，无此问题。</p>
 
 <h4>⑥ 落盘</h4>
 
@@ -976,6 +1039,23 @@ new_payload[0..wpos])</code> 一次完成：编码页头（含 nkeys）、拷 pa
     <span class="cm">// 若超 BRANCH_MAX_CHILDREN → 分裂 branch，返 up_key + right_page</span>
 }</code></pre>
 
+<div class="mermaid">
+flowchart TD
+    A["insertIntoBranch(page_no)<br/>findChildIdxAndOffset 找子"] --> B{"子是 leaf ?"}
+    B -- "是" --> C["insertIntoLeaf（§5.2）"]
+    B -- "否" --> D["insertIntoBranch（递归）"]
+    C --> E{"sub.split_key == null ?"}
+    D --> E
+    E -- "是：快路径" --> F["cowBranchNoSplit<br/>整页拷 + patch 4B 子指针（§5.3）"]
+    E -- "否：慢路径" --> G["重读 fresh payload → Branch.fromPayload<br/>child[ci] = new_child<br/>插入 split_key + split_right"]
+    G --> H{"超 BRANCH_MAX_CHILDREN ?"}
+    H -- "是" --> I["分裂 branch<br/>up_key = keys[mid] 上提 → 冒泡给父层"]
+    H -- "否" --> J["encode 写新页返回"]
+    F --> R["返回 InsertSub"]
+    I --> R
+    J --> R
+</div>
+
 <div class="note warn" role="note">⚠️ 注意 <b>慢路径重读 payload：</b>注释明说"recursive insert may have allocated pages,
 invalidating the earlier borrowed slice"。慢路径不复用开头读的 <code>payload</code>，而是 <code>readNodePayload</code>
 重读一份再 decode。这与快路径 <code>cowBranchNoSplit</code> 的栈拷贝是同一问题的两种应对：
@@ -1014,6 +1094,21 @@ invalidating the earlier borrowed slice"。慢路径不复用开头读的 <code>
 <p>三条路径：<code>insertBatchFresh</code>（空树）、<code>insertBatchIntoLeaf</code>（root 是叶）、
 <code>insertBatchIntoBranch</code>（root 是 branch）。root 分裂逻辑与单条 <code>insert</code> 相同。</p>
 
+<div class="mermaid">
+flowchart TD
+    S["insertBatch(已排序 entries)"] --> C0{"entries.len == 0 ?"}
+    C0 -- "是" --> Z["原样返回"]
+    C0 -- "否" --> C1{"root == NULL_ROOT ?"}
+    C1 -- "是" --> FR["insertBatchFresh<br/>bulk-load（§6.3）"]
+    C1 -- "否" --> C2{"root 是叶 ?"}
+    C2 -- "是" --> LF["insertBatchIntoLeaf<br/>O(n+m) 归并（§6.2）"]
+    C2 -- "否" --> BR["insertBatchIntoBranch"]
+    LF --> C3{"sub.split_key != null ?"}
+    BR --> C3
+    C3 -- "是" --> NR["建新 root branch（同 §5.1④）"]
+    C3 -- "否" --> RC["new_root = sub.new_child"]
+</div>
+
 <h3 id="s62">6.2 insertBatchIntoLeaf：O(n+m) 归并</h3>
 
 <pre><code><span class="kw">fn</span> <span class="fn">insertBatchIntoLeaf</span>(store, allocator, page_no, entries, dirty) !<span class="ty">InsertSub</span> {
@@ -1042,6 +1137,20 @@ invalidating the earlier borrowed slice"。慢路径不复用开头读的 <code>
     }
 }</code></pre>
 
+<div class="mermaid">
+flowchart TD
+    M["双游标归并：cmpKey(旧 entry.key, 新 entry.key)"] --> C{"比较结果"}
+    C -- ".lt" --> A1["取旧 entry，oi += 1"]
+    C -- ".gt" --> A2["取新 entry，bi += 1"]
+    C -- ".eq" --> A3["批量覆盖（last-write-wins）<br/>释放旧 key/value<br/>leaf.entries[oi] 置空切片防双 free"]
+    A1 --> N["一方耗尽 → 追加剩余"]
+    A2 --> N
+    A3 --> N
+    N --> F{"merged ≤ 32 条 ?"}
+    F -- "是" --> G["encode 单叶页"]
+    F -- "否" --> H["chunk 成组 → bulk-load 多叶 + branch（§6.3）"]
+</div>
+
 <div class="note ok" role="note">✅ 提示 <b>O(n+m) 归并：</b>旧叶条目与批量条目都已排序，双游标归并一遍即可产出合并结果。
 同 key 取批量条目（<strong>last-write-wins</strong>）——这是批量插入的语义约定，调用方须保证 entries 已按 key 升序排好。</div>
 
@@ -1069,6 +1178,15 @@ invalidating the earlier borrowed slice"。慢路径不复用开头读的 <code>
     <span class="cm">// split_key = current_keys[i + chunk_len - 1]</span>
 }
 <span class="cm">// 最终 root branch</span></code></pre>
+
+<div class="mermaid">
+flowchart TD
+    E["已排序 entries"] --> L["按 LEAF_MAX_ENTRIES (32) 切块建叶页<br/>下一段首 key 作分隔"]
+    L --> B{"current_pages.len &gt; BRANCH_MAX_CHILDREN ?"}
+    B -- "是" --> C["按 BRANCH_MAX_CHILDREN 切块建 branch<br/>level_pages_a/b 交替复用"]
+    C --> B
+    B -- "否" --> R["最顶层作 root branch"]
+</div>
 
 <div class="note warn" role="note">⚠️ 注意 <b>level_pages_a/b 交替复用：</b>多级 branch 构建用两个 <code>ArrayList</code>（a/b）
 交替作下一层的输入/输出。<code>defer</code> 在函数级释放——若在 while 体内 <code>defer</code>，下一轮读
@@ -1119,5 +1237,9 @@ insert 单条 COW（快/慢路径 + root 分裂）、insertBatch 批量（归并
 
 </main>
 <script src="lecture.js"></script>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'dark', flowchart: { htmlLabels: true } });
+</script>
 </body>
 </html>

@@ -78,3 +78,8 @@ a{color:var(--accent);}
 section.lecture{scroll-margin-top:16px;}
 footer{margin-top:64px;border-top:1px solid var(--border);padding-top:16px;color:var(--muted);font-size:.85rem;}
 a:focus-visible,button:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px;}
+
+/* mermaid 流程图 */
+.mermaid{display:flex;justify-content:center;margin:18px 0;background:var(--panel);
+  border:1px solid var(--border);border-radius:10px;padding:16px 12px;overflow-x:auto;}
+.mermaid svg{max-width:100%;height:auto;}
