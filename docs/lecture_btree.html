@@ -742,9 +742,10 @@ btree.zig:974，源码注释“key pointers transferred to new_keys”），由 
 
 <h4>④ root 分裂：树长高的唯一时机</h4>
 
-<p>递归返回 <code>sub.split_key != null</code>（root 是叶 → insertIntoLeafSplit 分裂了它；
-root 是 branch → insertIntoBranch 自身再分裂），insert 造一个新 branch root
-（btree.zig:1069-1084）：</p>
+<p><strong>触发条件</strong>：insert 的递归返回 <code>sub.split_key != null</code>。
+只有两种来源：root 是叶 → insertIntoLeafSplit 分裂了它（§5.2）；root 是 branch →
+insertIntoBranch 自身再分裂（§5.4）。此时 insert 在入口处造一个新 branch root
+（btree.zig:1077-1092）：</p>
 
 <ul>
 <li><code>keys = { sk }</code>，<code>children = { sub.new_child, sub.split_right }</code>——
@@ -757,18 +758,22 @@ key 均 &lt; sk）；children[1] = split_right 是右子树（key ≥ sk——�
 <strong>children 数</strong>，不是 key 数。</li>
 </ul>
 
-<p><strong>旧 root 的回收</strong>：insert 入口自己没有对旧 root 做 <code>dirty.append</code>——
-但并不遗漏：旧 root 正是递归调用的 page_no，已经在子函数里被标记过（root 是叶 → §5.2 第④步
-<code>dirty.append</code>，btree.zig:768；root 是 branch → §5.4 递归返回后立即
-<code>dirty.append</code>，btree.zig:945）。btree 层只负责把废弃页“点名”进 dirty；
-物理回收依赖上层事务机制——writer.zig 的 applyBatch 在事务末尾把 batch_dirty 加锁搬进
-<code>pending_free</code>，最终 <code>store.freePage</code> 归还（有活跃读者时延迟到末位读者
-flush）。</p>
+<p><strong>旧 root 的回收分两层：</strong></p>
 
-<p>为什么这是树长高的<strong>唯一</strong>时机：非 root 节点的分裂都在 insertIntoBranch 内部就地
-消化——分裂成左右两页、上提一个键给父层，对更上层至多表现为“child 指针变了”（快路径 patch）；
-只有 root 上面没有父层可接上提键，分裂结果才冒泡到 insert 入口造新 root。高度 +1
-当且仅当走这条路。</p>
+<ul>
+<li><strong>btree 层——把废弃页“点名”进 dirty</strong>。insert 入口自己没有对旧 root 做
+<code>dirty.append</code>，但并不遗漏：旧 root 正是递归调用的 page_no，已经在子函数里标记过
+（root 是叶 → §5.2 第④步，btree.zig:775；root 是 branch → §5.4 递归返回后立即标记，
+btree.zig:952）。</li>
+<li><strong>事务层——物理回收</strong>。writer.zig 的 applyBatch 在事务末尾把 batch_dirty
+加锁搬进 <code>pending_free</code>，最终 <code>store.freePage</code> 归还
+（有活跃读者时延迟到末位读者 flush）。</li>
+</ul>
+
+<p><strong>为什么这是树长高的唯一时机</strong>：非 root 节点的分裂都在 insertIntoBranch
+内部就地消化——分裂成左右两页、上提一个键给父层，对更上层至多表现为“child 指针变了”
+（快路径 patch）；只有 root 上面没有父层可接上提键，分裂结果才冒泡到 insert 入口造
+新 root。高度 +1 当且仅当走这条路。</p>
 
 <div class="note warn" role="note">⚠️ 注意 <b>nkeys 字段的两义性：</b>同一个页头字段，leaf 页记
 entry 数，branch 页记 children 数（key 数 = nkeys − 1）。新 root branch 是“1 key + 2 children”，
