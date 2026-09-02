@@ -25,8 +25,8 @@
     <li class="part"><a href="#part3">第三部分 · Branch 节点编码与内存表示</a></li>
     <li class="sub"><a href="#s31">3.1 branchPayloadSize / encode / decode</a></li>
     <li class="sub"><a href="#s32">3.2 Leaf / Branch 内存表示与 fromPayload</a></li>
-    <li class="part"><a href="#part4">第四部分 · 读取路径：get / getBorrowed</a></li>
-    <li class="sub"><a href="#s41">4.1 getBorrowed：零拷贝热路径</a></li>
+    <li class="part"><a href="#part4">第四部分 · 读取路径：get 与零拷贝的取舍</a></li>
+    <li class="sub"><a href="#s41">4.1 案例复盘：getBorrowed 的设计与移除</a></li>
     <li class="sub"><a href="#s42">4.2 get 与 findInLeaf：溢出与 tombstone</a></li>
     <li class="sub"><a href="#s43">4.3 findInBranchPayload：原页二分</a></li>
     <li class="part"><a href="#part5">第五部分 · 插入（COW）：快路径与分裂</a></li>
@@ -51,7 +51,7 @@
     <span class="tag">COW B-tree</span>
     <span class="tag">u32 页号寻址</span>
     <span class="tag">溢出页链</span>
-    <span class="tag">零拷贝借用</span>
+    <span class="tag">零拷贝借用（已移除）</span>
   </div>
 </header>
 
@@ -86,7 +86,7 @@
 
 <div class="note" role="note">💡 说明 <b>COW 含义：</b>写入永不修改既有页——而是分配新页、拷贝旧页内容、在新页上改、
 把新页号向上回报。旧页标记为 dirty 由 caller 回收。读者因此可零拷贝借用页缓冲：COW 保证被读的旧页
-在其生命期内内容不变。这是 <code>getBorrowed</code> 零拷贝与并发安全的基础。</div>
+在其生命期内内容不变。这是零拷贝读取与并发安全的基础（注：<code>getBorrowed</code> API 已于 T-23 移除，见第四部分案例复盘）。</div>
 
 <h3 id="s12">1.2 关键常量：容量上下限与节点种类</h3>
 
@@ -200,7 +200,7 @@
 
 <div class="note ok" role="note">✅ 提示 <b>注意 payload 首字节即节点 kind：</b><code>LEAF_KIND=2</code> / <code>BRANCH_KIND=1</code>
 写在 payload[0]。读路径 <code>payload[0] == LEAF_KIND</code> 即可分流，无需读页头 <code>page_type</code>——
-这是 <code>getBorrowed</code> / <code>findInBranchPayload</code> 零解码分流的依据。</div>
+这是 <code>findInBranchPayload</code> 零解码分流的依据（原 <code>getBorrowed</code> 也依赖此机制，该 API 已于 T-23 移除）。</div>
 
 <p class="muted">第一部分到此。下面进入节点编码：先 Leaf（含溢出页），再 Branch。</p>
 </section>
@@ -316,7 +316,7 @@ payload 区存 value 的一个 chunk（最多 <code>OVERFLOW_PAYLOAD</code> 字�
 
 <div class="note warn" role="note">⚠️ 注意 <b>链遍历用带 CRC 的 readNodePayload：</b>溢出页链是跨页结构，任一页损坏都会导致
 value 截断。读取走 <code>readNodePayload</code>（CRC 校验）而非 Fast 版，保证损坏可被 <code>CorruptCrc</code>
-错误捕获。热路径 <code>getBorrowed</code> 对溢出值直接返 null，迫使调用方走 <code>get</code> 走这条安全路径。</div>
+错误捕获。热路径曾通过 <code>getBorrowed</code>（已于 T-23 移除）对溢出值直接返 null，迫使调用方走 <code>get</code> 走这条安全路径。</div>
 
 <h3 id="s23">2.3 leafPayloadSize：容量预估</h3>
 
@@ -501,19 +501,26 @@ kind 字节不匹配返 <code>error.CorruptCrc</code>（复用此错误名表"�
 旧链必须回收。<code>insertIntoLeafSplit</code> / <code>insertBatchIntoLeaf</code> 走此路径，caller 的 dirty 列表
 负责最终 <code>freePage</code>。</div>
 
-<p class="muted">第三部分到此。下一部分讲读取路径 <code>get</code> / <code>getBorrowed</code>。</p>
+<p class="muted">第三部分到此。下一部分讲读取路径 <code>get</code> 及零拷贝 API 的设计取舍。</p>
 </section>
 
 
 <section class="lecture" id="part4">
-<h2><span class="no">第四部分</span>读取路径：get / getBorrowed</h2>
+<h2><span class="no">第四部分</span>读取路径：get 与零拷贝的取舍</h2>
 
-<p>读路径分两档：<code>getBorrowed</code> 零拷贝借用页缓冲（内联值热路径），<code>get</code> 堆拷贝（溢出值 / 需独立生命期）。
-两者共享 <code>findInBranchPayload</code> 做原页二分下沉，区别只在叶层处理。</p>
+<p>读路径的核心是 <code>get</code>：堆拷贝返回 owned slice，调用方负责 free。历史上曾存在一个零拷贝变体
+<code>getBorrowed</code>（已于 T-23 移除），它直接返回指向页缓冲的借用切片以避免分配开销。本部分先复盘
+<code>getBorrowed</code> 的设计动机与移除原因（null 多义性缺陷），再讲现役 <code>get</code> 与
+<code>findInBranchPayload</code> 的实现。</p>
 
-<h3 id="s41">4.1 getBorrowed：零拷贝热路径</h3>
+<h3 id="s41">4.1 案例复盘：getBorrowed 的设计与移除</h3>
 
-<pre><code><span class="kw">pub fn</span> <span class="fn">getBorrowed</span>(store: <span class="ty">PageStore</span>, root: <span class="ty">u32</span>, key: []const <span class="ty">u8</span>) !?[]const <span class="ty">u8</span> {
+<div class="note warn" role="note">⚠️ 历史 <b>以下代码已于 T-23 移除，仅作设计教训参考：</b>
+<code>getBorrowed</code> / <code>findInLeafBorrowed</code> 已从 <code>src/btree.zig</code> 和 <code>ReadTxn</code>
+中完整删除。保留在此处是为了展示零拷贝 API 在 COW B-tree 中的典型实现及其陷阱。</div>
+
+<pre><code><span class="cm">// 已于 T-23 移除 — 仅作历史/教学参考</span>
+<span class="kw">pub fn</span> <span class="fn">getBorrowed</span>(store: <span class="ty">PageStore</span>, root: <span class="ty">u32</span>, key: []const <span class="ty">u8</span>) !?[]const <span class="ty">u8</span> {
     <span class="kw">if</span> (root == NULL_ROOT) <span class="kw">return null</span>;
     <span class="kw">var</span> cur = root;
     <span class="kw">var</span> depth: <span class="ty">u32</span> = <span class="nu">0</span>;
@@ -525,9 +532,10 @@ kind 字节不匹配返 <code>error.CorruptCrc</code>（复用此错误名表"�
     <span class="kw">return error</span>.Truncated;
 }</code></pre>
 
-<p><code>getBorrowed</code> 从 root 下沉：branch 层调 <code>findInBranchPayload</code> 取下一层页号，
-到 leaf 层调 <code>findInLeafBorrowed</code>。全程 <code>readNodePayloadFast</code>（跳 CRC，COW 保证安全），
-返回的切片直接指向页缓冲——零堆分配。<code>depth &lt; 1000</code> 是防环保护。</p>
+<p><code>getBorrowed</code> 曾是 <code>get</code> 的零拷贝优化版：从 root 下沉，branch 层调
+<code>findInBranchPayload</code> 取下一层页号，到 leaf 层调 <code>findInLeafBorrowed</code>。全程
+<code>readNodePayloadFast</code>（跳 CRC，COW 保证安全），返回的切片直接指向页缓冲——零堆分配。
+然而全仓库盘点发现<strong>生产代码零调用者</strong>，仅测试、bench、文档引用。</p>
 
 <div class="flow">
 <span class="step">root</span>
@@ -542,7 +550,8 @@ kind 字节不匹配返 <code>error.CorruptCrc</code>（复用此错误名表"�
 <span class="arrow">→ ↻</span>
 </div>
 
-<pre><code><span class="kw">fn</span> <span class="fn">findInLeafBorrowed</span>(payload, key) !?[]const <span class="ty">u8</span> {
+<pre><code><span class="cm">// 已于 T-23 移除 — 仅作历史/教学参考</span>
+<span class="kw">fn</span> <span class="fn">findInLeafBorrowed</span>(payload, key) !?[]const <span class="ty">u8</span> {
     <span class="cm">// 逐条扫描，cmpKey 分流：</span>
     .lt => { pos += value_sz; <span class="kw">continue</span>; }  <span class="cm">// 跳过</span>
     .eq => {
@@ -556,7 +565,12 @@ kind 字节不匹配返 <code>error.CorruptCrc</code>（复用此错误名表"�
 <div class="note danger" role="alert">🔴 危险 <b>getBorrowed 对溢出值返 null：</b>这是<strong>信号</strong>不是"不存在"。
 <code>findInLeafBorrowed</code> 遇溢出 entry 无法返借用切片（值跨多页），返 null 让调用方改走 <code>get</code>。
 调用方若不区分"墓碑 null / 越界 null / 溢出 null"，会误判溢出值为不存在。正确用法：
-<code>getBorrowed</code> 返 null 时若需确认，再调 <code>get</code>。</div>
+<code>getBorrowed</code> 返 null 时若需确认，再调 <code>get</code>。<br>
+<strong>正因这个坑无法在类型层面消除（Zig 的 <code>?[]const u8</code> 装不下三种语义），最终选择移除 API 而非修补。</strong></div>
+
+<p><b>移除决策总结：</b>① 生产代码零调用——API 存在的维护成本大于收益；② null 三义性（溢出值 / 墓碑 / 不存在）
+无法通过 Zig 类型系统表达，任何"修补"方案（如返回 tagged union）都会破坏零拷贝的性能初衷；③ 统一用
+<code>get()</code> / <code>ReadTxn.get()</code> 消除调用方的心智负担。</p>
 
 <h3 id="s42">4.2 get 与 findInLeaf：溢出与 tombstone</h3>
 
@@ -575,7 +589,7 @@ kind 字节不匹配返 <code>error.CorruptCrc</code>（复用此错误名表"�
     }
 }</code></pre>
 
-<p><code>get</code> 是 <code>getBorrowed</code> 的"完整版"：内联值 <code>allocator.dupe</code> 堆拷贝，
+<p><code>get</code> 是读路径的"完整版"（也是移除 <code>getBorrowed</code> 后的唯一读取 API）：内联值 <code>allocator.dupe</code> 堆拷贝，
 溢出值 <code>readOverflowValue</code> 拼链。返回的 <code>[]u8</code> 由调用方 <code>free</code>。
 墓碑一律返 null——墓碑是 COW 删除留下的逻辑删除标记，读路径视为不存在。</p>
 
@@ -599,9 +613,10 @@ kind 字节不匹配返 <code>error.CorruptCrc</code>（复用此错误名表"�
 keys 区扫完后 <code>pos</code> 落在 children 区起点，<code>pos + child_idx*4</code> 定位目标子指针。
 越界检查 <code>pos + 4*count &gt; payload.len</code> 防 <code>Truncated</code>。</p>
 
-<div class="note" role="note">💡 说明 <b>getBorrowed 的生命期保证：</b>返回的切片借自 <code>readNodePayloadFast</code> 的页缓冲。
+<div class="note" role="note">💡 说明 <b>COW 借用生命期保证（历史背景）：</b>原 <code>getBorrowed</code>（已于 T-23 移除）返回的切片借自 <code>readNodePayloadFast</code> 的页缓冲。
 COW 保证旧页不被改写（写者分配新页），因此切片在调用方使用期间有效——前提是底层 <code>PageStore</code>
-实现保证页地址稳定（内存版每页独立堆分配，见 <code>page_store.zig</code> 讲义）。</div>
+实现保证页地址稳定（内存版每页独立堆分配，见 <code>page_store.zig</code> 讲义）。这一保证仍然是 <code>readNodePayloadFast</code>
+被读路径安全使用的基础，只是不再通过独立的零拷贝 API 暴露给调用方。</div>
 
 <p class="muted">第四部分到此。下一部分讲写路径——单条 insert 的 COW 实现。</p>
 </section>
@@ -866,7 +881,7 @@ invalidating the earlier borrowed slice"。慢路径不复用开头读的 <code>
 <tr><th>风险点</th><th>说明</th><th>缓解/注意</th></tr>
 <tr><td>端序统一（全 little-endian）</td><td>leaf/branch/溢出页号/页头/meta/CRC 全部 little-endian</td><td>无端序混用风险。T-9 统一后读写一致</td></tr>
 <tr><td>allocPage resize 悬垂</td><td><code>readPage</code> 借用切片在 <code>allocPage</code> 触发 HashMap resize 后失效</td><td>写路径先 <code>@memcpy</code> 整页到栈缓冲；慢路径重读 fresh payload</td></tr>
-<tr><td>getBorrowed 溢出返 null</td><td>溢出值无法借用，返 null 信号；调用方若不区分会误判不存在</td><td>需确认时改调 <code>get</code>；或文档约定 null 即"不可借用/不存在"</td></tr>
+<tr><td>getBorrowed 溢出返 null（已移除）</td><td>溢出值无法借用，返 null 信号；调用方若不区分会误判不存在</td><td>API 已于 T-23 移除（null 三义性无法在类型层面消除）；统一用 <code>get()</code></td></tr>
 <tr><td>DecodedLeafEntry.value 二义</td><td>溢出时 value 是 4 字节页号字节，非真实值</td><td>必查 <code>flags &amp; LEAF_FLAG_OVERFLOW</code> 分流</td></tr>
 <tr><td>批量覆盖 double-free</td><td>eq 分支释放旧 entry 后 <code>leaf.deinit</code> 再释放</td><td>释放后置 <code>leaf.entries[oi]</code> 为空切片</td></tr>
 <tr><td>level_pages defer 陷阱</td><td>while 内 defer 会在下一轮 use-after-free</td><td>a/b 声明在 while 外，<code>clearRetainingCapacity</code> 复用</td></tr>
@@ -881,7 +896,7 @@ invalidating the earlier borrowed slice"。慢路径不复用开头读的 <code>
 作为 cube_db 的索引核心，它把 COW 的不变量（不改既有页、脏页外挂、栈拷贝防悬垂）贯彻到每条写路径。</div>
 
 <p class="muted">第六部分到此。本讲义覆盖 <code>src/btree.zig</code> 全部公开函数与关键内部函数：
-常量与类型、页 I/O 三件套、leaf/branch 编解码、溢出页链、get/getBorrowed 读路径、
+常量与类型、页 I/O 三件套、leaf/branch 编解码、溢出页链、get 读路径（含已移除 getBorrowed 的设计复盘）、
 insert 单条 COW（快/慢路径 + root 分裂）、insertBatch 批量（归并 + bulk-load）、设计取舍与风险清单。</p>
 </section>
 
