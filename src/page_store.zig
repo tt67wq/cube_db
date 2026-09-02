@@ -23,7 +23,10 @@ pub const PageStore = struct {
         allocPage: *const fn (ptr: *anyopaque) anyerror!u32,
         /// 回收一页到 freelist（LIFO）。不释放页数据。
         freePage: *const fn (ptr: *anyopaque, page_no: u32) void,
-        /// 读页（返借用切片，零拷贝）
+        /// 读页（返借用切片，零拷贝）。
+        /// 借用契约：切片在 Store deinit 前始终有效——页数据地址稳定
+        /// （MemPageStore 独立堆分配 / FilePageStore mmap 预留区），且 COW
+        /// 保证已发布页不被原地修改。实现违反任一前提即违反此接口。
         readPage: *const fn (ptr: *anyopaque, page_no: u32) anyerror![]const u8,
         /// 写页（返可变切片）
         writePage: *const fn (ptr: *anyopaque, page_no: u32) anyerror![]u8,
@@ -43,6 +46,9 @@ pub const PageStore = struct {
     pub fn freePage(self: PageStore, page_no: u32) void {
         self.vtable.freePage(self.ptr, page_no);
     }
+    /// 读页，返借用切片（零拷贝）。无 allocator 参数 + `[]const u8` 返回值
+    /// 即借用语义（Zig 惯例，无需 Borrowed/Owned 后缀）：切片有效期为 Store
+    /// 生命周期，页内容不可变（COW）。需持有副本的调用方自行 allocator.dupe。
     pub fn readPage(self: PageStore, page_no: u32) ![]const u8 {
         return self.vtable.readPage(self.ptr, page_no);
     }

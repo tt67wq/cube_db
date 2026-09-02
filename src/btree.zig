@@ -35,7 +35,14 @@ pub fn cmpKey(a: []const u8, b: []const u8) std.math.Order {
 
 // ===== 页 I/O 辅助 =====
 
-/// 从页读节点 payload（借用页缓冲，不拷贝）
+/// 从页读节点 payload（CRC 校验后返 [PAGE_HEADER_SIZE .. PAGE_SIZE-4) 的借用切片，不拷贝）。
+/// 借用语义：栈上只压一个切片头（ptr+len），数据本体仍在 Store 的页存储里
+/// ——生产 FilePageStore 是 1TB mmap 预留区的裸指针，MemPageStore 是每页
+/// 独立堆分配的 slab。接口契约保证借用有效期 = Store 生命周期（页地址稳定
+/// + COW 不原地改，见 page_store.zig VTable.readPage）；接口层不依赖任何
+/// 「借用长存」之外的假设，写路径（split/merge 等）仍遵循「先整页拷到栈
+/// 缓冲再改」的防御模式——这是 allocPage 扩容曾致借用悬垂（SEGV）时留下的
+/// 惯例，现由页地址稳定性兜底。
 pub fn readNodePayload(store: PageStore, page_no: u32) ![]const u8 {
     const page = try store.readPage(page_no);
     const arr: *const [f2.PAGE_SIZE]u8 = @ptrCast(page.ptr);

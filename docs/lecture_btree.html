@@ -631,6 +631,11 @@ COW 保证旧页不被改写（写者分配新页），因此切片在调用方�
 
 <h3 id="s51">5.1 insert 入口与 root 分裂</h3>
 
+<p><code>insert</code>（btree.zig:1035-1096）是单条写入的对外入口，返回
+<code>WriteResult{ new_root, live_delta, count_delta }</code>。它自己不碰 entry 的字节布局，只做三件事：
+空树建档、判定 root 类型后递归、处理只有 root 才会冒泡上来的分裂。子层的活见 §5.2-§5.4，
+本节拆入口本身的三条路。</p>
+
 <pre><code><span class="kw">pub fn</span> <span class="fn">insert</span>(allocator, store, root, key, value, tombstone, dirty) !<span class="ty">WriteResult</span> {
     <span class="kw">if</span> (root == NULL_ROOT) {
         <span class="cm">// 空树：建首个 leaf，写一条 entry</span>
@@ -655,9 +660,54 @@ COW 保证旧页不被改写（写者分配新页），因此切片在调用方�
     <span class="kw">return</span> .{ .new_root = sub.new_child, ... };
 }</code></pre>
 
-<p><code>insert</code> 读 root payload 判 leaf/branch，调对应插入函数。<code>InsertSub</code> 结构体是子层回报：
-<code>new_child</code>（新页号）、可选 <code>split_key</code> + <code>split_right</code>（分裂时）、<code>live_delta</code> /
-<code>count_delta</code>。root 分裂时建新 branch root——这是树长高的唯一时机。</p>
+<h4>① 空树路径：root == NULL_ROOT，从零建第一个 leaf</h4>
+
+<p><code>NULL_ROOT = 0</code>（btree.zig:10）是 root 的空哨兵——页号 0 永不被分配
+（meta 页占 1/2，数据页从 <code>FIRST_DATA_PAGE=3</code> 起），所以 0 可以放心当“树不存在”用。
+此路没有任何旧页可 patch——patch 快路径的前提是“有一页旧数据可拷贝后局部改写”（§5.2/§5.3），
+空树无从谈起，于是直接走通用编码路径：构造单 entry 数组 → <code>leafPayloadSize</code>（§2.3）
+预估字节数 → 栈缓冲上 <code>encodeLeafPayload</code>（§2.4）→
+<code>writeNodePage(LEAF, nkeys=1)</code>（§1.4）。与 <code>insertIntoLeafSplit</code> 慢路径、
+bulk-load 用的是同一套编码器：字节布局、CRC、补零、溢出页链（value 超 <code>MAX_INLINE_VALUE</code>=3800 时
+<code>encodeLeafPayload</code> 内部自动 <code>writeOverflowPages</code>，§2.2）全部单点维护，空树不搞特殊。</p>
+
+<p>两个统计口径与 §5.2 完全一致：</p>
+
+<ul>
+<li><code>live_delta = key.len + (tombstone ? 0 : value.len) + 9</code>——+9 就是
+tombstone 1B + klen 4B + vlen 4B（flags 字节与溢出页号不计入，同 §5.2 的近似口径）。
+tombstone 的 value 落盘时按空串处理（dupe 时直接换成 <code>""</code>）。</li>
+<li><code>count_delta = tombstone ? 0 : 1</code>——<strong>墓碑不计数</strong>：往空树插一条墓碑，
+树上确实多出一个含 tombstone entry 的叶，但活条目数不变（0 → 0）。注意字节口径却照加
+<code>key.len + 9</code>：所谓 live 字节统计实际包含墓碑的 key 开销，这是全局统一口径，
+不是本路径的特殊行为。</li>
+</ul>
+
+<p>细节两则：key/value 先 <code>allocator.dupe</code> 进 entry 数组、encode 完成后由 <code>defer</code>
+立即释放（编码过程只读，caller 切片在此期间并无失效风险，属防御性拷贝）；
+<code>dirty</code> 全程未动——没有旧页要回收，且 <code>encodeLeafPayload</code> 的 dirty 形参
+在实现里本来就是空操作（<code>_ = dirty;</code>，btree.zig:175）。</p>
+
+<h4>② root 类型判定：payload[0] 一个字节定路由</h4>
+
+<p>非空树先 <code>readNodePayload(store, root)</code>（§1.4，btree.zig:39-44）：CRC 校验后返回
+<code>[24 .. 4092)</code> 的 payload 切片。要紧的是：它返回的是<strong>借用</strong>而非拷贝——
+栈上只多一个切片头（ptr+len），数据本体仍在 Store 的页存储里（生产 FilePageStore 是 1TB mmap
+区的裸指针；测试用 MemPageStore 是 <code>AutoHashMap</code> 的 value）。PageStore 接口不保证借用长存：
+<code>allocPage</code> 可能触发 HashMap rehash 使切片悬垂——这正是 §5.2/§5.3 写路径
+“先整页拷栈缓冲”的原因（见 §5.2 的 🔴 提示框）。</p>
+
+<p>那 <code>insert</code> 为何不拷？因为它对这份借用的<strong>全部使用发生在任何分配之前</strong>：
+<code>payload[0] == LEAF_KIND</code> 读一个字节（LEAF_KIND=2 / BRANCH_KIND=1，§1.4 提示框），
+拿到 is_leaf 后就把 payload 抛在脑后——递归返回后无论走 root 分裂还是快路径，用的都是
+<code>sub</code> 里的页号与指针，不再触碰这份借用。同一个悬垂问题，三种应对：
+<strong>即弃</strong>（本节，读一个字节就撒手）、<strong>先拷</strong>（§5.2/§5.3，要跨 allocPage
+用整页数据）、<strong>重读</strong>（§5.4 慢路径，递归后再 <code>readNodePayload</code> 一份
+fresh_payload）。</p>
+
+<h4>③ InsertSub 回报协议：五个字段与“未分裂”快路径</h4>
+
+<p>递归层（insertIntoLeaf / insertIntoBranch）用这个结构体向 caller 回报：</p>
 
 <pre><code><span class="kw">const</span> <span class="ty">InsertSub</span> = <span class="kw">struct</span> {
     new_child: <span class="ty">u32</span>,
@@ -667,10 +717,84 @@ COW 保证旧页不被改写（写者分配新页），因此切片在调用方�
     count_delta: <span class="ty">i64</span> = <span class="nu">0</span>,
 };</code></pre>
 
+<ul>
+<li><code>new_child</code>——子层完成后的新页号。COW 语义是“改一个节点 = 造一个新页”，
+所以哪怕没分裂，caller 也要把父指针从旧页改指到 new_child。</li>
+<li><code>split_key</code>——非 null 表示子层分裂了；值是 heap 分配的分隔键
+（叶分裂 = <code>right_entries[0].key</code> 的 dupe，btree.zig:906；branch 再分裂 = 上提键的
+dupe，btree.zig:1003）。</li>
+<li><code>split_right</code>——分裂时右半部分的页号。</li>
+<li><code>live_delta / count_delta</code>——统计增量，只在叶层计算、中间层原样透传（见 ⑤）。</li>
+</ul>
+
+<p><strong>快路径约定</strong>：<code>split_key == null</code> 等价于“子层未分裂”，caller 不需要插入任何
+新键，把 new_child 挂回父指针即可——branch 层这就是 <code>cowBranchNoSplit</code> 的 4 字节
+patch（§5.3），insert 入口则直接 <code>new_root = sub.new_child</code>。一个 optional 同时承载
+“是否分裂”与“分隔键内容”，连额外的 bool 字段都省了。</p>
+
+<div class="note danger" role="alert">🔴 危险 <b>split_key 的所有权：</b>它是分裂方 <code>allocator.dupe</code>
+出来的 heap 分配，随 InsertSub 移交给 caller，<strong>每条路径必须恰好释放一次</strong>：
+root 分裂时 insert 在 encode 完成后 <code>allocator.free(sk)</code>（btree.zig:1079）；
+非 root 时 insertIntoBranch 慢路径把 sk 转移进 <code>branch.keys</code>（<code>new_keys[ci] = sk</code>，
+btree.zig:974，源码注释“key pointers transferred to new_keys”），由 <code>defer branch.deinit()</code>
+统一释放；branch 若再次分裂，返回的 <code>up_key</code> 是对 <code>keys[mid]</code> 的<strong>全新 dupe</strong>，
+原 sk 仍由 deinit 释放。改任何一端都要守住这个不变量——漏 free 泄漏，双 free 崩溃。</div>
+
+<h4>④ root 分裂：树长高的唯一时机</h4>
+
+<p>递归返回 <code>sub.split_key != null</code>（root 是叶 → insertIntoLeafSplit 分裂了它；
+root 是 branch → insertIntoBranch 自身再分裂），insert 造一个新 branch root
+（btree.zig:1069-1084）：</p>
+
+<ul>
+<li><code>keys = { sk }</code>，<code>children = { sub.new_child, sub.split_right }</code>——
+新 root 恰好是最小合法 branch：1 key + 2 children。<code>encodeBranchPayload</code> 的
+debug assert 正是“children 至少 2 个，且 keys 数 = children 数减一”。</li>
+<li><strong>顺序不变量</strong>：children[0] = new_child 是左子树（原 root 路径 COW 后的新顶，
+key 均 &lt; sk）；children[1] = split_right 是右子树（key ≥ sk——叶分裂时 sk 本身就存在右叶里）。
+§4.3 的路由规则依赖这个顺序，永不颠倒。</li>
+<li><code>writeNodePage(..., PAGE_TYPE_BRANCH, 2, ...)</code>——nkeys=2 记的是
+<strong>children 数</strong>，不是 key 数。</li>
+</ul>
+
+<p><strong>旧 root 的回收</strong>：insert 入口自己没有对旧 root 做 <code>dirty.append</code>——
+但并不遗漏：旧 root 正是递归调用的 page_no，已经在子函数里被标记过（root 是叶 → §5.2 第④步
+<code>dirty.append</code>，btree.zig:768；root 是 branch → §5.4 递归返回后立即
+<code>dirty.append</code>，btree.zig:945）。btree 层只负责把废弃页“点名”进 dirty；
+物理回收依赖上层事务机制——writer.zig 的 applyBatch 在事务末尾把 batch_dirty 加锁搬进
+<code>pending_free</code>，最终 <code>store.freePage</code> 归还（有活跃读者时延迟到末位读者
+flush）。</p>
+
+<p>为什么这是树长高的<strong>唯一</strong>时机：非 root 节点的分裂都在 insertIntoBranch 内部就地
+消化——分裂成左右两页、上提一个键给父层，对更上层至多表现为“child 指针变了”（快路径 patch）；
+只有 root 上面没有父层可接上提键，分裂结果才冒泡到 insert 入口造新 root。高度 +1
+当且仅当走这条路。</p>
+
+<div class="note warn" role="note">⚠️ 注意 <b>nkeys 字段的两义性：</b>同一个页头字段，leaf 页记
+entry 数，branch 页记 children 数（key 数 = nkeys − 1）。新 root branch 是“1 key + 2 children”，
+nkeys=2。读页方必须先看 kind 再解释 nkeys，拿 leaf 语义读 branch 会差一。另外两套编号别混：
+payload 首字节 kind 是 <code>LEAF_KIND=2 / BRANCH_KIND=1</code>，页头 page_type 却是
+<code>LEAF=3 / BRANCH=2</code>（§1.4 表格）。</div>
+
+<h4>⑤ delta 冒泡：从叶层到 WriteResult</h4>
+
+<p><code>live_delta / count_delta</code> 只在叶层产生（§5.2 第③步：覆盖减旧加新、新增只加新；
+即使转慢路径，insertIntoLeafSplit 也是把算好的 delta 作为参数带入、原样填进返回值）。
+中间层 insertIntoBranch 不做任何加工——<code>const live_delta = sub.live_delta;</code> 抄一遍，
+快慢两条路径的返回值填的都是这两个局部变量。insert 入口再把它们包进
+<code>WriteResult{ new_root, live_delta, count_delta }</code>：root 分裂路径本身不产生统计变化
+（分隔键、新建 branch 页都不计入 live 口径），纯透传。</p>
+
+<p>真正的消费方在 Db 层：writer.zig 的 applyBatch 对每个 <code>WriteResult</code> 做
+<code>batch_entry_delta += wr.count_delta; batch_byte_delta += wr.live_delta;</code>，
+事务末尾按 <code>max(0, 当前值 + delta)</code> 算出新的 <code>entry_count / byte_size</code>
+写进 MetaPage——统计维护 O(1)，不需要全树扫描。</p>
+
 <h3 id="s52">5.2 insertIntoLeaf：栈缓冲 patch</h3>
 
 <p><code>insertIntoLeaf</code> 是叶层 COW 核心。它分两条路：<strong>快路径</strong>（条数未超限，栈缓冲 patch 新 entry）
-和<strong>慢路径</strong>（超限，调 <code>insertIntoLeafSplit</code> decode/分裂/encode）。</p>
+和<strong>慢路径</strong>（超限，调 <code>insertIntoLeafSplit</code> decode/分裂/encode）。
+整个函数零堆分配——两个栈缓冲 + 若干 <code>@memcpy</code>。</p>
 
 <pre><code><span class="kw">fn</span> <span class="fn">insertIntoLeaf</span>(store, allocator, page_no, key, value, tombstone, dirty) !<span class="ty">InsertSub</span> {
     <span class="cm">// ① 拷旧页到栈缓冲 — allocPage 可能触发 HashMap resize 使 readPage 切片失效</span>
@@ -697,15 +821,98 @@ COW 保证旧页不被改写（写者分配新页），因此切片在调用方�
     <span class="kw">return</span> .{ .new_child = new_page, .live_delta, .count_delta };
 }</code></pre>
 
+<h4>① 为什么先拷整页到栈缓冲</h4>
+
+<p><code>readPage</code> 返回的是 PageStore 内部页缓存切片的<strong>借用</strong>。后面第 ⑥ 步的
+<code>allocPage</code> 可能触发底层 <code>HashMap</code> resize，把整个缓存搬走——届时
+<code>old_payload</code> 就是悬垂指针。所以入口处第一件事就是把 4096 字节整页
+<code>@memcpy</code> 到栈上的 <code>old_page_buf</code>，之后的扫描与拷贝全部基于这份栈副本，
+与页缓存的生命周期彻底解耦。</p>
+
+<p><code>old_payload</code> 的切片范围 <code>[PAGE_HEADER_SIZE .. PAGE_SIZE - 4]</code> 正好剥掉
+24B 固定页头和 4B 页尾 CRC，即 §2.4 定义的裸 payload 区。</p>
+
 <div class="note danger" role="alert">🔴 危险 <b>栈缓冲拷贝的关键理由：</b>注释明确——<code>allocPage</code> 可能触发底层
 <code>HashMap</code> resize，使此前 <code>readPage</code> 返回的借用切片<strong>悬垂</strong>。因此必须先把整页
 <code>@memcpy</code> 到栈 <code>old_page_buf</code>，后续所有扫描/拷贝都基于栈缓冲，<code>allocPage</code> 之后才安全。
 <code>cowBranchNoSplit</code> 同此模式。这是 COW 写路径的<strong>不变量</strong>：用旧页数据前先拷离页缓冲。</div>
 
-<div class="note warn" role="note">⚠️ 注意 <b>live_delta 计算：</b>覆盖时减去旧 entry 大小 <code>old_key_len + old_val_sz + 9</code>
-（9 = 1 tombstone + 4 klen + 4 vlen；注意 flags 1 字节已计入 9？实际公式 <code>key.len + value.len + 9</code>，
-9 含 tombstone/klen/vlen/flags 共 10？源码写作 +9，遵循源码）。新增则只加 <code>key.len + value.len + 9</code>。
-tombstone 的 value 按 0 长度计。count_delta：活→墓 -1，墓→活 +1，新增活 +1。</div>
+<h4>② 定位扫描：三个游标钉住 splice 点</h4>
+
+<p>payload 里的 entry 变长且<strong>无偏移表</strong>（见 §2.4），想知道第 i 个 entry 从哪个字节开始，
+只能从 <code>pos = 3</code>（跳过 kind 1B + count 2B）起逐个解码累加。每轮循环按布局推进
+<code>pos</code>：ts(1) → klen(4) → key(klen) → vlen(4) → flags(1) → value(vlen) 或 overflow_page(4)，
+并对每个字段做越界检查（截断返 <code>error.Truncated</code>）。对当前 entry 的 key 做
+<code>cmpKey(ek, key)</code>，三种出口：</p>
+
+<ul>
+<li><strong><code>.eq</code>（key 已存在 → 覆盖写）</strong>：记 <code>entry_start = start</code>、
+<code>entry_end = pos</code>（旧 entry 的头尾），顺手抓旧 entry 元数据
+（<code>old_tombstone / old_vlen / old_is_overflow / old_key_len</code>，溢出时再从
+<code>entry_start + 1 + 4 + klen + 4 + 1</code> 读 4B 溢出首页号）供 ③④ 步使用。</li>
+<li><strong><code>.gt</code>（当前 entry 的 key 已大于待插 key → 有序插入点）</strong>：没有要被替换的
+entry，故 <code>entry_end = start</code>（同起同止、长度 0），后续拷贝走 insert 分支。</li>
+<li><strong>循环跑完全是 <code>.lt</code></strong>：插到末尾。兜底分支
+<code>if (!found and !gt_break)</code> 令 <code>entry_start = entry_end = entries_end</code>。</li>
+</ul>
+
+<p>三个游标的分工：新 payload = <code>header + old_payload[3 .. entry_start] + 新 entry +
+old_payload[尾部区间 .. entries_end]</code>。尾部区间的起点取决于场景——覆盖时是
+<code>entry_end</code>（跳过被替换的旧 entry），插入时是 <code>entry_start</code>（旧 entry 不删，整体后移）。</p>
+
+<p><strong>命中后为什么还要继续扫？</strong>因为 <code>entries_end</code> 必须是全部 entry 的真实末尾，
+而命中时 <code>pos</code> 只走到中途；leaf 页通常带 padding（writeNodePage 会把数据区补零到页尾，
+见 §1.4），拿 <code>pos</code> 当末尾会丢掉尾部剩余 entry。所以 <code>.eq</code>/<code>.gt</code>
+两个分支里各有一段重复的"快进扫描"内层循环（<code>klen2 / vlen2 / flags2</code>……）：不解码 key、
+不做比较，纯逐 entry 推进 <code>pos</code> 走完剩余条目来钉死 <code>entries_end</code>。
+每轮 <code>.lt</code> 迭代末尾也维护 <code>entries_end = pos</code>，保证落到第三种出口时它已是正确值。</p>
+
+<div class="note warn" role="note">⚠️ 注意 这段扫描是<strong>全函数唯一的 O(n) 遍历</strong>（n ≤ 32），
+也是快路径相对 decode 版省掉的主要工作之一：不需要为每个 entry 分配 key/value 切片的内存表示，
+只在原字节流上移动游标。代价是 <code>.eq</code>/<code>.gt</code> 两处内层循环与外层解码逻辑重复了一遍
+（源码以复制代替抽函数）。</div>
+
+<div class="note warn" role="note">⚠️ 注意 <b>live_delta 的 +9：</b>覆盖时减去旧 entry 大小 <code>old_key_len + old_val_sz + 9</code>
+（9 = tombstone 1B + klen 4B + vlen 4B）。flags 字节与溢出时的 4B 页号未计入——源码如此，属统计口径的近似。
+新增则只加 <code>key.len + value.len + 9</code>；tombstone 的 value 按 0 长度计。</div>
+
+<h4>③ live_delta / count_delta</h4>
+
+<p>覆盖时先减去旧 entry 占用：<code>old_key_len + old_val_sz + 9</code>，其中
+<code>old_val_sz</code> 对溢出 entry 按 4（页号指针）计而非真实 value 长度；再加上新 entry 的
+<code>key.len + value.len + 9</code>（tombstone 的 value 按 0 计）。count_delta 跟踪活条目数的净变化：
+活→墓 -1，墓→活 +1，新增活 +1，其余为 0。</p>
+
+<h4>④⑤ 溢出回收与三段拼接</h4>
+
+<p>若被覆盖的旧 entry 是溢出 entry，<code>freeOverflowPages</code> 沿链把旧溢出页收进 caller 的
+<code>dirty</code> 列表（回收时机见 §2.2）。随后判定：</p>
+
+<ul>
+<li><code>new_count = found ? old_count : old_count + 1</code>；旧页此刻入 <code>dirty</code>。</li>
+<li><code>new_count > LEAF_MAX_ENTRIES</code>（32）→ 转慢路径 <code>insertIntoLeafSplit</code>，
+传入的是 <code>old_page_buf</code>（栈副本），不是可能已失效的 <code>readPage</code> 借用。</li>
+<li>否则在第二个栈缓冲 <code>new_payload</code>（大小恰为一个 payload 区：4096 − 24 − 4）里三段拼接：
+写 3B header（kind + 新 count）→ <code>@memcpy</code> 前半段 <code>[3 .. entry_start]</code> →
+手工编码新 entry（tombstone / klen+key / vlen；value 超 <code>MAX_INLINE_VALUE</code>=3800 时置
+<code>LEAF_FLAG_OVERFLOW</code> 并现场 <code>writeOverflowPages</code> 写链、内联 4B 首页号）→
+<code>@memcpy</code> 后半段（区间起点按覆盖/插入二选一，终点恒为 <code>entries_end</code>）。</li>
+</ul>
+
+<p>一个值得点破的细节：快路径<strong>从不校验拼接后的总字节数是否放得下</strong>——它只数条数
+（≤ <code>LEAF_MAX_ENTRIES</code> = 32）。而 32 条本身并不保证装进一页：每条固定开销 10B
+（ts+klen+vlen+flags）加 key，若 key 较长（如每条约 127B），32 条就能超过 payload 区容量
+4068B，此时 <code>@memcpy</code> 会越出 <code>new_payload</code> 边界。当前靠调用方约束兜住
+（§6.4 风险清单可对照）；批量路径 <code>insertBatchIntoLeaf</code>（§6.2）则改用
+<code>leafPayloadSize</code>(§2.3) 显式预估字节数，无此问题。</p>
+
+<h4>⑥ 落盘</h4>
+
+<p><code>allocPage</code> 取新页号，<code>writeNodePage(store, new_page, PAGE_TYPE_LEAF, new_count,
+new_payload[0..wpos])</code> 一次完成：编码页头（含 nkeys）、拷 payload、剩余区域补零、重算 CRC
+（§1.4）。返回 <code>InsertSub{ new_child, live_delta, count_delta }</code>——<code>split_key</code>
+留空表示未分裂，caller（<code>insertIntoBranch</code>）据此走 <code>cowBranchNoSplit</code> 的
+4 字节 patch 快路径（§5.3）。</p>
 
 <p>慢路径 <code>insertIntoLeafSplit</code>：decode 旧叶为内存 <code>Leaf</code> → 应用 insert/overwrite →
 对半分裂成左右两叶 → <code>encodeLeafPayload</code> + <code>writeNodePage</code> 各写一页 → 返
