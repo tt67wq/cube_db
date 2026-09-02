@@ -1,184 +1,65 @@
-# Review: mvcc-race (fix commit 7f4805c)
+# T-23 Review: 移除 getBorrowed 零拷贝 API
 
-- **Branch**: `fix/mvcc-race`
-- **Reviewed SHA**: `7f4805c`
-- **Base**: `6834b7f`
-- **Reviewer constraints**: pure code reading (no `zig build test` / loops run — machine
-  crashed under parallel runs). Conclusions are static-analysis verdicts; the 20×
-  no-crash loop was NOT re-run by this reviewer and remains the tester/conductor gate.
+**Verdict**: APPROVE
+**Reviewed SHA**: f759b30d3e64ce8907830055da09a5d1cb2d48b2
+**Reviewer**: Droid (automated)
+**Date**: 2026-09-02
 
-## Verdict: **approve** (changes-requested → approve after c740825)
+## 契约逐项核查
 
-The fix correctly closes the actual root-cause crash (MemPageStore page-address
-dangling on ArrayList growth) and the pending_free concurrent-mutate UB, with
-consistent lock ordering and no deadlock. But it introduces one genuine latent
-correctness defect (ensurePage partial-failure leaves `undefined` pointers that
-`deinit` will `destroy` → UB) and one explicit contract-tension (a mutex on the
-reader hot path inside MemPageStore). Both are fixable in a few lines; neither is
-a reason to scrap the approach, but they must be addressed before sign-off.
+### 1. src/ 删除是否干净 ✅
 
-## What is correct (approve these)
+- `src/btree.zig`: `getBorrowed` (L429-449) 和 `findInLeafBorrowed` (L451-498) 已完整删除（74 行），紧随其后的 `pub fn get` 保留完好，diff 中 `get()` 函数体无任何改动。
+- `src/db.zig`: `ReadTxn.getBorrowed` (L344-349 含 doc comment) 已完整删除（7 行）。
+- `src/root.zig`: 无 diff，确认无直接导出。
 
-1. **Root cause identified & fixed.** The real SEGV was MemPageStore storing pages
-   by value (`ArrayList([PAGE_SIZE]u8)`); `ensurePage`→`appendNTimes` realloc moved
-   page data, so a reader's borrowed slice from `readPage` dangled. The fix
-   (`page_store.zig:68-72`) makes each page an independent heap allocation
-   (`*[PAGE_SIZE]u8`); page data addresses are now stable across `pages` growth.
-   This is the right minimal fix and matches the commit message. ✅
+### 2. get() 行为零改动 ✅
 
-2. **pending_free single-mutator (Race B).** `pending_free_mu` serializes writer
-   append (`writer.zig:402-406`), writer grace-flush (`writer.zig:229-231`), and
-   last-reader flush (`writer.zig:166-168`). Last-reader path is the only `endRead`
-   that takes the lock; common path (`prev>1`) stays a single `fetchSub` — reader
-   hot path is not regressed *at the MVCC layer*. ✅
+- `btree.get()` 函数签名、函数体在 diff 中无任何变更（仅上下文行出现在删除块之后）。
+- `ReadTxn.get()` 未被触及。
 
-3. **Lock ordering — no deadlock (concern 1).** Traced every lock-acquire site:
-   - `flushPendingFree`: `pending_free_mu` → (inside `store.freePage`) `freelist_mu`.
-   - `applyBatch` step 3 append: `pending_free_mu` only.
-   - `vtAllocPage` / `vtReadPage` / `vtWritePage` / `vtFreePage`: `freelist_mu` only.
-   - No path acquires `freelist_mu` first then `pending_free_mu`. Ordering is
-     globally consistent (`pending_free_mu` ≺ `freelist_mu`). No cycle, no deadlock. ✅
+### 3. tests/ 文件删除与 aggregator 清理 ✅
 
-4. **grace-period flush race (concern 3) — not a real hazard.** `applyBatch` step 0
-   (`writer.zig:251`) and step 9 flush only when `reader_count.load(.acquire)==0`.
-   Readers always snapshot the *current* `root` at `beginReadTxn` (`db.zig:227`);
-   `pending_free` holds pages freed by *already-committed* batches, which are not
-   reachable from the current root. If `reader_count==0`, no reader holds any old
-   root that could reference those pages; a reader beginning in the load→flush window
-   gets the new root and never traverses the freed pages. Safe. ✅
+- `tests/txn_writer_db/read_txn_borrowed_test.zig`: 整文件删除（159 行）。
+- `tests/core_format/zero_copy_test.zig`: 整文件删除（166 行）。
+- `tests/btree_storage/readtxn_fuzz.zig`: 整文件删除（269 行）。
+- `tests/txn_writer_db_test.zig:18`: import 行已移除。
+- `tests/core_format_test.zig:14`: import 行已移除。
+- `tests/btree_storage_test.zig:7`: import 行已移除。
 
-5. **`Db.compact` write_mutex (concern 4) — no self-deadlock.** `compact` is only
-   invoked externally (tests, bench, `db.compact()`); it is never called from
-   `applyBatch`, `WriteTxn.commit`, or any path already holding `write_mutex`
-   (`grep` confirms zero internal callers). `State.compact` does not touch
-   `write_mutex` itself, so no re-entrancy. The lock is a correct serialization
-   (compact and applyBatch both write meta). ✅
+### 4. binary_search_test 重写 ✅
 
-6. **Test preserved.** `tests/txn_test.zig` is byte-identical to base — name and
-   intent unchanged, not weakened/skipped. ✅
+- test 名称从 `"bsearch: getBorrowed on multi-level tree (depth 3+)"` 改为 `"bsearch: get on multi-level tree (depth 3+)"`。
+- 调用从 `btree.getBorrowed(s, root, k)` 改为 `btree.get(std.testing.allocator, s, root, k)`。
+- 命中路径正确添加 `std.testing.allocator.free(v.?);`（owned slice 释放）。
+- miss 路径类型从 `?[]const u8` 改为 `?[]u8`（匹配 `get()` 返回类型）。
+- 文件头注释 L2 同步更新：`get/getBorrowed` → `get`。
 
-7. **Docs updated.** `docs/architecture.md` reflects the mutex + stable-address
-   scheme. ✅
+### 5. build.zig 清理 ✅
 
-## Findings requiring changes
+- `read_txn_borrowed_test` 块（15 行）完整删除，包括 `addTest`、`addRunArtifact`、`dependOn`。
 
-### F1 — `ensurePage` partial-failure leaves `undefined` pointers → UB in `deinit` (real, latent)
-- **Location**: `src/page_store.zig:113-126` (`ensurePage`)
-- **Severity**: medium (latent — only triggers under OOM mid-loop, but it is a
-  correctness regression introduced by THIS commit)
-- **Detail**:
-  ```zig
-  try self.pages.appendNTimes(self.allocator, undefined, @as(usize, index) + 1 - old_len);
-  var i: usize = old_len;
-  while (i < self.pages.items.len) : (i += 1) {
-      self.pages.items[i] = try self.allocator.create([f2.PAGE_SIZE]u8);  // ← can fail
-      self.pages.items[i].* = [_]u8{0} ** f2.PAGE_SIZE;
-  }
-  ```
-  `appendNTimes` either appends all `n` slots or none (atomic on resize failure),
-  so on success `pages.items.len` is extended and slots `[old_len..new_len)` are
-  `undefined` pointers. If `allocator.create` fails at slot `k`, the function
-  returns the error, but `pages` still has length `new_len` with slots
-  `[k..new_len)` left as `undefined`. `deinit` then runs:
-  ```zig
-  for (self.pages.items) |p| self.allocator.destroy(p);  // destroy on undefined ptr = UB
-  ```
-  The *base* code stored pages by value (`[PAGE_SIZE]u8`), so a partial append
-  failure could not produce destroy-able dangling pointers — this UB is newly
-  introduced by the pointer-per-page change.
-- **Fix (minimal)**: on `create` failure, walk back and `destroy` the slots already
-  filled in this call, then `self.pages.shrinkRetainingCapacity(old_len)` (or
-  `truncate`) before returning the error:
-  ```zig
-  var i: usize = old_len;
-  while (i < self.pages.items.len) : (i += 1) {
-      self.pages.items[i] = self.allocator.create([f2.PAGE_SIZE]u8) catch {
-          var j: usize = old_len;
-          while (j < i) : (j += 1) self.allocator.destroy(self.pages.items[j]);
-          self.pages.shrinkRetainingCapacity(old_len);
-          return error.OutOfMemory;
-      };
-      self.pages.items[i].* = [_]u8{0} ** f2.PAGE_SIZE;
-  }
-  ```
+### 6. bench/ 清理 ✅
 
-### F2 — mutex added to the reader path (contract tension)
-- **Location**: `src/page_store.zig:148-154` (`vtReadPage`)
-- **Severity**: low-for-merge but must be acknowledged (contract rule 3)
-- **Detail**: the behavioral contract states: *"the fix must not add a lock to the
-  reader's hot path (`beginReadTxn`/`get`/`end`) beyond the existing atomic ops.
-  If you add a mutex to reads, that's a regression — don't."* The fix adds
-  `freelist_mu.lockUncancelable()` to `MemPageStore.vtReadPage`, which sits on the
-  `ReadTxn.get`/`getBorrowed` → `btree.get` → `store.readPage` hot path.
-- **Mitigating context**: the lock is *only* in `MemPageStore` (test-infra, per the
-  file's own doc-comment "测试用内存实现"). The production store (FilePageStore/mmap)
-  exposes page data at a stable mmap offset with no array mutation, so its
-  `readPage` needs no such lock. The lock here is *necessary* for MemPageStore
-  correctness: `ensurePage` can realloc the `pages.items` pointer-array backing
-  storage, and a concurrent reader's `pages.items[page_no]` index read would race
-  with that growth without the mutex. So removing it would reintroduce a (pointer-
-  array) data race.
-- **Why changes-requested, not approve**: the contract rule is stated absolutely.
-  A reviewer sign-off should either (a) get an explicit waiver from the conductor
-  that "MemPageStore test-infra mutex does not count as the reader-path lock the
-  contract forbids," or (b) document the carve-out in `docs/architecture.md` and
-  the task contract. As-is it is a literal contract violation. Recommend adding a
-  one-line note to `architecture.md` stating MemPageStore's readPage lock is
-  test-infra-only and the production FilePageStore read path remains lock-free.
+- `bench/bench_baseline.zig`: 基线条目 `.{ .name = "getBorrowed 100B", ... }` 已删除；测量分支 `else if (std.mem.eql(u8, name, "getBorrowed 100B"))` 整个分支已删除。
+- `bench/get_profile.zig`: `getBorrowed (no dupe)` 测量段已删除；分解逻辑简化为基于 `avg_get` 的估计输出（不再依赖 borrow 基准），脚本可编译运行且语义正确。
 
-### F3 — `State.deinit` mutates `pending_free` without `pending_free_mu` (minor, consistency)
-- **Location**: `src/writer.zig:115-117`
-- **Severity**: low (single-threaded teardown, not a live race, but breaks the
-  "single synchronized mutator" invariant the commit establishes)
-- **Detail**: `deinit` iterates `pending_free.items` and calls `freePage` without
-  holding `pending_free_mu`. Fine in practice (called post-join), but inconsistent
-  with the documented invariant. Either take the lock for symmetry or add a
-  `// ponytail: teardown post-join, no concurrent mutator` comment.
+### 7. docs/usage.md 更新 ✅
 
-## Notes (non-blocking)
+- §3.2 标题从「读：get / getBorrowed」改为「读：get」。
+- Zero-copy 读段落（原 L144-163）已删除。
+- 迁移说明已添加：说明 null 多义性原因及统一使用 `get()` / `ReadTxn.get()`。
 
-- The task's "Race A" (last-reader flush window) analysis turned out to be a red
-  herring at the MVCC-logical level: a new reader always snapshots the current
-  root, which never references `pending_free` pages. The actual crash was the
-  MemPageStore address-dangling (Race B-adjacent), correctly identified and fixed
-  in the commit message. No action needed — just recording that the logical MVCC
-  invariant ("never free a page a live reader can traverse") was already sound.
-- 20× no-crash loop was NOT run by this reviewer (machine crash constraint). The
-  commit message claims 10× clean; the tester/conductor must still run the 20×
-  acceptance loop per the done-definition.
+### 8. 不改文件清单 ✅
 
-## Required actions before approval
+以下文件在 diff 中无任何变更：
+- `docs/lecture_btree.html`
+- `docs/chronicle.md`
+- `README.md`
+- `review.md`
+- `benchcmp/COMPARISON.md`
+- `docs/test_gap_report.md`
 
-1. Fix F1 (ensurePage partial-failure rollback) — correctness regression, must fix.
-2. Resolve F2 (reader-path mutex contract tension) — either conductor waiver or a
-   docs note documenting the test-infra carve-out.
-3. (Optional) F3 comment for consistency.
+## 总结
 
-On F1 + F2 resolution, verdict flips to approve.
-
-## Follow-up: c740825 resolution (changes-requested → approve)
-
-Reviewed follow-up commit `c740825` on `fix/mvcc-race` (delta `f12136a..c740825`).
-Pure static reading only — 20× no-crash loop still not run by this reviewer
-(machine crash constraint); remains the tester/conductor gate.
-
-- **F1 RESOLVED ✅** — `src/page_store.zig:122-128` `ensurePage` now wraps
-  `allocator.create` in a `catch` that destroys slots `[old_len, i)` (exactly
-  the pages successfully allocated+zeroed in this call; the failed slot `i` is
-  *excluded* by the `j < i` bound, so no `destroy` on the `undefined` pointer)
-  and then `shrinkRetainingCapacity(old_len)` drops all undefined tail slots
-  `[i..new_len)`. Verified edge case `old_len == i` (failure on first slot):
-  rollback loop body never executes, shrink to `old_len`, no spurious destroys.
-  Subsequent `deinit` iterates only `[0..old_len)` → no UB. Correct.
-- **F2 RESOLVED ✅** — `docs/architecture.md` adds a note that `vtReadPage`'s
-  `freelist_mu` is test-infra-only (protects the pointer-array lookup against
-  `ensurePage` growth); the production FilePageStore(mmap) read path is
-  lock-free. This documents the carve-out, resolving the contract-tension.
-- **F3 SATISFIED ✅** — optional; the pre-existing comment
-  `// 释放剩余的 pending_free（safe: 写者线程结束，无读者）` (already present
-  at base `6834b7f`, `writer.zig:152`) conveys the teardown post-join /
-  no-concurrent-mutator rationale. Note: c740825's commit message claims a new
-  F3 comment but `src/writer.zig` was not actually modified in that commit;
-  however the substance is already present, so the optional F3 is met.
-
-All required changes addressed. Verdict: **approve**.
+所有契约条目均满足。删除干净，`get()` 零改动，测试重写正确处理 owned slice free，不改文件未被侵犯。
