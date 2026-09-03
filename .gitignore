@@ -2,6 +2,10 @@
 .claude/           # 团队任务契约共享路径（机器本地，不进 git）
 # 团队任务契约+状态（机器本地，不进 git；.agents/skills/ 除外）
 .agents/tasks/
+# 开发过程中的讨论/评审/测试流程文档（机器本地，不进 git）
+D-1-discussion.md
+review.md
+test-report.md
 *.db
 *.db.compact
 .cache_zig

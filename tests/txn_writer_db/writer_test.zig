@@ -191,12 +191,12 @@ test "writer: entry_count and byte_size updated correctly" {
     try std.testing.expectEqual(@as(u64, 0), state.entry_count.load(.acquire));
     try std.testing.expectEqual(@as(u64, 0), state.byte_size.load(.acquire));
 
-    // put "hello"="world" (5+5+9=19 bytes)
+    // put "hello"="world" (5+5+10=20 bytes; 开销 10 与 leafPayloadSize 对齐, T-26)
     var f1: zio.Future(wrt.OpResult) = .{};
     try state.applyBatch(&.{.{ .key = "hello", .value = "world", .tombstone = false, .future = &f1 }});
     _ = try f1.wait();
     try std.testing.expectEqual(@as(u64, 1), state.entry_count.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 19), state.byte_size.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 20), state.byte_size.load(.acquire));
 
     // delete "hello" (tombstone, but entry count should go to 0)
     var f2: zio.Future(wrt.OpResult) = .{};

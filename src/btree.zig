@@ -752,7 +752,8 @@ fn insertIntoLeaf(
     if (found) {
         // Overwrite: subtract old entry size
         const old_val_sz: usize = if (old_is_overflow) @as(usize, 4) else @as(usize, old_vlen);
-        live_delta -= @as(i64, @intCast(old_key_len + old_val_sz + 9));
+        // 固定开销 10 与 leafPayloadSize 对齐（tombstone 1 + klen 4 + vlen 4 + flags 1）
+        live_delta -= @as(i64, @intCast(old_key_len + old_val_sz + 10));
         if (!old_tombstone and tombstone) {
             count_delta = -1;
         } else if (old_tombstone and !tombstone) {
@@ -761,12 +762,8 @@ fn insertIntoLeaf(
     } else {
         if (!tombstone) count_delta = 1;
     }
-    live_delta += @as(i64, @intCast(key.len + (if (tombstone) @as(usize, 0) else value.len) + 9));
+    live_delta += @as(i64, @intCast(key.len + (if (tombstone) @as(usize, 0) else value.len) + 10));
 
-    // Free old overflow pages if overwriting an overflow entry
-    if (found and old_is_overflow) {
-        freeOverflowPages(store, old_overflow_page, dirty, allocator);
-    }
 
     // Determine new entry count
     const new_count: u16 = if (found) old_count else old_count + 1;
@@ -778,6 +775,30 @@ fn insertIntoLeaf(
     if (new_count > LEAF_MAX_ENTRIES) {
         // Split — fall back to decode/encode path
         return insertIntoLeafSplit(store, allocator, old_page_buf[0..], key, value, tombstone, dirty, found, live_delta, count_delta);
+    }
+
+    // Byte-budget precheck (T-26, issues/insert-into-leaf-fast-path-stack-overflow.md):
+    // 条数上限（LEAF_MAX_ENTRIES=32）不覆盖 payload 字节容量（PAGE_SIZE-24-4=4068B）。
+    // 31 条 ~130B 的合法满叶 + 1 条超限 entry 时 new_count 仍 ≤ 32，
+    // 下方栈缓冲拼接会越界 → fallback 到 split 路径。
+    // 口径与 leafPayloadSize 对齐：固定开销 10（tombstone 1 + klen 4 + vlen 4 + flags 1），
+    // 溢出 value 按 4B 页指针计。
+    {
+        const payload_cap = f2.PAGE_SIZE - f2.PAGE_HEADER_SIZE - 4;
+        const val_sz: usize = if (tombstone) 0 else (if (value.len > MAX_INLINE_VALUE) 4 else value.len);
+        const new_entry_sz = 10 + key.len + val_sz;
+        const tail_sz = entries_end - (if (found) entry_end else entry_start);
+        if (entry_start + new_entry_sz + tail_sz > payload_cap) {
+            return insertIntoLeafSplit(store, allocator, old_page_buf[0..], key, value, tombstone, dirty, found, live_delta, count_delta);
+        }
+    }
+
+    // Free old overflow pages if overwriting an overflow entry。
+    // 须在两个 fallback 判断之后：split 路径经 Leaf.fromPayload 已释放旧溢出链，
+    // 提前 free 会使同一批页号进 dirty 两次 → freelist 双重分配 → 页别名损坏
+    //（T-26 review 发现1）。只有真正走快路径才在此释放。
+    if (found and old_is_overflow) {
+        freeOverflowPages(store, old_overflow_page, dirty, allocator);
     }
 
     // Build new leaf payload in stack buffer (no heap allocation)
@@ -1061,7 +1082,7 @@ pub fn insert(
         try writeNodePage(store, new_page, f2.PAGE_TYPE_LEAF, 1, buf[0..pl]);
         return .{
             .new_root = new_page,
-            .live_delta = @intCast(key.len + (if (tombstone) @as(usize, 0) else value.len) + 9),
+            .live_delta = @intCast(key.len + (if (tombstone) @as(usize, 0) else value.len) + 10),
             .count_delta = if (tombstone) 0 else 1,
         };
     }
@@ -1166,7 +1187,7 @@ fn insertBatchFresh(
         var live: i64 = 0;
         var count: i64 = 0;
         for (entries) |e| {
-            live += @intCast(e.key.len + (if (e.tombstone) @as(usize, 0) else e.value.len) + 9);
+            live += @intCast(e.key.len + (if (e.tombstone) @as(usize, 0) else e.value.len) + 10);
             if (!e.tombstone) count += 1;
         }
         return .{ .new_root = new_page, .live_delta = live, .count_delta = count };
@@ -1204,7 +1225,7 @@ fn insertBatchSplitLeaves(
             try split_keys.append(allocator, entries[pos + chunk_len].key);
         }
         for (chunk) |e| {
-            live += @intCast(e.key.len + (if (e.tombstone) @as(usize, 0) else e.value.len) + 9);
+            live += @intCast(e.key.len + (if (e.tombstone) @as(usize, 0) else e.value.len) + 10);
             if (!e.tombstone) count += 1;
         }
         pos += chunk_len;
@@ -1350,7 +1371,7 @@ fn insertBatchIntoLeaf(
                     .key = try allocator.dupe(u8, new_e.key),
                     .value = if (new_e.tombstone) try allocator.dupe(u8, "") else try allocator.dupe(u8, new_e.value),
                 };
-                live_delta += @as(i64, @intCast(new_e.key.len + (if (new_e.tombstone) @as(usize, 0) else new_e.value.len) + 9));
+                live_delta += @as(i64, @intCast(new_e.key.len + (if (new_e.tombstone) @as(usize, 0) else new_e.value.len) + 10));
                 if (!new_e.tombstone) count_delta += 1;
                 mi += 1;
                 bi += 1;
@@ -1358,7 +1379,7 @@ fn insertBatchIntoLeaf(
             .eq => {
                 // Overwrite: batch entry wins (last write wins)
                 const old = old_e;
-                live_delta -= @as(i64, @intCast(old.key.len + old.value.len + 9));
+                live_delta -= @as(i64, @intCast(old.key.len + old.value.len + 10));
                 if (!old.tombstone and new_e.tombstone) count_delta -= 1;
                 if (old.tombstone and !new_e.tombstone) count_delta += 1;
                 // Free old entry's key/value (they're owned by leaf, which we'll deinit)
@@ -1376,7 +1397,7 @@ fn insertBatchIntoLeaf(
                     .key = try allocator.dupe(u8, new_e.key),
                     .value = if (new_e.tombstone) try allocator.dupe(u8, "") else try allocator.dupe(u8, new_e.value),
                 };
-                live_delta += @as(i64, @intCast(new_e.key.len + (if (new_e.tombstone) @as(usize, 0) else new_e.value.len) + 9));
+                live_delta += @as(i64, @intCast(new_e.key.len + (if (new_e.tombstone) @as(usize, 0) else new_e.value.len) + 10));
                 mi += 1;
                 oi += 1;
                 bi += 1;
@@ -1397,7 +1418,7 @@ fn insertBatchIntoLeaf(
             .key = try allocator.dupe(u8, new_e.key),
             .value = if (new_e.tombstone) try allocator.dupe(u8, "") else try allocator.dupe(u8, new_e.value),
         };
-        live_delta += @as(i64, @intCast(new_e.key.len + (if (new_e.tombstone) @as(usize, 0) else new_e.value.len) + 9));
+        live_delta += @as(i64, @intCast(new_e.key.len + (if (new_e.tombstone) @as(usize, 0) else new_e.value.len) + 10));
         if (!new_e.tombstone) count_delta += 1;
         mi += 1;
         bi += 1;
