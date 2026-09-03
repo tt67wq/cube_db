@@ -34,6 +34,12 @@ pub const PageStore = struct {
         readMeta: *const fn (ptr: *anyopaque) anyerror!?f2.MetaPage,
         /// 写 meta（交替写 meta0/meta1）
         writeMeta: *const fn (ptr: *anyopaque, meta: *const f2.MetaPage) anyerror!void,
+        /// 数据页区间落盘（fdatasync 语义）：把已 writePage 的数据页（不含 meta 页）
+        /// 刷到稳定存储。T-27 提交顺序：power_fail 档在 writeMeta 之前调用，
+        /// 保证 meta 指向的数据页先于（或至迟同时于）meta 页持久化——掉电不会
+        /// 恢复到指向悬垂页的 root。调用时 meta 页尚未写入，故此时刷盘的
+        /// dirty 页恰为本批数据页（见 FilePageStore 实现注释）。MemPageStore 为 no-op。
+        syncDataPages: *const fn (ptr: *anyopaque) anyerror!void,
         /// sync（fsync 到磁盘）
         sync: *const fn (ptr: *anyopaque) anyerror!void,
         /// mapsize（页数上限）
@@ -60,6 +66,10 @@ pub const PageStore = struct {
     }
     pub fn writeMeta(self: PageStore, meta: *const f2.MetaPage) !void {
         return self.vtable.writeMeta(self.ptr, meta);
+    }
+    /// 数据页区间落盘（fdatasync 语义，见 VTable.syncDataPages 契约注释）
+    pub fn syncDataPages(self: PageStore) !void {
+        return self.vtable.syncDataPages(self.ptr);
     }
     pub fn sync(self: PageStore) !void {
         return self.vtable.sync(self.ptr);
@@ -192,6 +202,11 @@ pub const MemPageStore = struct {
         _ = ptr;
     }
 
+    /// no-op：内存实现，无持久化语义（T-27）
+    fn vtSyncDataPages(ptr: *anyopaque) !void {
+        _ = ptr;
+    }
+
     fn vtMapSize(ptr: *anyopaque) u64 {
         const self: *MemPageStore = @ptrCast(@alignCast(ptr));
         return self.max_pages;
@@ -205,6 +220,7 @@ const mem_vtable: PageStore.VTable = .{
     .writePage = MemPageStore.vtWritePage,
     .readMeta = MemPageStore.vtReadMeta,
     .writeMeta = MemPageStore.vtWriteMeta,
+    .syncDataPages = MemPageStore.vtSyncDataPages,
     .sync = MemPageStore.vtSync,
     .mapsize = MemPageStore.vtMapSize,
 };

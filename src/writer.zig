@@ -86,9 +86,20 @@ pub const ProfileStats = struct {
     }
 };
 
+/// 持久化档位（T-27）：
+/// - `process_crash`（默认）：提交协议 = writeMeta + 单次 sync。进程崩溃
+///   （页缓存完好）模型下已安全且快——bench 主战场的默认行为。
+/// - `power_fail`：提交协议 = syncDataPages（数据页先落盘）→ writeMeta →
+///   sync（meta 落盘），两次 sync 换掉电正确性：meta 页到达稳定存储的
+///   时刻，其指向的数据页必已先于（或至迟同时）落盘。单条 put 延迟约
+///   翻倍，batch 摊销后可接受。此档下提交即双 sync（fsync=false 仅对
+///   process_crash 档有意义——用户自行 Db.sync() 的异步模式）。
+pub const Durability = enum { process_crash, power_fail };
+
 pub const Options = struct {
     fsync: bool = true,
     micro_batch: MicroBatchConfig = .{},
+    durability: Durability = .process_crash,
 };
 
 /// Micro-batching config: stage puts/deletes and commit in batches
@@ -432,10 +443,19 @@ pub const State = struct {
             .free_count = 0,
             .last_page = 0,
         };
+        // T-27 提交顺序：power_fail 档下，meta 写入前先把本批数据页刷到
+        // 稳定存储（fdatasync 语义），保证 meta 提交为持久的时刻，其指向的
+        // 数据页已先于（或至迟同时）落盘——掉电不会恢复到指向悬垂页的 root。
+        // process_crash 档保持旧行为（页缓存完好的进程崩溃模型下无需前置刷盘）。
+        if (self.opts.durability == .power_fail) {
+            try self.store.syncDataPages();
+        }
         try self.store.writeMeta(&meta);
 
-        // 6. fsync
-        if (self.opts.fsync) {
+        // 6. fsync（meta 落盘）。power_fail 档无条件 sync（提交即双 sync：
+        // 数据页先、meta 后——见上方 Durability 注释）；fsync=false 仅对
+        // process_crash 档有意义（异步 durability，用户自行 Db.sync()）。
+        if (self.opts.fsync or self.opts.durability == .power_fail) {
             try self.store.sync();
         }
         if (prof) ProfileStats.txn_meta_ns += @intCast(ProfileStats.now() - t_meta0);

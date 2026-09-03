@@ -6,6 +6,7 @@
 D-1-discussion.md
 review.md
 test-report.md
+docs/crash-model.md
 *.db
 *.db.compact
 .cache_zig

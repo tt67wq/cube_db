@@ -246,6 +246,37 @@ pub const FilePageStore = struct {
         if (c.fsync(self.fd) != 0) return error.SyncFailed;
     }
 
+    /// 数据页区间落盘（T-27）。语义调研与选择理由：
+    ///
+    /// 目标：writeMeta 之前把本批数据页（FIRST_DATA_PAGE..next_free-1，即 mmap 区
+    /// 中经 writePage 写脏的页）刷到稳定存储，建立「数据页先于 meta 页」的
+    /// 字节级提交顺序。
+    ///
+    /// 候选与取舍：
+    /// - `fdatasync(fd)`：macOS 有此符号，但 POSIX 语义允许不刷 inode 元数据。
+    ///   本引擎文件增长靠 `ftruncate`（ensureFileGrowth）——文件大小是 inode
+    ///   元数据。fdatasync 下可能出现「数据页字节已到盘但文件长度未持久」，
+    ///   超出旧 EOF 的数据页在掉电后不可达，而 meta 页（位于文件头部，不受
+    ///   长度影响）可能已持久 → 恰是要防止的悬垂 root。故不用。
+    /// - `msync(MS_SYNC)` 页区间：可精确到 [FIRST_DATA_PAGE, next_free) 页区间，
+    ///   但同样不保证 ftruncate 的长度元数据落盘，仍需补一次 fsync ——
+    ///   两次系统调用无收益。
+    /// - `fsync(fd)`（选用）：刷数据 + inode 元数据（含 ftruncate 后的长度）。
+    ///   调用时 writeMeta 尚未执行（meta 页在 mmap 中仍是干净的——上次
+    ///   sync 已将其落盘），故此刻 fsync 刷掉的 dirty 页恰为本批数据页，
+    ///   meta 页不可能搭车提前落盘。顺序由此建立，而非依赖运气。
+    ///
+    /// 已知边界（如实记录，不在此修）：macOS 的 fsync 历史上不保证刷透磁盘
+    /// 控制器缓存（需 F_FULLFSYNC）。本实现与既有 vtSync 使用同一原语，
+    /// 「数据页先于 meta」的相对顺序在两种原语下均成立；控制器缓存层面的
+    /// 绝对掉电安全（F_FULLFSYNC）是更高代价的独立选项，见 docs/crash-model.md。
+    fn vtSyncDataPages(ptr: *anyopaque) !void {
+        const self: *FilePageStore = @ptrCast(@alignCast(ptr));
+        // 数据页区间：FIRST_DATA_PAGE..next_free-1（本批 writePage 可能触及的
+        // 全部页；freelist 复用页亦在该 bump 上限内）。调用时 meta 页未写。
+        if (c.fsync(self.fd) != 0) return error.SyncFailed;
+    }
+
     fn vtMapSize(ptr: *anyopaque) u64 {
         const self: *FilePageStore = @ptrCast(@alignCast(ptr));
         return self.region_size / PAGE_SIZE;
@@ -259,6 +290,7 @@ const file_vtable: ps.PageStore.VTable = .{
     .writePage = FilePageStore.vtWritePage,
     .readMeta = FilePageStore.vtReadMeta,
     .writeMeta = FilePageStore.vtWriteMeta,
+    .syncDataPages = FilePageStore.vtSyncDataPages,
     .sync = FilePageStore.vtSync,
     .mapsize = FilePageStore.vtMapSize,
 };

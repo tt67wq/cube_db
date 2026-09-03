@@ -110,6 +110,11 @@ const MemPageStore = struct {
         // MemPageStore sync 是空操作
     }
 
+    fn vtSyncDataPages(ptr: *anyopaque) !void {
+        _ = ptr;
+        // MemPageStore syncDataPages 是空操作（T-27：内存实现无持久化语义）
+    }
+
     fn vtMapSize(ptr: *anyopaque) u64 {
         const self: *MemPageStore = @ptrCast(@alignCast(ptr));
         return self.max_pages;
@@ -123,6 +128,7 @@ const mem_vtable: ps.PageStore.VTable = .{
     .writePage = MemPageStore.vtWritePage,
     .readMeta = MemPageStore.vtReadMeta,
     .writeMeta = MemPageStore.vtWriteMeta,
+    .syncDataPages = MemPageStore.vtSyncDataPages,
     .sync = MemPageStore.vtSync,
     .mapsize = MemPageStore.vtMapSize,
 };

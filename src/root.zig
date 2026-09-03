@@ -12,6 +12,7 @@ pub const crc32_hw = @import("crc32_hw.zig");
 pub const Db = db.Db;
 pub const Entry = db.Entry;
 pub const Options = writer.Options;
+pub const Durability = writer.Durability;
 pub const WriteTxn = db.WriteTxn;
 pub const ReadTxn = db.ReadTxn;
 

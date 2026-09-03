@@ -15,4 +15,5 @@ comptime {
     _ = @import("crash_insertbatch_pb/pb_fps_ordered_test.zig");
     _ = @import("crash_insertbatch_pb/pb_fps_scale_test.zig");
     _ = @import("crash_insertbatch_pb/crash_meta_midwrite_test.zig");
+    _ = @import("crash_insertbatch_pb/durability_order_test.zig");
 }
