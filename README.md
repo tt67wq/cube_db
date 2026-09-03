@@ -16,7 +16,7 @@ with freelist page reuse, no WAL, crash-safe via atomic meta-page switch.
 - **Async/sync durability** — `Options{fsync}` (default sync-on-commit) + explicit `Db.sync()` for async mode
 - Pure synchronous API — no runtime setup needed
 
-**Usage manual: [`docs/usage.md`](docs/usage.md).** · **Benchmark data: [`bench/results/`](bench/results/).**
+**Usage manual: [`docs/usage.en.md`](docs/usage.en.md).** · **Chinese: [`docs/usage.md`](docs/usage.md).** · **Benchmark data: [`bench/results/`](bench/results/).**
 
 ## Dependencies
 
@@ -68,7 +68,7 @@ defer if (v) |val| allocator.free(val);
 ```
 
 For file-backed usage (`FilePageStore` — LMDB-style 1TB reserved mmap region),
-full API, and recipes see **[docs/usage.md](docs/usage.md)**.
+full API, and recipes see **[docs/usage.en.md](docs/usage.en.md)**.
 
 ## Benchmark
 
@@ -135,7 +135,8 @@ cube_db/
 ├── build.zig              # Build script
 ├── build.zig.zon          # Package metadata
 ├── docs/
-│   ├── usage.md           # Usage manual
+│   ├── usage.md           # Usage manual (Chinese)
+│   ├── usage.en.md        # Usage manual (English)
 │   ├── fuzz-testing.md    # Fuzz testing guide
 │   └── tutorial/          # Tutorial (5 chapters)
 ├── src/

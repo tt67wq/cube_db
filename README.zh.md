@@ -16,7 +16,7 @@
 - **异步/同步持久化** — `Options{fsync}`（默认 commit 即 fsync）+ async 模式下显式 `Db.sync()`
 - 纯同步 API，无需准备 runtime
 
-**使用手册：[`docs/usage.md`](docs/usage.md)。** · **Benchmark 数据：[`bench/results/`](bench/results/)。**
+**使用手册：[`docs/usage.md`](docs/usage.md)。** · **英文版：[`docs/usage.en.md`](docs/usage.en.md)。** · **Benchmark 数据：[`bench/results/`](bench/results/)。**
 
 > 英文版见 [README.md](README.md)。
 
@@ -118,7 +118,8 @@ cube_db/
 ├── build.zig              # 构建脚本
 ├── build.zig.zon          # 包元信息
 ├── docs/
-│   ├── usage.md           # 使用手册
+│   ├── usage.md           # 使用手册（中文）
+│   ├── usage.en.md        # 使用手册（英文）
 │   ├── fuzz-testing.md    # fuzz 测试指南
 │   └── tutorial/          # 教程（5 章）
 ├── src/
