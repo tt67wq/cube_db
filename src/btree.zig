@@ -132,14 +132,18 @@ fn writeOverflowPages(store: PageStore, value: []const u8) !u32 {
     return first_page;
 }
 
-/// 读溢出页链，返回值（调用方 free）
+/// 读溢出页链，返回值（调用方 free）。CRC 收敛（T-29 Phase B，N1 统一）：链页
+/// 读取与 getInto/迭代器一致走 readNodePayloadFast——正常读路径全部跳过 CRC
+/// （COW 保证已发布页不被原地修改）；CRC 保留在写路径读取与恢复/审计
+/// （readNodePayload 公开 API）。原实现链读带 CRC、下降不带，同一次 get 内
+/// 两种口径且与 getInto 可观测行为不一致（review N1），现统一为 fast。
 fn readOverflowValue(allocator: std.mem.Allocator, store: PageStore, first_page: u32, vlen: u32) ![]u8 {
     const result = try allocator.alloc(u8, vlen);
     errdefer allocator.free(result);
     var offset: usize = 0;
     var cur = first_page;
     while (cur != 0 and offset < vlen) {
-        const payload = try readNodePayload(store, cur);
+        const payload = try readNodePayloadFast(store, cur);
         const chunk = @min(vlen - offset, payload.len);
         @memcpy(result[offset..][0..chunk], payload[0..chunk]);
         offset += chunk;
@@ -495,6 +499,104 @@ fn findInLeaf(allocator: std.mem.Allocator, store: PageStore, payload: []const u
         }
     }
     return null;
+}
+
+// ===== getInto（T-29 Phase A：无拷贝读）=====
+
+/// 无拷贝点查：把 key 对应 value 拷入调用方 buffer，返回写入字节数。
+/// - key 不存在（或 tombstone）→ null（null 语义唯一保留给“不存在”，
+///   与 T-23 移除 borrowed API 时的 null 多义性彻底解耦）。
+/// - buffer 太小 → error.BufferTooSmall，且 buffer 内容不被写入/清空
+///   （调用方可安全换大 buffer 重试）。
+/// 与 get() 共享 readNodePayloadFast 下降路径（跳过 CRC，COW 保证读到的
+/// 已发布页不被原地修改；CRC 收敛到恢复/审计路径是既定取舍，见 T-27/T-29 背景）。
+pub fn getInto(store: PageStore, root: u32, key: []const u8, buffer: []u8) !?usize {
+    if (root == NULL_ROOT) return null;
+    var cur = root;
+    var depth: u32 = 0;
+    while (depth < 1000) : (depth += 1) {
+        const payload = try readNodePayloadFast(store, cur);
+        if (payload.len == 0) return error.Truncated;
+        if (payload[0] == LEAF_KIND) {
+            return findInLeafInto(store, payload, key, buffer);
+        } else {
+            cur = try findInBranchPayload(payload, key);
+        }
+    }
+    return error.Truncated;
+}
+
+/// findInLeaf 的无拷贝变体：叶内扫描与 findInLeaf 同构（同款逐 entry 定长头
+/// 线性序扫描，保持两路径行为一致），命中时不 dupe 而是直接拷入 buffer；
+/// buffer 不足在任何写入前拦截（无部分写入，失败时 buffer 原样）。
+fn findInLeafInto(store: PageStore, payload: []const u8, key: []const u8, buffer: []u8) !?usize {
+    if (payload.len < 3) return error.Truncated;
+    if (payload[0] != LEAF_KIND) return error.CorruptCrc;
+    const count = std.mem.readInt(u16, payload[1..3], .little);
+    var pos: usize = 3;
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        if (pos + 1 + 4 > payload.len) return error.Truncated;
+        const tombstone = payload[pos] == 1;
+        pos += 1;
+        const klen = std.mem.readInt(u32, payload[pos..][0..4], .little);
+        pos += 4;
+        if (pos + klen > payload.len) return error.Truncated;
+        const ek = payload[pos .. pos + klen];
+        pos += klen;
+        if (pos + 4 > payload.len) return error.Truncated;
+        const vlen = std.mem.readInt(u32, payload[pos..][0..4], .little);
+        pos += 4;
+        if (pos + 1 > payload.len) return error.Truncated;
+        const flags = payload[pos];
+        pos += 1;
+        switch (cmpKey(ek, key)) {
+            .lt => {
+                // skip value for non-matching key（与 findInLeaf 同构）
+                if (flags & LEAF_FLAG_OVERFLOW == 0) {
+                    if (pos + vlen > payload.len) return error.Truncated;
+                    pos += vlen;
+                } else {
+                    if (pos + 4 > payload.len) return error.Truncated;
+                    pos += 4;
+                }
+                continue;
+            },
+            .eq => {
+                if (tombstone) return null;
+                if (buffer.len < vlen) return error.BufferTooSmall; // 任何写入前拦截
+                if (flags & LEAF_FLAG_OVERFLOW != 0) {
+                    const ov_page = std.mem.readInt(u32, payload[pos..][0..4], .little);
+                    try readOverflowValueInto(store, ov_page, buffer[0..vlen]);
+                    return @as(usize, vlen);
+                }
+                if (pos + vlen > payload.len) return error.Truncated;
+                const ev = payload[pos .. pos + vlen];
+                @memcpy(buffer[0..vlen], ev);
+                return @as(usize, vlen);
+            },
+            .gt => return null,
+        }
+    }
+    return null;
+}
+
+/// readOverflowValue 的无拷贝变体：溢出链逐页拷入调用方 buffer（不再先
+/// alloc 整块再 memcpy 一次）。链页读取走 readNodePayloadFast（跳过 CRC，
+/// 与 get 下降路径同款取舍：COW 下已发布页不被原地修改）。vlen 由叶内
+/// entry 给出，buffer.len == vlen 已由调用方保证。
+fn readOverflowValueInto(store: PageStore, first_page: u32, buffer: []u8) !void {
+    var offset: usize = 0;
+    var cur = first_page;
+    while (cur != 0 and offset < buffer.len) {
+        const payload = try readNodePayloadFast(store, cur);
+        const chunk = @min(buffer.len - offset, payload.len);
+        @memcpy(buffer[offset..][0..chunk], payload[0..chunk]);
+        offset += chunk;
+        const page = try store.readPage(cur);
+        const hdr = f2.decodePageHeader(page[0..f2.PAGE_HEADER_SIZE]);
+        cur = hdr.free_next;
+    }
 }
 
 fn findInBranchPayload(payload: []const u8, key: []const u8) !u32 {
@@ -1694,114 +1796,244 @@ fn insertBatchIntoBranch(
     return .{ .new_child = left_page, .split_key = up_key, .split_right = right_page, .live_delta = live_delta, .count_delta = count_delta };
 }
 
-// ===== 范围迭代器 =====
+// ===== 范围迭代器（T-29 Phase B：借用化）=====
 
+/// 借用契约（T-29 Phase B，调用方必读）：
+/// 1. `next()` 返回的 entry 的 key/value 均为借用切片——仅在下一次 `next()` 或
+///    `deinit()` 前有效。内联 value/key 借自叶 payload；溢出 value 经迭代器内部
+///    复用缓冲拼接（连续溢出条目时前一 entry 的 value 会被新条目覆盖——这是
+///    可观察的失效面，契约测试锁定）。
+/// 2. 迭代器生命周期 pin 住读快照：`Db.select`/`ReadTxn.select` 创建的迭代器
+///    持有 MVCC 读者名额，COW 脏页延迟到 `deinit()`（末位读者）才回收——
+///    迭代中途的写者提交不影响已借用的页。直接用 `btree.select`（raw 页存储层）
+///    时无 pin，调用方自行保证 Store 稳定性（页不被回收/改写）。
+/// 3. 下推栈 O(深度)：每帧仅页号+子游标（定长数组，无每节点 dupe 副本）；
+///    内联值扫描零分配，溢出值仅首个条目惰性分配一次复用缓冲。
 pub const Iterator = struct {
     allocator: std.mem.Allocator,
     store: PageStore,
     min: ?[]const u8,
     max: ?[]const u8,
-    stack: std.ArrayList(StackFrame),
-    cur_leaf: ?Leaf,
-    cur_pos: usize,
+    /// 下推栈：定长数组（无 ArrayList 增长分配）。
+    frames: [MAX_DEPTH]Frame,
+    depth: usize,
+    /// 当前叶的借用 payload（readNodePayloadFast）。
+    leaf_payload: ?[]const u8,
+    /// 叶内 entry 总数与字节游标。
+    leaf_count: usize,
+    leaf_pos: usize,
+    /// 已解析 entry 序号（0..leaf_count）。
+    entry_i: usize,
+    /// 溢出值拼接缓冲：惰性分配、跨 entry 复用（借用契约的可观察失效面）。
+    ov_buf: std.ArrayList(u8),
+    /// MVCC pin（可选）：deinit 时回调。由 db.zig 注入（btree 层不依赖 wrt.State）。
+    pin_ctx: ?*anyopaque = null,
+    pin_deinit: ?*const fn (*anyopaque) void = null,
 
-    const StackFrame = struct {
-        branch: Branch,
-        child_idx: usize,
-    };
+    /// ponytail: 定长下推栈。4KB 页/32 路扇出下 1TB ≈ 深度 7，64 绰绰有余；
+    /// 超深树（病态小扇出）会在此报错而非静默截断。
+    const MAX_DEPTH: usize = 64;
+
+    const Frame = struct { page_no: u32, child_idx: usize };
 
     pub fn deinit(self: *Iterator) void {
-        for (self.stack.items) |*fr| fr.branch.deinit();
-        self.stack.deinit(self.allocator);
-        if (self.cur_leaf) |*l| l.deinit();
+        if (self.pin_deinit) |f| {
+            if (self.pin_ctx) |c| f(c);
+            self.pin_ctx = null;
+        }
+        self.ov_buf.deinit(self.allocator);
+    }
+
+    /// 叶内待解析的 entry 视图（借用）。
+    const EntryView = struct {
+        tombstone: bool,
+        key: []const u8,
+        vlen: usize,
+        flags: u8,
+        value_pos: usize,
+    };
+
+    /// 从 pos 解析 entry 头（不动游标；advance() 推进）。
+    /// 与 findInLeafInto 的逐 entry 解析同构，保持两路径行为一致。
+    fn peekEntry(payload: []const u8, pos: usize) !EntryView {
+        if (pos + 1 + 4 > payload.len) return error.Truncated;
+        const tombstone = payload[pos] == 1;
+        const klen = std.mem.readInt(u32, payload[pos + 1 ..][0..4], .little);
+        if (pos + 1 + 4 + klen > payload.len) return error.Truncated;
+        const koff = pos + 1 + 4;
+        if (koff + klen + 4 + 1 > payload.len) return error.Truncated;
+        const vlen = std.mem.readInt(u32, payload[koff + klen ..][0..4], .little);
+        const flags = payload[koff + klen + 4];
+        return .{
+            .tombstone = tombstone,
+            .key = payload[koff .. koff + klen],
+            .vlen = vlen,
+            .flags = flags,
+            .value_pos = koff + klen + 4 + 1,
+        };
+    }
+
+    /// 游标推进到 entry 末尾（value 区长度按 flags 分派：溢出 4B 指针 / 内联 vlen）。
+    fn advance(self: *Iterator) void {
+        const payload = self.leaf_payload.?;
+        const ev = peekEntry(payload, self.leaf_pos) catch return;
+        self.leaf_pos = ev.value_pos + (if (ev.flags & LEAF_FLAG_OVERFLOW != 0) @as(usize, 4) else ev.vlen);
+        self.entry_i += 1;
     }
 
     pub fn next(self: *Iterator) !?LeafEntry {
         while (true) {
-            if (self.cur_leaf) |*leaf| {
-                while (self.cur_pos < leaf.entries.len) : (self.cur_pos += 1) {
-                    const e = leaf.entries[self.cur_pos];
-                    if (e.tombstone) continue;
+            if (self.leaf_payload) |payload| {
+                while (self.entry_i < self.leaf_count) {
+                    const ev = try peekEntry(payload, self.leaf_pos);
+                    self.advance(); // 游标先推进：return/continue 均已消费本 entry
+                    if (ev.tombstone) continue;
                     if (self.min) |m| {
-                        if (cmpKey(e.key, m) == .lt) continue;
+                        if (cmpKey(ev.key, m) == .lt) continue;
                     }
                     if (self.max) |mx| {
-                        if (cmpKey(e.key, mx) != .lt) return null;
+                        if (cmpKey(ev.key, mx) != .lt) return null;
                     }
-                    self.cur_pos += 1;
-                    return e;
+                    if (ev.flags & LEAF_FLAG_OVERFLOW != 0) {
+                        // 溢出值：链拼接进复用缓冲（借用契约：下次 next 覆盖）
+                        const ov_page = std.mem.readInt(u32, payload[ev.value_pos..][0..4], .little);
+                        self.ov_buf.clearRetainingCapacity();
+                        try self.ov_buf.resize(self.allocator, ev.vlen);
+                        try readOverflowValueInto(self.store, ov_page, self.ov_buf.items);
+                        return .{ .tombstone = false, .key = ev.key, .value = self.ov_buf.items };
+                    }
+                    if (ev.value_pos + ev.vlen > payload.len) return error.Truncated;
+                    return .{ .tombstone = false, .key = ev.key, .value = payload[ev.value_pos .. ev.value_pos + ev.vlen] };
                 }
-                leaf.deinit();
-                self.cur_leaf = null;
+                self.leaf_payload = null;
             }
-            if (!try self.descendToNextLeaf()) return null;
+            if (!try self.stepToNextLeaf()) return null;
         }
     }
 
-    fn descendToNextLeaf(self: *Iterator) !bool {
-        while (self.stack.items.len > 0) {
-            const top_i = self.stack.items.len - 1;
-            self.stack.items[top_i].child_idx += 1;
-            const ci = self.stack.items[top_i].child_idx;
-            if (ci < self.stack.items[top_i].branch.children.len) {
-                var cur = self.stack.items[top_i].branch.children[ci];
-                var depth: u32 = 0;
-                while (depth < 1000) : (depth += 1) {
-                    const payload = try readNodePayload(self.store, cur);
-                    if (payload[0] == LEAF_KIND) {
-                        var _leaf_dirty = std.ArrayList(u32).empty;
-                        defer _leaf_dirty.deinit(self.allocator);
-                        self.cur_leaf = try Leaf.fromPayload(self.allocator, self.store, payload, &_leaf_dirty);
-                        self.cur_pos = 0;
-                        return true;
-                    } else {
-                        const br = try Branch.fromPayload(self.allocator, payload);
-                        const first_child = br.children[0];
-                        try self.stack.append(self.allocator, .{ .branch = br, .child_idx = 0 });
-                        cur = first_child;
-                    }
-                }
-                return false;
-            } else {
-                if (self.stack.pop()) |fr| {
-                    var f = fr;
-                    f.branch.deinit();
-                }
+    /// 向右步进到下一个叶：栈顶 child_idx+1，取该 child 的最左叶路径。
+    fn stepToNextLeaf(self: *Iterator) !bool {
+        while (self.depth > 0) {
+            const top = &self.frames[self.depth - 1];
+            top.child_idx += 1;
+            const br = try readBranchChildren(self.store, top.page_no);
+            if (top.child_idx < br.count) {
+                const child = std.mem.readInt(u32, br.payload[br.children_offset + top.child_idx * 4 ..][0..4], .little);
+                return try self.descendLeftmost(child);
             }
+            self.depth -= 1; // pop（定长数组，无 free）
         }
         return false;
     }
+
+    /// 沿 child[0] 一路下降到叶（中途压栈，child_idx=0）。
+    fn descendLeftmost(self: *Iterator, page_no: u32) !bool {
+        var cur = page_no;
+        var guard: u32 = 0;
+        while (guard < 1000) : (guard += 1) {
+            const payload = try readNodePayloadFast(self.store, cur);
+            if (payload.len == 0) return error.Truncated;
+            if (payload[0] == LEAF_KIND) {
+                try self.loadLeaf(payload);
+                return true;
+            }
+            const br = try branchChildren(payload);
+            if (br.count == 0) return error.Truncated;
+            if (self.depth >= MAX_DEPTH) return error.Truncated;
+            const child = std.mem.readInt(u32, br.payload[br.children_offset..][0..4], .little);
+            self.frames[self.depth] = .{ .page_no = cur, .child_idx = 0 };
+            self.depth += 1;
+            cur = child;
+        }
+        return error.Truncated;
+    }
+
+    fn loadLeaf(self: *Iterator, payload: []const u8) !void {
+        if (payload.len < 3) return error.Truncated;
+        if (payload[0] != LEAF_KIND) return error.CorruptCrc;
+        self.leaf_payload = payload;
+        self.leaf_count = std.mem.readInt(u16, payload[1..3], .little);
+        self.leaf_pos = 3;
+        self.entry_i = 0;
+    }
+
+    const BranchView = struct {
+        payload: []const u8,
+        count: usize,
+        children_offset: usize,
+    };
+
+    /// 读取 branch 页并跳过 keys 区（无解码副本、无 key dupe）。
+    fn readBranchChildren(store: PageStore, page_no: u32) !BranchView {
+        const payload = try readNodePayloadFast(store, page_no);
+        return try branchChildren(payload);
+    }
 };
 
+/// 解析 branch payload 头：count + children 区字节偏移（跳过 count-1 个 key）。
+fn branchChildren(payload: []const u8) !Iterator.BranchView {
+    if (payload.len < 3) return error.Truncated;
+    if (payload[0] != BRANCH_KIND) return error.CorruptCrc;
+    const count: usize = std.mem.readInt(u16, payload[1..3], .little);
+    var pos: usize = 3;
+    var i: usize = 0;
+    while (i + 1 < count) : (i += 1) {
+        if (pos + 4 > payload.len) return error.Truncated;
+        const klen = std.mem.readInt(u32, payload[pos..][0..4], .little);
+        pos += 4;
+        if (pos + klen > payload.len) return error.Truncated;
+        pos += klen;
+    }
+    if (pos + 4 * count > payload.len) return error.Truncated;
+    return .{ .payload = payload, .count = count, .children_offset = pos };
+}
+
+/// 范围查询（借用化）：返回借用迭代器（见 Iterator 借用契约）。
+/// raw 页存储层调用方自行保证 Store 稳定性；Db/ReadTxn 层由 db.zig 注入 MVCC pin。
 pub fn select(allocator: std.mem.Allocator, store: PageStore, root: u32, min: ?[]const u8, max: ?[]const u8) !Iterator {
     var it: Iterator = .{
         .allocator = allocator,
         .store = store,
         .min = min,
         .max = max,
-        .stack = .empty,
-        .cur_leaf = null,
-        .cur_pos = 0,
+        .frames = undefined,
+        .depth = 0,
+        .leaf_payload = null,
+        .leaf_count = 0,
+        .leaf_pos = 0,
+        .entry_i = 0,
+        .ov_buf = .empty,
     };
     if (root == NULL_ROOT) return it;
     var cur = root;
-    var depth: u32 = 0;
-    var _leaf_dirty = std.ArrayList(u32).empty;
-    defer _leaf_dirty.deinit(allocator);
-    while (depth < 1000) : (depth += 1) {
-        const payload = try readNodePayload(store, cur);
+    var guard: u32 = 0;
+    while (guard < 1000) : (guard += 1) {
+        // CRC 收敛取舍（T-29 Phase B）：正常读路径（get/getInto/迭代器）统一
+        // readNodePayloadFast 跳过 CRC；CRC 保留在写路径读取与恢复/审计
+        // （readNodePayload 公开 API）。COW 保证已发布页不被原地修改。
+        const payload = try readNodePayloadFast(store, cur);
+        if (payload.len == 0) return error.Truncated;
         if (payload[0] == LEAF_KIND) {
-            it.cur_leaf = try Leaf.fromPayload(allocator, store, payload, &_leaf_dirty);
-            it.cur_pos = 0;
+            try it.loadLeaf(payload);
             break;
-        } else {
-            var br = try Branch.fromPayload(allocator, payload);
-            var ci: usize = 0;
-            if (min) |m| ci = br.findChild(m);
-            const next = br.children[ci];
-            try it.stack.append(allocator, .{ .branch = br, .child_idx = ci });
-            cur = next;
         }
+        // min 路由：复用 findChildIdxAndOffset（与 get 同款分支下降语义）
+        var ci: usize = 0;
+        var children_offset: usize = undefined;
+        if (min) |m| {
+            const r = try findChildIdxAndOffset(payload, m);
+            ci = r.idx;
+            children_offset = r.children_offset;
+        } else {
+            const br = try branchChildren(payload);
+            children_offset = br.children_offset;
+        }
+        if (children_offset + 4 > payload.len) return error.Truncated;
+        const next = std.mem.readInt(u32, payload[children_offset + ci * 4 ..][0..4], .little);
+        if (it.depth >= Iterator.MAX_DEPTH) return error.Truncated;
+        it.frames[it.depth] = .{ .page_no = cur, .child_idx = ci };
+        it.depth += 1;
+        cur = next;
     }
     return it;
 }

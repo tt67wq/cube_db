@@ -141,8 +141,27 @@ if (v) |value| {
 - 非 null 的 value 是新分配的拷贝，必须 `free`。
 - get 无锁、无 fsync，读原子 root 快照。
 - **读路径优化**：跳过 CRC 校验，get 100B ~2.7µs（接近 LMDB 级）
+- **高频读选型**：逐次 alloc/free 有成本，热路径（缓存/索引层）用 `getInto`（见 3.2.1）。
 
-> **迁移说明**：零拷贝 borrowed 读 API（Db 层与 ReadTxn 层）已于 T-23 移除 — 其 null 返回值存在多义性（溢出值 / 墓碑 / 不存在三种语义不可区分）。读取统一用 `get()` / `ReadTxn.get()`。
+#### 3.2.1 无拷贝读：getInto（T-29）
+
+```zig
+var buf: [4096]u8 = undefined; // 调用方持有 buffer，可复用
+const n = (try db.getInto("hello", &buf)) orelse return; // null = key 不存在
+std.debug.print("hello = {s}\n", .{buf[0..n]});
+```
+
+- `getInto(key, buffer) !?usize`：value 拷入 buffer，返回写入字节数；
+  `ReadTxn.getInto` 同款（快照 pin 于 txn root）。
+- `null` 唯一保留给 **key 不存在**（含 tombstone）——与 T-23 移除的旧 borrowed
+  API 的 null 多义性彻底解耦（拷贝语义，无借用失效来源）。
+- buffer 不足返回 `error.BufferTooSmall`，且 **buffer 不被写入/不清空**（无部分
+  写入，可安全换大 buffer 重试）。
+- 精确边界：buffer 恰好等长成功；溢出值（>3800B）经溢出页链逐页直拷，
+  与 get() 逐字节一致。
+- 全链路零分配：分配权归调用方，高频读摆脱 per-call alloc/free。
+
+> **迁移说明**：零拷贝 borrowed 读 API（Db 层与 ReadTxn 层）已于 T-23 移除 — 其 null 返回值存在多义性（溢出值 / 墓碑 / 不存在三种语义不可区分）。T-29 以 `getInto`（拷贝入调用方 buffer + 显式 BufferTooSmall 错误）解决同一问题：null 语义唯一，分配权归调用方。读取可用 `get()` / `getInto()`，语义等价、性能特性不同。
 
 ### 3.3 写：put / putBatch / delete / flush
 
@@ -262,7 +281,18 @@ while (try it.next()) |entry| {
 - 区间是 **[min, max)**：min 包含、max 不包含。
 - `null` 表示无界：`db.select(null, null)` 遍历全部。
 - 自动跳过 tombstone。
-- `entry.key`/`entry.value` 借用迭代器内部缓冲，**下次 `next()` 后失效**。
+- **借用契约（T-29 Phase B）**：`entry.key`/`entry.value` 为借用切片，**仅到
+  下次 `next()` 或 `deinit()` 前有效**。内联 value/key 直接借自 mmap 页（零拷贝）；
+  溢出 value（>3800B）经迭代器内部复用缓冲拼接——连续迭代溢出条目时，前一
+  entry 的 value 会被新条目覆盖（借用契约的可观察面）。
+- **快照 pin（T-29 Phase B）**：迭代器生命周期持有 MVCC 读者名额——迭代中途
+  写者提交（COW）不影响已借用页，迭代器始终看到 select 时刻的快照；脏页延迟
+  到 `deinit()`（末位读者退出）才回收。**忘记 deinit 会滞留读者名额**（脏页
+  不回收、`dirt` 计数不降），务必 `defer it.deinit()`。`ReadTxn.select` 的
+  迭代器持有独立 pin（与 txn 的 pin 可叠加），同样须 deinit。
+- 直接用 `btree.select`（raw 页存储层）时无 pin，调用方自行保证 Store 稳定性。
+- 扫描性能（T-29 Phase B 借用化）：下推栈 O(深度)（无每节点 dupe 副本），
+  内联值扫描零分配，溢出值每迭代器惰性分配一次复用缓冲。
 
 保留 entry 内容：
 
@@ -407,6 +437,7 @@ defer db.close();
 
 // 读
 const v = try db.get(key);            // !?[]u8，调用方 free
+const n = (try db.getInto(key, &buf)) orelse 0; // !?usize 零拷贝入 buf；null=key 不存在
 
 // 写
 try db.put(key, value);               // 单条
@@ -416,7 +447,7 @@ try db.delete(key);                   // tombstone
 // 范围 [min, max)
 var it = try db.select(min, max);     // min/max 可 null
 defer it.deinit();
-while (try it.next()) |e| { /* e.key, e.value 借用 */ }
+while (try it.next()) |e| { /* e.key, e.value 借用，next() 后失效；it pin 快照，勿忘 deinit */ }
 
 // 压缩
 try db.compact();                     // O(1) meta 切换

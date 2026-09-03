@@ -200,9 +200,31 @@ pub const Db = struct {
         return try btree.get(self.allocator, self.store, root, key);
     }
 
-    pub fn select(self: *Db, min: ?[]const u8, max: ?[]const u8) !btree.Iterator {
+    /// 无拷贝点查（T-29 Phase A）：value 拷入调用方 buffer，返回写入字节数；
+    /// key 不存在 → null；buffer 不足 → error.BufferTooSmall（buffer 不被写入/清空）。
+    /// 高频读调用方（缓存/索引层）用它摆脱 get() 的 per-call alloc/free。
+    pub fn getInto(self: *Db, key: []const u8, buffer: []u8) !?usize {
         const root = self.state.getRoot();
-        return try btree.select(self.allocator, self.store, root, min, max);
+        return try btree.getInto(self.store, root, key, buffer);
+    }
+
+    /// 范围查询（T-29 Phase B 借用化）：返回借用迭代器——next() 的 entry 切片
+    /// 仅到下次 next()/deinit() 有效（溢出值经内部复用缓冲拼接）；迭代器 pin 住
+    /// MVCC 读者名额，写者 COW 脏页延迟到 deinit()（末位读者）才回收，迭代中
+    /// 途的写提交不影响已借用页。忘记 deinit 会滞留读者名额（脏页不回收）。
+    pub fn select(self: *Db, min: ?[]const u8, max: ?[]const u8) !btree.Iterator {
+        // T-29 review 发现1（major）：读者名额必须先于 root 快照捕获注册——
+        // 若先 getRoot() 后 beginRead()，两条指令间的窗口内写者 grace-period
+        // 回收（applyBatch 见 reader_count==0 即 flush）可释放快照 root 引用的
+        // 旧页。先注册后捕获：无论读到旧/新 root，其 COW 旧页均滞留 pending_free
+        // 到迭代器 deinit（末位读者）才回收。
+        _ = self.state.beginRead(); // MVCC pin：迭代器借用页的快照保护
+        errdefer self.state.endRead();
+        const root = self.state.getRoot();
+        var it = try btree.select(self.allocator, self.store, root, min, max);
+        it.pin_ctx = @ptrCast(self.state);
+        it.pin_deinit = endReadPin;
+        return it;
     }
 
     pub fn compact(self: *Db) !void {
@@ -341,8 +363,22 @@ pub const ReadTxn = struct {
         return try btree.get(self.db.allocator, self.db.store, self.snapshot_root, key);
     }
 
+    /// 无拷贝点查（T-29 Phase A）：语义同 Db.getInto（null=key 不存在，
+    /// BufferTooSmall=buffer 不足且不写入），快照 pin 于本 txn 的 root。
+    pub fn getInto(self: *ReadTxn, key: []const u8, buffer: []u8) !?usize {
+        return try btree.getInto(self.db.store, self.snapshot_root, key, buffer);
+    }
+
+    /// 范围查询（T-29 Phase B 借用化）：借用契约同 Db.select（next() 失效上一 entry）。
+    /// 快照 pin 于本 txn 的 root；迭代器另持独立 MVCC 读者名额（与 txn 的 pin
+    /// 可叠加，读者计数为增量），deinit() 释放——txn 结束前迭代器仍须 deinit。
     pub fn select(self: *ReadTxn, min: ?[]const u8, max: ?[]const u8) !btree.Iterator {
-        return try btree.select(self.db.allocator, self.db.store, self.snapshot_root, min, max);
+        _ = self.db.state.beginRead(); // 迭代器独立 pin（deinit 释放）
+        errdefer self.db.state.endRead();
+        var it = try btree.select(self.db.allocator, self.db.store, self.snapshot_root, min, max);
+        it.pin_ctx = @ptrCast(self.db.state);
+        it.pin_deinit = endReadPin;
+        return it;
     }
 
     pub fn end(self: *ReadTxn) void {
@@ -355,6 +391,13 @@ pub const ReadTxn = struct {
         self.end();
     }
 };
+
+/// btree.Iterator 的 MVCC pin 回调（T-29 Phase B）：deinit 时释放读者名额。
+/// btree 层不依赖 wrt.State，经 opaque 回调解耦。
+fn endReadPin(ctx: *anyopaque) void {
+    const st: *wrt.State = @ptrCast(@alignCast(ctx));
+    st.endRead();
+}
 test "db: open default state" {
     var ms = ps.MemPageStore.init(std.testing.allocator, 1000);
     defer ms.deinit();
