@@ -1,5 +1,9 @@
 # cube_db
 
+<p align="center">
+  <img src="docs/assets/cube_db_logo.png" alt="cube_db logo" width="100%" max-width="800">
+</p>
+
 An embedded key-value store written in Zig 0.16.0, LMDB-style architecture: pure COW B-tree
 with freelist page reuse, no WAL, crash-safe via atomic meta-page switch.
 
