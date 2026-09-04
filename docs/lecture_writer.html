@@ -13,8 +13,8 @@
   <ul>
     <li class="part"><a href="#part1">第一部分 · MVCC 读者模型（T-30）</a></li>
     <li class="sub"><a href="#s11">1.1 从全局计数到逐读者注册</a></li>
-    <li class="sub"><a href="#s12">1.2 槽位注册与 overflow 降级</a></li>
-    <li class="sub"><a href="#s13">1.3 注销配对与 B1 不变式</a></li>
+    <li class="sub"><a href="#s12">1.2 显式 Reader 句柄：结构、池与注册</a></li>
+    <li class="sub"><a href="#s13">1.3 beginRead/endRead 与 B1 不变式</a></li>
     <li class="sub"><a href="#s14">1.4 watermark 精确回收</a></li>
     <li class="part"><a href="#part2">第二部分 · State 骨架与读者 API</a></li>
     <li class="sub"><a href="#s21">2.1 State 字段与 init/deinit</a></li>
@@ -92,206 +92,177 @@ watermark = 活跃读者快照序列的最小值。快照为 <em>s</em> 的读�
 理论上已不含该页（它在 <em>S−1 → S</em> 提交时被替换），但实现选择保守保留——
 “等于 watermark 的页不回收”。这半步保守换来的是注册竞态下的安全余量（见 1.3 的 B1 不变式）。</p>
 
-<div class="note warn" role="note">⚠️ 注意 <b>两类读者、两套计数：</b><code>reader_count</code>（全局原子计数）仍然保留，
+<div class="note warn" role="note">⚠️ 注意 <b>两类读者、两套机制：</b><code>reader_count</code>（全局原子计数）仍然保留，
 它服务于<strong>快路径</strong>——<code>reader_count == 0</code> 时无需任何序列计算，直接全量回收（既有行为不变）。
-序列注册（<code>reader_slots</code>）只在<strong>有读者</strong>时参与精确判据。两套机制各司其职：
-计数答“还有没有人”，序列答“谁最老”。</div>
+活跃读者链表（<code>readers_head</code>，显式 Reader 句柄，见 1.2）只在<strong>有读者</strong>时参与精确判据。两套机制各司其职：
+计数答“还有没有人”，活跃集答“谁最老”。</div>
 
-<h3 id="s12">1.2 槽位注册与 overflow 降级</h3>
+<h3 id="s12">1.2 显式 Reader 句柄：结构、池与注册</h3>
 
-<p>逐读者注册的载体是三个常量与一个线程本地栈：</p>
+<p>T-32 用<b>显式 Reader 句柄</b>取代了早期逐读者注册的槽位/TLS 栈机制
+（<code>reader_slots</code>、<code>overflow_readers</code>、<code>CLAIM_BIT</code>、
+<code>claimReaderSlot</code>、<code>unregisterReaderSlot</code>、<code>saturatingOverflowDec</code>
+——全部删除）。难点从「注销如何配对」变成了「句柄如何回收」：因为 <code>endRead</code> 现在
+<strong>携带句柄参数</strong>，注销不再需要任何隐式栈；代价是必须管理好句柄池，保证无泄漏、无双重释放。
+载体是一个小结构体与一个按需链接的池：</p>
 
-<pre><code><span class="cm">/// Per-reader snapshot registration slots. When exceeded (concurrent readers</span>
-<span class="cm">/// &gt; 64, or TLS nesting overflow), degrade conservatively to watermark=0</span>
-<span class="cm">/// (pin everything = the old global-count behavior) — safe but imprecise.</span>
-<span class="kw">const</span> READER_SLOTS = <span class="nu">64</span>;
-<span class="cm">/// Max beginRead nesting depth per thread (ReadTxn + select nesting etc.;</span>
-<span class="cm">/// realistically &lt;= 3).</span>
-<span class="kw">const</span> MAX_TLS_READERS = <span class="nu">16</span>;
-<span class="cm">/// Slot value encoding: 0 = free; non-zero = snapshot | CLAIM_BIT (the</span>
-<span class="cm">/// snapshot sequence occupies everything below the top bit).</span>
-<span class="kw">const</span> CLAIM_BIT: <span class="ty">u64</span> = <span class="nu">1</span> &lt;&lt; <span class="nu">63</span>;
+<pre><code><span class="cm">/// 嵌入式句柄池大小：select() 读者热路径保持零分配（8 个并发内）</span>
+<span class="kw">const</span> EMBEDDED_READERS = <span class="nu">8</span>;
 
-<span class="kw">const</span> <span class="ty">TlsEntry</span> = <span class="kw">struct</span> {
-    state: <span class="ty">*const anyopaque</span>,
-    slot: <span class="ty">u32</span>, <span class="cm">// READER_SLOTS = overflow registration (not a slot)</span>
-};
-<span class="kw">threadlocal var</span> tls_readers: [MAX_TLS_READERS]<span class="ty">TlsEntry</span> = <span class="kw">undefined</span>;
-<span class="kw">threadlocal var</span> tls_readers_len: <span class="ty">usize</span> = <span class="nu">0</span>;</code></pre>
+<span class="kw">pub const</span> <span class="ty">Reader</span> = <span class="kw">struct</span> {
+    state: <span class="ty">*State</span>,       <span class="cm">// 所属 State（注销时做跨状态误用检查）</span>
+    seq: <span class="ty">u64</span>,            <span class="cm">// 快照序列（watermark = 活跃集 min seq）</span>
+    active: <span class="kw">bool</span>,         <span class="cm">// 双重 endRead 的 no-op guard</span>
+    prev_active: ?<span class="ty">*Reader</span> = <span class="kw">null</span>,  <span class="cm">// 活跃集（intrusive 双向链表）链接</span>
+    next_active: ?<span class="ty">*Reader</span> = <span class="kw">null</span>,
+    next_free: ?<span class="ty">*Reader</span> = <span class="kw">null</span>,       <span class="cm">// 空闲池 free-list 链接</span>
+};</code></pre>
 
 <table>
 <tr><th>成员</th><th>角色</th></tr>
-<tr><td><code>reader_slots</code></td><td><code>[64]std.atomic.Value(u64)</code>，State 内的全局槽位数组。值编码：<code>0</code> = 空闲；非 0 = <code>snapshot | CLAIM_BIT</code>——最高位是占用标记，低 63 位存快照序列。单槽一个原子字，注册零分配</td></tr>
-<tr><td><code>overflow_readers</code></td><td>溢出计数。槽位耗尽（并发读者 &gt; 64）或 TLS 栈满时走溢出注册；只要它 &gt; 0，watermark 视为 0（钉住一切）——恰好退化为旧的全局计数行为</td></tr>
-<tr><td><code>tls_readers</code> / <code>TlsEntry</code></td><td>每线程的注册栈，记录 <code>{ state 指针, slot 下标 }</code>。它存在的唯一原因是：<code>endRead()</code> 不带参数（db.zig 接口不许改），注销时必须靠它找回“我是哪个注册”</td></tr>
+<tr><td><code>readers_head</code></td><td>活跃集头指针。<code>State</code> 内 <code>?*Reader</code>，构成 intrusive 双向链表（受 <code>pending_free_mu</code> 保护）；watermark 就是遍历这个链表取 min <code>seq</code>，不再有 64 槽上限</td></tr>
+<tr><td><code>reader_free</code></td><td>空闲句柄池 free-list 头。注册时 pop、注销时 push，受同一把锁保护</td></tr>
+<tr><td><code>embedded_readers</code></td><td><code>[8]Reader</code> 嵌入式池。首次 <code>beginRead</code> 时一次性链接进 free-list（<code>init</code> 按值返回，self 指针只能在此处接线），保证 select() 读者路径零分配</td></tr>
+<tr><td><code>reader_pool</code></td><td><code>ArrayList(*Reader)</code>，记录所有堆分配的句柄，供 <code>deinit</code> 统一销毁（无泄漏）；随峰值并发有界增长、经 free-list 回收</td></tr>
 </table>
 
-<p><code>claimReaderSlot</code> 负责占位：</p>
+<p><code>beginRead</code> 的注册在 <code>pending_free_mu</code> 临界区内完成——关键的是快照读取与入活跃集
+<strong>共享同一临界区</strong>：</p>
 
-<pre><code><span class="kw">fn</span> <span class="fn">claimReaderSlot</span>(self: *<span class="ty">State</span>) <span class="ty">u32</span> {
-    <span class="kw">if</span> (tls_readers_len &lt; MAX_TLS_READERS) {
-        <span class="kw">var</span> i: <span class="ty">usize</span> = <span class="nu">0</span>;
-        <span class="kw">while</span> (i &lt; READER_SLOTS) {
-            <span class="kw">if</span> (self.reader_slots[i].<span class="fn">load</span>(.acquire) != <span class="nu">0</span>) {
-                i += <span class="nu">1</span>;
-                <span class="kw">continue</span>;
-            }
-            <span class="cm">// m2: cmpxchgWeak may fail spuriously — retry the same slot on</span>
-            <span class="cm">// failure (reload to re-check busyness) instead of skipping a</span>
-            <span class="cm">// still-free slot.</span>
-            <span class="kw">if</span> (self.reader_slots[i].<span class="fn">cmpxchgWeak</span>(<span class="nu">0</span>, CLAIM_BIT, .acq_rel, .acquire) == <span class="kw">null</span>) {
-                tls_readers[tls_readers_len] = .{ .state = <span class="fn">@ptrCast</span>(self), .slot = <span class="fn">@intCast</span>(i) };
-                tls_readers_len += <span class="nu">1</span>;
-                <span class="kw">return</span> <span class="fn">@intCast</span>(i);
-            }
-        }
-    }
-    <span class="cm">// Slots exhausted (or TLS stack full): overflow registration.</span>
-    _ = self.overflow_readers.<span class="fn">fetchAdd</span>(<span class="nu">1</span>, .acq_rel);
-    <span class="kw">if</span> (tls_readers_len &lt; MAX_TLS_READERS) { <span class="cm">/* push overflow entry */</span> }
-    <span class="kw">return</span> READER_SLOTS;
+<pre><code><span class="kw">pub fn</span> <span class="fn">beginRead</span>(self: *<span class="ty">State</span>) <span class="ty">*Reader</span> {
+    _ = self.reader_count.<span class="fn">fetchAdd</span>(<span class="nu">1</span>, .acquire);   <span class="cm">// 先计数（B1：见 1.3）</span>
+    self.pending_free_mu.<span class="fn">lockUncancelable</span>();
+    <span class="kw">defer</span> self.pending_free_mu.<span class="fn">unlock</span>();
+    <span class="kw">if</span> (!self.readers_linked) { <span class="cm">/* 首次：把 8 个嵌入式句柄链入 free-list */</span> }
+    <span class="kw">const</span> r = self.reader_free <span class="kw">orelse</span> blk: { <span class="cm">/* 池满 → 堆分配一个，记入 reader_pool */</span> ... };
+    self.reader_free = r.next_free;
+    r.* = .{
+        .state = self,
+        .seq = self.sequence.<span class="fn">load</span>(.acquire),  <span class="cm">// 锁内读快照 + 入活跃集 = 一个临界区</span>
+        .active = <span class="kw">true</span>,
+        .prev_active = <span class="kw">null</span>,
+        .next_active = self.readers_head,
+        .next_free = <span class="kw">null</span>,
+    };
+    <span class="kw">if</span> (self.readers_head) |h| h.prev_active = r;
+    self.readers_head = r;
+    <span class="kw">return</span> r;
 }</code></pre>
 
-<p>三个细节值得停下来看：</p>
-<p><strong>① CAS 占位值是哨兵，不是真实快照。</strong>占位写入的是 <code>CLAIM_BIT</code>（即“快照 0”）——
-此刻读者的真实快照还没读到（B1 不变式要求先占位再读 sequence，见 1.3）。哨兵的作用是：
-在真实快照发布之前，watermark 计算看到快照 0，于是钉住一切。<strong>宁可多钉，不可漏钉</strong>。</p>
-<p><strong>② CAS 失败要原地重试（m2 修复）。</strong><code>cmpxchgWeak</code> 允许<strong>spurious 失败</strong>——
-没被别人抢也可能失败。若失败就 <code>i += 1</code> 跳走，会把一个仍然空闲的槽位漏掉，64 个槽可能被
-几轮伪失败提前“用完”，白白降级到 overflow。所以循环体是“失败 → 回到同一槽重新 load 判忙”，
-只有槽位真的被别人占了才前进。</p>
-<p><strong>③ 溢出注册是安全降级，不是错误。</strong>并发读者超过 64 或线程内嵌套超过 16 层时，
-<code>fetchAdd(1, .acq_rel)</code> 把读者记入 <code>overflow_readers</code>——watermark 从此为 0，
-所有 pending 页全部保守保留。这<strong>恰好等于旧的全局计数模型的行为</strong>：不精确，但永不违反正确性。
-注意 RMW 用了 <code>.acq_rel</code>（M1 修复）：与 <code>readerWatermark</code> 的 <code>.acquire</code> 读配对，
-注册一旦被水位看到就有 happens-before 边；原先的 <code>.monotonic</code> 没有发布边，
-刚注册的溢出读者可能短暂不可见，水位会错误地放行它引用的页。</p>
+<p><strong>为什么这比槽位+TLS 简单且更好：</strong></p>
+<p><strong>① 无槽上限、无 overflow 降级。</strong>活跃读者数由池按峰值并发撑开（8 嵌入式 + 堆 fallback），
+不再有「并发读者 &gt; 64 → 退化为全钉」的分支，watermark 恒为精确 min-seq。旧的 64 槽/16 层/CLAIM_BIT
+降级路径整段消失，读者簿记从「两套计数（全局 + 槽位）」收敛为「一套计数 + 一个链表」。</p>
+<p><strong>② 注册的原子性从哨兵让位给锁。</strong>旧机制用「哨兵 0 占位 → 读 seq → 发布快照」三步在无锁下
+维持 B1（1.3）。新机制干脆把 <code>seq.load</code> 与入活跃集放进<strong>同一个锁临界区</strong>——
+其间没有任何回收能交错，watermark 在锁内永不可能看到「已入 pending_free 的页 < 本读者的 seq」。
+语义等价，但无需位编码哨兵，正确性由锁序直接保证。</p>
+<p><strong>③ 热路径零分配由嵌入式池保证。</strong>8 个并发读者以内 <code>beginRead</code> 不分配堆内存
+（嵌入式数组 + 链表操作），select() 迭代器借用的零分配测试（<code>iterator_borrow</code>）继续成立；
+超出的堆句柄也被 <code>reader_pool</code> 记录并在 <code>deinit</code> 统一释放，不随 begin/end 反复分配。</p>
 
-<div class="note" role="note">💡 说明 <b>槽位数怎么选：</b><code>READER_SLOTS = 64</code> 覆盖“64 个并发线程各持一个读事务”的典型形态
-（每个线程在 TLS 里只会同时占一个槽位，除非嵌套）；<code>MAX_TLS_READERS = 16</code> 是单线程嵌套
-<code>beginRead</code> 的上限——真实调用方最深不过 <code>ReadTxn</code> + <code>select</code> 迭代器两层。
-两者都不是硬约束，越界走溢出降级，只是回收退回“全钉”而已。</div>
+<div class="note" role="note">💡 说明 <b>池与 active/free 两条链为何并重：</b><code>next_active</code> 链让
+<code>readerWatermark</code> 能在锁内精确遍历所有存活读者；<code>next_free</code> 链让句柄在注销后能立即复用。
+一个 <code>Reader</code> 要么在活跃链上（<code>active=true</code>），要么在空闲链上，两条链都受
+<code>pending_free_mu</code> 保护——同一把锁既串行化「读者注册/注销 vs 回收」，也串行化句柄的取/还，
+不存在句柄被并发抢用的可能（详见 1.3 的误用语义）。</div>
 
-<h3 id="s13">1.3 注销配对与 B1 不变式</h3>
+<h3 id="s13">1.3 beginRead/endRead 与 B1 不变式</h3>
 
-<p>注册容易，注销难——难在<strong>配对</strong>：<code>endRead()</code> 签名是 <code>fn (self: *State) void</code>，
-一个参数都没有，它不知道自己是哪次 <code>beginRead</code> 的结束。解法是把配对信息藏在<strong>线程本地栈</strong>里：
-同一线程内 begin/end 按 LIFO 配对，栈条目携带 <code>state</code> 指针以精确区分多个 <code>Db</code> 实例的乱序嵌套。</p>
+<p>注册容易，注销也容易——因为 <code>endRead</code> 现在<strong>携带句柄</strong>：<code>fn (self: *State, reader: *Reader) void</code>。
+注销不再需要任何线程本地栈来“找回我是哪个注册”，配对信息就是句柄本身。代价转到了<strong>句柄的语义防护</strong>上：
+同一个句柄不得被重复释放，也不得对不属于本 State 的句柄误释放。</p>
 
-<pre><code><span class="kw">fn</span> <span class="fn">unregisterReaderSlot</span>(self: *<span class="ty">State</span>) <span class="ty">void</span> {
-    <span class="kw">if</span> (tls_readers_len == MAX_TLS_READERS) {
-        <span class="cm">// m1: 栈满且栈顶属于本 State → 弹栈精确注销（解除粘滞）；</span>
-        <span class="cm">// 栈顶不匹配 → 本 end 配对未入栈的溢出注册，饱和退减。</span>
-        <span class="kw">if</span> (tls_readers[tls_readers_len - <span class="nu">1</span>].state == <span class="fn">@as</span>(*<span class="kw">const</span> <span class="ty">anyopaque</span>, <span class="fn">@ptrCast</span>(self))) {
-            <span class="fn">popTopTlsEntry</span>(self);
-            <span class="kw">return</span>;
-        }
-        <span class="fn">saturatingOverflowDec</span>(self);
-        <span class="kw">return</span>;
+<pre><code><span class="kw">pub fn</span> <span class="fn">endRead</span>(self: *<span class="ty">State</span>, reader: *<span class="ty">Reader</span>) <span class="ty">void</span> {
+    <span class="kw">if</span> (reader.state != self) <span class="kw">return</span>; <span class="cm">// 跨状态误用：guarded no-op（评审裁决，见下）</span>
+    <span class="kw">if</span> (!reader.active) <span class="kw">return</span>;    <span class="cm">// 双重 endRead：no-op</span>
+    {
+        self.pending_free_mu.<span class="fn">lockUncancelable</span>();
+        <span class="kw">defer</span> self.pending_free_mu.<span class="fn">unlock</span>();
+        <span class="cm">// 从活跃链摘下</span>
+        <span class="kw">if</span> (reader.prev_active) |p| p.next_active = reader.next_active
+        <span class="kw">else</span> self.readers_head = reader.next_active;
+        <span class="kw">if</span> (reader.next_active) |n| n.prev_active = reader.prev_active;
+        reader.active = <span class="kw">false</span>;
+        <span class="cm">// 还回空闲池</span>
+        reader.next_free = self.reader_free;
+        self.reader_free = reader;
+        _ = self.reader_count.<span class="fn">fetchSub</span>(<span class="nu">1</span>, .release);
     }
-    <span class="kw">var</span> i = tls_readers_len;
-    <span class="kw">while</span> (i &gt; <span class="nu">0</span>) {
-        i -= <span class="nu">1</span>;
-        <span class="kw">if</span> (tls_readers[i].state == <span class="fn">@as</span>(*<span class="kw">const</span> <span class="ty">anyopaque</span>, <span class="fn">@ptrCast</span>(self))) {
-            <span class="kw">const</span> entry = tls_readers[i];
-            <span class="cm">// swap-remove: 移除的是本 State 最新注册，同 State 其余条目</span>
-            <span class="cm">// 相对 LIFO 顺序不变（中间只可能夹其他 State 的条目）。</span>
-            tls_readers[i] = tls_readers[tls_readers_len - <span class="nu">1</span>];
-            tls_readers_len -= <span class="nu">1</span>;
-            <span class="kw">if</span> (entry.slot &lt; READER_SLOTS) {
-                self.reader_slots[entry.slot].<span class="fn">store</span>(<span class="nu">0</span>, .release);
-            } <span class="kw">else</span> {
-                <span class="fn">saturatingOverflowDec</span>(self);
-            }
-            <span class="kw">return</span>;
-        }
-    }
-    <span class="cm">// 本线程无此 State 的注册记录（跨线程 end / 误用）→ 饱和退减溢出计数</span>
-    <span class="fn">saturatingOverflowDec</span>(self);
+    <span class="kw">if</span> (self.dirt.<span class="fn">load</span>(.acquire) &gt; <span class="nu">0</span>) self.<span class="fn">reclaimPendingFree</span>();
 }</code></pre>
 
-<p>从栈<strong>顶向下</strong>找第一个 <code>state</code> 匹配的条目弹掉，保证同一 State 内严格 LIFO
-（嵌套 <code>ReadTxn + select</code> 时内层先结束）；跨 State 的条目夹在中间也不影响各自顺序。
-删条目用 <code>swap-remove</code>——把末尾元素搬到空洞，同 State 条目的相对顺序不变。</p>
+<p><strong>误用语义（T-32 评审裁决）：</strong>对不属于本 State 的句柄调用 <code>endRead</code>（<code>reader.state != self</code>），
+实现为 <strong>guarded no-op</strong>——读到 <code>reader.state</code> 后、在任何锁/原子/链表修改<strong>之前</strong>返回。
+四个理由（见 <code>review.md</code>）：</p>
+<p><strong>① 不会损坏任一 State。</strong>返回早于任何临界区，对方 State 的注册表、free-list、<code>reader_count</code>
+以及本 State 的注册都未被触碰，也没有与 <code>reclaimPendingFree</code>/<code>flushPendingFree</code> 的任何交错。</p>
+<p><strong>② guard 不会被 stale state 绕过。</strong><code>reader.state</code> 在 <code>beginRead</code> 的临界区里每次复用都会重写，
+且池是 per-State 的（嵌入式数组 + 堆句柄不会跨 State 迁移）——句柄永远报告其真实属主，无法用旧 state 骗过检查。</p>
+<p><strong>③ 失败模式是「可见的泄漏」，不是静默损坏。</strong>若调用方误路由且一直没正确释放，读者会一直登记：
+<code>reader_count</code> 恒 &gt; 0、watermark 钉住、<code>pendingFreeCount()</code>/<code>dirtCount()</code> 升高——和「忘了 endRead」一样，
+通过既有公开计数即可检出，不会损坏数据或崩溃。</p>
+<p><strong>④ panic 更粗暴且不可测。</strong>panic 在 MVCC 临界路径上更严厉，且 Zig 0.16 无进程内 <code>expectPanics</code>，
+panic 契约在标准测试框架下不可测（需子进程 rig）；no-op 语义则被 <code>reader_handle_test.zig</code> 的用例 7 直接测试并固化。</p>
 
-<p><strong>饱和退减（m1 修复）</strong>是所有“配不上对”路径的统一出口：</p>
+<div class="note" role="note">💡 说明 <b>双重 endRead 同样是 no-op：</b>首次释放后 <code>active=false</code>，第二次进入前
+<code>if (!reader.active) return</code> 直接返回——幂等。注意这两道 guard（<code>state</code> 与 <code>active</code>）
+都在取锁<strong>前</strong>完成，保证常见路径零锁开销；并发对同一句柄的 endRead 属于契约外误用（评审 F1 记录了
+可选的一行加固：把 <code>active</code> 检查移入临界区，非阻塞）。</div>
 
-<pre><code><span class="cm">/// Saturating decrement of the overflow reader count (m1: no wraparound).</span>
-<span class="cm">/// An under-paired decrement only inflates the count -&gt; watermark=0 pins</span>
-<span class="cm">/// everything, the safe direction; a u32 wraparound would pin everything</span>
-<span class="cm">/// permanently and must be avoided.</span>
-<span class="kw">fn</span> <span class="fn">saturatingOverflowDec</span>(self: *<span class="ty">State</span>) <span class="ty">void</span> {
-    <span class="kw">while</span> (<span class="kw">true</span>) {
-        <span class="kw">const</span> cur = self.overflow_readers.<span class="fn">load</span>(.acquire);
-        <span class="kw">if</span> (cur == <span class="nu">0</span>) <span class="kw">return</span>; <span class="cm">// 欠配对退减：保守不退（计数偏高 = 多钉，安全）</span>
-        <span class="kw">if</span> (self.overflow_readers.<span class="fn">cmpxchgWeak</span>(cur, cur - <span class="nu">1</span>, .acq_rel, .acquire) == <span class="kw">null</span>) <span class="kw">return</span>;
-    }
+<p><strong>最后是注册模型最关键的次序不变式——B1</strong>（评审阻塞项，新机制由锁直接保证）：</p>
+
+<pre><code><span class="kw">pub fn</span> <span class="fn">beginRead</span>(self: *<span class="ty">State</span>) <span class="ty">*Reader</span> {
+    _ = self.reader_count.<span class="fn">fetchAdd</span>(<span class="nu">1</span>, .acquire);   <span class="cm">// 先计数</span>
+    self.pending_free_mu.<span class="fn">lockUncancelable</span>();          <span class="cm">// 锁内完成注册</span>
+    <span class="kw">defer</span> self.pending_free_mu.<span class="fn">unlock</span>();
+    <span class="cm">// （池取句柄省略）</span>
+    r.* = .{ .state = self,
+             .seq = self.sequence.<span class="fn">load</span>(.acquire),      <span class="cm">// 锁内读快照</span>
+             .active = <span class="kw">true</span>,
+             .prev_active = <span class="kw">null</span>, .next_active = self.readers_head, ... };
+    self.readers_head = r;                               <span class="cm">// 与读快照同一临界区入活跃集</span>
+    <span class="kw">return</span> r;
 }</code></pre>
 
-<p>为什么必须饱和而不能裸 <code>fetchSub</code>：配不上对的 end（跨线程 <code>endRead</code>、误用、栈满期间的
-模糊配对）会对一个从未为自己加过的计数做减法。裸减法的失败模式是 <code>u32</code> <strong>回绕成 0xFFFFFFFF</strong>——
-overflow 永远 &gt; 0，watermark 永久为 0，引擎从此一个脏页都回收不了，且再也无法自愈。
-饱和退减把失败方向锁死在安全侧：计数最多偏高，偏高 = 多钉 = 旧模型行为，下次正常配对就能自愈。
-同理，m1 还修了<strong>栈满粘滞</strong>：原实现栈满后永不弹栈、每次 end 都盲走保守分支；
-现在“栈满且栈顶属于本 State”仍精确弹栈，栈才能逐渐排空。</p>
+<p><strong>关键顺序：<code>fetchAdd</code>（先计数）→ 锁内读 <code>sequence</code> → 锁内入活跃集。</strong></p>
+<p><strong>① 先计数再取锁。</strong>若顺序颠倒（先占活跃集再计数），取锁前可能出现「<code>count==0</code> 的假象」，
+写者的 grace-period 全量回收（applyBatch 步骤 0/9）会把读者还需要的页放走。先 <code>fetchAdd</code> 保证
+任何并发回收看到 0 时，本读者尚未开始，不可能引用将被放走的页。</p>
+<p><strong>② 读快照与入活跃集在同一个临界区。</strong>这正是 B1 在新机制下的落点。旧机制用「哨兵 0 占位 → 读 seq →
+发布真实快照」三步在无锁下维持 B1；新机制把 <code>seq.load</code> 与入活跃集放进<strong>同一个锁临界区</strong>，
+其间回收（同样持有 <code>pending_free_mu</code>）不可能交错。因此任何一次 <code>reclaimPendingFree</code> 在锁内计算
+watermark 时，要么看到本读者已带着真实 seq 在活跃集里（watermark 被其压低），要么本读者尚未入集——
+但它读快照也在同一临界区，故此刻其 seq 还没被读过，也就没有「seq 已读但未登记」的窗口。</p>
 
-<div class="note danger" role="note">🚨 风险 <b>遗留的精确配对盲区（如实记录）：</b>同线程嵌套超过 16 层时，栈满期间的溢出注册
-无法精确配对——栈满且栈顶匹配时弹栈可能误弹更早的自有注册，把一个仍活跃读者的槽位提前放掉。
-这是已知 ceiling（代码内有 <code>ponytail:</code> 注释标注）：本代码库真实嵌套 ≤ 3，16 层不可达；
-若将来需要支持，升级路径是显式 reader handle API——那要求改 <code>db.zig</code> 的 <code>endRead()</code> 签名。</div>
-
-<p>最后是整个注册模型最关键的次序不变式——<strong>B1</strong>（评审阻塞项，修复方式是哨兵占位）：</p>
-
-<pre><code><span class="kw">pub fn</span> <span class="fn">beginRead</span>(self: *<span class="ty">State</span>) <span class="ty">u64</span> {
-    _ = self.reader_count.<span class="fn">fetchAdd</span>(<span class="nu">1</span>, .acquire);
-    <span class="kw">const</span> slot = <span class="fn">claimReaderSlot</span>(self); <span class="cm">// claim first (sentinel 0), then read sequence</span>
-    <span class="kw">const</span> seq = self.sequence.<span class="fn">load</span>(.acquire);
-    <span class="kw">if</span> (slot &lt; READER_SLOTS) {
-        self.reader_slots[slot].<span class="fn">store</span>(seq | CLAIM_BIT, .release);
-    }
-    <span class="kw">return</span> seq;
-}</code></pre>
-
-<p><strong>占位（哨兵 0）→ 读 sequence → 发布真实快照</strong>，三步次序不可交换。若按天真的
-“先读 sequence 再注册”，存在这样的竞态窗口：读者 X 已读到 <code>seq=5</code> 但槽位还没发布，
-期间提交 6/7 释放了页 P（release 6）；读者 Z 注册快照 7；读者 Y 退出触发回收——水位看到
-{Z:7}（X 不可见）= 7 &gt; 6，于是放行 P。X 恢复执行、发布 {5}、沿自己的快照树读页——
-<strong>P 已被回收，活跃快照引用了已释放页</strong>，这正是被禁止的“live snapshot references freed page”。</p>
-
-<p>哨兵占位堵死了这个窗口：占位到发布之间，水位看到快照 0 ⇒ 什么都不放行；发布
-（<code>.release</code> store）之后的任何水位计算，要么看到哨兵（钉住），要么看到真实快照（恒 ≤ 本读者快照）。
-读者快照注册<strong>先于</strong>返回，调用方（<code>Db.select</code> / <code>ReadTxn</code>）随后才捕获 root——
-无论读到旧 root 还是新 root，其 COW 旧页都滞留在 <code>pending_free</code> 直到 watermark 放行
-（这正是 db.zig 里 T-29 修复的“先注册后捕获”惯例在 writer 层的落点）。</p>
-
-<div class="note ok" role="note">✅ 正确性 <b>B1 不变式：</b>任何时刻的任何水位计算，看到的每个槽位值要么是哨兵 0（该读者注册中，
-钉住一切），要么是 ≤ 该读者真实快照的已发布值。因此 <code>watermark ≤ 每个活跃读者的快照</code>，
-而读者引用的页满足 <code>release_seq &gt; 快照 ≥ watermark</code>——被水位放行的页（<code>release_seq &lt; watermark</code>）
-在数学上不可能同时被任何活跃读者引用。回收安全由构造保证，不靠运气。</div>
+<div class="note ok" role="note">✅ 正确性 <b>B1 不变式（锁序版）：</b>因为 <code>readerWatermark</code> 只在持有
+<code>pending_free_mu</code> 时被调用，而 <code>beginRead</code> 的 <code>seq</code> 读取与入活跃集共享同一临界区，
+<code>watermark ≤ 每个活跃读者的快照</code> 由锁序直接成立。读者引用的页满足 <code>release_seq &gt; 快照 ≥ watermark</code>，
+被水位放行的页（<code>release_seq &lt; watermark</code>）在数学上不可能被任何活跃读者引用。读者快照注册
+<strong>先于</strong>返回，调用方（<code>Db.select</code> / <code>ReadTxn</code>）随后才捕获 root——无论旧 root 还是新 root，
+其 COW 旧页都滞留在 <code>pending_free</code> 直到 watermark 放行（这正是 db.zig 里 T-29「先注册后捕获」惯例在 writer 层的落点）。</div>
 
 <h3 id="s14">1.4 watermark 精确回收</h3>
 
 <p>注册数据齐了，剩下的两个函数把数据变成回收动作。<code>readerWatermark</code> 取活跃快照最小值：</p>
 
 <pre><code><span class="cm">/// Oldest-active-reader watermark: the minimum snapshot sequence across</span>
-<span class="cm">/// active readers. Returning 0 = the conservative floor (overflow</span>
-<span class="cm">/// readers / readers present but snapshot not yet visible) -&gt; pin everything.</span>
+<span class="cm">/// the active-reader set. Empty set -&gt; 0 (a reader is mid-registration, its</span>
+<span class="cm">/// seq not yet visible) = the conservative floor, pin everything.</span>
+<span class="cm">/// Caller must hold pending_free_mu.</span>
 <span class="kw">fn</span> <span class="fn">readerWatermark</span>(self: *<span class="ty">State</span>) <span class="ty">u64</span> {
-    <span class="kw">if</span> (self.overflow_readers.<span class="fn">load</span>(.acquire) &gt; <span class="nu">0</span>) <span class="kw">return</span> <span class="nu">0</span>;
     <span class="kw">var</span> min: <span class="ty">u64</span> = <span class="nu">0</span>;
     <span class="kw">var</span> found = <span class="kw">false</span>;
-    <span class="kw">for</span> (&amp;self.reader_slots) |*slot| {
-        <span class="kw">const</span> v = slot.<span class="fn">load</span>(.acquire);
-        <span class="kw">if</span> (v == <span class="nu">0</span>) <span class="kw">continue</span>;
-        <span class="kw">const</span> snap = v &amp; ~CLAIM_BIT;
-        <span class="kw">if</span> (!found <span class="kw">or</span> snap &lt; min) { min = snap; found = <span class="kw">true</span>; }
+    <span class="kw">var</span> cur = self.readers_head;
+    <span class="kw">while</span> (cur) |r| : (cur = r.next_active) {
+        <span class="kw">if</span> (!found <span class="kw">or</span> r.seq &lt; min) { min = r.seq; found = <span class="kw">true</span>; }
     }
     <span class="kw">return</span> min;
 }</code></pre>
 
-<p>三个“返回 0”的来源都要注意：溢出读者 &gt; 0（降级）；有读者但一个槽都没看见（读者正在注册的窗口，
-水位保守）；<code>found == false</code>（无注册读者——但这条路径只有 <code>reader_count &gt; 0</code> 时才会被走到，
-此时同样保守为 0）。0 是<strong>保守下界</strong>：严格小于 0 的 <code>release_seq</code> 不存在，所以什么都不放行。</p>
+<p>活跃集是 intrusive 双向链表（头 <code>readers_head</code>），遍历即可取 min <code>seq</code>，无槽上限、无位编码。
+一个“返回 0”的来源要注意：<code>found == false</code>（活跃集为空但 <code>reader_count &gt; 0</code>，说明读者正在注册的窗口，
+其 seq 尚未入集）——水位保守为 0。0 是<strong>保守下界</strong>：严格小于 0 的 <code>release_seq</code> 不存在，所以什么都不放行。</p>
 
 <p><code>reclaimPendingFree</code> 是增量回收本体，被 <code>endRead</code> 和 <code>compact</code> 调用：</p>
 
@@ -344,10 +315,12 @@ overflow 永远 &gt; 0，watermark 永久为 0，引擎从此一个脏页都回�
 配合 <code>compact()</code> 不再静默清零（T-30 语义修正），以及 <code>applyBatch</code> 把 dirt 更新移入锁内
 （避免写者用陈旧长度覆写读者刚写下的 keep），<code>dirt == pendingFreeCount()</code> 成为全程不变式，
 监控与测试不再被误导性 0 值欺骗。</p>
-<p><strong>④ 末位读者快路径完整保留。</strong><code>endRead</code> 里 <code>dirt == 0</code> 时只做两次原子操作（fetchSub + 退槽），
-不取锁——读者热路径不退化为锁；最后一个读者退出时 <code>count==0</code> 自然走全量分支，
-与旧行为逐字节一致。“短命读者退出即按水位增量回收”只发生在<strong>仍有其他读者</strong>时，
-这正是 T-30 要的语义：等最老读者，不等最后读者。</p>
+<p><strong>④ 末位读者快路径保留的是「回收」语义，不是「免锁」。</strong>新实现里 <code>endRead</code> 每次都要取
+<code>pending_free_mu</code> 才能安全地把句柄从活跃链表摘下并还回 free-list（intrusive 链必须串行化）；
+但锁内的摘链 + <code>fetchSub</code> 是 O(1)、零分配的。<code>dirt &gt; 0</code> 守门的是锁<strong>之后</strong>的
+<code>reclaimPendingFree</code>——无积压时跳过，避免再做一次「遍历 + 分区」的重活。
+最后一个读者退出时 <code>count==0</code> 自然走全量分支。这把锁的引入是显式句柄的固有代价
+（活跃集是链表而非无锁槽位），换来的是 B1 由锁序直接保证（1.3）。</p>
 
 <div class="note ok" role="note">✅ 正确性 <b>水位只升不降的回收时机论证：</b>新读者的快照 = 当前 sequence，
 永远 ≥ 既有任何快照，所以 begin 只会保持或抬高水位下限；水位<strong>上升只发生在 endRead</strong>。
@@ -358,9 +331,9 @@ overflow 永远 &gt; 0，watermark 永久为 0，引擎从此一个脏页都回�
 
 <div class="note warn" role="note">⚠️ 注意 <b>边界保守性的代价：</b><code>release_seq == watermark</code> 的页会被多钉一个读者代际
 （下一位读者退出、水位抬高后才放行）。这是刻意的半步保守：它给 B1 的注册窗口
-（哨兵 → 发布之间）留出安全余量，也是“精确判据”与“简单可证”的折中。
-若未来追求极致精确，可以改为 <code>release_seq ≤ watermark</code> 放行，但必须同时把注册次序
-改为“先占位读 sequence 前的旧值”或引入槽位版本号——复杂度上升，收益只有一个序列代际的延迟，不值。</div>
+（读快照 → 入活跃集之间）留出安全余量，也是“精确判据”与“简单可证”的折中。
+若未来追求极致精确，可以改为 <code>release_seq ≤ watermark</code> 放行，但必须同时改变注册次序——
+复杂度上升，收益只有一个序列代际的延迟，不值。</div>
 
 </section>
 
@@ -369,10 +342,10 @@ overflow 永远 &gt; 0，watermark 永久为 0，引擎从此一个脏页都回�
 <a id="part2"></a>
 <h2><span class="no">第二部分</span>State 骨架与读者 API</h2>
 
-<p>如果说第一部分的读者注册槽是「精密切割刀」，那么 <code>State</code> 就是整个 writer 的「底盘」：
-它持有全部原子状态（root / sequence / dirt / 统计）、MVCC 读者模型的两套簿记（全局计数 + 逐读者槽位）、
+<p>如果说第一部分的显式 Reader 句柄是「精密切割刀」，那么 <code>State</code> 就是整个 writer 的「底盘」：
+它持有全部原子状态（root / sequence / dirt / 统计）、MVCC 读者模型的两套簿记（全局计数 + 活跃读者链表）、
 以及待回收页队列 <code>pending_free</code> 与保护它的互斥锁 <code>pending_free_mu</code>。
-本部分逐字段拆解 <code>State</code>（writer.zig:281-313），讲清 <code>init</code>/<code>deinit</code> 的生命周期约定、
+本部分逐字段拆解 <code>State</code>（writer.zig:150-219），讲清 <code>init</code>/<code>deinit</code> 的生命周期约定、
 <code>beginRead</code>/<code>endRead</code> 这对读者 API 的精确顺序（B1 不变式落在何处）、
 以及 <code>compact</code> 在 T-30 之后如何做到「dirt 永远说真话」。</p>
 
@@ -391,10 +364,13 @@ overflow 永远 &gt; 0，watermark 永久为 0，引擎从此一个脏页都回�
 
     meta_index: <span class="ty">u32</span>,                     <span class="cm">// meta 双页交替写游标（0/1）</span>
 
-    <span class="cm">// ---- MVCC 读者簿记：快路径计数 + T-30 逐读者槽位 ----</span>
+    <span class="cm">// ---- MVCC 读者簿记：快路径计数 + 活跃读者链表 ----</span>
     reader_count: std.atomic.<span class="ty">Value</span>(<span class="ty">u32</span>),   <span class="cm">// 0 = 无读者（全量回收快路径判据）</span>
-    reader_slots: [READER_SLOTS]std.atomic.<span class="ty">Value</span>(<span class="ty">u64</span>),
-    overflow_readers: std.atomic.<span class="ty">Value</span>(<span class="ty">u32</span>),
+    readers_head: ?<span class="ty">*Reader</span> = <span class="kw">null</span>,        <span class="cm">// 活跃读者 intrusive 双向链表头（受 pending_free_mu 保护）</span>
+    reader_free: ?<span class="ty">*Reader</span> = <span class="kw">null</span>,         <span class="cm">// 句柄池 free-list 头</span>
+    embedded_readers: [EMBEDDED_READERS]<span class="ty">Reader</span>, <span class="cm">// 嵌入式句柄池（首次 use 时懒链接）</span>
+    readers_linked: <span class="kw">bool</span> = <span class="kw">false</span>,
+    reader_pool: std.<span class="ty">ArrayList</span>(<span class="ty">*Reader</span>) = .empty, <span class="cm">// 堆句柄登记，deinit 统一销毁</span>
 
     <span class="cm">// ---- 待回收页队列 + 互斥锁 ----</span>
     pending_free: std.<span class="ty">ArrayList</span>(<span class="ty">PendingPage</span>),
@@ -411,8 +387,8 @@ overflow 永远 &gt; 0，watermark 永久为 0，引擎从此一个脏页都回�
 <tr><td><code>meta_index</code></td><td>meta 双页（page 0/1）交替写游标，崩溃安全的关键——上次写哪页，这次就写另一页</td></tr>
 <tr><td rowspan="2">统计簿记</td><td><code>entry_count</code> / <code>byte_size</code></td><td>逻辑条数与活字节数，applyBatch 按 count_delta/live_delta 增量更新，供 compact meta 与测试断言</td></tr>
 <tr><td><code>dirt</code></td><td><b>仍被钉住（不可回收）</b>的 pending 页数——T-30 之后它与 <code>pendingFreeCount()</code> 恒等（见 2.3）</td></tr>
-<tr><td rowspan="2">读者簿记</td><td><code>reader_count</code></td><td>全局活跃读者计数。<b>0 = 无读者</b>是全量回收的快路径判据；有读者时精确化交给槽位</td></tr>
-<tr><td><code>reader_slots</code> / <code>overflow_readers</code></td><td>T-30 逐读者快照注册槽（64 个，值 = snapshot|CLAIM_BIT）与溢出计数——第一部分的主角，这里只作为 State 的「仪表盘」</td></tr>
+<tr><td rowspan="2">读者簿记</td><td><code>reader_count</code></td><td>全局活跃读者计数。<b>0 = 无读者</b>是全量回收的快路径判据；有读者时精确化交给活跃读者链表</td></tr>
+<tr><td><code>readers_head</code> / <code>reader_free</code> / <code>embedded_readers</code> / <code>reader_pool</code></td><td>活跃读者链表头、句柄池 free-list 头、嵌入式 8 句柄、堆句柄登记表——第一部分的主角（显式 Reader 句柄机制），这里只作为 State 的「仪表盘」</td></tr>
 <tr><td>页回收队列</td><td><code>pending_free</code> + <code>pending_free_mu</code></td><td>待回收页（携带 release_seq）与保护它的锁——见下方一致性分析</td></tr>
 </table>
 
@@ -425,8 +401,9 @@ overflow 永远 &gt; 0，watermark 永久为 0，引擎从此一个脏页都回�
         .root = std.atomic.<span class="ty">Value</span>(<span class="ty">u32</span>).<span class="fn">init</span>(btree.NULL_ROOT),
         .sequence = std.atomic.<span class="ty">Value</span>(<span class="ty">u64</span>).<span class="fn">init</span>(<span class="nu">0</span>),
         .dirt = std.atomic.<span class="ty">Value</span>(<span class="ty">u64</span>).<span class="fn">init</span>(<span class="nu">0</span>),
-        <span class="cm">// ... 其余原子量同理初始化为 0 / false</span>
-        .reader_slots = <span class="fn">@splat</span>(std.atomic.<span class="ty">Value</span>(<span class="ty">u64</span>).<span class="fn">init</span>(<span class="nu">0</span>)),
+        <span class="cm">// ... 其余原子量同理初始化为 0 / false；读者簿记字段走默认值</span>
+        <span class="cm">// (readers_head/reader_free = null, embedded_readers = undefined,</span>
+        <span class="cm">//  readers_linked = false, reader_pool = .empty)</span>
         .pending_free = .empty,
         .pending_free_mu = .{},
     };
@@ -437,6 +414,9 @@ overflow 永远 &gt; 0，watermark 永久为 0，引擎从此一个脏页都回�
     <span class="cm">// Free the remaining pending_free (safe: writer thread done, no readers)</span>
     <span class="kw">for</span> (self.pending_free.items) |pp| self.store.<span class="fn">freePage</span>(pp.page_no);
     self.pending_free.<span class="fn">deinit</span>(self.allocator);
+    <span class="cm">// 释放所有堆分配的句柄（嵌入式 8 个随 State 一起回收，无需逐个 destroy）</span>
+    <span class="kw">for</span> (self.reader_pool.items) |r| self.allocator.<span class="fn">destroy</span>(r);
+    self.reader_pool.<span class="fn">deinit</span>(self.allocator);
 }</code></pre>
 
 <div class="note" role="note">💡 说明 <b>deinit 的安全前提：</b>注释里那句 "safe: writer thread done, no readers" 是调用契约——
@@ -477,52 +457,66 @@ freePage 少调一次只是浪费空间，多调一次才是灾难）。这是�
 
 <p>这对 API 是 MVCC 的入口，也是第一部分所有机制的被调用方。它们的<b>语句顺序本身就是正确性论证</b>：</p>
 
-<pre><code><span class="kw">pub fn</span> <span class="fn">beginRead</span>(self: *<span class="ty">State</span>) <span class="ty">u64</span> {
+<pre><code><span class="kw">pub fn</span> <span class="fn">beginRead</span>(self: *<span class="ty">State</span>) <span class="ty">*Reader</span> {
     _ = self.reader_count.<span class="fn">fetchAdd</span>(<span class="nu">1</span>, .acquire);
-    <span class="kw">const</span> slot = <span class="fn">claimReaderSlot</span>(self); <span class="cm">// claim first (sentinel 0), then read sequence</span>
-    <span class="kw">const</span> seq = self.sequence.<span class="fn">load</span>(.acquire);
-    <span class="kw">if</span> (slot &lt; READER_SLOTS) {
-        self.reader_slots[slot].<span class="fn">store</span>(seq | CLAIM_BIT, .release);
-    }
-    <span class="kw">return</span> seq;
+    self.pending_free_mu.<span class="fn">lockUncancelable</span>();
+    <span class="kw">defer</span> self.pending_free_mu.<span class="fn">unlock</span>();
+    <span class="kw">if</span> (!self.readers_linked) { <span class="cm">/* 首次：链入 8 个嵌入式句柄 */</span> }
+    <span class="kw">const</span> r = self.reader_free <span class="kw">orelse</span> blk: { <span class="cm">/* 池满 → 堆分配 + 记入 reader_pool */</span> ... };
+    self.reader_free = r.next_free;
+    r.* = .{ .state = self,
+             .seq = self.sequence.<span class="fn">load</span>(.acquire),
+             .active = <span class="kw">true</span>,
+             .prev_active = <span class="kw">null</span>,
+             .next_active = self.readers_head, .next_free = <span class="kw">null</span> };
+    <span class="kw">if</span> (self.readers_head) |h| h.prev_active = r;
+    self.readers_head = r;
+    <span class="kw">return</span> r;
 }
 
-<span class="kw">pub fn</span> <span class="fn">endRead</span>(self: *<span class="ty">State</span>) <span class="ty">void</span> {
-    _ = self.reader_count.<span class="fn">fetchSub</span>(<span class="nu">1</span>, .release);
-    <span class="fn">unregisterReaderSlot</span>(self);
-    <span class="kw">if</span> (self.dirt.<span class="fn">load</span>(.acquire) &gt; <span class="nu">0</span>) {
-        self.<span class="fn">reclaimPendingFree</span>();
+<span class="kw">pub fn</span> <span class="fn">endRead</span>(self: *<span class="ty">State</span>, reader: *<span class="ty">Reader</span>) <span class="ty">void</span> {
+    <span class="kw">if</span> (reader.state != self) <span class="kw">return</span>; <span class="cm">// 跨状态误用：guarded no-op</span>
+    <span class="kw">if</span> (!reader.active) <span class="kw">return</span>;    <span class="cm">// 双重 endRead：no-op</span>
+    {
+        self.pending_free_mu.<span class="fn">lockUncancelable</span>();
+        <span class="kw">defer</span> self.pending_free_mu.<span class="fn">unlock</span>();
+        <span class="cm">/* 从活跃链摘下、active=false、还回 free-list */</span>
+        _ = self.reader_count.<span class="fn">fetchSub</span>(<span class="nu">1</span>, .release);
     }
+    <span class="kw">if</span> (self.dirt.<span class="fn">load</span>(.acquire) &gt; <span class="nu">0</span>) self.<span class="fn">reclaimPendingFree</span>();
 }</code></pre>
 
-<p><code>beginRead</code> 的三步顺序是评审轮 B1 修复后定下的<b>不变式</b>（writer.zig:345-366）：</p>
+<p><code>beginRead</code> 的关键顺序是评审轮 B1 修复后定下的<b>不变式</b>（writer.zig:249-282）：</p>
 
 <div class="flow" role="flow">
 <span class="step">① fetchAdd(reader_count)</span><span class="arrow">→</span>
-<span class="step">② claimReaderSlot（哨兵快照 0）</span><span class="arrow">→</span>
-<span class="step">③ sequence.load（读快照）</span><span class="arrow">→</span>
-<span class="step">④ 槽位 release-store 发布 seq|CLAIM_BIT</span><span class="arrow">→</span>
-<span class="step">⑤ 返回 seq，调用方捕获 root</span>
+<span class="step">② 取 pending_free_mu</span><span class="arrow">→</span>
+<span class="step">③ 池取句柄 + 锁内 sequence.load（读快照）</span><span class="arrow">→</span>
+<span class="step">④ 锁内入活跃集（active=true）</span><span class="arrow">→</span>
+<span class="step">⑤ 返回句柄，调用方捕获 root</span>
 </div>
 
 <ul>
-<li><b>①→②：</b>先计数再占位。若顺序颠倒，占位与计数之间可能出现「count==0 的假象」，写者的 grace-period 全量回收（applyBatch 步骤 0/9）会把读者还需要的页放走。</li>
-<li><b>②→③→④（B1 核心）：</b>先占一个<b>哨兵值为 0 的槽</b>，再读 sequence，最后才发布真实快照。占位到发布的窗口里，<code>readerWatermark()</code> 看到快照 0 → watermark=0 → 钉住一切。若反过来「先读 seq 再占位」，被抢占的窗口内读者已计入 count 但快照对 watermark 不可见，其他读者的 endRead 回收可能放走它仍要读的页——这正是 B1 修复掉的竞态。</li>
+<li><b>①→②：</b>先计数再取锁。若顺序颠倒，取锁前可能出现「count==0 的假象」，写者的 grace-period 全量回收（applyBatch 步骤 0/9）会把读者还需要的页放走。</li>
+<li><b>③→④（B1 核心）：</b>读快照与入活跃集在<strong>同一个锁临界区</strong>内完成。期间回收（同样持锁）不可能交错，watermark 要么看到本读者带着真实 seq 在集里（被其压低），要么本读者尚未入集——而其 seq 也还没被读，没有「seq 已读但未登记」的窗口。这正是 B1 修复掉的竞态，由锁序直接保证，无需哨兵占位。</li>
 <li><b>⑤：</b>注册先于返回，调用方（<code>db.zig</code> 的 ReadTxn / select 的 Iterator pin）随后才捕获 root；无论看到新 root 还是旧 root，其 COW 旧页都滞留在 pending_free 直到 watermark 放行。</li>
 </ul>
 
-<div class="note ok" role="note">✅ 正确性 <b>endRead 的顺序同样有讲究：</b>先 <code>fetchSub</code> 再 <code>unregisterReaderSlot</code>，
-最后视积压回收。注销发生在回收<b>之前</b>，所以本次计算 watermark 时自己已经不在槽里——「退出者的快照不再需要保护」先于「按新 watermark 放页」。
+<div class="note ok" role="note">✅ 正确性 <b>endRead 的顺序同样有讲究：</b>先 <code>fetchSub</code> 再（出锁后按积压）回收。注销发生在回收
+<strong>之前</strong>，所以本次计算 watermark 时自己已经不在活跃集里——「退出者的快照不再需要保护」先于「按新 watermark 放页」。
 若注销在后，watermark 会被自己的旧快照压低，只是偏保守（多钉不少放），不破坏正确性，但白白放过回收机会。</div>
 
-<div class="note" role="note">💡 说明 <b>读者热路径不退化为锁：</b><code>endRead</code> 里对 <code>pending_free_mu</code> 的获取被
-<code>if (dirt.load(.acquire) &gt; 0)</code> 守门——无积压时整个 endRead 只有两次原子 RMW + 一次 load，
-<b>不取任何锁</b>。绝大多数短命读者（读一个 key 就退出）都走这条无锁路径；只有恰好赶上写者提交过、且本读者退出瞬间仍有积压时才进锁。
-而 <code>beginRead</code> 常态下也只是一次 fetchAdd + 一次槽位 CAS + 两次 load/store。</div>
+<div class="note" role="note">💡 说明 <b>读者路径的锁开销与零分配：</b>新实现里 <code>endRead</code> 每次都要取 <code>pending_free_mu</code>
+（把句柄从活跃链表摘下并还回 free-list），但锁内操作是 O(1)、零分配的；<code>if (dirt.load(.acquire) &gt; 0)</code>
+守门的是锁<strong>之后</strong>的 <code>reclaimPendingFree</code>，无积压时跳过（见 1.4 ④）。
+而 <code>beginRead</code> 也取同一把锁，但 8 个嵌入式句柄以内<strong>零堆分配</strong>（链表取/还），
+select() 迭代器借用的零分配测试（<code>iterator_borrow</code>）依然成立。这把锁的引入是显式句柄的固有代价，
+换来的是 B1 由锁序直接保证（1.3）。</div>
 
-<div class="note warn" role="note">⚠️ 注意 <b>忘记 endRead 的后果：</b>读者名额泄漏——<code>reader_count</code> 永不归零、槽位永久占用，
+<div class="note warn" role="note">⚠️ 注意 <b>忘记 endRead 的后果：</b>读者名额泄漏——<code>reader_count</code> 永不归零、句柄永久留在活跃集，
 watermark 被钉在泄漏者的快照上，其后所有提交的脏页（release_seq &gt;= watermark）<b>永不回收</b>，pending_free 无界增长。
-<code>db.zig</code> 层用 <code>defer r.end()</code> / Iterator 的 <code>pin_deinit</code> 兜底，但直接使用 State 的调用方必须自觉配对。</div>
+<code>db.zig</code> 层用 <code>defer endRead</code> / Iterator 的 <code>pin_deinit</code> 兜底，但直接使用 State 的调用方必须自觉配对。
+（跨状态误用与双重 endRead 的 guarded no-op 语义见 1.3。）</div>
 
 <h3 id="s23">2.3 compact 与 dirt 真实性</h3>
 
@@ -599,9 +593,9 @@ watermark 被钉在泄漏者的快照上，其后所有提交的脏页（release
 
 <ul>
 <li><b>reader_count 检查在锁内。</b>为什么不锁外判一次就完事？因为「count==0 → 全量放页」这个决定必须与
-「新读者注册」互斥。读者注册（fetchAdd + 槽位哨兵）不取这把锁，但它的快照读取发生在 fetchAdd <b>之后</b>；
-只要回收在锁内看到 count==0，其后注册的读者快照必然 ≥ 所有已入队页的 release_seq，不可能引用被放走的页。
-锁内复查把这个论证钉死。</li>
+「新读者注册」互斥。读者注册（<code>fetchAdd</code> + 锁内读快照 + 入活跃集，见 1.2/1.3）取同一把锁，
+但 <code>fetchAdd</code> 先于取锁发生；只要回收在锁内看到 count==0，其后注册的读者快照必然 ≥ 所有已入队页的
+release_seq，不可能引用被放走的页。锁内复查把这个论证钉死。</li>
 <li><b>分拣是原地压缩（keep 游标）。</b>一次遍历，无临时分配：<code>release_seq &lt; watermark</code> 的立即 freePage，
 其余前移到 <code>items[0..keep]</code>，最后 <code>shrinkRetainingCapacity</code>。注意判定是<b>严格小于</b>——
 release_seq == watermark 的页保守保留（边界页宁可多钉一拍，也不赌快照可见性的边）。</li>
