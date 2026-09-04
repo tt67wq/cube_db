@@ -1,0 +1,946 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>cube_db · src/writer.zig 讲义</title>
+<link rel="stylesheet" href="lecture.css">
+</head>
+<body>
+<button class="sidenav-toggle" id="navToggle" aria-label="目录" aria-expanded="false">☰ 目录</button>
+<nav class="sidenav" id="sidenav" aria-label="章节导航">
+  <h4>目录 · 章节导航</h4>
+  <ul>
+    <li class="part"><a href="#part1">第一部分 · MVCC 读者模型（T-30）</a></li>
+    <li class="sub"><a href="#s11">1.1 从全局计数到逐读者注册</a></li>
+    <li class="sub"><a href="#s12">1.2 槽位注册与 overflow 降级</a></li>
+    <li class="sub"><a href="#s13">1.3 注销配对与 B1 不变式</a></li>
+    <li class="sub"><a href="#s14">1.4 watermark 精确回收</a></li>
+    <li class="part"><a href="#part2">第二部分 · State 骨架与读者 API</a></li>
+    <li class="sub"><a href="#s21">2.1 State 字段与 init/deinit</a></li>
+    <li class="sub"><a href="#s22">2.2 beginRead / endRead</a></li>
+    <li class="sub"><a href="#s23">2.3 compact 与 dirt 真实性</a></li>
+    <li class="part"><a href="#part3">第三部分 · applyBatch 写路径与持久化</a></li>
+    <li class="sub"><a href="#s31">3.1 结构：Durability / Options / Request / ProfileStats</a></li>
+    <li class="sub"><a href="#s32">3.2 applyBatch 流水线</a></li>
+    <li class="sub"><a href="#s33">3.3 持久化顺序与设计取舍</a></li>
+  </ul>
+</nav>
+<main class="wrap">
+
+<header class="hero">
+  <h1>cube_db · <code>src/writer.zig</code> 讲义</h1>
+  <div class="sub">v2 批量写路径逐段精讲：MVCC 读者模型（T-30）· State 骨架 · applyBatch 流水线与持久化</div>
+  <div style="margin-top:12px">
+    <span class="tag">Zig 0.16</span>
+    <span class="tag">COW B-tree 存储引擎</span>
+    <span class="tag">MVCC 读者模型</span>
+    <span class="tag">applyBatch 批量写</span>
+    <span class="tag">crash 持久化</span>
+  </div>
+</header>
+
+<p class="muted">本讲义逐段精讲 <code>src/writer.zig</code>（约 660 行）：v2 batch apply 写路径。代码标识符、函数名保持原文；讲解为中文。点击侧边目录或直接滚动阅读。</p>
+
+<section class="lecture">
+<h2 id="part1"><span class="no">第一部分</span>MVCC 读者模型（T-30）</h2>
+
+<p><code>src/writer.zig</code> 的核心职责之一是 <strong>MVCC 安全的脏页回收</strong>：写者每次提交都会把
+COW 出来的旧页放进 <code>pending_free</code> 列表延迟回收，回收的前提是<strong>没有任何活跃读者还在引用这些页</strong>。
+T-30 之前，读者跟踪只有单一全局 <code>reader_count</code>：任何一个读者活跃，所有积压脏页都不敢动，
+只有<strong>最后一个</strong>读者退出（<code>prev==1</code>）才一次性全部回收。T-30 把它演进为
+<strong>逐读者序列注册 + oldest-reader watermark</strong>：一页只要在序列 <em>S</em> 之前释放、且所有活跃读者的快照
+都 ≥ <em>S</em>，就能回收——不必等最老的那个读者退出。</p>
+
+<div class="note" role="note">💡 为什么旧模型是个缺陷：<strong>单个长命读者会钉住其存活期间所有提交释放的脏页</strong>。
+一个开着迭代器慢慢扫描的读者 + 持续写入的负载，会让 <code>pending_free</code> 与 <code>dirt</code> 计数无界增长；
+<code>compact()</code> 在有读者时更是只能静默清计数（dirt 误报 0，页仍被钉住）。精确回收语义也是后续
+「freelist 持久化」（演进点 #2）的前置条件——free 链要安全落盘，必须先知道每一页何时真正可回收。</div>
+
+<h3 id="s11">1.1 从全局计数到逐读者注册</h3>
+
+<p>先看新模型给回收判据带来的变化。旧 <code>pending_free</code> 只存裸页号
+（<code>ArrayList(u32)</code>），“能不能回收”的答案只有两种：无读者（全回收）或有读者（全保留）。
+新模型让每个条目携带<strong>释放序列</strong>：</p>
+
+<pre><code><span class="cm">/// pending_free entry: page number + the sequence of the commit that freed it</span>
+<span class="cm">/// (that commit's new_sequence).</span>
+<span class="cm">/// Reclamation rule: safe to reclaim when release_seq &lt; the oldest-active-reader</span>
+<span class="cm">/// watermark (every active reader snapshot is &gt;= watermark &gt; release_seq, so</span>
+<span class="cm">/// nobody can still reference the page); equal or greater must be kept (old</span>
+<span class="cm">/// snapshots remain valid — the correctness floor, conservatively including</span>
+<span class="cm">/// the boundary).</span>
+<span class="kw">pub const</span> <span class="ty">PendingPage</span> = <span class="kw">struct</span> {
+    page_no: <span class="ty">u32</span>,
+    release_seq: <span class="ty">u64</span>,
+};</code></pre>
+
+<p><code>release_seq</code> 是<strong>释放该页的那次提交的 <code>new_sequence</code></strong>（<code>applyBatch</code> 第 3 步入队时写入
+<code>cur_sequence + 1</code>）。这个数字的语义是：该页属于 <code>cur_sequence</code> 时刻的树——
+<strong>快照 ≥ <code>new_sequence</code> 的读者不可能引用它</strong>（它已经不在 <code>new_sequence</code> 提交之后的树里），
+而快照更老的读者可能还在沿着它走。于是回收判据从二值变成了一条精确的序列不等式：</p>
+
+<div class="card">
+<p><b>回收规则（正确性核心）：</b>页 <code>release_seq = S</code>（由 <em>q → S</em> 的提交释放，属于 <em>q = S−1</em> 时刻的树）
+可以回收，当且仅当所有活跃读者的快照都 ≥ <em>S</em>——即 <code>release_seq &lt; watermark</code>，其中
+watermark = 活跃读者快照序列的最小值。快照为 <em>s</em> 的读者遍历的是 <code>root(s)</code> 的树，
+它引用的页只可能是“释放序列 &gt; <em>s</em>”的页（被更晚的提交释放、但当时还是树的一部分），
+所以快照 ≥ <em>S</em> ⇒ 不引用该页。</p>
+</div>
+
+<p>注意边界：判据用<strong>严格小于</strong>。快照恰好等于 <code>S</code> 的读者看到的是 <code>root(S)</code>，
+理论上已不含该页（它在 <em>S−1 → S</em> 提交时被替换），但实现选择保守保留——
+“等于 watermark 的页不回收”。这半步保守换来的是注册竞态下的安全余量（见 1.3 的 B1 不变式）。</p>
+
+<div class="note warn" role="note">⚠️ 注意 <b>两类读者、两套计数：</b><code>reader_count</code>（全局原子计数）仍然保留，
+它服务于<strong>快路径</strong>——<code>reader_count == 0</code> 时无需任何序列计算，直接全量回收（既有行为不变）。
+序列注册（<code>reader_slots</code>）只在<strong>有读者</strong>时参与精确判据。两套机制各司其职：
+计数答“还有没有人”，序列答“谁最老”。</div>
+
+<h3 id="s12">1.2 槽位注册与 overflow 降级</h3>
+
+<p>逐读者注册的载体是三个常量与一个线程本地栈：</p>
+
+<pre><code><span class="cm">/// Per-reader snapshot registration slots. When exceeded (concurrent readers</span>
+<span class="cm">/// &gt; 64, or TLS nesting overflow), degrade conservatively to watermark=0</span>
+<span class="cm">/// (pin everything = the old global-count behavior) — safe but imprecise.</span>
+<span class="kw">const</span> READER_SLOTS = <span class="nu">64</span>;
+<span class="cm">/// Max beginRead nesting depth per thread (ReadTxn + select nesting etc.;</span>
+<span class="cm">/// realistically &lt;= 3).</span>
+<span class="kw">const</span> MAX_TLS_READERS = <span class="nu">16</span>;
+<span class="cm">/// Slot value encoding: 0 = free; non-zero = snapshot | CLAIM_BIT (the</span>
+<span class="cm">/// snapshot sequence occupies everything below the top bit).</span>
+<span class="kw">const</span> CLAIM_BIT: <span class="ty">u64</span> = <span class="nu">1</span> &lt;&lt; <span class="nu">63</span>;
+
+<span class="kw">const</span> <span class="ty">TlsEntry</span> = <span class="kw">struct</span> {
+    state: <span class="ty">*const anyopaque</span>,
+    slot: <span class="ty">u32</span>, <span class="cm">// READER_SLOTS = overflow registration (not a slot)</span>
+};
+<span class="kw">threadlocal var</span> tls_readers: [MAX_TLS_READERS]<span class="ty">TlsEntry</span> = <span class="kw">undefined</span>;
+<span class="kw">threadlocal var</span> tls_readers_len: <span class="ty">usize</span> = <span class="nu">0</span>;</code></pre>
+
+<table>
+<tr><th>成员</th><th>角色</th></tr>
+<tr><td><code>reader_slots</code></td><td><code>[64]std.atomic.Value(u64)</code>，State 内的全局槽位数组。值编码：<code>0</code> = 空闲；非 0 = <code>snapshot | CLAIM_BIT</code>——最高位是占用标记，低 63 位存快照序列。单槽一个原子字，注册零分配</td></tr>
+<tr><td><code>overflow_readers</code></td><td>溢出计数。槽位耗尽（并发读者 &gt; 64）或 TLS 栈满时走溢出注册；只要它 &gt; 0，watermark 视为 0（钉住一切）——恰好退化为旧的全局计数行为</td></tr>
+<tr><td><code>tls_readers</code> / <code>TlsEntry</code></td><td>每线程的注册栈，记录 <code>{ state 指针, slot 下标 }</code>。它存在的唯一原因是：<code>endRead()</code> 不带参数（db.zig 接口不许改），注销时必须靠它找回“我是哪个注册”</td></tr>
+</table>
+
+<p><code>claimReaderSlot</code> 负责占位：</p>
+
+<pre><code><span class="kw">fn</span> <span class="fn">claimReaderSlot</span>(self: *<span class="ty">State</span>) <span class="ty">u32</span> {
+    <span class="kw">if</span> (tls_readers_len &lt; MAX_TLS_READERS) {
+        <span class="kw">var</span> i: <span class="ty">usize</span> = <span class="nu">0</span>;
+        <span class="kw">while</span> (i &lt; READER_SLOTS) {
+            <span class="kw">if</span> (self.reader_slots[i].<span class="fn">load</span>(.acquire) != <span class="nu">0</span>) {
+                i += <span class="nu">1</span>;
+                <span class="kw">continue</span>;
+            }
+            <span class="cm">// m2: cmpxchgWeak may fail spuriously — retry the same slot on</span>
+            <span class="cm">// failure (reload to re-check busyness) instead of skipping a</span>
+            <span class="cm">// still-free slot.</span>
+            <span class="kw">if</span> (self.reader_slots[i].<span class="fn">cmpxchgWeak</span>(<span class="nu">0</span>, CLAIM_BIT, .acq_rel, .acquire) == <span class="kw">null</span>) {
+                tls_readers[tls_readers_len] = .{ .state = <span class="fn">@ptrCast</span>(self), .slot = <span class="fn">@intCast</span>(i) };
+                tls_readers_len += <span class="nu">1</span>;
+                <span class="kw">return</span> <span class="fn">@intCast</span>(i);
+            }
+        }
+    }
+    <span class="cm">// Slots exhausted (or TLS stack full): overflow registration.</span>
+    _ = self.overflow_readers.<span class="fn">fetchAdd</span>(<span class="nu">1</span>, .acq_rel);
+    <span class="kw">if</span> (tls_readers_len &lt; MAX_TLS_READERS) { <span class="cm">/* push overflow entry */</span> }
+    <span class="kw">return</span> READER_SLOTS;
+}</code></pre>
+
+<p>三个细节值得停下来看：</p>
+<p><strong>① CAS 占位值是哨兵，不是真实快照。</strong>占位写入的是 <code>CLAIM_BIT</code>（即“快照 0”）——
+此刻读者的真实快照还没读到（B1 不变式要求先占位再读 sequence，见 1.3）。哨兵的作用是：
+在真实快照发布之前，watermark 计算看到快照 0，于是钉住一切。<strong>宁可多钉，不可漏钉</strong>。</p>
+<p><strong>② CAS 失败要原地重试（m2 修复）。</strong><code>cmpxchgWeak</code> 允许<strong>spurious 失败</strong>——
+没被别人抢也可能失败。若失败就 <code>i += 1</code> 跳走，会把一个仍然空闲的槽位漏掉，64 个槽可能被
+几轮伪失败提前“用完”，白白降级到 overflow。所以循环体是“失败 → 回到同一槽重新 load 判忙”，
+只有槽位真的被别人占了才前进。</p>
+<p><strong>③ 溢出注册是安全降级，不是错误。</strong>并发读者超过 64 或线程内嵌套超过 16 层时，
+<code>fetchAdd(1, .acq_rel)</code> 把读者记入 <code>overflow_readers</code>——watermark 从此为 0，
+所有 pending 页全部保守保留。这<strong>恰好等于旧的全局计数模型的行为</strong>：不精确，但永不违反正确性。
+注意 RMW 用了 <code>.acq_rel</code>（M1 修复）：与 <code>readerWatermark</code> 的 <code>.acquire</code> 读配对，
+注册一旦被水位看到就有 happens-before 边；原先的 <code>.monotonic</code> 没有发布边，
+刚注册的溢出读者可能短暂不可见，水位会错误地放行它引用的页。</p>
+
+<div class="note" role="note">💡 说明 <b>槽位数怎么选：</b><code>READER_SLOTS = 64</code> 覆盖“64 个并发线程各持一个读事务”的典型形态
+（每个线程在 TLS 里只会同时占一个槽位，除非嵌套）；<code>MAX_TLS_READERS = 16</code> 是单线程嵌套
+<code>beginRead</code> 的上限——真实调用方最深不过 <code>ReadTxn</code> + <code>select</code> 迭代器两层。
+两者都不是硬约束，越界走溢出降级，只是回收退回“全钉”而已。</div>
+
+<h3 id="s13">1.3 注销配对与 B1 不变式</h3>
+
+<p>注册容易，注销难——难在<strong>配对</strong>：<code>endRead()</code> 签名是 <code>fn (self: *State) void</code>，
+一个参数都没有，它不知道自己是哪次 <code>beginRead</code> 的结束。解法是把配对信息藏在<strong>线程本地栈</strong>里：
+同一线程内 begin/end 按 LIFO 配对，栈条目携带 <code>state</code> 指针以精确区分多个 <code>Db</code> 实例的乱序嵌套。</p>
+
+<pre><code><span class="kw">fn</span> <span class="fn">unregisterReaderSlot</span>(self: *<span class="ty">State</span>) <span class="ty">void</span> {
+    <span class="kw">if</span> (tls_readers_len == MAX_TLS_READERS) {
+        <span class="cm">// m1: 栈满且栈顶属于本 State → 弹栈精确注销（解除粘滞）；</span>
+        <span class="cm">// 栈顶不匹配 → 本 end 配对未入栈的溢出注册，饱和退减。</span>
+        <span class="kw">if</span> (tls_readers[tls_readers_len - <span class="nu">1</span>].state == <span class="fn">@as</span>(*<span class="kw">const</span> <span class="ty">anyopaque</span>, <span class="fn">@ptrCast</span>(self))) {
+            <span class="fn">popTopTlsEntry</span>(self);
+            <span class="kw">return</span>;
+        }
+        <span class="fn">saturatingOverflowDec</span>(self);
+        <span class="kw">return</span>;
+    }
+    <span class="kw">var</span> i = tls_readers_len;
+    <span class="kw">while</span> (i &gt; <span class="nu">0</span>) {
+        i -= <span class="nu">1</span>;
+        <span class="kw">if</span> (tls_readers[i].state == <span class="fn">@as</span>(*<span class="kw">const</span> <span class="ty">anyopaque</span>, <span class="fn">@ptrCast</span>(self))) {
+            <span class="kw">const</span> entry = tls_readers[i];
+            <span class="cm">// swap-remove: 移除的是本 State 最新注册，同 State 其余条目</span>
+            <span class="cm">// 相对 LIFO 顺序不变（中间只可能夹其他 State 的条目）。</span>
+            tls_readers[i] = tls_readers[tls_readers_len - <span class="nu">1</span>];
+            tls_readers_len -= <span class="nu">1</span>;
+            <span class="kw">if</span> (entry.slot &lt; READER_SLOTS) {
+                self.reader_slots[entry.slot].<span class="fn">store</span>(<span class="nu">0</span>, .release);
+            } <span class="kw">else</span> {
+                <span class="fn">saturatingOverflowDec</span>(self);
+            }
+            <span class="kw">return</span>;
+        }
+    }
+    <span class="cm">// 本线程无此 State 的注册记录（跨线程 end / 误用）→ 饱和退减溢出计数</span>
+    <span class="fn">saturatingOverflowDec</span>(self);
+}</code></pre>
+
+<p>从栈<strong>顶向下</strong>找第一个 <code>state</code> 匹配的条目弹掉，保证同一 State 内严格 LIFO
+（嵌套 <code>ReadTxn + select</code> 时内层先结束）；跨 State 的条目夹在中间也不影响各自顺序。
+删条目用 <code>swap-remove</code>——把末尾元素搬到空洞，同 State 条目的相对顺序不变。</p>
+
+<p><strong>饱和退减（m1 修复）</strong>是所有“配不上对”路径的统一出口：</p>
+
+<pre><code><span class="cm">/// Saturating decrement of the overflow reader count (m1: no wraparound).</span>
+<span class="cm">/// An under-paired decrement only inflates the count -&gt; watermark=0 pins</span>
+<span class="cm">/// everything, the safe direction; a u32 wraparound would pin everything</span>
+<span class="cm">/// permanently and must be avoided.</span>
+<span class="kw">fn</span> <span class="fn">saturatingOverflowDec</span>(self: *<span class="ty">State</span>) <span class="ty">void</span> {
+    <span class="kw">while</span> (<span class="kw">true</span>) {
+        <span class="kw">const</span> cur = self.overflow_readers.<span class="fn">load</span>(.acquire);
+        <span class="kw">if</span> (cur == <span class="nu">0</span>) <span class="kw">return</span>; <span class="cm">// 欠配对退减：保守不退（计数偏高 = 多钉，安全）</span>
+        <span class="kw">if</span> (self.overflow_readers.<span class="fn">cmpxchgWeak</span>(cur, cur - <span class="nu">1</span>, .acq_rel, .acquire) == <span class="kw">null</span>) <span class="kw">return</span>;
+    }
+}</code></pre>
+
+<p>为什么必须饱和而不能裸 <code>fetchSub</code>：配不上对的 end（跨线程 <code>endRead</code>、误用、栈满期间的
+模糊配对）会对一个从未为自己加过的计数做减法。裸减法的失败模式是 <code>u32</code> <strong>回绕成 0xFFFFFFFF</strong>——
+overflow 永远 &gt; 0，watermark 永久为 0，引擎从此一个脏页都回收不了，且再也无法自愈。
+饱和退减把失败方向锁死在安全侧：计数最多偏高，偏高 = 多钉 = 旧模型行为，下次正常配对就能自愈。
+同理，m1 还修了<strong>栈满粘滞</strong>：原实现栈满后永不弹栈、每次 end 都盲走保守分支；
+现在“栈满且栈顶属于本 State”仍精确弹栈，栈才能逐渐排空。</p>
+
+<div class="note danger" role="note">🚨 风险 <b>遗留的精确配对盲区（如实记录）：</b>同线程嵌套超过 16 层时，栈满期间的溢出注册
+无法精确配对——栈满且栈顶匹配时弹栈可能误弹更早的自有注册，把一个仍活跃读者的槽位提前放掉。
+这是已知 ceiling（代码内有 <code>ponytail:</code> 注释标注）：本代码库真实嵌套 ≤ 3，16 层不可达；
+若将来需要支持，升级路径是显式 reader handle API——那要求改 <code>db.zig</code> 的 <code>endRead()</code> 签名。</div>
+
+<p>最后是整个注册模型最关键的次序不变式——<strong>B1</strong>（评审阻塞项，修复方式是哨兵占位）：</p>
+
+<pre><code><span class="kw">pub fn</span> <span class="fn">beginRead</span>(self: *<span class="ty">State</span>) <span class="ty">u64</span> {
+    _ = self.reader_count.<span class="fn">fetchAdd</span>(<span class="nu">1</span>, .acquire);
+    <span class="kw">const</span> slot = <span class="fn">claimReaderSlot</span>(self); <span class="cm">// claim first (sentinel 0), then read sequence</span>
+    <span class="kw">const</span> seq = self.sequence.<span class="fn">load</span>(.acquire);
+    <span class="kw">if</span> (slot &lt; READER_SLOTS) {
+        self.reader_slots[slot].<span class="fn">store</span>(seq | CLAIM_BIT, .release);
+    }
+    <span class="kw">return</span> seq;
+}</code></pre>
+
+<p><strong>占位（哨兵 0）→ 读 sequence → 发布真实快照</strong>，三步次序不可交换。若按天真的
+“先读 sequence 再注册”，存在这样的竞态窗口：读者 X 已读到 <code>seq=5</code> 但槽位还没发布，
+期间提交 6/7 释放了页 P（release 6）；读者 Z 注册快照 7；读者 Y 退出触发回收——水位看到
+{Z:7}（X 不可见）= 7 &gt; 6，于是放行 P。X 恢复执行、发布 {5}、沿自己的快照树读页——
+<strong>P 已被回收，活跃快照引用了已释放页</strong>，这正是被禁止的“live snapshot references freed page”。</p>
+
+<p>哨兵占位堵死了这个窗口：占位到发布之间，水位看到快照 0 ⇒ 什么都不放行；发布
+（<code>.release</code> store）之后的任何水位计算，要么看到哨兵（钉住），要么看到真实快照（恒 ≤ 本读者快照）。
+读者快照注册<strong>先于</strong>返回，调用方（<code>Db.select</code> / <code>ReadTxn</code>）随后才捕获 root——
+无论读到旧 root 还是新 root，其 COW 旧页都滞留在 <code>pending_free</code> 直到 watermark 放行
+（这正是 db.zig 里 T-29 修复的“先注册后捕获”惯例在 writer 层的落点）。</p>
+
+<div class="note ok" role="note">✅ 正确性 <b>B1 不变式：</b>任何时刻的任何水位计算，看到的每个槽位值要么是哨兵 0（该读者注册中，
+钉住一切），要么是 ≤ 该读者真实快照的已发布值。因此 <code>watermark ≤ 每个活跃读者的快照</code>，
+而读者引用的页满足 <code>release_seq &gt; 快照 ≥ watermark</code>——被水位放行的页（<code>release_seq &lt; watermark</code>）
+在数学上不可能同时被任何活跃读者引用。回收安全由构造保证，不靠运气。</div>
+
+<h3 id="s14">1.4 watermark 精确回收</h3>
+
+<p>注册数据齐了，剩下的两个函数把数据变成回收动作。<code>readerWatermark</code> 取活跃快照最小值：</p>
+
+<pre><code><span class="cm">/// Oldest-active-reader watermark: the minimum snapshot sequence across</span>
+<span class="cm">/// active readers. Returning 0 = the conservative floor (overflow</span>
+<span class="cm">/// readers / readers present but snapshot not yet visible) -&gt; pin everything.</span>
+<span class="kw">fn</span> <span class="fn">readerWatermark</span>(self: *<span class="ty">State</span>) <span class="ty">u64</span> {
+    <span class="kw">if</span> (self.overflow_readers.<span class="fn">load</span>(.acquire) &gt; <span class="nu">0</span>) <span class="kw">return</span> <span class="nu">0</span>;
+    <span class="kw">var</span> min: <span class="ty">u64</span> = <span class="nu">0</span>;
+    <span class="kw">var</span> found = <span class="kw">false</span>;
+    <span class="kw">for</span> (&amp;self.reader_slots) |*slot| {
+        <span class="kw">const</span> v = slot.<span class="fn">load</span>(.acquire);
+        <span class="kw">if</span> (v == <span class="nu">0</span>) <span class="kw">continue</span>;
+        <span class="kw">const</span> snap = v &amp; ~CLAIM_BIT;
+        <span class="kw">if</span> (!found <span class="kw">or</span> snap &lt; min) { min = snap; found = <span class="kw">true</span>; }
+    }
+    <span class="kw">return</span> min;
+}</code></pre>
+
+<p>三个“返回 0”的来源都要注意：溢出读者 &gt; 0（降级）；有读者但一个槽都没看见（读者正在注册的窗口，
+水位保守）；<code>found == false</code>（无注册读者——但这条路径只有 <code>reader_count &gt; 0</code> 时才会被走到，
+此时同样保守为 0）。0 是<strong>保守下界</strong>：严格小于 0 的 <code>release_seq</code> 不存在，所以什么都不放行。</p>
+
+<p><code>reclaimPendingFree</code> 是增量回收本体，被 <code>endRead</code> 和 <code>compact</code> 调用：</p>
+
+<pre><code><span class="kw">fn</span> <span class="fn">reclaimPendingFree</span>(self: *<span class="ty">State</span>) <span class="ty">void</span> {
+    self.pending_free_mu.<span class="fn">lockUncancelable</span>();
+    <span class="kw">defer</span> self.pending_free_mu.<span class="fn">unlock</span>();
+    <span class="kw">if</span> (self.reader_count.<span class="fn">load</span>(.acquire) == <span class="nu">0</span>) {
+        <span class="cm">// 无读者（锁内复查）→ 全量回收（旧快路径，保留）</span>
+        <span class="kw">for</span> (self.pending_free.items) |pp| self.store.<span class="fn">freePage</span>(pp.page_no);
+        self.pending_free.<span class="fn">clearRetainingCapacity</span>();
+        self.dirt.<span class="fn">store</span>(<span class="nu">0</span>, .release);
+        <span class="kw">return</span>;
+    }
+    <span class="kw">const</span> watermark = self.<span class="fn">readerWatermark</span>();
+    <span class="kw">var</span> keep: <span class="ty">usize</span> = <span class="nu">0</span>;
+    <span class="kw">for</span> (self.pending_free.items) |pp| {
+        <span class="kw">if</span> (pp.release_seq &lt; watermark) {
+            self.store.<span class="fn">freePage</span>(pp.page_no);  <span class="cm">// 放行</span>
+        } <span class="kw">else</span> {
+            self.pending_free.items[keep] = pp;  <span class="cm">// 原地保留</span>
+            keep += <span class="nu">1</span>;
+        }
+    }
+    self.pending_free.<span class="fn">shrinkRetainingCapacity</span>(keep);
+    self.dirt.<span class="fn">store</span>(keep, .release);
+}</code></pre>
+
+<div class="flow">
+<span class="step">endRead / compact</span><span class="arrow">→</span>
+<span class="step">取 pending_free_mu</span><span class="arrow">→</span>
+<span class="step">锁内查 reader_count</span><span class="arrow">→</span>
+<span class="step">0：全量回收</span><span class="arrow">｜</span>
+<span class="step">&gt;0：算 watermark</span><span class="arrow">→</span>
+<span class="step">原地分区：release_seq &lt; w 放行，其余保留</span><span class="arrow">→</span>
+<span class="step">dirt = 保留数</span>
+</div>
+
+<p>几个工程要点：</p>
+<p><strong>① 分区是原地的、O(n)、零分配。</strong>单次遍历里 <code>keep</code> 游标压缩保留项（source 下标恒 ≥ keep，
+不会覆盖未处理项），<code>shrinkRetainingCapacity</code> 只改长度。回收发生在读者线程的
+<code>endRead</code> 里——读者路径不碰 <code>state.allocator</code>，只动 <code>MemPageStore.freelist</code>（自有锁保护），
+所以 <code>std.testing.allocator</code> 的泄漏检测依然有效。</p>
+<p><strong>② <code>reader_count</code> 的检查在锁内。</strong>读者回收与写者 append（<code>applyBatch</code> 第 3 步）
+经 <code>pending_free_mu</code> 互斥；锁内看到 <code>count==0</code> 才全量。若检查在锁外，会出现
+“检查时无读者 → 锁前新读者注册 + 写者入队 → 全量回收误放新读者引用的页”的窗口。
+锁内复查保证：其后注册的新读者快照必 ≥ 全部 pending 的 <code>release_seq</code>，不可能引用被回收的页。
+（写者侧的 <code>flushPendingFree</code> 快路径在锁外预检 count 是安全的——单写者上下文里 sequence
+不会在检查与锁之间前进。这两处看似一样、实则语境不同，是很好的阅读考点。）</p>
+<p><strong>③ <code>dirt</code> 从“计数器”变成“真话”。</strong>回收后 <code>dirt = keep</code>——仍被钉住的真实页数。
+配合 <code>compact()</code> 不再静默清零（T-30 语义修正），以及 <code>applyBatch</code> 把 dirt 更新移入锁内
+（避免写者用陈旧长度覆写读者刚写下的 keep），<code>dirt == pendingFreeCount()</code> 成为全程不变式，
+监控与测试不再被误导性 0 值欺骗。</p>
+<p><strong>④ 末位读者快路径完整保留。</strong><code>endRead</code> 里 <code>dirt == 0</code> 时只做两次原子操作（fetchSub + 退槽），
+不取锁——读者热路径不退化为锁；最后一个读者退出时 <code>count==0</code> 自然走全量分支，
+与旧行为逐字节一致。“短命读者退出即按水位增量回收”只发生在<strong>仍有其他读者</strong>时，
+这正是 T-30 要的语义：等最老读者，不等最后读者。</p>
+
+<div class="note ok" role="note">✅ 正确性 <b>水位只升不降的回收时机论证：</b>新读者的快照 = 当前 sequence，
+永远 ≥ 既有任何快照，所以 begin 只会保持或抬高水位下限；水位<strong>上升只发生在 endRead</strong>。
+因此回收动作全部挂在 endRead / compact / applyBatch 快路径三个时机上即可，不会漏放——
+即使某次 endRead 因 <code>dirt==0</code> 跳过回收（此时本就无页可放），下次任何时机都会重新计算。
+配套测试（<code>mvcc_test.zig</code> T-30 用例）锁定三件事：短命读者退出（长命读者仍活跃）即回收
+<code>release_seq &lt; watermark</code> 的页；<code>release_seq &gt; 长命读者快照</code> 的页不回收；末位读者退出全量清零。</div>
+
+<div class="note warn" role="note">⚠️ 注意 <b>边界保守性的代价：</b><code>release_seq == watermark</code> 的页会被多钉一个读者代际
+（下一位读者退出、水位抬高后才放行）。这是刻意的半步保守：它给 B1 的注册窗口
+（哨兵 → 发布之间）留出安全余量，也是“精确判据”与“简单可证”的折中。
+若未来追求极致精确，可以改为 <code>release_seq ≤ watermark</code> 放行，但必须同时把注册次序
+改为“先占位读 sequence 前的旧值”或引入槽位版本号——复杂度上升，收益只有一个序列代际的延迟，不值。</div>
+
+</section>
+
+
+<section class="lecture">
+<a id="part2"></a>
+<h2><span class="no">第二部分</span>State 骨架与读者 API</h2>
+
+<p>如果说第一部分的读者注册槽是「精密切割刀」，那么 <code>State</code> 就是整个 writer 的「底盘」：
+它持有全部原子状态（root / sequence / dirt / 统计）、MVCC 读者模型的两套簿记（全局计数 + 逐读者槽位）、
+以及待回收页队列 <code>pending_free</code> 与保护它的互斥锁 <code>pending_free_mu</code>。
+本部分逐字段拆解 <code>State</code>（writer.zig:281-313），讲清 <code>init</code>/<code>deinit</code> 的生命周期约定、
+<code>beginRead</code>/<code>endRead</code> 这对读者 API 的精确顺序（B1 不变式落在何处）、
+以及 <code>compact</code> 在 T-30 之后如何做到「dirt 永远说真话」。</p>
+
+<h3 id="s21">2.1 State 字段与 init/deinit</h3>
+
+<pre><code><span class="kw">pub const</span> <span class="ty">State</span> = <span class="kw">struct</span> {
+    allocator: std.mem.<span class="ty">Allocator</span>,
+    store: <span class="ty">PageStore</span>,
+    root: std.atomic.<span class="ty">Value</span>(<span class="ty">u32</span>),          <span class="cm">// 当前树根页号（写者发布，读者 acquire）</span>
+    sequence: std.atomic.<span class="ty">Value</span>(<span class="ty">u64</span>),      <span class="cm">// 提交序列号 = 快照水位</span>
+    dirt: std.atomic.<span class="ty">Value</span>(<span class="ty">u64</span>),         <span class="cm">// 仍被钉住（不可回收）的 pending 页数</span>
+    entry_count: std.atomic.<span class="ty">Value</span>(<span class="ty">u64</span>),
+    byte_size: std.atomic.<span class="ty">Value</span>(<span class="ty">u64</span>),
+    opts: <span class="ty">Options</span>,
+    closed: std.atomic.<span class="ty">Value</span>(<span class="ty">bool</span>),
+
+    meta_index: <span class="ty">u32</span>,                     <span class="cm">// meta 双页交替写游标（0/1）</span>
+
+    <span class="cm">// ---- MVCC 读者簿记：快路径计数 + T-30 逐读者槽位 ----</span>
+    reader_count: std.atomic.<span class="ty">Value</span>(<span class="ty">u32</span>),   <span class="cm">// 0 = 无读者（全量回收快路径判据）</span>
+    reader_slots: [READER_SLOTS]std.atomic.<span class="ty">Value</span>(<span class="ty">u64</span>),
+    overflow_readers: std.atomic.<span class="ty">Value</span>(<span class="ty">u32</span>),
+
+    <span class="cm">// ---- 待回收页队列 + 互斥锁 ----</span>
+    pending_free: std.<span class="ty">ArrayList</span>(<span class="ty">PendingPage</span>),
+    pending_free_mu: zio.<span class="ty">Mutex</span>,
+    ...
+};</code></pre>
+
+<p>字段分四组看：</p>
+
+<table>
+<tr><th>分组</th><th>字段</th><th>语义要点</th></tr>
+<tr><td rowspan="3">提交状态<br>（写者更新）</td><td><code>root</code></td><td>当前树根页号。写者在 applyBatch 第 7 步 <code>.release</code> store；读者 <code>.acquire</code> load 后即拿到一致性快照入口</td></tr>
+<tr><td><code>sequence</code></td><td>提交序列号，也是 <b>快照水位</b>：<code>beginRead</code> 读它作为本读者的 snapshot；pending 页的 <code>release_seq</code> 也是某个提交的 new_sequence</td></tr>
+<tr><td><code>meta_index</code></td><td>meta 双页（page 0/1）交替写游标，崩溃安全的关键——上次写哪页，这次就写另一页</td></tr>
+<tr><td rowspan="2">统计簿记</td><td><code>entry_count</code> / <code>byte_size</code></td><td>逻辑条数与活字节数，applyBatch 按 count_delta/live_delta 增量更新，供 compact meta 与测试断言</td></tr>
+<tr><td><code>dirt</code></td><td><b>仍被钉住（不可回收）</b>的 pending 页数——T-30 之后它与 <code>pendingFreeCount()</code> 恒等（见 2.3）</td></tr>
+<tr><td rowspan="2">读者簿记</td><td><code>reader_count</code></td><td>全局活跃读者计数。<b>0 = 无读者</b>是全量回收的快路径判据；有读者时精确化交给槽位</td></tr>
+<tr><td><code>reader_slots</code> / <code>overflow_readers</code></td><td>T-30 逐读者快照注册槽（64 个，值 = snapshot|CLAIM_BIT）与溢出计数——第一部分的主角，这里只作为 State 的「仪表盘」</td></tr>
+<tr><td>页回收队列</td><td><code>pending_free</code> + <code>pending_free_mu</code></td><td>待回收页（携带 release_seq）与保护它的锁——见下方一致性分析</td></tr>
+</table>
+
+<p><code>init</code> 只做字段默认化，无任何 I/O；<code>deinit</code> 则是一条硬约定：</p>
+
+<pre><code><span class="kw">pub fn</span> <span class="fn">init</span>(allocator: std.mem.<span class="ty">Allocator</span>, store: <span class="ty">PageStore</span>, opts: <span class="ty">Options</span>) <span class="ty">State</span> {
+    <span class="kw">return</span> .{
+        .allocator = allocator,
+        .store = store,
+        .root = std.atomic.<span class="ty">Value</span>(<span class="ty">u32</span>).<span class="fn">init</span>(btree.NULL_ROOT),
+        .sequence = std.atomic.<span class="ty">Value</span>(<span class="ty">u64</span>).<span class="fn">init</span>(<span class="nu">0</span>),
+        .dirt = std.atomic.<span class="ty">Value</span>(<span class="ty">u64</span>).<span class="fn">init</span>(<span class="nu">0</span>),
+        <span class="cm">// ... 其余原子量同理初始化为 0 / false</span>
+        .reader_slots = <span class="fn">@splat</span>(std.atomic.<span class="ty">Value</span>(<span class="ty">u64</span>).<span class="fn">init</span>(<span class="nu">0</span>)),
+        .pending_free = .empty,
+        .pending_free_mu = .{},
+    };
+}
+
+<span class="kw">pub fn</span> <span class="fn">deinit</span>(self: *<span class="ty">State</span>) <span class="ty">void</span> {
+    self.closed.<span class="fn">store</span>(<span class="kw">true</span>, .release);
+    <span class="cm">// Free the remaining pending_free (safe: writer thread done, no readers)</span>
+    <span class="kw">for</span> (self.pending_free.items) |pp| self.store.<span class="fn">freePage</span>(pp.page_no);
+    self.pending_free.<span class="fn">deinit</span>(self.allocator);
+}</code></pre>
+
+<div class="note" role="note">💡 说明 <b>deinit 的安全前提：</b>注释里那句 "safe: writer thread done, no readers" 是调用契约——
+<code>deinit</code> 直接遍历 <code>pending_free</code> 全量 freePage，<b>不取 <code>pending_free_mu</code>、不查 <code>reader_count</code></b>。
+它只在「写者线程已结束、无任何读者存活」的关闭路径上调用（<code>Db.close</code> 持有写锁后到达）。
+<code>closed.store(true)</code> 在最前面，让并发迟到者（如 applyBatch）走 error.Closed 分支而不是踩已释放内存。</div>
+
+<h4>pending_free 与 pending_free_mu：谁在锁内动这张表</h4>
+
+<p><code>pending_free</code> 是 <code>ArrayList(PendingPage)</code>——一个会被<b>写者线程与读者线程同时 mutate</b> 的容器，
+这正是 <code>pending_free_mu</code> 存在的理由（历史上 ArrayList 并发 mutate 曾直接 SEGV，修复见 commit 7f4805c）。
+全部三处 mutate 点：</p>
+
+<pre><code><span class="cm">// ① 写者 append（applyBatch 步骤 3，writer.zig:679-697）：</span>
+{
+    self.pending_free_mu.<span class="fn">lockUncancelable</span>();
+    <span class="kw">defer</span> self.pending_free_mu.<span class="fn">unlock</span>();
+    <span class="kw">for</span> (batch_dirty.items) |pn| {
+        <span class="cm">// T-30: carry the release sequence (this commit's new_sequence)</span>
+        self.pending_free.<span class="fn">append</span>(self.allocator,
+            .{ .page_no = pn, .release_seq = cur_sequence + <span class="nu">1</span> }) <span class="kw">catch</span> {};
+    }
+    <span class="cm">// T-30: dirt is updated under the lock together with the append</span>
+    self.dirt.<span class="fn">store</span>(<span class="fn">@intCast</span>(self.pending_free.items.len), .release);
+}
+
+<span class="cm">// ② 读者/compact 增量回收（reclaimPendingFree，见 2.3）</span>
+<span class="cm">// ③ 写者 grace-period 全量回收（flushPendingFree，见 2.3）</span></code></pre>
+
+<div class="note warn" role="note">⚠️ 注意 <b>dirt 为什么搬进锁内：</b>T-30 之前 <code>dirt.store(...)</code> 在 applyBatch 第 7 步<b>锁外</b>执行，
+与读者线程 <code>endRead</code> 里的回收写回 <code>dirt.store(keep)</code> 存在竞态——写者可能用「append 前的旧值」覆盖读者刚算出的「回收后新值」。
+T-30 把它移进 <code>pending_free_mu</code> 临界区，与 append 原子化：锁内永远满足不变式 <b>dirt == pending_free.items.len</b>。</div>
+
+<div class="note danger" role="note">🔴 风险 <b>append 的 <code>catch {}</code>：</b>页号入队时 OOM 被静默吞掉——该脏页从此<b>永远不会被回收</b>（泄漏一页，但不破坏正确性：
+freePage 少调一次只是浪费空间，多调一次才是灾难）。这是有意的保守取舍：写路径不因簿记失败而中断提交。</div>
+
+<h3 id="s22">2.2 beginRead / endRead</h3>
+
+<p>这对 API 是 MVCC 的入口，也是第一部分所有机制的被调用方。它们的<b>语句顺序本身就是正确性论证</b>：</p>
+
+<pre><code><span class="kw">pub fn</span> <span class="fn">beginRead</span>(self: *<span class="ty">State</span>) <span class="ty">u64</span> {
+    _ = self.reader_count.<span class="fn">fetchAdd</span>(<span class="nu">1</span>, .acquire);
+    <span class="kw">const</span> slot = <span class="fn">claimReaderSlot</span>(self); <span class="cm">// claim first (sentinel 0), then read sequence</span>
+    <span class="kw">const</span> seq = self.sequence.<span class="fn">load</span>(.acquire);
+    <span class="kw">if</span> (slot &lt; READER_SLOTS) {
+        self.reader_slots[slot].<span class="fn">store</span>(seq | CLAIM_BIT, .release);
+    }
+    <span class="kw">return</span> seq;
+}
+
+<span class="kw">pub fn</span> <span class="fn">endRead</span>(self: *<span class="ty">State</span>) <span class="ty">void</span> {
+    _ = self.reader_count.<span class="fn">fetchSub</span>(<span class="nu">1</span>, .release);
+    <span class="fn">unregisterReaderSlot</span>(self);
+    <span class="kw">if</span> (self.dirt.<span class="fn">load</span>(.acquire) &gt; <span class="nu">0</span>) {
+        self.<span class="fn">reclaimPendingFree</span>();
+    }
+}</code></pre>
+
+<p><code>beginRead</code> 的三步顺序是评审轮 B1 修复后定下的<b>不变式</b>（writer.zig:345-366）：</p>
+
+<div class="flow" role="flow">
+<span class="step">① fetchAdd(reader_count)</span><span class="arrow">→</span>
+<span class="step">② claimReaderSlot（哨兵快照 0）</span><span class="arrow">→</span>
+<span class="step">③ sequence.load（读快照）</span><span class="arrow">→</span>
+<span class="step">④ 槽位 release-store 发布 seq|CLAIM_BIT</span><span class="arrow">→</span>
+<span class="step">⑤ 返回 seq，调用方捕获 root</span>
+</div>
+
+<ul>
+<li><b>①→②：</b>先计数再占位。若顺序颠倒，占位与计数之间可能出现「count==0 的假象」，写者的 grace-period 全量回收（applyBatch 步骤 0/9）会把读者还需要的页放走。</li>
+<li><b>②→③→④（B1 核心）：</b>先占一个<b>哨兵值为 0 的槽</b>，再读 sequence，最后才发布真实快照。占位到发布的窗口里，<code>readerWatermark()</code> 看到快照 0 → watermark=0 → 钉住一切。若反过来「先读 seq 再占位」，被抢占的窗口内读者已计入 count 但快照对 watermark 不可见，其他读者的 endRead 回收可能放走它仍要读的页——这正是 B1 修复掉的竞态。</li>
+<li><b>⑤：</b>注册先于返回，调用方（<code>db.zig</code> 的 ReadTxn / select 的 Iterator pin）随后才捕获 root；无论看到新 root 还是旧 root，其 COW 旧页都滞留在 pending_free 直到 watermark 放行。</li>
+</ul>
+
+<div class="note ok" role="note">✅ 正确性 <b>endRead 的顺序同样有讲究：</b>先 <code>fetchSub</code> 再 <code>unregisterReaderSlot</code>，
+最后视积压回收。注销发生在回收<b>之前</b>，所以本次计算 watermark 时自己已经不在槽里——「退出者的快照不再需要保护」先于「按新 watermark 放页」。
+若注销在后，watermark 会被自己的旧快照压低，只是偏保守（多钉不少放），不破坏正确性，但白白放过回收机会。</div>
+
+<div class="note" role="note">💡 说明 <b>读者热路径不退化为锁：</b><code>endRead</code> 里对 <code>pending_free_mu</code> 的获取被
+<code>if (dirt.load(.acquire) &gt; 0)</code> 守门——无积压时整个 endRead 只有两次原子 RMW + 一次 load，
+<b>不取任何锁</b>。绝大多数短命读者（读一个 key 就退出）都走这条无锁路径；只有恰好赶上写者提交过、且本读者退出瞬间仍有积压时才进锁。
+而 <code>beginRead</code> 常态下也只是一次 fetchAdd + 一次槽位 CAS + 两次 load/store。</div>
+
+<div class="note warn" role="note">⚠️ 注意 <b>忘记 endRead 的后果：</b>读者名额泄漏——<code>reader_count</code> 永不归零、槽位永久占用，
+watermark 被钉在泄漏者的快照上，其后所有提交的脏页（release_seq &gt;= watermark）<b>永不回收</b>，pending_free 无界增长。
+<code>db.zig</code> 层用 <code>defer r.end()</code> / Iterator 的 <code>pin_deinit</code> 兜底，但直接使用 State 的调用方必须自觉配对。</div>
+
+<h3 id="s23">2.3 compact 与 dirt 真实性</h3>
+
+<p>T-30 之前 <code>compact</code> 在有读者时只做 <code>dirt.store(0)</code>——计数被静默清零而页面仍被钉住，<b>dirt 说谎</b>。
+现在的版本把「回收」统一交给 <code>reclaimPendingFree</code>，自己只负责 meta：</p>
+
+<pre><code><span class="kw">pub fn</span> <span class="fn">compact</span>(self: *<span class="ty">State</span>) !<span class="ty">void</span> {
+    <span class="cm">// Reclaim (dispatched internally by reader_count/watermark; dirt set</span>
+    <span class="cm">// to the remaining pinned count)</span>
+    self.<span class="fn">reclaimPendingFree</span>();
+    <span class="cm">// Write the new meta</span>
+    <span class="kw">const</span> cur_root = self.root.<span class="fn">load</span>(.acquire);
+    <span class="kw">const</span> cur_sequence = self.sequence.<span class="fn">load</span>(.acquire);
+    <span class="cm">// ... entry_count / byte_size 同快照 ...</span>
+    <span class="kw">const</span> meta = f2.<span class="ty">MetaPage</span>{
+        .magic = f2.MAGIC_V2, .version = <span class="nu">2</span>,
+        .mapsize = self.store.<span class="fn">mapsize</span>(),
+        .sequence = cur_sequence + <span class="nu">1</span>,
+        .root_page = cur_root,
+        <span class="cm">// free_head/count、last_page 由 FilePageStore.writeMeta 覆写校准</span>
+        ...
+    };
+    <span class="kw">try</span> self.store.<span class="fn">writeMeta</span>(&amp;meta);
+    <span class="kw">if</span> (self.opts.fsync) {
+        <span class="kw">try</span> self.store.<span class="fn">sync</span>();
+    }
+    self.sequence.<span class="fn">store</span>(cur_sequence + <span class="nu">1</span>, .release);
+    <span class="cm">// T-30: dirt is no longer zeroed — reclaimPendingFree already set it</span>
+    <span class="cm">// to the still-pinned page count</span>
+}</code></pre>
+
+<p>注意函数末尾<b>没有</b> <code>dirt.store(0)</code>——这不是遗漏，而是语义修正的落点。回收的真正逻辑在
+<code>reclaimPendingFree</code>，以及它的「全量兄弟」<code>flushPendingFree</code>：</p>
+
+<pre><code><span class="cm">// 全量回收：不检查 reader_count（调用方保证无读者——applyBatch 的</span>
+<span class="cm">// reader_count==0 快路径，单写者上下文）</span>
+<span class="kw">fn</span> <span class="fn">flushPendingFree</span>(self: *<span class="ty">State</span>) <span class="ty">void</span> {
+    self.pending_free_mu.<span class="fn">lockUncancelable</span>();
+    <span class="kw">defer</span> self.pending_free_mu.<span class="fn">unlock</span>();
+    <span class="kw">for</span> (self.pending_free.items) |pp| {
+        self.store.<span class="fn">freePage</span>(pp.page_no);
+    }
+    self.pending_free.<span class="fn">clearRetainingCapacity</span>();
+    self.dirt.<span class="fn">store</span>(<span class="nu">0</span>, .release);
+}
+
+<span class="cm">// T-30 增量回收：按 oldest-reader watermark 分拣</span>
+<span class="kw">fn</span> <span class="fn">reclaimPendingFree</span>(self: *<span class="ty">State</span>) <span class="ty">void</span> {
+    self.pending_free_mu.<span class="fn">lockUncancelable</span>();
+    <span class="kw">defer</span> self.pending_free_mu.<span class="fn">unlock</span>();
+
+    <span class="kw">if</span> (self.reader_count.<span class="fn">load</span>(.acquire) == <span class="nu">0</span>) {
+        <span class="cm">// 无读者 → 全量回收（旧快路径，保留）</span>
+        <span class="kw">for</span> (self.pending_free.items) |pp| self.store.<span class="fn">freePage</span>(pp.page_no);
+        self.pending_free.<span class="fn">clearRetainingCapacity</span>();
+        self.dirt.<span class="fn">store</span>(<span class="nu">0</span>, .release);
+        <span class="kw">return</span>;
+    }
+    <span class="kw">const</span> watermark = self.<span class="fn">readerWatermark</span>();
+    <span class="kw">var</span> keep: <span class="ty">usize</span> = <span class="nu">0</span>;
+    <span class="kw">for</span> (self.pending_free.items) |pp| {
+        <span class="kw">if</span> (pp.release_seq &lt; watermark) {
+            self.store.<span class="fn">freePage</span>(pp.page_no);   <span class="cm">// 释放</span>
+        } <span class="kw">else</span> {
+            self.pending_free.items[keep] = pp;  <span class="cm">// 原地压缩保留</span>
+            keep += <span class="nu">1</span>;
+        }
+    }
+    self.pending_free.<span class="fn">shrinkRetainingCapacity</span>(keep);
+    self.dirt.<span class="fn">store</span>(keep, .release);
+}</code></pre>
+
+<p>三个值得咀嚼的设计点：</p>
+
+<ul>
+<li><b>reader_count 检查在锁内。</b>为什么不锁外判一次就完事？因为「count==0 → 全量放页」这个决定必须与
+「新读者注册」互斥。读者注册（fetchAdd + 槽位哨兵）不取这把锁，但它的快照读取发生在 fetchAdd <b>之后</b>；
+只要回收在锁内看到 count==0，其后注册的读者快照必然 ≥ 所有已入队页的 release_seq，不可能引用被放走的页。
+锁内复查把这个论证钉死。</li>
+<li><b>分拣是原地压缩（keep 游标）。</b>一次遍历，无临时分配：<code>release_seq &lt; watermark</code> 的立即 freePage，
+其余前移到 <code>items[0..keep]</code>，最后 <code>shrinkRetainingCapacity</code>。注意判定是<b>严格小于</b>——
+release_seq == watermark 的页保守保留（边界页宁可多钉一拍，也不赌快照可见性的边）。</li>
+<li><b>flushPendingFree 与 reclaimPendingFree 的分工。</b>前者是「调用方已证无读者」的全量版本，只在写者自己的
+applyBatch 步骤 0/9（grace-period）调用；后者是通用入口（endRead / compact），自己锁内判 count。两者共享同一把锁，
+对 <code>pending_free</code> 的所有 mutate 归一。</li>
+</ul>
+
+<div class="note ok" role="note">✅ 正确性 <b>dirt 真实性不变式：</b>T-30 之后，<b><code>dirtCount() == pendingFreeCount()</code> 恒成立</b>
+（deinit 之外）。三个写点——applyBatch 锁内 append 后 store(len)、reclaim 的 store(keep)、flush 的 store(0)——全在
+<code>pending_free_mu</code> 临界区内与队列变更原子配对。<code>compact_strong_assert_test.zig</code> 正是拿这个等式做强断言：
+有读者时 compact 后 <code>dirt &gt; 0</code> 且等于 pendingFreeCount；末位读者退出后双双归零。</div>
+
+<div class="note" role="note">💡 说明 <b>compact 的 meta 语义：</b>compact 本质是一次「只动元数据」的提交——root/entry_count/byte_size
+原样搬运，sequence +1（meta 双页交替需要序列号单调，也顺带把水位推高一格）；<code>free_head/free_count/last_page</code>
+填 0 只是占位，FilePageStore.writeMeta 会用实际值覆写（last_page = next_free-1）。
+它<b>不会收缩文件</b>，也不等待读者——「等」的部分已由 reclaimPendingFree 按 watermark 增量消化。</div>
+
+<div class="note warn" role="note">⚠️ 注意 <b>compact 不是 free 的对立面：</b>名字容易让人以为 compact = 空间整理，实际它只是
+「回收当前可回收的 + 写一版新 meta」。真正把页还回 freelist 的是 reclaimPendingFree / flushPendingFree；而 freelist
+本身是页存储的内存簿记（尚未持久化——见第三部分的 free_head 讨论）。把 compact 理解成「一次不写数据的提交」更准确。</div>
+
+<div class="note danger" role="note">🔴 风险 <b>长命读者的天花板仍在：</b>watermark 机制让「短命读者先走」能立即回收，但一个真正长命的读者
+（如长开的 Iterator）依然会把 release_seq &gt;= 其快照的所有页钉到底——这是 MVCC 的本质代价，不是缺陷。
+区别在于 T-30 之后 <code>dirt</code> 如实报告这个钉住量，运维可以据此判断「是有人在长读，还是泄漏了 endRead」。</div>
+
+</section>
+
+
+<section class="lecture">
+<div id="part3">
+<h2><span class="no">第三部分</span>applyBatch 写路径与持久化</h2>
+
+<p>前两部分讲清了「读」的一侧：MVCC 读者如何注册快照、dirty 页如何按 watermark 增量回收。这一部分进入
+<strong>写的一侧</strong>——<code>applyBatch</code> 是 writer.zig 的核心写路径：把一批 <code>Request</code>
+应用到 COW B-tree、提交 meta、按持久化级别落盘、再原子更新可见状态。整条路径是一条
+<strong>9 步流水线</strong>，每一步都在为「正确性边界」与「性能」做取舍。</p>
+
+<div class="note" role="note">💡 说明 <b>写路径的宏观图景：</b>一次 <code>applyBatch</code> = 一次逻辑事务。
+它先做「准入检查 + 机会性回收」（步骤 0），再对 B-tree 做一次批量 COW 改写（步骤 1–2），
+把改写挤出的旧页挂到 <code>pending_free</code> 等待 MVCC 安全回收（步骤 3），
+写 meta 并按 <code>Durability</code> 级别决定几次 fsync（步骤 4–6），
+最后原子翻转可见状态并唤醒所有 future（步骤 7–8）。步骤 9 再做一次机会性回收。</div>
+
+<h3 id="s31">3.1 结构：Durability / Options / Request / ProfileStats</h3>
+
+<p>写路径的配置与输入由四个小结构承载，全部集中在文件头部：</p>
+
+<pre><code><span class="kw">pub const</span> <span class="ty">Durability</span> = <span class="kw">enum</span> { process_crash, power_fail };
+
+<span class="kw">pub const</span> <span class="ty">Options</span> = <span class="kw">struct</span> {
+    fsync: <span class="ty">bool</span> = <span class="kw">true</span>,
+    micro_batch: <span class="ty">MicroBatchConfig</span> = .{},
+    durability: <span class="ty">Durability</span> = .process_crash,
+};
+
+<span class="kw">pub const</span> <span class="ty">MicroBatchConfig</span> = <span class="kw">struct</span> {
+    <span class="cm">/// Max staged entries before auto-flush. 0 = disabled (direct commit).</span>
+    batch_threshold: <span class="ty">usize</span> = <span class="nu">0</span>,
+};
+
+<span class="kw">pub const</span> <span class="ty">OpResult</span> = anyerror!<span class="ty">void</span>;
+
+<span class="kw">pub const</span> <span class="ty">Request</span> = <span class="kw">struct</span> {
+    key: []<span class="kw">const</span> <span class="ty">u8</span>,
+    value: []<span class="kw">const</span> <span class="ty">u8</span>,
+    tombstone: <span class="ty">bool</span>,
+    future: *zio.<span class="ty">Future</span>(<span class="ty">OpResult</span>),
+};</code></pre>
+
+<div class="card">
+<table>
+<tr><th>结构</th><th>角色</th><th>关键字段 / 取值</th></tr>
+<tr><td><code>Durability</code></td><td>持久化级别（T-27）</td><td><code>process_crash</code>（默认，页缓存完好模型）/ <code>power_fail</code>（掉电正确）</td></tr>
+<tr><td><code>Options</code></td><td>写路径总配置</td><td><code>fsync</code>、<code>micro_batch</code>、<code>durability</code> 三个旋钮</td></tr>
+<tr><td><code>MicroBatchConfig</code></td><td>微批暂存配置</td><td><code>batch_threshold</code>：暂存上限，0 = 关闭（直接提交）</td></tr>
+<tr><td><code>Request</code></td><td>单个写请求</td><td>key/value 切片 + <code>tombstone</code> 标记 + 一个 <code>zio.Future</code></td></tr>
+</table>
+</div>
+
+<p>几个值得展开的点：</p>
+
+<p><strong>① <code>Request.future</code> —— 失败也必须交付。</strong>每个请求自带一个
+<code>zio.Future(OpResult)</code>。<code>applyBatch</code> 的每条失败路径（closed、B-tree 错误）
+都<strong>不会</strong>直接把错误抛给调用方了事，而是逐一 <code>r.future.set(err)</code> 把结果
+「送达」给等待者；成功路径则在步骤 8 统一 <code>req.future.set({})</code>。这保证批量提交的
+调用方（db 层的 group commit / 事务 future 聚合）无论成败都能被唤醒，不会悬挂。</p>
+
+<pre><code><span class="kw">if</span> (self.closed.<span class="fn">load</span>(.acquire)) {
+    <span class="kw">for</span> (batch) |r| r.future.<span class="fn">set</span>(error.Closed);
+    <span class="kw">return</span>;
+}</code></pre>
+
+<p><strong>② <code>Durability</code> 的两级语义。</strong>这是 T-27 引入的持久化契约：</p>
+<ul>
+<li><code>process_crash</code>（默认）：提交协议 = <code>writeMeta</code> + 一次 <code>sync</code>。
+在「进程崩溃但页缓存完好」的模型下安全且快——这是 bench 主战场的默认档。</li>
+<li><code>power_fail</code>：提交协议 = <code>syncDataPages</code>（数据页先落盘）→ <code>writeMeta</code>
+→ <code>sync</code>（meta 落盘）。两次 sync 换掉电正确性：meta 到达稳定存储的那一刻，
+它指向的数据页已经（最迟同时）落盘。单次 put 延迟约翻倍，摊到批里可接受。</li>
+</ul>
+
+<div class="note warn" role="note">⚠️ 注意 <b>fsync=false 与 power_fail 的组合语义：</b><code>fsync=false</code>
+只在 <code>process_crash</code> 下有意义（异步持久化，用户手动调 <code>Db.sync()</code>）；
+<code>power_fail</code> 档每次提交无条件双重 sync——源码中的条件是
+<code>if (self.opts.fsync or self.opts.durability == .power_fail)</code>，即 power_fail 压过 fsync=false。</div>
+
+<p><strong>③ <code>MicroBatchConfig</code> —— 摊销的入口。</strong>db 层用 <code>batch_threshold</code>
+把单条 put/delete 暂存成批再调 <code>applyBatch</code>，摊薄 COW + meta 写 + fsync 的固定开销。
+writer.zig 本身不实现暂存逻辑，只吃「已经是批」的输入——分层清晰。</p>
+
+<p><strong>④ <code>ProfileStats</code> —— 编译期开关的分相计时（#35）。</strong>一组 <code>pub var</code>
+全局计数器（dupe / order_detect / sort / dedup / insertBatch / pending_free / flush_free / meta+write，
+外加 db 层的 staging / reqs / futures.wait），由 <code>enable</code> 布尔控制。生产热路径上
+<code>prof=false</code>，全部计时点退化为一次布尔测试；profiling 工具设
+<code>ProfileStats.enable = true</code> 后，<code>applyBatch</code> 内各阶段自动累计纳秒数，
+<code>print()</code> 输出每相占比与 ns/entry。</p>
+
+<pre><code><span class="kw">pub const</span> <span class="ty">ProfileStats</span> = <span class="kw">struct</span> {
+    <span class="kw">pub var</span> enable: <span class="ty">bool</span> = <span class="kw">false</span>;
+    <span class="cm">// Per-phase timings (ns) and call counts</span>
+    <span class="kw">pub var</span> txn_dupe_ns: <span class="ty">u64</span> = <span class="nu">0</span>;
+    <span class="kw">pub var</span> txn_order_ns: <span class="ty">u64</span> = <span class="nu">0</span>;
+    <span class="kw">pub var</span> txn_sort_ns: <span class="ty">u64</span> = <span class="nu">0</span>;
+    <span class="kw">pub var</span> txn_dedup_ns: <span class="ty">u64</span> = <span class="nu">0</span>;
+    <span class="kw">pub var</span> txn_insertbatch_ns: <span class="ty">u64</span> = <span class="nu">0</span>;
+    <span class="cm">// ... 以及 flush_free / meta / total / count / entries</span>
+    <span class="cm">// db layer (staging/futures)</span>
+    <span class="kw">pub var</span> db_staging_ns: <span class="ty">u64</span> = <span class="nu">0</span>;
+    <span class="kw">pub var</span> db_reqs_ns: <span class="ty">u64</span> = <span class="nu">0</span>;
+    <span class="kw">pub var</span> db_futures_wait_ns: <span class="ty">u64</span> = <span class="nu">0</span>;
+
+    <span class="kw">pub fn</span> <span class="fn">print</span>() <span class="ty">void</span> { <span class="cm">/* 各相 ns、占比、ns/entry 汇总输出 */</span> }
+};</code></pre>
+
+<div class="note" role="note">💡 说明 <b>为什么用全局 var 而不是字段：</b>ProfileStats 是跨批聚合的
+进程级统计，放进 <code>State</code> 会让每份状态各记一份、失去「全局视角」；而全局 <code>pub var</code>
+让 profiling 工具从任意位置开关、读取。代价是非线程安全——但它的设计场景（单写者线程 + 工具线程只读打印）
+本就允许这一点。Zig 惯用法：<code>std.debug.print</code> 直出，不引依赖。</div>
+
+<h3 id="s32">3.2 applyBatch 流水线</h3>
+
+<p>先看全景。<code>applyBatch</code> 对 <code>batch.len &gt; 1</code> 的输入走「order 检测 → 三条支路」，
+单条输入走直插快路径：</p>
+
+<div class="flow">
+<span class="step">0 grace-period 回收</span>
+<span class="arrow">→</span>
+<span class="step">1 快照 root/seq</span>
+<span class="arrow">→</span>
+<span class="step">2 arena + B-tree 改写</span>
+<span class="arrow">→</span>
+<span class="step">3 pending_free 入队</span>
+<span class="arrow">→</span>
+<span class="step">4-5 算 meta + 写 meta</span>
+<span class="arrow">→</span>
+<span class="step">6 fsync</span>
+<span class="arrow">→</span>
+<span class="step">7 原子状态更新</span>
+<span class="arrow">→</span>
+<span class="step">8 future 唤醒</span>
+<span class="arrow">→</span>
+<span class="step">9 机会性回收</span>
+</div>
+
+<p><strong>步骤 0 · grace-period 回收。</strong>进入写路径第一件事：如果此刻
+<code>reader_count == 0</code>，说明历史上积累的 dirty 页已无任何读者持有——直接
+<code>flushPendingFree()</code> 全量回收。这是「宽限期」语义：写者每批开始前顺手清理上一批留下的垃圾，
+不留给专门的回收线程。注意它与读者 <code>endRead</code> 的回收通过 <code>pending_free_mu</code>
+互斥——pending_free 是一个普通 <code>ArrayList</code>，并发变更必须串行化。</p>
+
+<p><strong>步骤 1 · 快照。</strong>读取当前 <code>root / sequence / entry_count / byte_size</code>
+四个原子值作为本批的基线。整批的改写与记账都基于这份快照，最后一步再原子地翻转出去——
+这就是「提交」的本质。</p>
+
+<p><strong>步骤 2 · arena + B-tree 改写（核心）。</strong>先建一个
+<code>ArenaAllocator</code> 承载整批临时分配（key/value 拷贝、Leaf/Branch 解码）：</p>
+
+<pre><code><span class="cm">// 2. Arena for COW path temporary allocations (key/value dupe, Leaf/Branch decode).</span>
+<span class="cm">// Eliminates per-allocation syscall overhead: ~145 alloc/free per btree.insert</span>
+<span class="cm">// collapses to arena bump-pointer, freed in one shot at batch end.</span>
+<span class="kw">var</span> arena = std.heap.<span class="ty">ArenaAllocator</span>.<span class="fn">init</span>(self.allocator);
+<span class="kw">defer</span> arena.<span class="fn">deinit</span>();
+<span class="kw">const</span> arena_alloc = arena.<span class="fn">allocator</span>();</code></pre>
+
+<div class="note ok" role="note">✅ 提示 <b>arena 的收益量级：</b>一次 <code>btree.insert</code> 内部约
+145 次 alloc/free；换成 arena 后全部退化为 bump-pointer 递增，批结束时一次性释放。
+对万级 entry 的批，这是「每条 145 次分配器往返」与「整批一次释放」的差别。</div>
+
+<p>然后按输入形状分三条支路。<strong>单条快路径</strong>直接调 <code>btree.insert</code>，
+省掉 sort/dupe/insertBatch 的全部准备开销。<strong>多条</strong>则先做一遍 O(n) 的
+<strong>order 检测</strong>——扫描相邻 key 的比较结果，归为三档：</p>
+
+<pre><code><span class="kw">const</span> <span class="ty">Order</span> = <span class="kw">enum</span> { strict, non_dec, unordered };
+<span class="kw">const</span> order = <span class="fn">blk</span>: {
+    <span class="kw">if</span> (batch.len &lt;= <span class="nu">1</span>) <span class="kw">break</span> :blk Order.strict;
+    <span class="kw">var</span> has_dup = <span class="kw">false</span>;
+    <span class="kw">for</span> (<span class="nu">1</span>..batch.len) |i| {
+        <span class="kw">switch</span> (btree.<span class="fn">cmpKey</span>(batch[i - <span class="nu">1</span>].key, batch[i].key)) {
+            .lt =&gt; {},
+            .eq =&gt; has_dup = <span class="kw">true</span>,
+            .gt =&gt; <span class="kw">break</span> :blk Order.unordered,
+        }
+    }
+    <span class="kw">break</span> :blk <span class="kw">if</span> (has_dup) Order.non_dec <span class="kw">else</span> Order.strict;
+};</code></pre>
+
+<ul>
+<li><strong>strict / non_dec（有序输入）</strong>：跳过 dupe 与 sort，<code>arena_entries</code>
+直接引用调用方的切片（零拷贝），再走一遍 O(n) 相邻去重（last write wins），然后
+<code>btree.insertBatch</code>。</li>
+<li><strong>unordered（乱序输入）</strong>：先把所有 key/value 打进<strong>一块连续 arena 缓冲</strong>
+（单次分配 + memcpy），再排序——排序读写的是 cache 热的连续内存；排序后同样相邻去重，
+最后 <code>insertBatch</code>。</li>
+</ul>
+
+<div class="note" role="note">💡 说明 <b>order 检测为何值得：</b>一趟 O(n) 邻对比较的成本远低于
+「盲目 sort」。真实负载里顺序 put（自增 key）与有序批是常态，strict 支路省掉的是整个
+dupe+sort 阶段；连「有序但带重复」（non_dec）也能只花一遍 O(n) 去重。只有真正乱序才付
+O(n log n) 的排序税——而且是对连续内存排序。</div>
+
+<div class="note warn" role="note">⚠️ 注意 <b>调用方切片可能不长寿：</b>注释明言
+「caller slices may not survive — e.g. stack buffer reuse」。因此<strong>只有</strong>检测出有序输入时
+才直接引用调用方切片（本函数同步完成，切片在批处理期间存活）；乱序路径则必须先 memcpy 进
+arena 自有缓冲再排序——排序过程中切片内容不能被外部复用踩掉。</div>
+
+<p><strong>步骤 3 · pending_free 入队。</strong>本批 COW 挤出的旧页（<code>batch_dirty</code>）
+<strong>不立即回收</strong>——可能有活跃读者还引用着旧树。它们带着「释放序列」进入
+<code>pending_free</code>：</p>
+
+<pre><code>{
+    self.pending_free_mu.<span class="fn">lockUncancelable</span>();
+    <span class="kw">defer</span> self.pending_free_mu.<span class="fn">unlock</span>();
+    <span class="kw">for</span> (batch_dirty.items) |pn| {
+        <span class="cm">// T-30: carry the release sequence (this commit's</span>
+        <span class="cm">// new_sequence = cur_sequence+1). The page belongs to the</span>
+        <span class="cm">// tree as of cur_sequence; readers with snapshot &gt;=</span>
+        <span class="cm">// new_sequence cannot reference it.</span>
+        self.pending_free.<span class="fn">append</span>(self.allocator, .{ .page_no = pn,
+            .release_seq = cur_sequence + <span class="nu">1</span> }) <span class="kw">catch</span> {};
+    }
+    <span class="cm">// T-30: dirt is updated under the lock together with the append</span>
+    self.dirt.<span class="fn">store</span>(@<span class="fn">intCast</span>(self.pending_free.items.len), .release);
+}</code></pre>
+
+<p>两个细节：<code>release_seq = cur_sequence + 1</code>（本提交的 <code>new_sequence</code>）——
+快照 ≥ new_sequence 的读者不可能引用此页（它在 new_sequence 提交后已不在树中），这正是第一部分
+watermark 回收判据的数据来源；<code>dirt</code> 的更新<strong>移进了锁内</strong>——旧版在步骤 7
+无锁 store，会覆盖读者线程增量回收刚写入的结果（修复回顾：锁内 append 与锁内 store 原子成对）。</p>
+
+<p><strong>步骤 4–5 · meta 计算与写入。</strong>新 <code>entry_count</code> / <code>byte_size</code>
+由快照值加本批 delta（可为负，delete 场景），<code>@max(..., 0)</code> 钳到非负后写入
+<code>MetaPage</code>：<code>sequence = cur_sequence + 1</code>、<code>root_page = new_root</code>。
+meta 的交替写（meta0/meta1）由 store 层完成。</p>
+
+<p><strong>步骤 6–9 · 收尾。</strong>按持久化级别 sync（见 3.3）；然后四个原子
+<code>.release</code> store 一次性翻转可见状态（root/sequence/entry_count/byte_size）；
+所有 future 设成功；最后再看一眼 <code>reader_count</code>——为 0 则本批 dirty 立即回收。
+注意步骤 0 与步骤 9 是同一判断的两次机会：批开始前与批结束后各一次。</p>
+
+<div class="note ok" role="note">✅ 提示 <b>「先写数据页、后翻 root」的可见性语义：</strong>新页
+（batch_dirty 中的 COW 新页）在步骤 3–5 期间已全部落盘，但读者仍看旧 root——直到步骤 7 的
+release store。任何时刻拿到 root 快照的读者，看到的都是一棵完整一致的树：要么全旧、要么全新。
+这是 COW + 原子指针翻转的经典提交协议。</div>
+
+<h3 id="s33">3.3 持久化顺序与设计取舍</h3>
+
+<p>步骤 5 与 6 之间藏着 T-27 的核心——<strong>提交顺序契约</strong>：</p>
+
+<pre><code><span class="cm">// T-27 commit ordering: under power_fail, flush this batch's data</span>
+<span class="cm">// pages to stable storage (fdatasync semantics) before writing meta,</span>
+<span class="cm">// guaranteeing that at the moment the meta commit becomes durable,</span>
+<span class="cm">// the data pages it points to have already landed (or land at the</span>
+<span class="cm">// latest simultaneously) — power loss can never recover a root</span>
+<span class="cm">// pointing at dangling pages.</span>
+<span class="kw">if</span> (self.opts.durability == .power_fail) {
+    <span class="kw">try</span> self.store.<span class="fn">syncDataPages</span>();
+}
+<span class="kw">try</span> self.store.<span class="fn">writeMeta</span>(&amp;meta);
+
+<span class="cm">// 6. fsync (meta to disk)</span>
+<span class="kw">if</span> (self.opts.fsync <span class="kw">or</span> self.opts.durability == .power_fail) {
+    <span class="kw">try</span> self.store.<span class="fn">sync</span>();
+}</code></pre>
+
+<div class="flow">
+<span class="step">COW 写新数据页</span>
+<span class="arrow">→</span>
+<span class="step">syncDataPages（仅 power_fail）</span>
+<span class="arrow">→</span>
+<span class="step">writeMeta（交替 meta 页）</span>
+<span class="arrow">→</span>
+<span class="step">sync（meta 落盘）</span>
+</div>
+
+<p>为什么这个顺序是掉电正确的？关键在于<strong>恢复时读的是 meta</strong>。崩溃恢复 = 读 meta →
+拿到 root_page → 沿 root 读树。如果 meta 先于数据页落盘，掉电后可能恢复出一个指向
+「还没落盘的新页」的 root——悬空页，整库不可读。反过来，只要保证 meta 落盘时它指向的数据页
+已在稳定存储，恢复出的树就一定完整：<code>syncDataPages → writeMeta → sync</code>
+正是把「数据页先落盘」做成了字节级的先后。</p>
+
+<div class="note danger" role="note">🚨 风险 <b>process_crash 档不承诺掉电安全：</strong>默认档的
+提交协议是 <code>writeMeta + 一次 sync</code>——在「进程崩溃、OS 页缓存完好」的模型下正确
+（崩溃后另一个进程 reopen，页缓存里的数据页仍然可见）；但真掉电时数据页可能在 meta 之后
+才落盘，恢复可能拿到悬空 root。这是<strong>明确的取舍</strong>而非疏漏：默认档为 bench 主战场
+换速度，需要掉电正确性的用户显式选 <code>.power_fail</code>。</div>
+
+<p>这套顺序契约由 <code>durability_order_test.zig</code> 用一个 <code>RecordingStore</code>
+（vtable 桩）钉死：power_fail 档断言每个 <code>write_meta</code> 之前都有一次
+<code>sync_data</code>、之后恰有一次 <code>sync</code>；process_crash 档断言没有前置
+<code>syncDataPages</code> 且仅一次 <code>sync</code>。</p>
+
+<p>最后把整条写路径的取舍表收拢：</p>
+
+<div class="card">
+<table>
+<tr><th>决策点</th><th>选择</th><th>代价 / 边界</th></tr>
+<tr><td>批内临时分配</td><td>整批一个 <code>ArenaAllocator</code></td><td>批内峰值内存略高；换 145×n 次分配器调用为一次释放</td></tr>
+<tr><td>输入形状</td><td>O(n) order 检测三分支</td><td>多一趟扫描；有序输入省掉 dupe+sort 整个阶段</td></tr>
+<tr><td>重复 key</td><td>相邻去重，last write wins</td><td>批内语义与逐条提交一致（后写覆盖前写）</td></tr>
+<tr><td>脏页回收时机</td><td>步骤 0 / 9 两次机会 + 读者退出时的 watermark 增量</td><td>长命读者期间 dirty 页滞留 pending_free（T-30 已精确到 watermark 可回收部分）</td></tr>
+<tr><td>持久化</td><td>两档 Durability，默认 process_crash</td><td>power_fail 双 sync，单条延迟约 ×2；掉电正确是显式 opt-in</td></tr>
+<tr><td>状态可见性</td><td>四个原子 release store 一次翻转</td><td>读者要么全旧要么全新；翻转前 future 不唤醒</td></tr>
+</table>
+</div>
+
+<div class="note" role="note">💡 说明 <b>与第一、二部分的衔接：</b>步骤 3 入队的
+<code>release_seq</code> 是第一部分 watermark 判据的<strong>生产端</strong>；步骤 0/9 的
+<code>flushPendingFree</code> 与读者 <code>endRead → reclaimPendingFree</code> 通过
+<code>pending_free_mu</code> 互斥，是第二部分「pending_free 一致性」的<strong>写者侧</strong>。
+三个部分合起来，就是 writer.zig 的完整闭环：读者精确注册、写者安全入队、回收按 watermark 增量推进。</div>
+</div>
+</section>
+
+
+<footer>
+  <p>cube_db — <code>src/writer.zig</code> 讲义 · 由 herdr 多 agent 团队协作生成（conductor + pi1 + pi2 + pi3）</p>
+</footer>
+
+</div>
+</body>
+</html>
