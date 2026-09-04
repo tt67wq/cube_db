@@ -11,4 +11,6 @@ docs/crash-model.md
 *.db.compact
 .cache_zig
 .xdg-cache/zig/
+zig-pkg/
+# Zig 本地包提取缓存（远程依赖解包产物，可复现，不进 git）
 root.o

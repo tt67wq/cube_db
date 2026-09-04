@@ -5,7 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .zio = .{
-            .path = "../zio",
+            .url = "https://github.com/lalinsky/zio/archive/9af2e66b3bb4f78bc153e9323cdf8fa9c89da9e4.tar.gz",
+            .hash = "zio-0.17.0-xHbVVMs7KQDQv6kgwE6sVhFoTWa0cyHnc9c3T07cN2aI",
         },
     },
     .paths = .{
