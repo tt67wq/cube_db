@@ -3,10 +3,12 @@
 //! 补充 compact_test.zig 中缺失的强断言：不只要"数据可读"，还要断言
 //! dirt / pendingFreeCount 的具体数值，验证 compact 的实际语义。
 //!
-//! 核心语义（src/writer.zig:185 State.compact）：
-//! - 无读者时：compact → flushPendingFree() → pending_free 清空, dirt=0
-//! - 有读者时：compact → 只 dirt.store(0)（清计数不 flush 页）→ pending_free 非空
-//! - reader 结束（末位）→ flushPendingFree() → pending_free 清空
+//! 核心语义（src/writer.zig State.compact，T-30 修订）：
+//! - 无读者时：compact → 全量回收 → pending_free 清空, dirt=0
+//! - 有读者时：compact → 按 oldest-reader watermark 回收可安全回收部分；
+//!   无可回收页时 pending_free 不变，dirt 不再静默清零——反映仍被钉住的
+//!   真实页数（旧 MVP "只清计数"行为已于 T-30 移除）
+//! - reader 结束（末位）→ 全量回收 → pending_free 清空
 //!
 //! 不改 src/ 和现有 compact_test.zig。
 
@@ -21,12 +23,12 @@ fn newStore() ps.MemPageStore {
     return ps.MemPageStore.init(alloc, 10000);
 }
 
-// ---- Test 1: compact 有读者时清 dirt 但不 flush 页 ----
+// ---- Test 1: compact 有读者时按 watermark 回收，dirt 反映真实钉住页数（T-30 语义） ----
 // put(k, v1) → beginRead → put(k, v2) → dirt > 0, pendingFree > 0
-// compact() → dirt == 0（compact 清了计数）
-// 但 pendingFreeCount > 0（页未实际回收，因为 reader 还在）
-// endRead → pendingFreeCount == 0（reader 结束触发 flush）
-test "compact_strong: with reader — compact clears dirt but not pendingFree" {
+// compact() → 无可回收页（release_seq=2 ≮ watermark=1）→ pendingFree 不变，
+//             dirt 不清零（仍反映被钉住的页数；旧 MVP 静默清 0 已移除）
+// endRead → pendingFreeCount == 0（末位读者全量回收）
+test "compact_strong: with reader — compact keeps dirt truthful, pages pinned until reader ends" {
     var ms = newStore();
     defer ms.deinit();
     var db = try cube.Db.open(alloc, ms.store(), .{});
@@ -45,11 +47,13 @@ test "compact_strong: with reader — compact clears dirt but not pendingFree" {
     try std.testing.expect(db.dirtCount() > 0);
     try std.testing.expect(db.state.pendingFreeCount() > 0);
 
-    // compact：有读者 → 只清 dirt 计数，不 flush 页
+    // compact：有读者 → 无可安全回收的页 → pendingFree 不变，dirt 仍 > 0
+    // （T-30：不再静默清计数——dirt 反映仍被钉住的真实页数）
     try db.compact();
-    try std.testing.expectEqual(@as(u64, 0), db.dirtCount());
+    try std.testing.expect(db.dirtCount() > 0);
     // 关键断言：pendingFreeCount 仍 > 0（页未回收）
     try std.testing.expect(db.state.pendingFreeCount() > 0);
+    try std.testing.expectEqual(db.state.pendingFreeCount(), @as(usize, @intCast(db.dirtCount())));
 
     // 数据仍可读（compact 不影响数据可见性）
     const v = try db.get("k");
@@ -157,9 +161,10 @@ test "compact_strong: after compact, reopen — meta restored, data readable" {
     alloc.free(v2.?);
 }
 
-// ---- Test 5: compact 多次覆写后 pendingFree 积累 → reader 中 compact → endRead 清空 ----
+// ---- Test 5: compact 多次覆写后 pendingFree 积累 → reader 中 compact 保持 dirt 真实 → endRead 清空 ----
 // 更复杂场景：多次覆写在 reader 持续期间产生多批 pendingFree
-test "compact_strong: multiple overwrites during reader — compact clears dirt, endRead clears pages" {
+// T-30：compact 有读者时不再清 dirt 计数；dirt == pendingFreeCount（真实钉住数）
+test "compact_strong: multiple overwrites during reader — compact keeps dirt truthful, endRead clears pages" {
     var ms = newStore();
     defer ms.deinit();
     var db = try cube.Db.open(alloc, ms.store(), .{});
@@ -181,18 +186,19 @@ test "compact_strong: multiple overwrites during reader — compact clears dirt,
     try std.testing.expect(db.dirtCount() > 0);
     try std.testing.expect(db.state.pendingFreeCount() > pending_after_v1);
 
-    // compact：清 dirt 但不清 pendingFree
+    // compact：有读者 → 无可回收页（watermark=1，全部 release_seq ≥ 2）→ 保持
     try db.compact();
-    try std.testing.expectEqual(@as(u64, 0), db.dirtCount());
+    try std.testing.expect(db.dirtCount() > 0);
     try std.testing.expect(db.state.pendingFreeCount() > 0);
+    try std.testing.expectEqual(db.state.pendingFreeCount(), @as(usize, @intCast(db.dirtCount())));
 
-    // 再覆写 → dirt 再次 > 0（compact 清了计数但页没回收）
+    // 再覆写 → 钉住页继续增长（dirt 随 pendingFree 增长）
     try db.put("k", "v3");
     try std.testing.expect(db.dirtCount() > 0);
 
     // 第二次 compact
     try db.compact();
-    try std.testing.expectEqual(@as(u64, 0), db.dirtCount());
+    try std.testing.expect(db.dirtCount() > 0);
     try std.testing.expect(db.state.pendingFreeCount() > 0);
 
     // 数据正确
