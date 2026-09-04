@@ -1,6 +1,6 @@
-//! txn_arena_test.zig — TDD: WriteTxn staging arena 化
-//! 验证 arena 化后的正确性：put/delete/commit/abort 语义不变，
-//! 且 arena 释放无泄漏、无残留引用。
+//! txn_arena_test.zig — TDD: WriteTxn staging arena
+//! Verify correctness after arena-ization: put/delete/commit/abort semantics unchanged,
+//! with no leaks and no dangling references when the arena is released.
 const std = @import("std");
 const cube = @import("cube_db");
 const ps = cube.page_store;
@@ -10,7 +10,7 @@ fn newStore(comptime n: usize) ps.MemPageStore {
     return ps.MemPageStore.init(std.testing.allocator, n);
 }
 
-// Test 1: put/commit roundtrip — staged entries 正确应用
+// Test 1: put/commit roundtrip — staged entries applied correctly
 test "txn arena: put/commit roundtrip" {
     var ms = newStore(100000);
     defer ms.deinit();
@@ -31,17 +31,17 @@ test "txn arena: put/commit roundtrip" {
     try std.testing.expectEqualStrings("value2", v2.?);
 }
 
-// Test 2: abort 后无脏数据（@archon 风险点：arena 释放后无残留引用）
+// Test 2: no dirty data after abort (@archon risk point: no dangling references after arena release)
 test "txn arena: abort discards staged, no dirty data" {
     var ms = newStore(100000);
     defer ms.deinit();
     var db = try Db.open(std.testing.allocator, ms.store(), .{});
     defer db.close();
 
-    // 先写入一条 committed 数据
+    // First write one committed entry
     try db.putDirect("base", "keep");
 
-    // txn 暂存后 abort
+    // Stage in the txn, then abort
     var txn = try db.beginWriteTxn();
     defer txn.deinit();
     try txn.put("aborted1", "x");
@@ -49,7 +49,7 @@ test "txn arena: abort discards staged, no dirty data" {
     try txn.delete("base");
     try txn.abort();
 
-    // abort 后：committed 数据保持，aborted 数据不存在
+    // After abort: the committed data survives, the aborted data does not exist
     try std.testing.expectEqual(@as(u64, 1), db.entryCount());
     const v = try db.get("base");
     defer if (v) |val| std.testing.allocator.free(val);
@@ -58,7 +58,7 @@ test "txn arena: abort discards staged, no dirty data" {
     try std.testing.expectEqual(@as(?[]u8, null), try db.get("aborted2"));
 }
 
-// Test 3: stack buffer keys — txn.put 立即 dupe，key 不活到 commit 也安全
+// Test 3: stack-buffer keys — txn.put dupes immediately; keys need not live until commit
 test "txn arena: stack buffer keys survive until commit" {
     var ms = newStore(100000);
     defer ms.deinit();
@@ -67,7 +67,7 @@ test "txn arena: stack buffer keys survive until commit" {
 
     var txn = try db.beginWriteTxn();
     defer txn.deinit();
-    // 共享栈 buffer：模拟调用方复用 buffer 的场景
+    // Shared stack buffer: simulates a caller reusing one buffer
     var kbuf: [16]u8 = undefined;
     {
         const k1 = try std.fmt.bufPrint(&kbuf, "key_{d}", .{1});
@@ -88,7 +88,7 @@ test "txn arena: stack buffer keys survive until commit" {
     try std.testing.expectEqualStrings("v2", v2.?);
 }
 
-// Test 4: 大批量 put（1000 条）后 entryCount 正确
+// Test 4: entryCount is correct after a large batch of puts (1000 entries)
 test "txn arena: large batch put count correct" {
     var ms = newStore(500000);
     defer ms.deinit();
@@ -115,7 +115,7 @@ test "txn arena: large batch put count correct" {
     }
 }
 
-// Test 5: 多次 commit/abort 交替 — arena 生命周期正确，无泄漏
+// Test 5: alternating commit/abort — arena lifetime correct, no leaks
 test "txn arena: alternating commit and abort" {
     var ms = newStore(500000);
     defer ms.deinit();
@@ -136,18 +136,18 @@ test "txn arena: alternating commit and abort" {
             try txn.abort();
         }
     }
-    // 10 轮 commit × 50 = 500 entries
+    // 10 rounds of commit x 50 = 500 entries
     try std.testing.expectEqual(@as(u64, 500), db.entryCount());
 }
 
-// Test 6: putBatch 使用共享栈 buffer — 语义保持（值语义由调用方保证）
+// Test 6: putBatch with a shared stack buffer — semantics preserved (value semantics are the caller's)
 test "txn arena: putBatch with shared buffer collapses (caller semantics)" {
     var ms = newStore(100000);
     defer ms.deinit();
     var db = try Db.open(std.testing.allocator, ms.store(), .{});
     defer db.close();
 
-    // 模拟 bench_baseline 曾经的共享 buffer 模式：所有 entry 的 key 指向同一 buffer
+    // Simulates bench_baseline's former shared-buffer pattern: all entries' keys point at the same buffer
     var kbuf: [12]u8 = undefined;
     const entries = try std.testing.allocator.alloc(cube.Entry, 10);
     defer std.testing.allocator.free(entries);
@@ -156,11 +156,11 @@ test "txn arena: putBatch with shared buffer collapses (caller semantics)" {
         e.* = .{ .key = k, .value = "v" };
     }
     try db.putBatch(entries);
-    // 所有 key 相同 → collapse 到 1 条（这是调用方语义，不是 putBatch 的 bug）
+    // All keys identical -> collapses to 1 entry (that is caller semantics, not a putBatch bug)
     try std.testing.expectEqual(@as(u64, 1), db.entryCount());
 }
 
-// Test 7: deinit 未 commit 的 txn — 不泄漏、不崩
+// Test 7: deinit of an uncommitted txn — no leaks, no crash
 test "txn arena: deinit without commit or abort" {
     var ms = newStore(100000);
     defer ms.deinit();
@@ -175,10 +175,10 @@ test "txn arena: deinit without commit or abort" {
             const k = try std.fmt.bufPrint(&kbuf, "tmp_{d}", .{i});
             try txn.put(k, "v");
         }
-        // 不 commit 不 abort，直接出作用域（deinit 触发 abort）
+        // Neither commit nor abort; just leave the scope (deinit triggers abort)
     }
     try std.testing.expectEqual(@as(u64, 0), db.entryCount());
-    // 互斥锁应已释放 — 能再开新 txn
+    // The mutex should be released — a new txn can be opened
     var txn2 = try db.beginWriteTxn();
     defer txn2.deinit();
     try txn2.put("after", "ok");

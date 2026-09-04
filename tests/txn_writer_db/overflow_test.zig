@@ -1,6 +1,6 @@
-//! overflow_test.zig — 溢出页测试（TDD RED）
-//! 覆盖：大 value > 4KB 的 put/get、超大 value 链、覆写、delete、select。
-//! 先 fail（overflow 尚未实现）。
+//! overflow_test.zig — overflow page tests (TDD RED)
+//! Covers: put/get of values > 4KB, very large value chains, overwrite, delete, select.
+//! Written to fail first (overflow not yet implemented).
 const std = @import("std");
 const zio = @import("zio");
 const cube = @import("cube_db");

@@ -1,6 +1,6 @@
-//! bench/profile_fps.zig — #41: FPS 写路径计数器剖析
-//! 用法：zig build profile-fps -Doptimize=ReleaseFast
-//! 统计 writePage/allocPage/freePage/readPage/fstat/ftruncate 调用次数 + 耗时
+//! bench/profile_fps.zig — #41: FPS write-path counter profiling
+//! Usage: zig build profile-fps -Doptimize=ReleaseFast
+//! Counts writePage/allocPage/freePage/readPage/fstat/ftruncate calls + timings
 const std = @import("std");
 const cube = @import("cube_db");
 const Db = cube.Db;
@@ -26,7 +26,7 @@ fn unlinkPath(path: []const u8) void {
     _ = c.unlink(@ptrCast(&buf));
 }
 
-/// 构建 entries：连续 key 缓冲区 + 共享 value（与 MemPageStore 对照一致）
+/// Build entries: contiguous key buffer + shared value (matching the MemPageStore comparison)
 fn buildEntries(allocator: std.mem.Allocator, n: usize) !struct { entries: []Entry, key_buf: []u8 } {
     const entries = try allocator.alloc(Entry, n);
     errdefer allocator.free(entries);
@@ -41,7 +41,7 @@ fn buildEntries(allocator: std.mem.Allocator, n: usize) !struct { entries: []Ent
     return .{ .entries = entries, .key_buf = key_buf };
 }
 
-/// 构建 entries：分散 key（每个 allocPrint 独立页，模拟 rigor 的 pb_fps_ordered_test）
+/// Build entries: scattered keys (each allocPrint on its own page, mimicking rigor's pb_fps_ordered_test)
 fn buildEntriesScattered(allocator: std.mem.Allocator, n: usize) ![]Entry {
     const entries = try allocator.alloc(Entry, n);
     errdefer allocator.free(entries);
@@ -76,27 +76,27 @@ fn runScale(allocator: std.mem.Allocator, n: usize, label: []const u8, fsync: bo
     const elapsed = monoNs() - t0;
 
     const per_entry = @divFloor(elapsed, @as(i64, @intCast(n)));
-    std.debug.print("\n=== {s}: N={d} fsync={} 总耗时 {d} ms, {d} ns/entry ===\n", .{ label, n, fsync, @divFloor(elapsed, 1_000_000), per_entry });
+    std.debug.print("\n=== {s}: N={d} fsync={} total {d} ms, {d} ns/entry ===\n", .{ label, n, fsync, @divFloor(elapsed, 1_000_000), per_entry });
     std.debug.print("entryCount = {d}\n", .{db.entryCount()});
 
-    std.debug.print("--- FPS 计数器 ---\n", .{});
-    std.debug.print("  writePage:  {d} 次 ({d:.1} ms, {d} ns/次)\n", .{ FpsCounters.write_page_calls, @as(f64, @floatFromInt(FpsCounters.write_page_ns)) / 1e6, if (FpsCounters.write_page_calls > 0) @divFloor(FpsCounters.write_page_ns, FpsCounters.write_page_calls) else 0 });
-    std.debug.print("  allocPage:  {d} 次 ({d:.1} ms, {d} ns/次)\n", .{ FpsCounters.alloc_page_calls, @as(f64, @floatFromInt(FpsCounters.alloc_page_ns)) / 1e6, if (FpsCounters.alloc_page_calls > 0) @divFloor(FpsCounters.alloc_page_ns, FpsCounters.alloc_page_calls) else 0 });
-    std.debug.print("  freePage:   {d} 次\n", .{FpsCounters.free_page_calls});
-    std.debug.print("  readPage:   {d} 次\n", .{FpsCounters.read_page_calls});
-    std.debug.print("  fstat:      {d} 次\n", .{FpsCounters.fstat_calls});
-    std.debug.print("  ftruncate:  {d} 次\n", .{FpsCounters.ftruncate_calls});
-    std.debug.print("  ensureGrowth合计: {d:.1} ms\n", .{@as(f64, @floatFromInt(FpsCounters.ensure_growth_ns)) / 1e6});
-    std.debug.print("  writePage+allocPage 合计: {d:.1} ms ({d:.1}% of total {d} ms)\n", .{
+    std.debug.print("--- FPS counters ---\n", .{});
+    std.debug.print("  writePage:  {d} calls ({d:.1} ms, {d} ns/call)\n", .{ FpsCounters.write_page_calls, @as(f64, @floatFromInt(FpsCounters.write_page_ns)) / 1e6, if (FpsCounters.write_page_calls > 0) @divFloor(FpsCounters.write_page_ns, FpsCounters.write_page_calls) else 0 });
+    std.debug.print("  allocPage:  {d} calls ({d:.1} ms, {d} ns/call)\n", .{ FpsCounters.alloc_page_calls, @as(f64, @floatFromInt(FpsCounters.alloc_page_ns)) / 1e6, if (FpsCounters.alloc_page_calls > 0) @divFloor(FpsCounters.alloc_page_ns, FpsCounters.alloc_page_calls) else 0 });
+    std.debug.print("  freePage:   {d} calls\n", .{FpsCounters.free_page_calls});
+    std.debug.print("  readPage:   {d} calls\n", .{FpsCounters.read_page_calls});
+    std.debug.print("  fstat:      {d} calls\n", .{FpsCounters.fstat_calls});
+    std.debug.print("  ftruncate:  {d} calls\n", .{FpsCounters.ftruncate_calls});
+    std.debug.print("  ensureGrowth total: {d:.1} ms\n", .{@as(f64, @floatFromInt(FpsCounters.ensure_growth_ns)) / 1e6});
+    std.debug.print("  writePage+allocPage total: {d:.1} ms ({d:.1}% of total {d} ms)\n", .{
         (@as(f64, @floatFromInt(FpsCounters.write_page_ns)) + @as(f64, @floatFromInt(FpsCounters.alloc_page_ns))) / 1e6,
         (@as(f64, @floatFromInt(FpsCounters.write_page_ns)) + @as(f64, @floatFromInt(FpsCounters.alloc_page_ns))) / @as(f64, @floatFromInt(elapsed)) * 100.0,
         @as(f64, @floatFromInt(elapsed)) / 1e6,
     });
 
-    // 预估页数：LEAF_MAX_ENTRIES=32 → n/32 leaf + branch
+    // Estimated page count: LEAF_MAX_ENTRIES=32 -> n/32 leaves + branches
     const est_leaf = n / 32;
-    std.debug.print("  预估 leaf 页数: {d} (n/32)\n", .{est_leaf});
-    std.debug.print("  每 entry store 调用: {d:.3} (writePage+allocPage)/entry\n", .{
+    std.debug.print("  Estimated leaf pages: {d} (n/32)\n", .{est_leaf});
+    std.debug.print("  Store calls per entry: {d:.3} (writePage+allocPage)/entry\n", .{
         (@as(f64, @floatFromInt(FpsCounters.write_page_calls)) + @as(f64, @floatFromInt(FpsCounters.alloc_page_calls))) / @as(f64, @floatFromInt(n)),
     });
 }
@@ -104,16 +104,17 @@ fn runScale(allocator: std.mem.Allocator, n: usize, label: []const u8, fsync: bo
 pub fn main() !void {
     const alloc = std.heap.page_allocator;
 
-    // 1M ordered, fsync=false（对齐 rigor 的 nosync 16.9µs）
+    // 1M ordered, fsync=false (aligned with rigor's nosync 16.9us)
     try runScale(alloc, 1_000_000, "1M ordered nosync", false);
 
-    // 100K ordered（超线性对照点）
+    // 100K ordered (superlinear comparison point)
     try runScale(alloc, 100_000, "100K ordered nosync", false);
 
-    // 10K ordered（最小规模对照）
+    // 10K ordered (smallest-scale comparison)
     try runScale(alloc, 10_000, "10K ordered nosync", false);
 
-    // 分散 key 变体（rigor 的 pb_fps_ordered_test 布局）1M
+    // Scattered-key variant (rigor's pb_fps_ordered_test layout) 1M
+
     try runScaleScattered(alloc, 1_000_000, "1M scattered nosync", false);
 }
 
@@ -142,15 +143,15 @@ fn runScaleScattered(allocator: std.mem.Allocator, n: usize, label: []const u8, 
     const elapsed = monoNs() - t0;
 
     const per_entry = @divFloor(elapsed, @as(i64, @intCast(n)));
-    std.debug.print("\n=== {s}: N={d} fsync={} 总耗时 {d} ms, {d} ns/entry ===\n", .{ label, n, fsync, @divFloor(elapsed, 1_000_000), per_entry });
+    std.debug.print("\n=== {s}: N={d} fsync={} total {d} ms, {d} ns/entry ===\n", .{ label, n, fsync, @divFloor(elapsed, 1_000_000), per_entry });
     std.debug.print("entryCount = {d}\n", .{db.entryCount()});
 
-    std.debug.print("--- FPS 计数器 ---\n", .{});
-    std.debug.print("  writePage:  {d} 次 ({d:.1} ms, {d} ns/次)\n", .{ FpsCounters.write_page_calls, @as(f64, @floatFromInt(FpsCounters.write_page_ns)) / 1e6, if (FpsCounters.write_page_calls > 0) @divFloor(FpsCounters.write_page_ns, FpsCounters.write_page_calls) else 0 });
-    std.debug.print("  allocPage:  {d} 次 ({d:.1} ms, {d} ns/次)\n", .{ FpsCounters.alloc_page_calls, @as(f64, @floatFromInt(FpsCounters.alloc_page_ns)) / 1e6, if (FpsCounters.alloc_page_calls > 0) @divFloor(FpsCounters.alloc_page_ns, FpsCounters.alloc_page_calls) else 0 });
-    std.debug.print("  fstat:      {d} 次\n", .{FpsCounters.fstat_calls});
-    std.debug.print("  ftruncate:  {d} 次\n", .{FpsCounters.ftruncate_calls});
-    std.debug.print("  writePage+allocPage 合计: {d:.1} ms ({d:.1}% of total {d} ms)\n", .{
+    std.debug.print("--- FPS counters ---\n", .{});
+    std.debug.print("  writePage:  {d} calls ({d:.1} ms, {d} ns/call)\n", .{ FpsCounters.write_page_calls, @as(f64, @floatFromInt(FpsCounters.write_page_ns)) / 1e6, if (FpsCounters.write_page_calls > 0) @divFloor(FpsCounters.write_page_ns, FpsCounters.write_page_calls) else 0 });
+    std.debug.print("  allocPage:  {d} calls ({d:.1} ms, {d} ns/call)\n", .{ FpsCounters.alloc_page_calls, @as(f64, @floatFromInt(FpsCounters.alloc_page_ns)) / 1e6, if (FpsCounters.alloc_page_calls > 0) @divFloor(FpsCounters.alloc_page_ns, FpsCounters.alloc_page_calls) else 0 });
+    std.debug.print("  fstat:      {d} calls\n", .{FpsCounters.fstat_calls});
+    std.debug.print("  ftruncate:  {d} calls\n", .{FpsCounters.ftruncate_calls});
+    std.debug.print("  writePage+allocPage total: {d:.1} ms ({d:.1}% of total {d} ms)\n", .{
         (@as(f64, @floatFromInt(FpsCounters.write_page_ns)) + @as(f64, @floatFromInt(FpsCounters.alloc_page_ns))) / 1e6,
         (@as(f64, @floatFromInt(FpsCounters.write_page_ns)) + @as(f64, @floatFromInt(FpsCounters.alloc_page_ns))) / @as(f64, @floatFromInt(elapsed)) * 100.0,
         @as(f64, @floatFromInt(elapsed)) / 1e6,

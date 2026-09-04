@@ -1,12 +1,12 @@
-//! crash_recovery_framework.zig — P3 TDD: 崩溃恢复测试框架
+//! crash_recovery_framework.zig - P3 TDD: crash recovery test framework
 //!
-//! COW + 原子 meta 切换已崩溃安全（LMDB 无 WAL），本框架验证：
-//! - 进程崩溃后已提交数据存活
-//! - 未提交数据丢失
-//! - 多次 open/close 后数据一致性
-//! - mmap 边界条件
+//! COW + atomic meta switching is already crash-safe (LMDB-style, no WAL); this framework verifies:
+//! - committed data survives a process crash
+//! - uncommitted data is lost
+//! - data consistency across multiple open/close cycles
+//! - mmap boundary conditions
 //!
-//! 依赖 FilePageStore（持久化），不使用 MemPageStore。
+//! Depends on FilePageStore (persistent); MemPageStore is not used.
 const std = @import("std");
 const cube = @import("cube_db");
 const f2 = cube.format;
@@ -33,7 +33,7 @@ fn pathZ(allocator: std.mem.Allocator, path: []const u8) ![:0]u8 {
     return try allocator.dupeZ(u8, path);
 }
 
-// ===== 基础 reopen 测试 =====
+// ===== basic reopen tests =====
 
 test "crash_framework: reopen after single commit" {
     const path = ".test_cf_commit.db";
@@ -96,7 +96,7 @@ test "crash_framework: reopen after 10 alternating commits" {
     }
 }
 
-// ===== 多轮 reopen 迭代 =====
+// ===== multi-round reopen iteration =====
 
 test "crash_framework: 5 rounds of write + reopen" {
     const path = ".test_cf_5round.db";
@@ -170,9 +170,9 @@ test "crash_framework: 100 keys batch commit then reopen" {
     }
 }
 
-// ===== fork 式崩溃模拟 =====
+// ===== fork-style crash simulation =====
 
-/// 子进程：写入并提交后正常退出
+/// Child process: write and commit, then exit normally
 fn childCommitExit(path: [:0]const u8, entries: []const struct { []const u8, []const u8 }) noreturn {
     var fps = FilePageStore.init(alloc, path.ptr[0..path.len]) catch c._exit(2);
     defer fps.deinit();
@@ -186,24 +186,24 @@ fn childCommitExit(path: [:0]const u8, entries: []const struct { []const u8, []c
     c._exit(0);
 }
 
-/// 子进程：写入但不提交直接 _exit（模拟崩溃）
+/// Child process: write but _exit without committing (simulated crash)
 fn childCrashNoCommit(path: [:0]const u8, committed: []const struct { []const u8, []const u8 }, uncommitted: []const struct { []const u8, []const u8 }) noreturn {
     var fps = FilePageStore.init(alloc, path.ptr[0..path.len]) catch c._exit(2);
     defer fps.deinit();
     var db = Db.open(alloc, fps.store(), .{}) catch c._exit(3);
     defer db.close();
-    // 先提交安全条目
+    // commit safe entries first
     for (committed) |entry| {
         var txn = db.beginWriteTxn() catch c._exit(4);
         txn.put(entry[0], entry[1]) catch c._exit(5);
         txn.commit() catch c._exit(6);
     }
-    // 写入但 NOT commit（模拟崩溃）
+    // write but do NOT commit (simulated crash)
     var txn = db.beginWriteTxn() catch c._exit(7);
     for (uncommitted) |entry| {
         txn.put(entry[0], entry[1]) catch c._exit(8);
     }
-    // 不 commit，直接崩溃
+    // no commit, crash directly
     c._exit(0);
 }
 
@@ -271,7 +271,7 @@ test "crash_framework: fork child crashes before commit, uncommitted lost" {
     try std.testing.expectEqual(@as(?[]u8, null), try db.get("lost"));
 }
 
-// ===== 随机 workload + reopen =====
+// ===== random workload + reopen =====
 
 test "crash_framework: random keys reopen persists" {
     const path = ".test_cf_random.db";
@@ -329,7 +329,7 @@ test "crash_framework: random keys reopen persists" {
     }
 }
 
-// ===== 更新后 reopen =====
+// ===== update then reopen =====
 
 test "crash_framework: update existing key then reopen" {
     const path = ".test_cf_update.db";

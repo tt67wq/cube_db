@@ -1,6 +1,6 @@
-//! crash_harness_test.zig — P4 TDD: 真实进程崩溃 harness（fork+kill）
-//! 模拟崩溃：fork 子进程写/不写后 _exit，父进程 reopen 验证一致性。
-//! COW + 原子 meta 切换保证：未提交的写入崩溃后不污染已提交数据。
+//! crash_harness_test.zig - P4 TDD: real process-crash harness (fork+kill)
+//! Crash simulation: fork a child that writes (or not) then _exit; the parent reopens and verifies consistency.
+//! COW + atomic meta switching guarantee: uncommitted writes never pollute committed data after a crash.
 
 const std = @import("std");
 const cube = @import("cube_db");
@@ -27,7 +27,7 @@ fn pathZ(allocator: std.mem.Allocator, path: []const u8) ![:0]u8 {
     return try allocator.dupeZ(u8, path);
 }
 
-/// 子进程：写入并提交（fsync）后正常退出
+/// Child process: write and commit (fsync), then exit normally
 fn childCommitExit(path: [:0]const u8, k: []const u8, v: []const u8) noreturn {
     var fps = FilePageStore.init(alloc, path) catch c._exit(2);
     defer fps.deinit();
@@ -51,7 +51,7 @@ test "crash harness: child commits cleanly, parent reopens sees data" {
 
     var status: c_int = 0;
     _ = c.waitpid(pid, &status, 0);
-    try std.testing.expectEqual(@as(c_int, 0), status); // 子正常退出
+    try std.testing.expectEqual(@as(c_int, 0), status); // child exited normally
 
     var fps = try FilePageStore.init(alloc, path);
     defer fps.deinit();
@@ -62,27 +62,27 @@ test "crash harness: child commits cleanly, parent reopens sees data" {
     try std.testing.expectEqualStrings("child1", v.?);
 }
 
-/// 子进程：写入但提交前 _exit（崩溃）→ 父 reopen 不应有该写入
+/// Child process: write but _exit before commit (crash) -> parent reopen must not see the write
 fn childCrashBeforeCommit(path: [:0]const u8, committed_k: []const u8, committed_v: []const u8, lost_k: []const u8, lost_v: []const u8) noreturn {
     var fps = FilePageStore.init(alloc, path) catch c._exit(2);
     defer fps.deinit();
     var db = Db.open(alloc, fps.store(), .{}) catch c._exit(3);
     defer db.close();
-    // 先提交一笔（应存活）
+    // commit one record first (should survive)
     var t1 = db.beginWriteTxn() catch c._exit(4);
     t1.put(committed_k, committed_v) catch c._exit(5);
     t1.commit() catch c._exit(6);
-    // 再开写事务写第二笔，但 _exit 前不 commit（崩溃）→ 不应落盘
+    // open another write txn for a second record, but _exit before commit (crash) -> must not hit disk
     var t2 = db.beginWriteTxn() catch c._exit(7);
     t2.put(lost_k, lost_v) catch c._exit(8);
-    // 模拟崩溃：不 commit 直接退出
+    // simulate crash: exit without committing
     c._exit(0);
 }
 
 test "crash harness: child crashes before commit, uncommitted write lost, committed survives" {
     const path = ".test_crashfork_lost.db";
     defer unlinkPath(path);
-    // 先父进程建空库
+    // parent creates an empty DB first
     {
         var fps = try FilePageStore.init(alloc, path);
         defer fps.deinit();
@@ -103,11 +103,11 @@ test "crash harness: child crashes before commit, uncommitted write lost, commit
     defer fps.deinit();
     var db = try Db.open(alloc, fps.store(), .{});
     defer db.close();
-    // committed 笔存活
+    // committed record survives
     const k = try db.get("keep");
     defer if (k) |val| alloc.free(val);
     try std.testing.expectEqualStrings("K", k.?);
-    // 未提交的写入应丢失
+    // uncommitted write must be lost
     const l = try db.get("lost");
     defer if (l) |val| alloc.free(val);
     try std.testing.expectEqual(@as(?[]u8, null), l);

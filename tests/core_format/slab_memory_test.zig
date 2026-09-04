@@ -1,12 +1,12 @@
-//! slab_memory_test.zig — #34 验收：MemPageStore slab 页池内存语义
-//! @archon 要求：大 batch + delete 后的内存占用验证（slab 释放路径正确归还，无泄漏）
+//! slab_memory_test.zig - #34 acceptance: MemPageStore slab page-pool memory semantics
+//! Requested by @archon: memory usage verification after a large batch + delete (slab free path returns pages correctly, no leak)
 const std = @import("std");
 const cube = @import("cube_db");
 const Db = cube.Db;
 const MemPageStore = cube.page_store.MemPageStore;
 const testing = std.testing;
 
-// 大 batch 插入后 delete 全部，验证内存占用回落（slab 页归还）
+// large batch insert then delete all; verify memory usage falls back (slab pages returned)
 test "slab: large batch then delete all, memory returns" {
     const n: usize = 100000;
     var ms = MemPageStore.init(testing.allocator, @as(u32, @intCast(3 + n * 10 + 10000)));
@@ -17,7 +17,7 @@ test "slab: large batch then delete all, memory returns" {
     var v100: [100]u8 = undefined;
     @memset(&v100, 'x');
 
-    // 插入大 batch
+    // insert a large batch
     {
         var entries = try testing.allocator.alloc(cube.Entry, n);
         defer testing.allocator.free(entries);
@@ -31,7 +31,7 @@ test "slab: large batch then delete all, memory returns" {
     const free_after_insert = ms.freelist.items.len;
     std.debug.print("pages after insert: {d} (freelist={d}, active={d})\n", .{ pages_after_insert, free_after_insert, pages_after_insert - free_after_insert });
 
-    // delete 全部
+    // delete all
     {
         var txn = try db.beginWriteTxn();
         var kbuf: [12]u8 = undefined;
@@ -47,16 +47,16 @@ test "slab: large batch then delete all, memory returns" {
     const free_after_delete = ms.freelist.items.len;
     std.debug.print("pages after delete: {d} (freelist={d}, active={d})\n", .{ pages_after_delete, free_after_delete, pages_after_delete - free_after_delete });
 
-    // slab 释放路径：delete 后活跃页数（items.len - freelist.len）应回落
-    // COW 下 delete 会写新页（tombstone），旧页进 freelist，所以 items.len 可能增长
-    // 但 freelist 应积累已释放页，活跃页数应 <= insert 时的活跃页数
+    // slab free path: after delete, the active page count (items.len - freelist.len) should fall back
+    // under COW, delete writes new pages (tombstones) and old pages go to the freelist, so items.len may grow
+    // but the freelist accumulates the freed pages, so active pages should be <= the active count at insert time
     const active_after_insert = pages_after_insert - free_after_insert;
     const active_after_delete = pages_after_delete - free_after_delete;
     try testing.expect(active_after_delete <= active_after_insert);
     std.debug.print("active pages: {d} -> {d} ({s})\n", .{ active_after_insert, active_after_delete, if (active_after_delete <= active_after_insert) "OK" else "FAIL" });
 }
 
-// 交替插入/删除多轮，验证 slab 池复用（不泄漏增长）
+// alternating insert/delete cycles, verifying slab pool reuse (no leak growth)
 test "slab: repeated insert/delete cycles, no leak" {
     const n: usize = 10000;
     var ms = MemPageStore.init(testing.allocator, @as(u32, @intCast(3 + n * 10 + 10000)));
@@ -94,6 +94,6 @@ test "slab: repeated insert/delete cycles, no leak" {
     try testing.expectEqual(@as(u64, 0), db.entryCount());
     const final_pages = ms.pages.items.len - ms.freelist.items.len;
     std.debug.print("peak active: {d}, final active: {d}\n", .{ peak_pages, final_pages });
-    // slab 池复用后，final 活跃页数不应超过峰值（无泄漏增长）
+    // with slab pool reuse, the final active page count must not exceed the peak (no leak growth)
     try testing.expect(final_pages <= peak_pages);
 }

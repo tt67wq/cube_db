@@ -1,15 +1,15 @@
-//! crc_regression_test.zig — Phase 2 正确性回归测试（@ZigFollower2）
+//! crc_regression_test.zig - Phase 2 correctness regression tests (@ZigFollower2)
 //!
-//! 覆盖：全量页格式（meta/freelist/leaf/branch/overflow）的 CRC 校验回归。
-//! 验证点：
-//!   1. format.computePageChecksum（ARM64 硬件路径）与 crc32_hw.crc32Sw（纯软件）结果一致
-//!   2. setPageChecksum + verifyPageChecksum 往返通过
-//!   3. 篡改 payload / header 任一处 → verifyPageChecksum 失败
-//!   4. 确定性：同一页多次计算 checksum 一致
+//! Covers: CRC verification regression for all page formats (meta/freelist/leaf/branch/overflow).
+//! Verification points:
+//!   1. format.computePageChecksum (ARM64 hardware path) matches crc32_hw.crc32Sw (pure software)
+//!   2. setPageChecksum + verifyPageChecksum round-trip passes
+//!   3. tampering with any payload / header byte -> verifyPageChecksum fails
+//!   4. determinism: repeated checksums of the same page agree
 //!
-//! 依赖 Phase 1 接口（commit 42f1a05）：
-//!   - cube.crc32_hw.crc32Sw(init, data) — 软件 CRC32 对照
-//!   - cube.format.computePageChecksum — ARM64 自动走硬件路径
+//! Depends on Phase 1 interfaces (commit 42f1a05):
+//!   - cube.crc32_hw.crc32Sw(init, data) - software CRC32 reference
+//!   - cube.format.computePageChecksum - automatic ARM64 hardware path
 //!   - cube.format.setPageChecksum / verifyPageChecksum
 
 const std = @import("std");
@@ -17,7 +17,7 @@ const cube = @import("cube_db");
 const f2 = cube.format;
 const crc32_hw = cube.crc32_hw;
 
-// ===== 页构造辅助 =====
+// ===== page construction helpers =====
 
 const PageTypeInfo = struct {
     name: []const u8,
@@ -25,7 +25,7 @@ const PageTypeInfo = struct {
     nkeys: u16,
 };
 
-/// 5 种页类型的基本信息
+/// Basic info for the 5 page types
 const ALL_PAGE_TYPES = [_]PageTypeInfo{
     .{ .name = "meta", .page_type = f2.PAGE_TYPE_META, .nkeys = 0 },
     .{ .name = "freelist", .page_type = f2.PAGE_TYPE_FREE, .nkeys = 0 },
@@ -34,9 +34,9 @@ const ALL_PAGE_TYPES = [_]PageTypeInfo{
     .{ .name = "overflow", .page_type = f2.PAGE_TYPE_OVERFLOW, .nkeys = 0 },
 };
 
-/// 按页类型构造一个"真实"页（页头 + payload，尚未写 CRC）
-/// meta/freelist 用 format.zig 的 canonical 编码器；
-/// leaf/branch/overflow 按 btree.zig 的编码格式手工构造（inline 值，无 store 依赖）。
+/// Build a "realistic" page for a given page type (header + payload, CRC not yet written)
+/// meta/freelist use format.zig's canonical encoders;
+/// leaf/branch/overflow are hand-built following btree.zig's encoding format (inline values, no store dependency).
 fn buildPage(page_type: u8, page: *[f2.PAGE_SIZE]u8) void {
     @memset(page, 0);
     switch (page_type) {
@@ -53,7 +53,7 @@ fn buildPage(page_type: u8, page: *[f2.PAGE_SIZE]u8) void {
                 .free_count = 0,
                 .last_page = 200,
             };
-            // 复用 canonical 编码（含 CRC），稍后统一重算校验
+            // reuse the canonical encoding (includes CRC); recompute the checksum uniformly later
             f2.writeMetaPage(page, &meta, 0);
         },
         f2.PAGE_TYPE_FREE => {
@@ -142,7 +142,7 @@ fn buildPage(page_type: u8, page: *[f2.PAGE_SIZE]u8) void {
     }
 }
 
-/// 确定性伪随机填充（无 RNG 依赖，与 crc32_hw_test.zig 同款）
+/// Deterministic pseudo-random fill (no RNG dependency, same as crc32_hw_test.zig)
 fn fillRandom(page: *[f2.PAGE_SIZE]u8, seed0: u64) void {
     var seed = seed0;
     for (page) |*b| {
@@ -151,41 +151,41 @@ fn fillRandom(page: *[f2.PAGE_SIZE]u8, seed0: u64) void {
     }
 }
 
-// ===== 测试 1: 每种页类型 HW-SW 一致性 + 往返 + 篡改检测 =====
+// ===== Test 1: per-page-type HW-SW consistency + roundtrip + tamper detection =====
 
 test "crc_regression: 5 page types hw/sw consistency + roundtrip + tamper" {
     inline for (ALL_PAGE_TYPES) |t| {
         var page: [f2.PAGE_SIZE]u8 = undefined;
         buildPage(t.page_type, &page);
 
-        // 1. HW（computePageChecksum 在 ARM64 走硬件）vs SW（crc32Sw）一致性
+        // 1. HW (computePageChecksum uses hardware on ARM64) vs SW (crc32Sw) consistency
         const hw_cs = f2.computePageChecksum(&page);
         const sw_cs = crc32_hw.crc32Sw(0, page[0 .. f2.PAGE_SIZE - 4]);
         try std.testing.expectEqual(sw_cs, hw_cs);
 
-        // 2. set + verify 往返
+        // 2. set + verify roundtrip
         f2.setPageChecksum(&page, hw_cs);
         try std.testing.expect(f2.verifyPageChecksum(&page));
 
-        // 3. 篡改 payload 区一字节 → 失败
+        // 3. tamper one payload byte -> fails
         var page_payload = page;
         const tamper_pos = f2.PAGE_HEADER_SIZE + 16;
         page_payload[tamper_pos] ^= 0xFF;
         try std.testing.expect(!f2.verifyPageChecksum(&page_payload));
 
-        // 4. 篡改 header 区一字节 → 失败
+        // 4. tamper one header byte -> fails
         var page_header = page;
         page_header[3] ^= 0xFF;
         try std.testing.expect(!f2.verifyPageChecksum(&page_header));
 
-        // 5. 篡改 CRC 存储区 → 失败
+        // 5. tamper the stored CRC region -> fails
         var page_crc = page;
         page_crc[f2.PAGE_SIZE - 1] ^= 0xFF;
         try std.testing.expect(!f2.verifyPageChecksum(&page_crc));
     }
 }
 
-// ===== 测试 2: 确定性 =====
+// ===== Test 2: determinism =====
 
 test "crc_regression: checksum deterministic for all page types" {
     inline for (ALL_PAGE_TYPES) |t| {
@@ -197,7 +197,7 @@ test "crc_regression: checksum deterministic for all page types" {
     }
 }
 
-// ===== 测试 3: canonical helpers 产出可验证页 =====
+// ===== Test 3: canonical helpers produce verifiable pages =====
 
 test "crc_regression: writeMetaPage produces verifiable page" {
     const meta = f2.MetaPage{
@@ -216,7 +216,7 @@ test "crc_regression: writeMetaPage produces verifiable page" {
     f2.writeMetaPage(&page, &meta, 0);
     try std.testing.expect(f2.verifyPageChecksum(&page));
 
-    // 读回验证
+    // read-back verification
     const got = f2.readMetaPageSingle(&page);
     try std.testing.expect(got != null);
     try std.testing.expectEqual(meta.sequence, got.?.sequence);
@@ -235,7 +235,7 @@ test "crc_regression: writeFreelistEntries produces verifiable page" {
     try std.testing.expectEqual(@as(u32, 50), got[4]);
 }
 
-// ===== 测试 4: 随机数据页 HW-SW 一致性（多 seed） =====
+// ===== Test 4: random-data pages HW-SW consistency (multiple seeds) =====
 
 test "crc_regression: random pages hw/sw consistency" {
     inline for ([_]u64{ 0x1111, 0x2222, 0x3333, 0x4444, 0x5555 }) |seed0| {

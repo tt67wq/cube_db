@@ -1,6 +1,6 @@
-//! core_format_test.zig — 领域汇总：页格式 / page_store / slab / CRC32 / mmap / 二分 / cow
-//! comptime @import 聚合子文件，编译单元从 38 降到 6。
-//! 搬运自原 tests/*.zig，逻辑未动。
+//! core_format_test.zig - domain aggregate: page format / page_store / slab / CRC32 / mmap / binary search / cow
+//! comptime @import aggregates sub-files, reducing compilation units from 38 to 6.
+//! Moved from original tests/*.zig, logic unchanged.
 
 comptime {
     _ = @import("core_format/format_test.zig");

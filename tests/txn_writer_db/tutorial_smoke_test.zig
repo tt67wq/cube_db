@@ -1,5 +1,5 @@
-//! tutorial_smoke_test.zig — 验证 docs/tutorial/ 所有可运行片段语法正确
-//! 读者复制其中任意片段到独立 test 文件均可独立运行。
+//! tutorial_smoke_test.zig — verify that every runnable snippet in docs/tutorial/ compiles
+//! A reader can copy any snippet into a standalone test file and it will run independently.
 const std = @import("std");
 const cube = @import("cube_db");
 const zio = @import("zio");
@@ -8,8 +8,8 @@ const format = cube.format;
 const MemPageStore = cube.page_store.MemPageStore;
 const btree = cube.btree;
 
-// ---- 第 01 章：页格式 ----
-test "T01 页头编解码和 CRC 校验" {
+// ---- Chapter 01: page format ----
+test "T01 page header encode/decode and CRC" {
     const h = format.PageHeader{
         .page_no = 42,
         .page_type = format.PAGE_TYPE_LEAF,
@@ -38,8 +38,8 @@ test "T01 页头编解码和 CRC 校验" {
     try std.testing.expect(!format.verifyPageChecksum(&page));
 }
 
-// ---- 第 02 章：B-tree ----
-test "T02 B-tree 插入和查询" {
+// ---- Chapter 02: B-tree ----
+test "T02 B-tree insert and lookup" {
     const allocator = std.testing.allocator;
     var ms = MemPageStore.init(allocator, 1 << 10);
     defer ms.deinit();
@@ -66,8 +66,8 @@ test "T02 B-tree 插入和查询" {
     try std.testing.expect(nv == null);
 }
 
-// ---- 第 03 章：COW 写入 ----
-test "T03 applyBatch 批量写入 + compact" {
+// ---- Chapter 03: COW writes ----
+test "T03 applyBatch batch write + compact" {
     const allocator = std.testing.allocator;
     var ms = MemPageStore.init(allocator, 1 << 10);
     defer ms.deinit();
@@ -96,8 +96,8 @@ test "T03 applyBatch 批量写入 + compact" {
     try std.testing.expectEqual(@as(u64, 0), state.dirtCount());
 }
 
-// ---- 第 04 章：MVCC ----
-test "T04 MVCC 读者延迟回收" {
+// ---- Chapter 04: MVCC ----
+test "T04 MVCC reader deferred reclamation" {
     const allocator = std.testing.allocator;
     var ms = MemPageStore.init(allocator, 1 << 10);
     defer ms.deinit();
@@ -107,7 +107,7 @@ test "T04 MVCC 读者延迟回收" {
     var state = wrt.State.init(allocator, store, .{ .fsync = false });
     defer state.deinit();
 
-    // 先写一条，让树有数据（后续 insert 才会产生脏页）
+    // Write one entry first so the tree has data (later inserts will produce dirty pages)
     {
         var f0: zio.Future(wrt.OpResult) = .{};
         try state.applyBatch(&.{.{ .key = "seed", .value = "x",
@@ -115,7 +115,7 @@ test "T04 MVCC 读者延迟回收" {
         _ = try f0.wait();
     }
 
-    // 启动读者
+    // Start the reader
     const snap = state.beginRead();
     defer state.endRead();
 
@@ -130,8 +130,8 @@ test "T04 MVCC 读者延迟回收" {
     try std.testing.expect(state.pendingFreeCount() > 0);
 }
 
-// ---- 第 05 章：溢出页 ----
-test "T05 大 value 溢出页链" {
+// ---- Chapter 05: overflow pages ----
+test "T05 large-value overflow page chain" {
     const allocator = std.testing.allocator;
     var ms = MemPageStore.init(allocator, 1 << 12);
     defer ms.deinit();

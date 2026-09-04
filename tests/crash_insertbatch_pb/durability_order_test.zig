@@ -1,15 +1,16 @@
-//! durability_order_test.zig — T-27: 提交顺序契约（数据页先于 meta 落盘）
+//! durability_order_test.zig - T-27: commit ordering contract (data pages hit disk before meta)
 //!
-//! RED 阶段（本文件先落）：Options.durability 与 PageStore.syncDataPages 尚不存在，
-//! 编译失败即 RED（与 btree_test.zig「先 fail（btree.zig 不存在）」同款 TDD 先例）。
+//! RED stage (this file landed first): Options.durability and PageStore.syncDataPages did not exist yet,
+//! so compilation failure was the RED signal (same TDD precedent as btree_test.zig's "initially failing
+//! because btree.zig did not exist").
 //!
-//! GREEN 后的契约：
-//! - .power_fail 档：syncDataPages（数据页落盘）先于 writeMeta，
-//!   writeMeta 之后 sync（meta 落盘）——两次 sync，字节级提交顺序。
-//! - .process_crash 档（默认）：保持旧行为——无 syncDataPages 前置调用，
-//!   writeMeta 后（若 fsync=true）单次 sync。
+//! Contract after GREEN:
+//! - .power_fail tier: syncDataPages (flush data pages) happens before writeMeta,
+//!   then sync after writeMeta (meta hits disk) - two syncs, byte-level commit ordering.
+//! - .process_crash tier (default): keeps the old behavior - no preceding syncDataPages call,
+//!   a single sync after writeMeta (if fsync=true).
 //!
-//! 用 RecordingStore（包装 MemPageStore 的 vtable 桩）记录事件序列断言顺序。
+//! Uses RecordingStore (a vtable stub wrapping MemPageStore) to record the event sequence and assert ordering.
 const std = @import("std");
 const zio = @import("zio");
 const cube = @import("cube_db");
@@ -18,7 +19,7 @@ const wrt = cube.writer;
 
 const alloc = std.testing.allocator;
 
-// ---- 记录事件的 PageStore 包装桩 ----
+// ---- PageStore wrapper stub that records events ----
 
 const Event = enum { write_page, sync_data, write_meta, sync };
 
@@ -84,7 +85,7 @@ const RecordingStore = struct {
     fn vtSyncDataPages(ptr: *anyopaque) !void {
         const self: *RecordingStore = @ptrCast(@alignCast(ptr));
         self.events.append(alloc, .sync_data) catch {};
-        // no-op：顺序契约测试不依赖真实落盘
+        // no-op: the ordering-contract tests do not depend on real disk flushes
     }
     fn vtSync(ptr: *anyopaque) !void {
         const self: *RecordingStore = @ptrCast(@alignCast(ptr));
@@ -108,7 +109,7 @@ const rec_vtable: ps.PageStore.VTable = .{
     .mapsize = RecordingStore.vtMapSize,
 };
 
-/// 单次 put（单条 applyBatch），返回事件序列供断言
+/// Single put (a one-entry applyBatch); the event sequence is asserted by callers
 fn applyOnePut(state: *wrt.State, key: []const u8, value: []const u8) !void {
     var fut: zio.Future(wrt.OpResult) = .{};
     const reqs = [_]wrt.Request{.{ .key = key, .value = value, .tombstone = false, .future = &fut }};
@@ -116,9 +117,9 @@ fn applyOnePut(state: *wrt.State, key: []const u8, value: []const u8) !void {
     _ = try fut.wait();
 }
 
-// ===== 1. power_fail 档：数据页先于 meta 落盘，meta 之后 sync =====
+// ===== 1. power_fail tier: data pages before meta, sync after meta =====
 
-test "durability order: power_fail — syncDataPages before writeMeta, sync after" {
+test "durability order: power_fail - syncDataPages before writeMeta, sync after" {
     var rs = RecordingStore.init(1000);
     defer rs.deinit();
     var state = wrt.State.init(alloc, rs.store(), .{ .durability = .power_fail });
@@ -130,16 +131,16 @@ test "durability order: power_fail — syncDataPages before writeMeta, sync afte
     const i_meta = rs.firstIndex(.write_meta) orelse return error.TestUnexpectedResult;
     const i_sync = rs.lastIndex(.sync) orelse return error.TestUnexpectedResult;
 
-    // 数据页落盘先于 meta 写入
+    // data pages flushed before the meta write
     try std.testing.expect(i_sync_data < i_meta);
-    // meta 落盘在 meta 写入之后
+    // meta flushed after the meta write
     try std.testing.expect(i_meta < i_sync);
-    // 至少有数据页被写入（本批 COW 出了新页）
+    // at least one data page written (this batch COWed new pages)
     const i_write = rs.firstIndex(.write_page) orelse return error.TestUnexpectedResult;
     try std.testing.expect(i_write < i_sync_data);
 }
 
-test "durability order: power_fail — 每个批次都有前置 syncDataPages（多批提交）" {
+test "durability order: power_fail - every batch has a preceding syncDataPages (multi-batch commits)" {
     var rs = RecordingStore.init(1000);
     defer rs.deinit();
     var state = wrt.State.init(alloc, rs.store(), .{ .durability = .power_fail });
@@ -148,7 +149,7 @@ test "durability order: power_fail — 每个批次都有前置 syncDataPages（
     try applyOnePut(&state, "a", "1");
     try applyOnePut(&state, "b", "2");
 
-    // 两次批提交 → 每批各自 write_meta 前都有 sync_data
+    // two batch commits -> each write_meta has its own preceding sync_data
     var meta_count: usize = 0;
     var sync_data_count: usize = 0;
     var last_sync_data: ?usize = null;
@@ -156,7 +157,7 @@ test "durability order: power_fail — 每个批次都有前置 syncDataPages（
         switch (e) {
             .write_meta => {
                 meta_count += 1;
-                // 每个 write_meta 之前必须存在一个更晚的 sync_data
+                // every write_meta must have a preceding sync_data at an earlier index
                 try std.testing.expect(last_sync_data != null);
                 try std.testing.expect(last_sync_data.? < i);
             },
@@ -171,10 +172,10 @@ test "durability order: power_fail — 每个批次都有前置 syncDataPages（
     try std.testing.expectEqual(@as(usize, 2), sync_data_count);
 }
 
-// ===== 2. process_crash 档（默认）：保持旧行为 =====
+// ===== 2. process_crash tier (default): keep the old behavior =====
 
-test "durability order: process_crash default — no syncDataPages, single sync after writeMeta" {
-    // Options 默认值契约
+test "durability order: process_crash default - no syncDataPages, single sync after writeMeta" {
+    // Options default value contract
     const default_opts = wrt.Options{};
     try std.testing.expectEqual(wrt.Durability.process_crash, default_opts.durability);
 
@@ -185,9 +186,9 @@ test "durability order: process_crash default — no syncDataPages, single sync 
 
     try applyOnePut(&state, "k", "v");
 
-    // 旧行为：无数据页前置落盘调用
+    // old behavior: no preceding data-page flush call
     try std.testing.expect(rs.firstIndex(.sync_data) == null);
-    // writeMeta 之后单次 sync（fsync 默认 true）
+    // single sync after writeMeta (fsync defaults to true)
     const i_meta = rs.firstIndex(.write_meta) orelse return error.TestUnexpectedResult;
     const i_sync = rs.lastIndex(.sync) orelse return error.TestUnexpectedResult;
     try std.testing.expect(i_meta < i_sync);
@@ -198,7 +199,7 @@ test "durability order: process_crash default — no syncDataPages, single sync 
     try std.testing.expectEqual(@as(usize, 1), sync_count);
 }
 
-// ===== 3. 语义冒烟：power_fail 档下数据仍然完整（透过桩读写一致） =====
+// ===== 3. semantic smoke test: data still intact under power_fail tier (reads/writes agree through the stub) =====
 
 test "durability order: power_fail smoke — data readable after commit" {
     var rs = RecordingStore.init(1000);

@@ -1,30 +1,30 @@
-//! page_store_test.zig — PageStore 测试（TDD RED）
-//! 覆盖：allocPage（空闲时 bump）、freePage 回收复用、freelist LIFO 语义、
-//! readPage/writePage roundtrip、meta 交替读写恢复、mapsize 超限、sync。
+//! page_store_test.zig - PageStore tests (TDD RED)
+//! Covers: allocPage (bump when freelist empty), freePage reclaim/reuse, freelist LIFO semantics,
+//! readPage/writePage roundtrip, meta alternating write/read recovery, mapsize limit, sync.
 //!
-//! MemPageStore 是 page_store.PageStore 接口的内存实现（测试用）。
+//! MemPageStore is an in-memory implementation of the page_store.PageStore interface (for tests).
 const std = @import("std");
 const cube = @import("cube_db");
 const f2 = cube.format;
 const ps = cube.page_store;
 
-// ===== 内存 PageStore 实现 =====
+// ===== in-memory PageStore implementation =====
 
 const MemPageStore = struct {
     allocator: std.mem.Allocator,
-    /// 页帧数组（page_no → page data）。稀疏（只有分配的页在 map 中）。
+    /// Page frame map (page_no -> page data). Sparse (only allocated pages are in the map).
     pages: std.AutoHashMap(u32, [f2.PAGE_SIZE]u8),
-    /// 空闲页号链表（LIFO）
+    /// Free page number list (LIFO)
     freelist: std.ArrayList(u32),
-    /// bump 分配下一个页号（初始 = FIRST_DATA_PAGE）
+    /// Next page number for bump allocation (initial = FIRST_DATA_PAGE)
     next_free: u32,
-    /// 用户指定的 mapsize（页数）
+    /// User-specified mapsize (in pages)
     max_pages: u32,
-    /// meta page 0 缓冲区
+    /// meta page 0 buffer
     meta0: [f2.PAGE_SIZE]u8,
-    /// meta page 1 缓冲区
+    /// meta page 1 buffer
     meta1: [f2.PAGE_SIZE]u8,
-    /// meta 交替写入索引（0 或 1）
+    /// Alternating meta write index (0 or 1)
     meta_index: u32,
 
     pub fn init(allocator: std.mem.Allocator, mapsize_pages: u32) MemPageStore {
@@ -55,22 +55,22 @@ const MemPageStore = struct {
 
     fn vtAllocPage(ptr: *anyopaque) !u32 {
         const self: *MemPageStore = @ptrCast(@alignCast(ptr));
-        // 优先 freelist
+        // freelist first
         if (self.freelist.items.len > 0) {
             return self.freelist.pop().?;
         }
-        // bump 分配
+        // bump allocation
         const pn = self.next_free;
         if (pn >= self.max_pages) return error.MapFull;
         self.next_free = pn + 1;
-        // 初始化零页
+        // initialize zeroed page
         try self.pages.put(pn, [_]u8{0} ** f2.PAGE_SIZE);
         return pn;
     }
 
     fn vtFreePage(ptr: *anyopaque, page_no: u32) void {
         const self: *MemPageStore = @ptrCast(@alignCast(ptr));
-        // 不从 pages map 删除（MVCC reader 可能还在读）；freelist 优先分配
+        // do not remove from the pages map (an MVCC reader may still be reading it); freelist takes allocation priority
         self.freelist.append(self.allocator, page_no) catch {};
     }
 
@@ -107,12 +107,12 @@ const MemPageStore = struct {
 
     fn vtSync(ptr: *anyopaque) !void {
         _ = ptr;
-        // MemPageStore sync 是空操作
+        // MemPageStore sync is a no-op
     }
 
     fn vtSyncDataPages(ptr: *anyopaque) !void {
         _ = ptr;
-        // MemPageStore syncDataPages 是空操作（T-27：内存实现无持久化语义）
+        // MemPageStore syncDataPages is a no-op (T-27: the in-memory implementation has no persistence semantics)
     }
 
     fn vtMapSize(ptr: *anyopaque) u64 {
@@ -133,7 +133,7 @@ const mem_vtable: ps.PageStore.VTable = .{
     .mapsize = MemPageStore.vtMapSize,
 };
 
-// ===== 测试 =====
+// ===== tests =====
 
 test "page_store: alloc page from empty freelist bumps next_free" {
     var ms = MemPageStore.init(std.testing.allocator, 1000);
@@ -163,7 +163,7 @@ test "page_store: free multiple, alloc returns last freed (LIFO)" {
     ms.vtable().freePage(a);
     ms.vtable().freePage(c);
     ms.vtable().freePage(b);
-    // LIFO: 先取 b, 再取 c, 再取 a
+    // LIFO: b first, then c, then a
     try std.testing.expectEqual(b, try ms.vtable().allocPage());
     try std.testing.expectEqual(c, try ms.vtable().allocPage());
     try std.testing.expectEqual(a, try ms.vtable().allocPage());
@@ -174,10 +174,10 @@ test "page_store: write then read page roundtrip" {
     defer ms.deinit();
     const pn = try ms.vtable().allocPage();
     const wbuf = try ms.vtable().writePage(pn);
-    // 写一些内容
+    // write some content
     wbuf[0] = 0xAB;
     wbuf[100] = 0xCD;
-    wbuf[4095] = 0xEF; // 最后一字节（CRC 区域也会被写）
+    wbuf[4095] = 0xEF; // last byte (the CRC region gets written too)
     const rbuf = try ms.vtable().readPage(pn);
     try std.testing.expectEqual(@as(u8, 0xAB), rbuf[0]);
     try std.testing.expectEqual(@as(u8, 0xCD), rbuf[100]);
@@ -187,24 +187,24 @@ test "page_store: write then read page roundtrip" {
 test "page_store: allocPage beyond mapsize returns MapFull" {
     var ms = MemPageStore.init(std.testing.allocator, ps.FIRST_DATA_PAGE + 2);
     defer ms.deinit();
-    // 分配一个页（FIRST_DATA_PAGE），应该分配 FIRST_DATA_PAGE
-    // mapsize=FIRST_DATA_PAGE+2 意味着 max_pages=FIRST_DATA_PAGE+2
-    // next_free 从 FIRST_DATA_PAGE 开始
-    // 可分配页 = max_pages - next_free = 2
+    // allocate one page (FIRST_DATA_PAGE); it should allocate FIRST_DATA_PAGE
+    // mapsize=FIRST_DATA_PAGE+2 means max_pages=FIRST_DATA_PAGE+2
+    // next_free starts at FIRST_DATA_PAGE
+    // allocatable pages = max_pages - next_free = 2
     try std.testing.expectEqual(ps.FIRST_DATA_PAGE, try ms.vtable().allocPage());
     try std.testing.expectEqual(ps.FIRST_DATA_PAGE + 1, try ms.vtable().allocPage());
-    // 第三次应满
+    // the third allocation should be full
     try std.testing.expectError(error.MapFull, ms.vtable().allocPage());
 }
 
 test "page_store: free page then alloc beyond mapsize still works (reuse)" {
     var ms = MemPageStore.init(std.testing.allocator, ps.FIRST_DATA_PAGE + 1);
     defer ms.deinit();
-    // 只有一个可分配页
+    // only one allocatable page
     const pn = try ms.vtable().allocPage();
     try std.testing.expectEqual(ps.FIRST_DATA_PAGE, pn);
     try std.testing.expectError(error.MapFull, ms.vtable().allocPage());
-    // 释放后可以再分配
+    // after freeing, allocation works again
     ms.vtable().freePage(pn);
     try std.testing.expectEqual(pn, try ms.vtable().allocPage());
 }
@@ -223,7 +223,7 @@ test "page_store: meta write then read alternates pages" {
     try std.testing.expectEqual(@as(u64, 1), got1.?.sequence);
     try std.testing.expectEqual(@as(u32, 10), got1.?.root_page);
 
-    // 第二次写入应写另一 meta page
+    // the second write should go to the other meta page
     const meta2 = f2.MetaPage{
         .magic = f2.MAGIC_V2, .version = 2, .mapsize = 1 << 30,
         .sequence = 2, .root_page = 20, .entry_count = 200, .byte_size = 10000,
@@ -245,10 +245,10 @@ test "page_store: meta alternation — one corrupt, recover from other" {
         .free_head = 10, .free_count = 5, .last_page = 50,
     };
     try ms.vtable().writeMeta(&meta); // writes to meta0
-    // 损坏 meta1（把 header 置乱，但保持 checksum 一致——实际 crash 不会修复 checksum）
+    // corrupt meta1 (scramble the header but keep the checksum consistent - a real crash would not fix the checksum)
     @memset(&ms.meta1, 0xff);
-    f2.setPageChecksum(&ms.meta1, f2.computePageChecksum(&ms.meta1)); // checksum 匹配垃圾
-    // readMeta 应返回 meta0 的内容（checksum 正确的那个）
+    f2.setPageChecksum(&ms.meta1, f2.computePageChecksum(&ms.meta1)); // checksum matches garbage
+    // readMeta should return meta0's contents (the one with the correct checksum)
     const got = try ms.vtable().readMeta();
     try std.testing.expect(got != null);
     try std.testing.expectEqual(@as(u64, 42), got.?.sequence);
@@ -272,9 +272,9 @@ test "page_store: allocPage after many frees reuses in LIFO order" {
     while (i < count) : (i += 1) {
         try pages.append(std.testing.allocator, try ms.vtable().allocPage());
     }
-    // 释放全部
+    // free all
     for (pages.items) |p| ms.vtable().freePage(p);
-    // 重新分配顺序应为 LIFO（逆向）
+    // reallocation order should be LIFO (reverse)
     var j: u32 = count;
     while (j > 0) {
         j -= 1;
@@ -293,7 +293,7 @@ test "page_store: write many pages and verify independently" {
         const w = try ms.vtable().writePage(pn);
         @memset(w, @intCast(i & 0xff));
     }
-    // 验证每个写的页模式是独立的
+    // verify each written page's pattern independently
     var j: u32 = 0;
     while (j < count) : (j += 1) {
         const pn = ps.FIRST_DATA_PAGE + j;

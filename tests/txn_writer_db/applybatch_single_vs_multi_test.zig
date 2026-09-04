@@ -1,16 +1,16 @@
-//! applybatch_single_vs_multi_test.zig — T-21: applyBatch 单条 fast path vs 多条 insertBatch 一致性
+//! applybatch_single_vs_multi_test.zig — T-21: applyBatch single-entry fast path vs multi-entry insertBatch consistency
 //!
-//! src/writer.zig:280 applyBatch 两条路径：
-//! - 单条 fast path（batch.len==1）：直接 btree.insert，跳过 sort/dedup
-//! - 多条 path（batch.len>1）：有序性检测 → 有序走 btree.insertBatch（含 dedup last-write-wins），
-//!   无序走 dupe+sort+dedup+insertBatch
+//! src/writer.zig:280 applyBatch has two paths:
+//! - Single-entry fast path (batch.len==1): direct btree.insert, skipping sort/dedup
+//! - Multi-entry path (batch.len>1): order detection -> ordered goes to btree.insertBatch (with dedup last-write-wins),
+//!   unordered goes through dupe+sort+dedup+insertBatch
 //!
-//! 两条路径的 count_delta/live_delta 在 overwrite 场景下是否一致从未直接对比。
-//! 本文件在新建 key / overwrite / delete 三场景下对比单条 vs 多条的
-//! entry_count / byte_size / get 结果一致性。
+//! Whether the two paths' count_delta/live_delta agree on overwrites has never been compared directly.
+//! This file compares single vs multi consistency for entry_count / byte_size / get results
+//! across three scenarios: fresh keys, overwrites, and deletes.
 //!
-//! 参考 mvcc_test.zig 的 State + applyBatch + Future 搭建。单线程，testing.allocator 安全。
-//! 接入：build.zig 注册到 test-db step。
+//! Modeled on mvcc_test.zig's State + applyBatch + Future setup. Single-threaded; testing.allocator is safe.
+//! Wiring: registered in build.zig under the test-db step.
 
 const std = @import("std");
 const zio = @import("zio");
@@ -39,7 +39,7 @@ fn metrics(state: *wrt.State) Metrics {
     };
 }
 
-/// 应用单条 batch（走 fast path），返回 OpResult（应成功）
+/// Apply a single-entry batch (fast path); returns the OpResult (should succeed)
 fn applySingle(state: *wrt.State, key: []const u8, value: []const u8, tombstone: bool) !void {
     var fut: zio.Future(wrt.OpResult) = .{};
     const reqs = [_]wrt.Request{.{ .key = key, .value = value, .tombstone = tombstone, .future = &fut }};
@@ -47,16 +47,16 @@ fn applySingle(state: *wrt.State, key: []const u8, value: []const u8, tombstone:
     _ = try fut.wait();
 }
 
-/// 应用多条 batch（走 insertBatch path），entries 须调用方构造好的 Request 切片
+/// Apply a multi-entry batch (insertBatch path); entries is a caller-built Request slice
 fn applyMulti(state: *wrt.State, reqs: []wrt.Request) !void {
     var fut: zio.Future(wrt.OpResult) = .{};
-    // 简化：只支持单一 future（多 entry 共享一个 future，applyBatch 会 set 所有）
+    // Simplification: a single shared future (applyBatch sets all entries' futures)
     for (reqs) |*r| r.future = &fut;
     try state.applyBatch(reqs);
     _ = try fut.wait();
 }
 
-/// 构造 N 个独立 future 的多条 batch（每 entry 一个 future，更真实）
+/// Build a multi-entry batch with N independent futures (one per entry; more realistic)
 fn applyMultiMultiFut(state: *wrt.State, entries: []const struct { k: []const u8, v: []const u8, t: bool }) !void {
     var futs = try alloc.alloc(zio.Future(wrt.OpResult), entries.len);
     defer alloc.free(futs);
@@ -70,10 +70,10 @@ fn applyMultiMultiFut(state: *wrt.State, entries: []const struct { k: []const u8
     for (futs) |*f| _ = try f.wait();
 }
 
-// ===== 1. 新建 key：单条 ×N vs 多条有序 ×1 =====
+// ===== 1. Fresh keys: N single-entry batches vs 1 ordered multi-entry batch =====
 
 test "applybatch_single_vs_multi: new keys — 3 single vs 1 ordered multi" {
-    // 场景 A：3 次单条 batch put k1/k2/k3
+    // Scenario A: 3 single-entry batches putting k1/k2/k3
     var ms_a = newStore();
     defer ms_a.deinit();
     var state_a = wrt.State.init(alloc, ms_a.store(), .{});
@@ -83,7 +83,7 @@ test "applybatch_single_vs_multi: new keys — 3 single vs 1 ordered multi" {
     try applySingle(&state_a, "k3", "v3", false);
     const m_a = metrics(&state_a);
 
-    // 场景 B：1 次多条有序 batch put k1/k2/k3
+    // Scenario B: 1 ordered multi-entry batch putting k1/k2/k3
     var ms_b = newStore();
     defer ms_b.deinit();
     var state_b = wrt.State.init(alloc, ms_b.store(), .{});
@@ -95,13 +95,13 @@ test "applybatch_single_vs_multi: new keys — 3 single vs 1 ordered multi" {
     });
     const m_b = metrics(&state_b);
 
-    // 断言 entry_count / byte_size 一致
+    // Assert entry_count / byte_size agree
     try std.testing.expectEqual(m_a.entry_count, m_b.entry_count);
     try std.testing.expectEqual(@as(u64, 3), m_a.entry_count);
     try std.testing.expectEqual(@as(u64, 3), m_b.entry_count);
     try std.testing.expectEqual(m_a.byte_size, m_b.byte_size);
 
-    // get 结果一致
+    // get results agree
     const va1 = try btree.get(alloc, ms_a.store(), m_a.root, "k1");
     const vb1 = try btree.get(alloc, ms_b.store(), m_b.root, "k1");
     try std.testing.expectEqualStrings("v1", va1.?);
@@ -117,10 +117,10 @@ test "applybatch_single_vs_multi: new keys — 3 single vs 1 ordered multi" {
     alloc.free(vb3.?);
 }
 
-// ===== 2. overwrite 一致性：单条两次 vs 多条含重复 key（dedup last-write-wins）=====
+// ===== 2. Overwrite consistency: two single puts vs one multi-entry batch with a duplicate key (dedup last-write-wins) =====
 
 test "applybatch_single_vs_multi: overwrite — single twice vs multi dedup last-write-wins" {
-    // 场景 A：两次单条 batch put k1=v1 然后 k1=v2
+    // Scenario A: two single-entry batches, put k1=v1 then k1=v2
     var ms_a = newStore();
     defer ms_a.deinit();
     var state_a = wrt.State.init(alloc, ms_a.store(), .{});
@@ -129,7 +129,7 @@ test "applybatch_single_vs_multi: overwrite — single twice vs multi dedup last
     try applySingle(&state_a, "k1", "v2", false);
     const m_a = metrics(&state_a);
 
-    // 场景 B：1 次多条有序 batch（含重复 k1，触发 dedup last-write-wins）put k1=v1, k1=v2
+    // Scenario B: 1 ordered multi-entry batch (with duplicate k1, triggering dedup last-write-wins) put k1=v1, k1=v2
     var ms_b = newStore();
     defer ms_b.deinit();
     var state_b = wrt.State.init(alloc, ms_b.store(), .{});
@@ -140,7 +140,7 @@ test "applybatch_single_vs_multi: overwrite — single twice vs multi dedup last
     });
     const m_b = metrics(&state_b);
 
-    // 两者最终 get(k1) 都返回 "v2"
+    // Both eventually return "v2" for get(k1)
     const va = try btree.get(alloc, ms_a.store(), m_a.root, "k1");
     const vb = try btree.get(alloc, ms_b.store(), m_b.root, "k1");
     try std.testing.expectEqualStrings("v2", va.?);
@@ -148,18 +148,18 @@ test "applybatch_single_vs_multi: overwrite — single twice vs multi dedup last
     alloc.free(va.?);
     alloc.free(vb.?);
 
-    // entry_count 都为 1（overwrite 不翻倍）
+    // entry_count is 1 for both (overwrite does not double-count)
     try std.testing.expectEqual(@as(u64, 1), m_a.entry_count);
     try std.testing.expectEqual(@as(u64, 1), m_b.entry_count);
 
-    // byte_size 一致（overwrite 后两场景都是 k1=v2 的 live size）
+    // byte_size agrees (after the overwrite, both scenarios hold the live size of k1=v2)
     try std.testing.expectEqual(m_a.byte_size, m_b.byte_size);
 }
 
-// ===== 3. 无序 vs 有序：同一组 kv，shuffle 顺序写入，遍历结果一致 =====
+// ===== 3. Unordered vs ordered: same kv set, written shuffled; traversal results agree =====
 
 test "applybatch_single_vs_multi: unordered vs ordered batch — same final tree" {
-    // 有序 batch：k1,k2,k3,k4,k5（严格递增）
+    // Ordered batch: k1,k2,k3,k4,k5 (strictly increasing)
     var ms_ord = newStore();
     defer ms_ord.deinit();
     var state_ord = wrt.State.init(alloc, ms_ord.store(), .{});
@@ -173,7 +173,7 @@ test "applybatch_single_vs_multi: unordered vs ordered batch — same final tree
     });
     const m_ord = metrics(&state_ord);
 
-    // 无序 batch：k3,k1,k5,k2,k4（乱序，触发 dupe+sort+dedup 路径）
+    // Unordered batch: k3,k1,k5,k2,k4 (shuffled, triggering the dupe+sort+dedup path)
     var ms_unord = newStore();
     defer ms_unord.deinit();
     var state_unord = wrt.State.init(alloc, ms_unord.store(), .{});
@@ -187,13 +187,13 @@ test "applybatch_single_vs_multi: unordered vs ordered batch — same final tree
     });
     const m_unord = metrics(&state_unord);
 
-    // entry_count / byte_size 一致
+    // entry_count / byte_size agree
     try std.testing.expectEqual(m_ord.entry_count, m_unord.entry_count);
     try std.testing.expectEqual(@as(u64, 5), m_ord.entry_count);
     try std.testing.expectEqual(@as(u64, 5), m_unord.entry_count);
     try std.testing.expectEqual(m_ord.byte_size, m_unord.byte_size);
 
-    // 遍历结果一致：逐个 key 对比
+    // Traversal results agree: compare key by key
     var idx: u8 = 1;
     while (idx <= 5) : (idx += 1) {
         var kbuf: [3]u8 = undefined;
@@ -209,10 +209,10 @@ test "applybatch_single_vs_multi: unordered vs ordered batch — same final tree
     }
 }
 
-// ===== 4. delete 对比：单条 delete vs 多条 delete，count_delta=-1 =====
+// ===== 4. Delete comparison: single delete vs multi-entry delete, count_delta=-1 =====
 
 test "applybatch_single_vs_multi: delete — single vs multi count_delta consistent" {
-    // 场景 A：单条 put k1, 然后 单条 delete k1（tombstone）
+    // Scenario A: single put k1, then single delete k1 (tombstone)
     var ms_a = newStore();
     defer ms_a.deinit();
     var state_a = wrt.State.init(alloc, ms_a.store(), .{});
@@ -222,7 +222,7 @@ test "applybatch_single_vs_multi: delete — single vs multi count_delta consist
     try applySingle(&state_a, "k1", "", true); // delete
     const m_a = metrics(&state_a);
 
-    // 场景 B：多条 batch put k1, 然后 多条 batch delete k1
+    // Scenario B: multi-entry put k1, then multi-entry delete k1
     var ms_b = newStore();
     defer ms_b.deinit();
     var state_b = wrt.State.init(alloc, ms_b.store(), .{});
@@ -231,24 +231,24 @@ test "applybatch_single_vs_multi: delete — single vs multi count_delta consist
     try applyMultiMultiFut(&state_b, &.{.{ .k = "k1", .v = "", .t = true }});
     const m_b = metrics(&state_b);
 
-    // 两者 entry_count 都为 0（delete 后）
+    // entry_count is 0 for both (after the delete)
     try std.testing.expectEqual(@as(u64, 0), m_a.entry_count);
     try std.testing.expectEqual(@as(u64, 0), m_b.entry_count);
 
-    // byte_size 一致（delete 后都是 0）
+    // byte_size agrees (both are 0 after the delete)
     try std.testing.expectEqual(m_a.byte_size, m_b.byte_size);
 
-    // get(k1) 都返回 null
+    // get(k1) returns null for both
     const va = try btree.get(alloc, ms_a.store(), m_a.root, "k1");
     const vb = try btree.get(alloc, ms_b.store(), m_b.root, "k1");
     try std.testing.expect(va == null);
     try std.testing.expect(vb == null);
 }
 
-// ===== 5. 混合：新建+overwrite+delete 在同一多条 batch vs 逐条单条 =====
+// ===== 5. Mixed: fresh+overwrite+delete in one multi-entry batch vs entry-by-entry singles =====
 
 test "applybatch_single_vs_multi: mixed ops — multi batch vs sequential single" {
-    // 场景 A：逐条单条
+    // Scenario A: entry-by-entry singles
     var ms_a = newStore();
     defer ms_a.deinit();
     var state_a = wrt.State.init(alloc, ms_a.store(), .{});
@@ -260,8 +260,8 @@ test "applybatch_single_vs_multi: mixed ops — multi batch vs sequential single
     try applySingle(&state_a, "b", "", true); // delete b
     const m_a = metrics(&state_a);
 
-    // 场景 B：1 次多条有序 batch（a,b,a,c,b 含重复 + 1 delete）— 需有序：a,a,b,b,c
-    // 排序后 dedup：a=9（last wins），b=delete（last wins），c=3
+    // Scenario B: 1 ordered multi-entry batch (a,b,a,c,b with duplicates + 1 delete) — must be ordered: a,a,b,b,c
+    // After sort, dedup: a=9 (last wins), b=delete (last wins), c=3
     var ms_b = newStore();
     defer ms_b.deinit();
     var state_b = wrt.State.init(alloc, ms_b.store(), .{});
@@ -275,12 +275,12 @@ test "applybatch_single_vs_multi: mixed ops — multi batch vs sequential single
     });
     const m_b = metrics(&state_b);
 
-    // 最终：a=9, b=deleted(null), c=3 → entry_count=2（a, c）
+    // Final state: a=9, b=deleted(null), c=3 -> entry_count=2 (a, c)
     try std.testing.expectEqual(@as(u64, 2), m_a.entry_count);
     try std.testing.expectEqual(@as(u64, 2), m_b.entry_count);
     try std.testing.expectEqual(m_a.byte_size, m_b.byte_size);
 
-    // get 结果一致
+    // get results agree
     const va_a = try btree.get(alloc, ms_a.store(), m_a.root, "a");
     const va_b = try btree.get(alloc, ms_b.store(), m_b.root, "a");
     try std.testing.expectEqualStrings("9", va_a.?);
@@ -295,7 +295,7 @@ test "applybatch_single_vs_multi: mixed ops — multi batch vs sequential single
     alloc.free(vc_a.?);
     alloc.free(vc_b.?);
 
-    // b 都应 null
+    // b should be null for both
     const vb_a = try btree.get(alloc, ms_a.store(), m_a.root, "b");
     const vb_b = try btree.get(alloc, ms_b.store(), m_b.root, "b");
     try std.testing.expect(vb_a == null);

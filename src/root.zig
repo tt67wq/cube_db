@@ -1,4 +1,5 @@
-//! cube_db — 嵌入式 KV 引擎库入口
+//! cube_db — embedded key-value engine library root
+
 const std = @import("std");
 
 pub const format = @import("format.zig");

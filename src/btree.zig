@@ -1,6 +1,7 @@
-//! btree.zig — 页号 COW B-tree（v2，page-based）
-//! 与 v1 btree.zig 相同算法，但节点寻址用 u32 页号，I/O 走 PageStore，
-//! 固定页大小，分支子指针为 u32。脏页收集到 caller 的 ArrayList。
+//! btree.zig — page-number COW B-tree (v2, page-based)
+//! Same algorithm as the v1 btree.zig, but nodes are addressed by u32 page
+//! numbers, I/O goes through PageStore, pages are fixed-size, and branch child
+//! pointers are u32. Dirty pages are collected into the caller's ArrayList.
 const std = @import("std");
 const f2 = @import("format.zig");
 const ps = @import("page_store.zig");
@@ -28,21 +29,26 @@ pub const WriteResult = struct {
     count_delta: i64,
 };
 
-// ===== key 比较 =====
+// ===== Key comparison =====
 pub fn cmpKey(a: []const u8, b: []const u8) std.math.Order {
     return std.mem.order(u8, a, b);
 }
 
-// ===== 页 I/O 辅助 =====
+// ===== Page I/O helpers =====
 
-/// 从页读节点 payload（CRC 校验后返 [PAGE_HEADER_SIZE .. PAGE_SIZE-4) 的借用切片，不拷贝）。
-/// 借用语义：栈上只压一个切片头（ptr+len），数据本体仍在 Store 的页存储里
-/// ——生产 FilePageStore 是 1TB mmap 预留区的裸指针，MemPageStore 是每页
-/// 独立堆分配的 slab。接口契约保证借用有效期 = Store 生命周期（页地址稳定
-/// + COW 不原地改，见 page_store.zig VTable.readPage）；接口层不依赖任何
-/// 「借用长存」之外的假设，写路径（split/merge 等）仍遵循「先整页拷到栈
-/// 缓冲再改」的防御模式——这是 allocPage 扩容曾致借用悬垂（SEGV）时留下的
-/// 惯例，现由页地址稳定性兜底。
+/// Read a node payload from a page (after CRC validation, returns the borrowed
+/// slice [PAGE_HEADER_SIZE .. PAGE_SIZE-4), no copy).
+/// Borrowing semantics: only a slice header (ptr+len) is pushed on the stack;
+/// the data itself stays in the Store's page storage — the production
+/// FilePageStore is a raw pointer into a 1TB reserved mmap region, MemPageStore
+/// is a per-page heap-allocated slab. The interface contract guarantees the
+/// borrow is valid for the Store's lifetime (stable page addresses + COW never
+/// modifies in place, see page_store.zig VTable.readPage); the interface layer
+/// relies on no assumption beyond "borrows outlive the call", and the write
+/// path (split/merge etc.) still follows the defensive "copy the whole page to
+/// a stack buffer before modifying" pattern — a habit left over from when
+/// allocPage growth once dangled a borrow (SEGV), now backstopped by page
+/// address stability.
 pub fn readNodePayload(store: PageStore, page_no: u32) ![]const u8 {
     const page = try store.readPage(page_no);
     const arr: *const [f2.PAGE_SIZE]u8 = @ptrCast(page.ptr);
@@ -58,7 +64,7 @@ pub fn readNodePayloadFast(store: PageStore, page_no: u32) ![]const u8 {
     return page[f2.PAGE_HEADER_SIZE .. f2.PAGE_SIZE - 4];
 }
 
-/// 写节点页（页头 + payload + CRC）
+/// Write a node page (page header + payload + CRC)
 pub fn writeNodePage(store: PageStore, page_no: u32, page_type: u8, nkeys: u16, payload: []const u8) !void {
     const page = try store.writePage(page_no);
     const arr: *[f2.PAGE_SIZE]u8 = @ptrCast(page.ptr);
@@ -76,19 +82,19 @@ pub fn writeNodePage(store: PageStore, page_no: u32, page_type: u8, nkeys: u16, 
     f2.setPageChecksum(arr, f2.computePageChecksum(arr));
 }
 
-// ===== Leaf 节点编码 =====
+// ===== Leaf node encoding =====
 
-/// 最大内联值大小（留余量给页头和多个 entry）
+/// Max inline value size (leaves headroom for the page header and multiple entries)
 pub const MAX_INLINE_VALUE: usize = 3800;
 
-/// 溢出页最多可存 payload 字节数
+/// Max payload bytes an overflow page can hold
 const OVERFLOW_PAYLOAD: usize = f2.PAGE_SIZE - f2.PAGE_HEADER_SIZE - 4;
 
-/// flags: 1 = 溢出页
+/// flags: 1 = overflow page
 const LEAF_FLAG_OVERFLOW: u8 = 1;
 
-/// 写值到溢出页链，返首页号
-/// ponytail: MVP 无 nkeys 更新，链靠 free_next
+/// Write a value to an overflow page chain, returning the head page number
+/// ponytail: MVP has no nkeys update; the chain relies on free_next
 fn writeOverflowPages(store: PageStore, value: []const u8) !u32 {
     var remaining = value.len;
     var offset: usize = 0;
@@ -117,7 +123,7 @@ fn writeOverflowPages(store: PageStore, value: []const u8) !u32 {
         if (first_page == 0) {
             first_page = page_no;
         } else {
-            // 链接前页 → 本页
+            // Link the previous page -> this page
             const prev = try store.writePage(prev_page);
             const prev_arr: *[f2.PAGE_SIZE]u8 = @ptrCast(prev.ptr);
             var prev_hdr = f2.decodePageHeader(prev[0..f2.PAGE_HEADER_SIZE]);
@@ -132,11 +138,14 @@ fn writeOverflowPages(store: PageStore, value: []const u8) !u32 {
     return first_page;
 }
 
-/// 读溢出页链，返回值（调用方 free）。CRC 收敛（T-29 Phase B，N1 统一）：链页
-/// 读取与 getInto/迭代器一致走 readNodePayloadFast——正常读路径全部跳过 CRC
-/// （COW 保证已发布页不被原地修改）；CRC 保留在写路径读取与恢复/审计
-/// （readNodePayload 公开 API）。原实现链读带 CRC、下降不带，同一次 get 内
-/// 两种口径且与 getInto 可观测行为不一致（review N1），现统一为 fast。
+/// Read an overflow page chain, returning the value (caller frees).
+/// CRC convergence (T-29 Phase B, N1 unification): chain pages are read via
+/// readNodePayloadFast, consistent with getInto/iterator — all normal read
+/// paths skip CRC (COW guarantees published pages are never modified in
+/// place); CRC stays on write-path reads and recovery/audit
+/// (readNodePayload public API). The old implementation read the chain with
+/// CRC but descended without — two different disciplines within a single get,
+/// observably inconsistent with getInto (review N1); now unified to fast.
 fn readOverflowValue(allocator: std.mem.Allocator, store: PageStore, first_page: u32, vlen: u32) ![]u8 {
     const result = try allocator.alloc(u8, vlen);
     errdefer allocator.free(result);
@@ -154,7 +163,7 @@ fn readOverflowValue(allocator: std.mem.Allocator, store: PageStore, first_page:
     return result;
 }
 
-/// 回收溢出页链到 dirty list
+/// Recycle an overflow page chain into the dirty list
 fn freeOverflowPages(store: PageStore, first_page: u32, dirty: *std.ArrayList(u32), allocator: std.mem.Allocator) void {
     var cur = first_page;
     while (cur != 0) {
@@ -166,7 +175,7 @@ fn freeOverflowPages(store: PageStore, first_page: u32, dirty: *std.ArrayList(u3
     }
 }
 
-/// 判断 entry 需要溢出页
+/// Determine whether an entry needs an overflow page
 fn needsOverflow(entry: LeafEntry) bool {
     return entry.value.len > MAX_INLINE_VALUE;
 }
@@ -262,7 +271,7 @@ pub fn decodeLeafPayload(payload: []const u8, entries_out: []DecodedLeafEntry) !
     }
 }
 
-// ===== Branch 节点编码（u32 子指针） =====
+// ===== Branch node encoding (u32 child pointers) =====
 
 pub fn branchPayloadSize(keys: []const []const u8, children: []const u32) usize {
     var n: usize = 1 + 2;
@@ -318,7 +327,7 @@ pub fn decodeBranchPayload(payload: []const u8, keys_out: [][]const u8, children
     }
 }
 
-// ===== Leaf 内存表示 =====
+// ===== Leaf in-memory representation =====
 
 pub const Leaf = struct {
     entries: []LeafEntry,
@@ -350,7 +359,7 @@ pub const Leaf = struct {
         const entries = try allocator.alloc(LeafEntry, count);
         for (dec_slice, 0..) |d, i| {
             if (d.flags & LEAF_FLAG_OVERFLOW != 0) {
-                // 读溢出页链，获完整值；并将旧溢出页加入 dirty
+                // Read the overflow chain for the full value; add the old overflow pages to dirty
                 const ov_page = std.mem.readInt(u32, d.value[0..4], .little);
                 freeOverflowPages(store, ov_page, dirty, allocator);
                 const full_val = try readOverflowValue(allocator, store, ov_page, d.vlen);
@@ -384,7 +393,7 @@ pub const Leaf = struct {
     }
 };
 
-// ===== Branch 内存表示 =====
+// ===== Branch in-memory representation =====
 
 pub const Branch = struct {
     keys: [][]u8,
@@ -419,7 +428,7 @@ pub const Branch = struct {
         return .{ .keys = keys, .children = children, .allocator = allocator };
     }
 
-    /// 找 key 应走哪个子节点（返回 child index 0..count-1）
+    /// Find which child a key descends into (returns child index 0..count-1)
     pub fn findChild(self: *const Branch, key: []const u8) usize {
         var lo: usize = 0;
         var hi: usize = self.keys.len;
@@ -501,15 +510,19 @@ fn findInLeaf(allocator: std.mem.Allocator, store: PageStore, payload: []const u
     return null;
 }
 
-// ===== getInto（T-29 Phase A：无拷贝读）=====
+// ===== getInto (T-29 Phase A: zero-copy read) =====
 
-/// 无拷贝点查：把 key 对应 value 拷入调用方 buffer，返回写入字节数。
-/// - key 不存在（或 tombstone）→ null（null 语义唯一保留给“不存在”，
-///   与 T-23 移除 borrowed API 时的 null 多义性彻底解耦）。
-/// - buffer 太小 → error.BufferTooSmall，且 buffer 内容不被写入/清空
-///   （调用方可安全换大 buffer 重试）。
-/// 与 get() 共享 readNodePayloadFast 下降路径（跳过 CRC，COW 保证读到的
-/// 已发布页不被原地修改；CRC 收敛到恢复/审计路径是既定取舍，见 T-27/T-29 背景）。
+/// Zero-copy point read: copies the key's value into the caller's buffer and
+/// returns the byte count written.
+/// - Missing key (or tombstone) -> null (null is reserved exclusively for
+///   "not found", fully decoupled from the null ambiguity of the borrowed API
+///   removed in T-23).
+/// - Buffer too small -> error.BufferTooSmall, with the buffer left unwritten
+///   /uncleared (the caller can safely retry with a larger buffer).
+/// Shares the readNodePayloadFast descent path with get() (skips CRC; COW
+/// guarantees the published pages read are never modified in place;
+/// converging CRC onto recovery/audit paths is the settled trade-off, see the
+/// T-27/T-29 background).
 pub fn getInto(store: PageStore, root: u32, key: []const u8, buffer: []u8) !?usize {
     if (root == NULL_ROOT) return null;
     var cur = root;
@@ -526,9 +539,11 @@ pub fn getInto(store: PageStore, root: u32, key: []const u8, buffer: []u8) !?usi
     return error.Truncated;
 }
 
-/// findInLeaf 的无拷贝变体：叶内扫描与 findInLeaf 同构（同款逐 entry 定长头
-/// 线性序扫描，保持两路径行为一致），命中时不 dupe 而是直接拷入 buffer；
-/// buffer 不足在任何写入前拦截（无部分写入，失败时 buffer 原样）。
+/// Zero-copy variant of findInLeaf: the in-leaf scan is isomorphic to
+/// findInLeaf (the same per-entry fixed-header linear scan, keeping both
+/// paths behaviorally identical); on a hit it copies straight into the buffer
+/// instead of duping; an insufficient buffer is intercepted before any write
+/// (no partial writes; the buffer is untouched on failure).
 fn findInLeafInto(store: PageStore, payload: []const u8, key: []const u8, buffer: []u8) !?usize {
     if (payload.len < 3) return error.Truncated;
     if (payload[0] != LEAF_KIND) return error.CorruptCrc;
@@ -552,7 +567,7 @@ fn findInLeafInto(store: PageStore, payload: []const u8, key: []const u8, buffer
         pos += 1;
         switch (cmpKey(ek, key)) {
             .lt => {
-                // skip value for non-matching key（与 findInLeaf 同构）
+                // skip value for non-matching key (isomorphic to findInLeaf)
                 if (flags & LEAF_FLAG_OVERFLOW == 0) {
                     if (pos + vlen > payload.len) return error.Truncated;
                     pos += vlen;
@@ -564,7 +579,7 @@ fn findInLeafInto(store: PageStore, payload: []const u8, key: []const u8, buffer
             },
             .eq => {
                 if (tombstone) return null;
-                if (buffer.len < vlen) return error.BufferTooSmall; // 任何写入前拦截
+                if (buffer.len < vlen) return error.BufferTooSmall; // intercept before any write
                 if (flags & LEAF_FLAG_OVERFLOW != 0) {
                     const ov_page = std.mem.readInt(u32, payload[pos..][0..4], .little);
                     try readOverflowValueInto(store, ov_page, buffer[0..vlen]);
@@ -581,10 +596,12 @@ fn findInLeafInto(store: PageStore, payload: []const u8, key: []const u8, buffer
     return null;
 }
 
-/// readOverflowValue 的无拷贝变体：溢出链逐页拷入调用方 buffer（不再先
-/// alloc 整块再 memcpy 一次）。链页读取走 readNodePayloadFast（跳过 CRC，
-/// 与 get 下降路径同款取舍：COW 下已发布页不被原地修改）。vlen 由叶内
-/// entry 给出，buffer.len == vlen 已由调用方保证。
+/// Zero-copy variant of readOverflowValue: copies the overflow chain into the
+/// caller's buffer page by page (no more alloc-whole-block-then-memcpy).
+/// Chain pages are read via readNodePayloadFast (skipping CRC, the same
+/// trade-off as the get descent path: under COW, published pages are never
+/// modified in place). vlen comes from the in-leaf entry; buffer.len == vlen
+/// is already guaranteed by the caller.
 fn readOverflowValueInto(store: PageStore, first_page: u32, buffer: []u8) !void {
     var offset: usize = 0;
     var cur = first_page;
@@ -620,7 +637,7 @@ fn findInBranchPayload(payload: []const u8, key: []const u8) !u32 {
         }
     }
     if (!found) child_idx = count - 1;
-    // children 区：keys 区结束后
+    // children area: starts after the keys area
     if (pos + 4 * count > payload.len) return error.Truncated;
     return std.mem.readInt(u32, payload[pos + child_idx * 4 ..][0..4], .little);
 }
@@ -854,7 +871,7 @@ fn insertIntoLeaf(
     if (found) {
         // Overwrite: subtract old entry size
         const old_val_sz: usize = if (old_is_overflow) @as(usize, 4) else @as(usize, old_vlen);
-        // 固定开销 10 与 leafPayloadSize 对齐（tombstone 1 + klen 4 + vlen 4 + flags 1）
+        // Fixed overhead 10, aligned with leafPayloadSize (tombstone 1 + klen 4 + vlen 4 + flags 1)
         live_delta -= @as(i64, @intCast(old_key_len + old_val_sz + 10));
         if (!old_tombstone and tombstone) {
             count_delta = -1;
@@ -880,11 +897,13 @@ fn insertIntoLeaf(
     }
 
     // Byte-budget precheck (T-26, issues/insert-into-leaf-fast-path-stack-overflow.md):
-    // 条数上限（LEAF_MAX_ENTRIES=32）不覆盖 payload 字节容量（PAGE_SIZE-24-4=4068B）。
-    // 31 条 ~130B 的合法满叶 + 1 条超限 entry 时 new_count 仍 ≤ 32，
-    // 下方栈缓冲拼接会越界 → fallback 到 split 路径。
-    // 口径与 leafPayloadSize 对齐：固定开销 10（tombstone 1 + klen 4 + vlen 4 + flags 1），
-    // 溢出 value 按 4B 页指针计。
+    // The entry-count cap (LEAF_MAX_ENTRIES=32) does not cover the payload
+    // byte capacity (PAGE_SIZE-24-4=4068B). A legal full leaf of 31 entries
+    // at ~130B plus one oversized entry keeps new_count <= 32, and the stack
+    // buffer concatenation below would overflow -> fall back to the split
+    // path. Accounting aligned with leafPayloadSize: fixed overhead 10
+    // (tombstone 1 + klen 4 + vlen 4 + flags 1), overflow values counted as
+    // a 4B page pointer.
     {
         const payload_cap = f2.PAGE_SIZE - f2.PAGE_HEADER_SIZE - 4;
         const val_sz: usize = if (tombstone) 0 else (if (value.len > MAX_INLINE_VALUE) 4 else value.len);
@@ -896,9 +915,11 @@ fn insertIntoLeaf(
     }
 
     // Free old overflow pages if overwriting an overflow entry。
-    // 须在两个 fallback 判断之后：split 路径经 Leaf.fromPayload 已释放旧溢出链，
-    // 提前 free 会使同一批页号进 dirty 两次 → freelist 双重分配 → 页别名损坏
-    //（T-26 review 发现1）。只有真正走快路径才在此释放。
+    // Must come after both fallback checks: the split path already frees the
+    // old overflow chain via Leaf.fromPayload; freeing early would push the
+    // same page numbers into dirty twice -> double freelist allocation ->
+    // page aliasing corruption (T-26 review finding 1). Only the true fast
+    // path frees here.
     if (found and old_is_overflow) {
         freeOverflowPages(store, old_overflow_page, dirty, allocator);
     }
@@ -1198,7 +1219,7 @@ pub fn insert(
         try insertIntoBranch(store, allocator, root, key, value, tombstone, dirty);
 
     if (sub.split_key) |sk| {
-        // root 分裂：建新 root branch
+        // Root split: build a new root branch
         var keys: [1][]const u8 = .{sk};
         var children: [2]u32 = .{ sub.new_child, sub.split_right };
         const new_page = try store.allocPage();
@@ -1220,11 +1241,12 @@ pub fn insert(
     };
 }
 
-// ===== 批量插入（单 txn 内共享 COW 路径）=====
+// ===== Batch insert (shared COW path within a single txn) =====
 
-/// 批量插入多条 entry，沿 B-tree 路径一次遍历。
-/// 同一 leaf 范围内的 entry 只复制一次页，避免逐条 COW。
-/// entries 必须按 key 排序（升序），同 key 取最后一条。
+/// Batch-insert multiple entries in one B-tree traversal.
+/// Entries within the same leaf range copy the page only once, avoiding
+/// per-entry COW. entries must be sorted by key (ascending); for duplicate
+/// keys the last one wins.
 pub fn insertBatch(
     allocator: std.mem.Allocator,
     store: PageStore,
@@ -1796,42 +1818,51 @@ fn insertBatchIntoBranch(
     return .{ .new_child = left_page, .split_key = up_key, .split_right = right_page, .live_delta = live_delta, .count_delta = count_delta };
 }
 
-// ===== 范围迭代器（T-29 Phase B：借用化）=====
+// ===== Range iterator (T-29 Phase B: borrowed) =====
 
-/// 借用契约（T-29 Phase B，调用方必读）：
-/// 1. `next()` 返回的 entry 的 key/value 均为借用切片——仅在下一次 `next()` 或
-///    `deinit()` 前有效。内联 value/key 借自叶 payload；溢出 value 经迭代器内部
-///    复用缓冲拼接（连续溢出条目时前一 entry 的 value 会被新条目覆盖——这是
-///    可观察的失效面，契约测试锁定）。
-/// 2. 迭代器生命周期 pin 住读快照：`Db.select`/`ReadTxn.select` 创建的迭代器
-///    持有 MVCC 读者名额，COW 脏页延迟到 `deinit()`（末位读者）才回收——
-///    迭代中途的写者提交不影响已借用的页。直接用 `btree.select`（raw 页存储层）
-///    时无 pin，调用方自行保证 Store 稳定性（页不被回收/改写）。
-/// 3. 下推栈 O(深度)：每帧仅页号+子游标（定长数组，无每节点 dupe 副本）；
-///    内联值扫描零分配，溢出值仅首个条目惰性分配一次复用缓冲。
+/// Borrowing contract (T-29 Phase B, callers must read):
+/// 1. The key/value of the entry returned by `next()` are borrowed slices —
+///    valid only until the next `next()` or `deinit()`. Inline value/key are
+///    borrowed from the leaf payload; overflow values are assembled in the
+///    iterator's internal reuse buffer (with consecutive overflow entries,
+///    the previous entry's value is overwritten by the new one — this is the
+///    observable invalidation surface, locked by contract tests).
+/// 2. The iterator's lifetime pins the read snapshot: iterators created by
+///    `Db.select`/`ReadTxn.select` hold an MVCC reader slot, so COW dirty
+///    pages are deferred until `deinit()` (last reader out) — mid-iteration
+///    writer commits do not affect already-borrowed pages. Using
+///    `btree.select` directly (raw page-store layer) has no pin; the caller
+///    guarantees Store stability (pages not recycled/rewritten) itself.
+/// 3. Pushdown stack O(depth): each frame is just a page number + child
+///    cursor (fixed-size array, no per-node dupe copies); inline-value scans
+///    are allocation-free, and the overflow reuse buffer is allocated lazily
+///    once for the first overflow entry.
 pub const Iterator = struct {
     allocator: std.mem.Allocator,
     store: PageStore,
     min: ?[]const u8,
     max: ?[]const u8,
-    /// 下推栈：定长数组（无 ArrayList 增长分配）。
+    /// Pushdown stack: fixed-size array (no ArrayList growth allocations).
     frames: [MAX_DEPTH]Frame,
     depth: usize,
-    /// 当前叶的借用 payload（readNodePayloadFast）。
+    /// The current leaf's borrowed payload (readNodePayloadFast).
     leaf_payload: ?[]const u8,
-    /// 叶内 entry 总数与字节游标。
+    /// In-leaf entry count and byte cursor.
     leaf_count: usize,
     leaf_pos: usize,
-    /// 已解析 entry 序号（0..leaf_count）。
+    /// Index of the parsed entry (0..leaf_count).
     entry_i: usize,
-    /// 溢出值拼接缓冲：惰性分配、跨 entry 复用（借用契约的可观察失效面）。
+    /// Overflow value assembly buffer: lazily allocated, reused across entries
+    /// (the borrowing contract's observable invalidation surface).
     ov_buf: std.ArrayList(u8),
-    /// MVCC pin（可选）：deinit 时回调。由 db.zig 注入（btree 层不依赖 wrt.State）。
+    /// MVCC pin (optional): callback at deinit. Injected by db.zig (the btree
+    /// layer does not depend on wrt.State).
     pin_ctx: ?*anyopaque = null,
     pin_deinit: ?*const fn (*anyopaque) void = null,
 
-    /// ponytail: 定长下推栈。4KB 页/32 路扇出下 1TB ≈ 深度 7，64 绰绰有余；
-    /// 超深树（病态小扇出）会在此报错而非静默截断。
+    /// ponytail: fixed-size pushdown stack. With 4KB pages / 32-way fanout,
+    /// 1TB is roughly depth 7 — 64 is plenty; pathologically deep trees
+    /// (tiny fanout) error here rather than silently truncating.
     const MAX_DEPTH: usize = 64;
 
     const Frame = struct { page_no: u32, child_idx: usize };
@@ -1844,7 +1875,7 @@ pub const Iterator = struct {
         self.ov_buf.deinit(self.allocator);
     }
 
-    /// 叶内待解析的 entry 视图（借用）。
+    /// View of the pending in-leaf entries to parse (borrowed).
     const EntryView = struct {
         tombstone: bool,
         key: []const u8,
@@ -1853,8 +1884,9 @@ pub const Iterator = struct {
         value_pos: usize,
     };
 
-    /// 从 pos 解析 entry 头（不动游标；advance() 推进）。
-    /// 与 findInLeafInto 的逐 entry 解析同构，保持两路径行为一致。
+    /// Parse the entry header at pos (does not move the cursor; advance()
+    /// does). Isomorphic to findInLeafInto's per-entry parsing, keeping both
+    /// paths behaviorally identical.
     fn peekEntry(payload: []const u8, pos: usize) !EntryView {
         if (pos + 1 + 4 > payload.len) return error.Truncated;
         const tombstone = payload[pos] == 1;
@@ -1873,7 +1905,8 @@ pub const Iterator = struct {
         };
     }
 
-    /// 游标推进到 entry 末尾（value 区长度按 flags 分派：溢出 4B 指针 / 内联 vlen）。
+    /// Advance the cursor past the entry's end (value-area length dispatched
+    /// by flags: overflow 4B pointer / inline vlen).
     fn advance(self: *Iterator) void {
         const payload = self.leaf_payload.?;
         const ev = peekEntry(payload, self.leaf_pos) catch return;
@@ -1886,7 +1919,7 @@ pub const Iterator = struct {
             if (self.leaf_payload) |payload| {
                 while (self.entry_i < self.leaf_count) {
                     const ev = try peekEntry(payload, self.leaf_pos);
-                    self.advance(); // 游标先推进：return/continue 均已消费本 entry
+                    self.advance(); // advance the cursor first: both return/continue consume this entry
                     if (ev.tombstone) continue;
                     if (self.min) |m| {
                         if (cmpKey(ev.key, m) == .lt) continue;
@@ -1895,7 +1928,8 @@ pub const Iterator = struct {
                         if (cmpKey(ev.key, mx) != .lt) return null;
                     }
                     if (ev.flags & LEAF_FLAG_OVERFLOW != 0) {
-                        // 溢出值：链拼接进复用缓冲（借用契约：下次 next 覆盖）
+                        // Overflow value: assemble the chain into the reuse
+                        // buffer (borrowing contract: overwritten by next next())
                         const ov_page = std.mem.readInt(u32, payload[ev.value_pos..][0..4], .little);
                         self.ov_buf.clearRetainingCapacity();
                         try self.ov_buf.resize(self.allocator, ev.vlen);
@@ -1911,7 +1945,8 @@ pub const Iterator = struct {
         }
     }
 
-    /// 向右步进到下一个叶：栈顶 child_idx+1，取该 child 的最左叶路径。
+    /// Step right to the next leaf: child_idx+1 at the stack top, then take
+    /// that child's leftmost leaf path.
     fn stepToNextLeaf(self: *Iterator) !bool {
         while (self.depth > 0) {
             const top = &self.frames[self.depth - 1];
@@ -1921,12 +1956,13 @@ pub const Iterator = struct {
                 const child = std.mem.readInt(u32, br.payload[br.children_offset + top.child_idx * 4 ..][0..4], .little);
                 return try self.descendLeftmost(child);
             }
-            self.depth -= 1; // pop（定长数组，无 free）
+            self.depth -= 1; // pop (fixed-size array, nothing to free)
         }
         return false;
     }
 
-    /// 沿 child[0] 一路下降到叶（中途压栈，child_idx=0）。
+    /// Descend along child[0] all the way to a leaf (pushing frames along
+    /// the way, child_idx=0).
     fn descendLeftmost(self: *Iterator, page_no: u32) !bool {
         var cur = page_no;
         var guard: u32 = 0;
@@ -1963,14 +1999,16 @@ pub const Iterator = struct {
         children_offset: usize,
     };
 
-    /// 读取 branch 页并跳过 keys 区（无解码副本、无 key dupe）。
+    /// Read a branch page and skip past the keys area (no decoded copies, no
+    /// key dupes).
     fn readBranchChildren(store: PageStore, page_no: u32) !BranchView {
         const payload = try readNodePayloadFast(store, page_no);
         return try branchChildren(payload);
     }
 };
 
-/// 解析 branch payload 头：count + children 区字节偏移（跳过 count-1 个 key）。
+/// Parse the branch payload header: count + byte offset of the children area
+/// (skipping count-1 keys).
 fn branchChildren(payload: []const u8) !Iterator.BranchView {
     if (payload.len < 3) return error.Truncated;
     if (payload[0] != BRANCH_KIND) return error.CorruptCrc;
@@ -1988,8 +2026,9 @@ fn branchChildren(payload: []const u8) !Iterator.BranchView {
     return .{ .payload = payload, .count = count, .children_offset = pos };
 }
 
-/// 范围查询（借用化）：返回借用迭代器（见 Iterator 借用契约）。
-/// raw 页存储层调用方自行保证 Store 稳定性；Db/ReadTxn 层由 db.zig 注入 MVCC pin。
+/// Range query (borrowed): returns a borrowed iterator (see the Iterator
+/// borrowing contract). Raw page-store callers guarantee Store stability
+/// themselves; the Db/ReadTxn layer injects the MVCC pin via db.zig.
 pub fn select(allocator: std.mem.Allocator, store: PageStore, root: u32, min: ?[]const u8, max: ?[]const u8) !Iterator {
     var it: Iterator = .{
         .allocator = allocator,
@@ -2008,16 +2047,19 @@ pub fn select(allocator: std.mem.Allocator, store: PageStore, root: u32, min: ?[
     var cur = root;
     var guard: u32 = 0;
     while (guard < 1000) : (guard += 1) {
-        // CRC 收敛取舍（T-29 Phase B）：正常读路径（get/getInto/迭代器）统一
-        // readNodePayloadFast 跳过 CRC；CRC 保留在写路径读取与恢复/审计
-        // （readNodePayload 公开 API）。COW 保证已发布页不被原地修改。
+        // CRC convergence trade-off (T-29 Phase B): normal read paths
+        // (get/getInto/iterator) uniformly use readNodePayloadFast, skipping
+        // CRC; CRC stays on write-path reads and recovery/audit
+        // (readNodePayload public API). COW guarantees published pages are
+        // never modified in place.
         const payload = try readNodePayloadFast(store, cur);
         if (payload.len == 0) return error.Truncated;
         if (payload[0] == LEAF_KIND) {
             try it.loadLeaf(payload);
             break;
         }
-        // min 路由：复用 findChildIdxAndOffset（与 get 同款分支下降语义）
+        // min routing: reuse findChildIdxAndOffset (the same branch descent
+        // semantics as get)
         var ci: usize = 0;
         var children_offset: usize = undefined;
         if (min) |m| {
@@ -2038,7 +2080,8 @@ pub fn select(allocator: std.mem.Allocator, store: PageStore, root: u32, min: ?[
     return it;
 }
 
-// ===== 错误 =====
+// ===== Errors =====
+
 pub const Error = error{
     OutOfMemory,
     Truncated,

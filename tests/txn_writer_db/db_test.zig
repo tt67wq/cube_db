@@ -1,6 +1,6 @@
-//! db_test.zig — Db2 集成测试（TDD RED）
-//! 覆盖：open/close、put/get、putBatch、delete、select、meta 恢复。
-//! 用 MemPageStore 模拟持久化。先 fail（db.zig 不存在）。
+//! db_test.zig — Db2 integration tests (TDD RED)
+//! Covers: open/close, put/get, putBatch, delete, select, meta recovery.
+//! Uses MemPageStore to simulate persistence. Written to fail first (db.zig does not exist).
 const std = @import("std");
 const cube = @import("cube_db");
 const ps = cube.page_store;
@@ -156,7 +156,7 @@ test "db: close and reopen recovers from meta" {
     defer ms.deinit();
     const s = ms.store();
 
-    // 第一次打开，写入数据
+    // First open: write data
     var db = try dbi.Db.open(std.testing.allocator, s, .{});
     try db.put("persist", "me");
     try db.put("another", "key");
@@ -164,16 +164,16 @@ test "db: close and reopen recovers from meta" {
     const root_seq1 = db.getRoot();
     db.close();
 
-    // 第二次打开（同一个 store，meta 应恢复）
+    // Second open (same store; meta should be recovered)
     var db2_ = try dbi.Db.open(std.testing.allocator, s, .{});
     defer db2_.close();
-    // 根应不同（因为上次 close 后 meta 持久化了 COW 状态）
+    // The root should differ (the last close persisted the COW state via meta)
     _ = root_seq1;
     const v = try db2_.get("persist");
     try std.testing.expect(v != null);
     try std.testing.expectEqualStrings("me", v.?);
     std.testing.allocator.free(v.?);
-    // another 应被删了
+    // "another" should have been deleted
     try std.testing.expectEqual(@as(?[]u8, null), try db2_.get("another"));
 }
 
@@ -182,30 +182,30 @@ test "db: meta alternation — write, corrupt one meta, recover" {
     defer ms.deinit();
     const s = ms.store();
 
-    // 写两个 batch → meta 交替到 page 1
+    // Write two batches -> meta alternates to page 1
     var db = try dbi.Db.open(std.testing.allocator, s, .{});
     try db.put("k1", "v1");
     try db.put("k2", "v2");
     const expected_root = db.getRoot();
     db.close();
 
-    // 损坏 meta page 0（使 checksum 不对 — 用垃圾数据）
-    // MemPageStore 的 writePage 返回 meta0 的可变指针
+    // Corrupt meta page 0 (break the checksum — with garbage bytes)
+    // MemPageStore's writePage returns a mutable pointer to meta0
     _ = try s.writePage(1);
     const corrupted_page = try s.writePage(1);
     @memset(corrupted_page, 0xff);
-    // 保留 checksum 有效性（故意让 checksum 也错—不走 setPageChecksum）
+    // Leave the checksum invalid (deliberately skip setPageChecksum)
 
-    // 第三次打开 — 应从 meta page 1 恢复
+    // Third open — should recover from meta page 1
     var db2_ = try dbi.Db.open(std.testing.allocator, s, .{});
     defer db2_.close();
-    // k1 和 k2 应还在
+    // k1 and k2 should still be there
     const v1 = try db2_.get("k1");
     try std.testing.expectEqualStrings("v1", v1.?);
     std.testing.allocator.free(v1.?);
     const v2 = try db2_.get("k2");
     try std.testing.expectEqualStrings("v2", v2.?);
     std.testing.allocator.free(v2.?);
-    // root 应匹配
+    // The root should match
     try std.testing.expectEqual(expected_root, db2_.getRoot());
 }

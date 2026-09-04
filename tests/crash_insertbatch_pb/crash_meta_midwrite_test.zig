@@ -1,13 +1,13 @@
-//! crash_meta_midwrite_test.zig — T-6: meta 写入中途崩溃测试
-//! 覆盖 src/writer.zig:435-439 writeMeta + sync 之间的崩溃窗口。
+//! crash_meta_midwrite_test.zig - T-6: crash during meta write tests
+//! Covers the crash window between writeMeta and sync at src/writer.zig:435-439.
 //!
-//! 策略（方案 C）：fork 子进程，用 fsync=false 提交（writeMeta 执行但 sync 不执行），
-//! 然后立即 _exit(0) 模拟崩溃。reopen 后验证：
-//!   - meta 校验和有效（db 可正常 open，不 panic）
-//!   - 数据要么全有（新 meta 已生效）要么全无（旧 meta 兜底）
-//!   - 绝不出现 meta 页校验和失效导致全库不可读
+//! Strategy (plan C): fork a child, commit with fsync=false (writeMeta executes but sync does not),
+//! then _exit(0) immediately to simulate a crash. After reopen, verify:
+//!   - the meta checksum is valid (db opens normally, no panic)
+//!   - data is either all present (new meta took effect) or all absent (old meta as fallback)
+//!   - never a broken meta-page checksum that renders the whole DB unreadable
 //!
-//! 另测 fsync=true + commit 中途 kill -9（更宽窗口，覆盖 writeMeta-sync 之间）。
+//! Also tests fsync=true + kill -9 mid-commit (a wider window, covering writeMeta-sync).
 const std = @import("std");
 const cube = @import("cube_db");
 const f2 = cube.format;
@@ -35,12 +35,12 @@ fn pathZ(allocator: std.mem.Allocator, path: []const u8) ![:0]u8 {
     return try allocator.dupeZ(u8, path);
 }
 
-/// 子进程：用 fsync=false putBatch 一批 key，commit 后 _exit（sync 未调用）。
-/// writeMeta 已执行（meta 页写入 mmap），但 fsync 未调用 → 模拟 writeMeta-sync 间崩溃。
+/// Child process: putBatch a set of keys with fsync=false, _exit after commit (sync never called).
+/// writeMeta has run (meta page written into mmap) but fsync was not called -> simulates a crash between writeMeta and sync.
 fn childCommitNoSync(path: [:0]const u8, n: usize) noreturn {
     var fps = FilePageStore.init(alloc, path) catch c._exit(2);
     defer fps.deinit();
-    // fsync=false：commit 走 writeMeta 但跳过 sync
+    // fsync=false: commit goes through writeMeta but skips sync
     var db = Db.open(alloc, fps.store(), .{ .fsync = false }) catch c._exit(3);
     defer db.close();
 
@@ -53,15 +53,15 @@ fn childCommitNoSync(path: [:0]const u8, n: usize) noreturn {
         };
     }
 
-    // putBatch → applyBatch → writeMeta（已执行）→ skip sync（fsync=false）
+    // putBatch -> applyBatch -> writeMeta (executed) -> skip sync (fsync=false)
     db.putBatch(entries) catch c._exit(6);
-    // close 会 flush pending + deinit，但不再 sync
-    // _exit 直接退出，模拟崩溃
+    // close flushes pending + deinits, but no further sync
+    // _exit exits directly, simulating a crash
     c._exit(0);
 }
 
-/// 子进程：用 fsync=true putBatch 一批 key，在 commit 过程中 kill -9。
-/// 父进程在短延迟后 kill，可能命中 writeMeta-sync 之间窗口。
+/// Child process: putBatch a set of keys with fsync=true, then gets kill -9 mid-commit.
+/// The parent kills after a short delay, which may hit the window between writeMeta and sync.
 fn childCommitKillable(path: [:0]const u8, n: usize) noreturn {
     var fps = FilePageStore.init(alloc, path) catch c._exit(2);
     var db = Db.open(alloc, fps.store(), .{ .fsync = true }) catch c._exit(3);
@@ -76,21 +76,21 @@ fn childCommitKillable(path: [:0]const u8, n: usize) noreturn {
     }
 
     db.putBatch(entries) catch c._exit(6);
-    // 若执行到这里，commit 已完成（包括 fsync）
+    // if execution reaches here, the commit completed (including fsync)
     db.close();
     fps.deinit();
     c._exit(0);
 }
 
-/// 验证 reopen 后数据一致性：要么全有要么全无，meta 校验和有效
+/// Verify post-reopen data consistency: all-or-nothing, meta checksum valid
 fn verifyMetaConsistency(path: []const u8, n: usize) !void {
     var fps = try FilePageStore.init(alloc, path);
     defer fps.deinit();
     var db = try Db.open(alloc, fps.store(), .{});
     defer db.close();
 
-    // db 能 open = meta 校验和有效（readMetaPage 选了有效 meta 页）
-    // 数据要么全有要么全无
+    // db opens = meta checksum valid (readMetaPage picked a valid meta page)
+    // data is either all present or all absent
     var present: usize = 0;
     var kbuf: [16]u8 = undefined;
     for (0..n) |i| {
@@ -106,12 +106,12 @@ fn verifyMetaConsistency(path: []const u8, n: usize) !void {
     }
 }
 
-// ===== Test 1: fsync=false commit 后 _exit，reopen meta 一致 =====
+// ===== Test 1: fsync=false commit then _exit, reopen meta consistent =====
 test "crash_meta: fsync=false commit then exit, reopen meta consistent" {
     const path = ".test_cmm_nosync.db";
     defer unlinkPath(path);
 
-    // 先建空库
+    // create an empty DB first
     {
         var fps = try FilePageStore.init(alloc, path);
         defer fps.deinit();
@@ -127,19 +127,19 @@ test "crash_meta: fsync=false commit then exit, reopen meta consistent" {
 
     var status: c_int = 0;
     _ = c.waitpid(pid, &status, 0);
-    // 子进程应正常退出（_exit(0)）
+    // child should exit normally (_exit(0))
     try std.testing.expectEqual(@as(c_int, 0), status);
 
-    // reopen：meta 必须有效，数据要么全有要么全无
+    // reopen: meta must be valid, data either all present or all absent
     try verifyMetaConsistency(path, n);
 }
 
-// ===== Test 2: fsync=true commit 中途 kill -9，reopen meta 一致 =====
+// ===== Test 2: fsync=true, kill -9 mid-commit, reopen meta consistent =====
 test "crash_meta: kill -9 during commit, reopen meta consistent" {
     const path = ".test_cmm_kill9.db";
     defer unlinkPath(path);
 
-    // 先写入旧状态（已提交数据）
+    // write the old state first (committed data)
     const n: usize = 100;
     {
         var fps = try FilePageStore.init(alloc, path);
@@ -156,25 +156,25 @@ test "crash_meta: kill -9 during commit, reopen meta consistent" {
     if (pid < 0) return error.ForkFailed;
     if (pid == 0) childCommitKillable(pz, n);
 
-    // 等一小段后 kill -9（可能命中 writeMeta-sync 窗口）
+    // wait briefly then kill -9 (may hit the writeMeta-sync window)
     _ = c.usleep(200000); // 200ms
     _ = c.kill(pid, 9);
 
     var status: c_int = 0;
     _ = c.waitpid(pid, &status, 0);
 
-    // reopen：旧数据应在，新数据要么全有要么全无
+    // reopen: old data must be present, new data either all present or all absent
     var fps = try FilePageStore.init(alloc, path);
     defer fps.deinit();
     var db = try Db.open(alloc, fps.store(), .{});
     defer db.close();
 
-    // 旧状态数据存活
+    // old-state data survives
     const v = try db.get("existing");
     defer if (v) |val| alloc.free(val);
     try std.testing.expectEqualStrings("keep", v.?);
 
-    // 新 batch 一致性：要么全有要么全无
+    // new batch consistency: all-or-nothing
     var present: usize = 0;
     var kbuf: [16]u8 = undefined;
     for (0..n) |i| {
@@ -187,7 +187,7 @@ test "crash_meta: kill -9 during commit, reopen meta consistent" {
     try std.testing.expect(present == 0 or present == n);
 }
 
-// ===== Test 3: 多轮 writeMeta 崩溃，每次 reopen 一致 =====
+// ===== Test 3: multiple rounds of writeMeta crashes, reopen consistent each time =====
 test "crash_meta: 5 rounds of nosync commit, always consistent" {
     const path = ".test_cmm_5round.db";
     defer unlinkPath(path);
@@ -201,11 +201,11 @@ test "crash_meta: 5 rounds of nosync commit, always consistent" {
     defer alloc.free(pz);
 
     for (0..5) |round| {
-        // 每轮 fork 子进程做 nosync commit
+        // each round forks a child to do a nosync commit
         const pid = c.fork();
         if (pid < 0) return error.ForkFailed;
         if (pid == 0) {
-            // 子进程：putBatch 一批新 key（每轮不同 key 前缀）
+            // child: putBatch a set of new keys (different key prefix per round)
             var fps = FilePageStore.init(alloc, pz) catch c._exit(2);
             var db = Db.open(alloc, fps.store(), .{ .fsync = false }) catch c._exit(3);
             var entries = alloc.alloc(cube.Entry, 10) catch c._exit(4);
@@ -225,7 +225,7 @@ test "crash_meta: 5 rounds of nosync commit, always consistent" {
         var status: c_int = 0;
         _ = c.waitpid(pid, &status, 0);
 
-        // 每轮后 reopen 验证 meta 一致
+        // after each round, reopen and verify meta consistency
         try verifyMetaConsistency(path, 0);
     }
 }

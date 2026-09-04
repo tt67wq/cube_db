@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // ponytail: bench scale 过滤（smoke/small-only）；默认 all 跑全 20 格。
+    // ponytail: bench scale filter (smoke/small-only); default "all" runs the full 20 cells.
     const bench_scale = b.option([]const u8, "bench-scale", "Bench scale filter: all|small|large") orelse "all";
 
     const zio_dep = b.dependency("zio", .{
@@ -19,7 +19,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     mod.addImport("zio", zio_mod);
-    mod.link_libc = true; // T1: mmap wrapper 用 @cImport libc
+    mod.link_libc = true; // T1: mmap wrapper uses @cImport libc
 
     const exe = b.addExecutable(.{
         .name = "cube_db",
@@ -91,7 +91,7 @@ pub fn build(b: *std.Build) void {
         fps_bench_cmd.addArgs(args);
     }
 
-    // ponytail: bench-get-profile — get 分阶段耗时分解
+    // ponytail: bench-get-profile — phase-by-phase get latency breakdown
     const get_profile_exe = b.addExecutable(.{
         .name = "get_profile",
         .root_module = b.createModule(.{
@@ -128,7 +128,7 @@ pub fn build(b: *std.Build) void {
     const perf_batch_cmd = b.addRunArtifact(perf_batch_exe);
     perf_batch_step.dependOn(&perf_batch_cmd.step);
 
-    // profile-commit — commit 路径分段耗时剖析 (#35)
+    // profile-commit — commit path phase profiling (#35)
     const profile_commit_exe = b.addExecutable(.{
         .name = "profile_commit",
         .root_module = b.createModule(.{
@@ -146,7 +146,7 @@ pub fn build(b: *std.Build) void {
     const profile_commit_cmd = b.addRunArtifact(profile_commit_exe);
     profile_commit_step.dependOn(&profile_commit_cmd.step);
 
-    // mmap-vs-pwrite — FPS 判别式实验（#41）：mmap MAP_SHARED vs pwrite 顺序写 100MB
+    // mmap-vs-pwrite — FPS discriminating experiment (#41): mmap MAP_SHARED vs pwrite sequential 100MB writes
     const mmap_pwrite_exe = b.addExecutable(.{
         .name = "mmap_vs_pwrite",
         .root_module = b.createModule(.{
@@ -161,7 +161,7 @@ pub fn build(b: *std.Build) void {
     const mmap_pwrite_cmd = b.addRunArtifact(mmap_pwrite_exe);
     mmap_pwrite_step.dependOn(&mmap_pwrite_cmd.step);
 
-    // profile-fps — FPS 写路径计数器剖析（#41）
+    // profile-fps — FPS write-path counter profiling (#41)
     const profile_fps_exe = b.addExecutable(.{
         .name = "profile_fps",
         .root_module = b.createModule(.{
@@ -180,7 +180,7 @@ pub fn build(b: *std.Build) void {
     const profile_fps_cmd = b.addRunArtifact(profile_fps_exe);
     profile_fps_step.dependOn(&profile_fps_cmd.step);
 
-    // crc32-bench — CRC32 硬件 (ARMv8) vs 软件 (表驱动) 单页耗时对比
+    // crc32-bench — CRC32 hardware (ARMv8) vs software (table-driven) single-page latency comparison
     const crc32_bench_exe = b.addExecutable(.{
         .name = "crc32_bench",
         .root_module = b.createModule(.{
@@ -198,7 +198,7 @@ pub fn build(b: *std.Build) void {
     const crc32_bench_cmd = b.addRunArtifact(crc32_bench_exe);
     crc32_bench_step.dependOn(&crc32_bench_cmd.step);
 
-    // ponytail: bench-baseline — benchmark 回归基线检查
+    // ponytail: bench-baseline — benchmark regression baseline check
     const baseline_exe = b.addExecutable(.{
         .name = "bench_baseline",
         .root_module = b.createModule(.{
@@ -278,7 +278,7 @@ pub fn build(b: *std.Build) void {
     const crc32_hw_test_step = b.step("test-crc32", "Run crc32_hw tests only");
     crc32_hw_test_step.dependOn(&run_crc32_hw_test.step);
 
-    // zig build test-format 只跑 format 测试
+    // zig build test-format runs only format tests
     const format_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/core_format/format_test.zig"),
@@ -294,7 +294,7 @@ pub fn build(b: *std.Build) void {
     const format_test_step = b.step("test-format", "Run format tests only");
     format_test_step.dependOn(&run_format_test.step);
 
-    // ponytail: zig build test-ps 只跑 page_store 测试
+    // ponytail: zig build test-ps runs only page_store tests
     const ps_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/core_format/page_store_test.zig"),
@@ -310,7 +310,7 @@ pub fn build(b: *std.Build) void {
     const ps_test_step = b.step("test-ps", "Run page_store tests only");
     ps_test_step.dependOn(&run_ps_test.step);
 
-    // slab_page_store_test — MemPageStore slab 页池改造测试
+    // slab_page_store_test — MemPageStore slab page-pool rework tests
     const slab_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/core_format/slab_page_store_test.zig"),
@@ -326,7 +326,7 @@ pub fn build(b: *std.Build) void {
     const slab_test_step = b.step("test-slab", "Run slab page store tests only");
     slab_test_step.dependOn(&run_slab_test.step);
 
-    // ponytail: zig build test-btree 只跑 btree 测试
+    // ponytail: zig build test-btree runs only btree tests
     const btree_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/btree_storage/btree_test.zig"),
@@ -342,7 +342,7 @@ pub fn build(b: *std.Build) void {
     const btree_test_step = b.step("test-btree", "Run btree tests only");
     btree_test_step.dependOn(&run_btree_test.step);
 
-    // ponytail: zig build test-writer 只跑 writer 测试
+    // ponytail: zig build test-writer runs only writer tests
     const writer_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/txn_writer_db/writer_test.zig"),
@@ -358,7 +358,7 @@ pub fn build(b: *std.Build) void {
     const writer_test_step = b.step("test-writer", "Run writer tests only");
     writer_test_step.dependOn(&run_writer_test.step);
 
-    // ponytail: zig build test-mvcc 只跑 MVCC 测试
+    // ponytail: zig build test-mvcc runs only MVCC tests
     const mvcc_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/txn_writer_db/mvcc_test.zig"),
@@ -374,7 +374,7 @@ pub fn build(b: *std.Build) void {
     const mvcc_test_step = b.step("test-mvcc", "Run MVCC reader tests only");
     mvcc_test_step.dependOn(&run_mvcc_test.step);
 
-    // ponytail: zig build test-db 只跑 db 测试
+    // ponytail: zig build test-db runs only db tests
     const db_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/txn_writer_db/db_test.zig"),
@@ -390,7 +390,7 @@ pub fn build(b: *std.Build) void {
     const db_test_step = b.step("test-db", "Run db tests only");
     db_test_step.dependOn(&run_db_test.step);
 
-    // closed_state_test — applyBatch closed 分支测试（T-4）
+    // closed_state_test — applyBatch closed-branch tests (T-4)
     const closed_state_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/txn_writer_db/closed_state_test.zig"),
@@ -405,7 +405,7 @@ pub fn build(b: *std.Build) void {
     const run_closed_state_test = b.addRunArtifact(closed_state_test);
     db_test_step.dependOn(&run_closed_state_test.step);
 
-    // lock_failure_test — putBatch 锁失败 / 并发正确性测试（T-13）
+    // lock_failure_test — putBatch lock failure / concurrency correctness tests (T-13)
     const lock_failure_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/txn_writer_db/lock_failure_test.zig"),
@@ -420,7 +420,7 @@ pub fn build(b: *std.Build) void {
     const run_lock_failure_test = b.addRunArtifact(lock_failure_test);
     db_test_step.dependOn(&run_lock_failure_test.step);
 
-    // close_flush_failure_test — close flush 失败测试（T-19）
+    // close_flush_failure_test — close-time flush failure tests (T-19)
     const close_flush_failure_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/txn_writer_db/close_flush_failure_test.zig"),
@@ -435,7 +435,7 @@ pub fn build(b: *std.Build) void {
     const run_close_flush_failure_test = b.addRunArtifact(close_flush_failure_test);
     db_test_step.dependOn(&run_close_flush_failure_test.step);
 
-    // compact_strong_assert_test — compact 强断言测试（T-22）
+    // compact_strong_assert_test — compact strong-assertion tests (T-22)
     const compact_strong_assert_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/txn_writer_db/compact_strong_assert_test.zig"),
@@ -450,7 +450,7 @@ pub fn build(b: *std.Build) void {
     const run_compact_strong_assert_test = b.addRunArtifact(compact_strong_assert_test);
     db_test_step.dependOn(&run_compact_strong_assert_test.step);
 
-    // txn_arena_test — WriteTxn staging arena 化测试
+    // txn_arena_test — WriteTxn staging arena tests
     const txn_arena_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/txn_writer_db/txn_arena_test.zig"),
@@ -466,7 +466,7 @@ pub fn build(b: *std.Build) void {
     const txn_arena_step = b.step("test-txn-arena", "Run txn arena tests only");
     txn_arena_step.dependOn(&run_txn_arena_test.step);
 
-    // ponytail: zig build test-compact 只跑 compact 测试
+    // ponytail: zig build test-compact runs only compact tests
     const compact_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/txn_writer_db/compact_test.zig"),
@@ -482,7 +482,7 @@ pub fn build(b: *std.Build) void {
     const compact_test_step = b.step("test-compact", "Run compact tests only");
     compact_test_step.dependOn(&run_compact_test.step);
 
-    // ponytail: zig build test-overflow 只跑 overflow 测试
+    // ponytail: zig build test-overflow runs only overflow tests
     const overflow_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/txn_writer_db/overflow_test.zig"),
@@ -498,7 +498,7 @@ pub fn build(b: *std.Build) void {
     const overflow_test_step = b.step("test-overflow", "Run overflow tests only");
     overflow_test_step.dependOn(&run_overflow_test.step);
 
-    // mvcc_concurrent_flush_test — MVCC 并发 flush 压测（T-16）
+    // mvcc_concurrent_flush_test — MVCC concurrent flush stress test (T-16)
     const mvcc_concurrent_flush_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/txn_writer_db/mvcc_concurrent_flush_test.zig"),
@@ -513,7 +513,7 @@ pub fn build(b: *std.Build) void {
     const run_mvcc_concurrent_flush_test = b.addRunArtifact(mvcc_concurrent_flush_test);
     db_test_step.dependOn(&run_mvcc_concurrent_flush_test.step);
 
-    // delete_range_concurrent_test — deleteRange 并发测试（T-20）
+    // delete_range_concurrent_test — deleteRange concurrency tests (T-20)
     const delete_range_concurrent_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/txn_writer_db/delete_range_concurrent_test.zig"),
@@ -528,7 +528,8 @@ pub fn build(b: *std.Build) void {
     const run_delete_range_concurrent_test = b.addRunArtifact(delete_range_concurrent_test);
     db_test_step.dependOn(&run_delete_range_concurrent_test.step);
 
-    // applybatch_single_vs_multi_test — applyBatch 单条 vs 多条一致性测试（T-21）
+    // applybatch_single_vs_multi_test — applyBatch single vs multi entry consistency tests (T-21)
+
     const applybatch_single_vs_multi_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/txn_writer_db/applybatch_single_vs_multi_test.zig"),

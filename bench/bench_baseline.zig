@@ -1,6 +1,7 @@
-//! bench_baseline.zig — benchmark 回归基线检查
-//! 注意：Zig 0.16.0 构建系统并行测试有竞争条件（txn_test 间歇 SEGV），
-//! 跑全量测试时务必串行执行（`zig build test` 仅单模块），避免并行触发 flaky。
+//! bench_baseline.zig — benchmark regression baseline check
+//! Note: Zig 0.16.0's build system has a race in parallel test execution
+//! (txn_test intermittently SEGVs); always run the full suite serially
+//! (`zig build test` is single-module anyway) to avoid flaky parallel runs.
 const std = @import("std");
 const cube = @import("cube_db");
 const Db = cube.Db;
@@ -21,14 +22,15 @@ const MetricList = []const Metric;
 
 fn currentBaseline() MetricList {
     return &.{
-        // 2026-07-31 重校：put/delete 解释 = 写路径 dupe 开销（假设，待 commit 分解任务验证）
-        .{ .name = "put 100B", .store = "mem", .value_ns = 123721, .threshold_pct = 25, .note = "MemPageStore, 5K keys, 重校(dupe 假设)" },
-        .{ .name = "putBatch 100B", .store = "mem", .value_ns = 13240, .threshold_pct = 25, .note = "MemPageStore, 30 keys(快路径), 重校(旧值=1-key bug)" },
-        .{ .name = "get 100B", .store = "mem", .value_ns = 2907, .threshold_pct = 15, .note = "MemPageStore, 5K keys, A/B 确认无回归" },
-        .{ .name = "delete 100B", .store = "mem", .value_ns = 117093, .threshold_pct = 25, .note = "MemPageStore, 5K keys, 重校(dupe 假设)" },
-        .{ .name = "put 100B", .store = "file-fsync", .value_ns = 167499, .threshold_pct = 20, .note = "FilePageStore+fsync, 1K keys, 重校" },
-        .{ .name = "putBatch 100B", .store = "file-fsync", .value_ns = 15233, .threshold_pct = 25, .note = "FilePageStore+fsync, 30 keys, 重校(旧值=1-key bug)" },
-        .{ .name = "get 100B", .store = "file-fsync", .value_ns = 3100, .threshold_pct = 25, .note = "FilePageStore+fsync, 1K keys, 噪声敏感" },
+        // Recalibrated 2026-07-31: put/delete explanation = write-path dupe
+        // overhead (hypothesis, to be verified by a commit-path breakdown task)
+        .{ .name = "put 100B", .store = "mem", .value_ns = 123721, .threshold_pct = 25, .note = "MemPageStore, 5K keys, recalibrated (dupe hypothesis)" },
+        .{ .name = "putBatch 100B", .store = "mem", .value_ns = 13240, .threshold_pct = 25, .note = "MemPageStore, 30 keys (fast path), recalibrated (old value had 1-key bug)" },
+        .{ .name = "get 100B", .store = "mem", .value_ns = 2907, .threshold_pct = 15, .note = "MemPageStore, 5K keys, A/B confirmed no regression" },
+        .{ .name = "delete 100B", .store = "mem", .value_ns = 117093, .threshold_pct = 25, .note = "MemPageStore, 5K keys, recalibrated (dupe hypothesis)" },
+        .{ .name = "put 100B", .store = "file-fsync", .value_ns = 167499, .threshold_pct = 20, .note = "FilePageStore+fsync, 1K keys, recalibrated" },
+        .{ .name = "putBatch 100B", .store = "file-fsync", .value_ns = 15233, .threshold_pct = 25, .note = "FilePageStore+fsync, 30 keys, recalibrated (old value had 1-key bug)" },
+        .{ .name = "get 100B", .store = "file-fsync", .value_ns = 3100, .threshold_pct = 25, .note = "FilePageStore+fsync, 1K keys, noise-sensitive" },
     };
 }
 
@@ -172,11 +174,11 @@ pub fn main() !void {
     const allocator = std.heap.page_allocator;
     const baseline = currentBaseline();
 
-    std.debug.print("=== benchmark 回归基线检查 ===\n", .{});
-    std.debug.print("机器: Apple M1 Pro (8 cores)\n", .{});
-    std.debug.print("日期: 2026-07-31\n\n", .{});
+    std.debug.print("=== benchmark regression baseline check ===\n", .{});
+    std.debug.print("Machine: Apple M1 Pro (8 cores)\n", .{});
+    std.debug.print("Date: 2026-07-31\n\n", .{});
 
-    std.debug.print("  {s:>25}  {s:>12}  {s:>10}  {s:>10}  {s:>6}  {s}\n", .{ "操作", "存储后端", "基准(ns)", "实测(ns)", "阈值", "结果" });
+    std.debug.print("  {s:>25}  {s:>12}  {s:>10}  {s:>10}  {s:>6}  {s}\n", .{ "op", "store", "base(ns)", "actual(ns)", "thresh", "result" });
     std.debug.print("  {s:->25}  {s:->12}  {s:->10}  {s:->10}  {s:->6}  {s:->6}\n", .{ "", "", "", "", "", "" });
 
     const mem_n: usize = 5000;
@@ -205,15 +207,16 @@ pub fn main() !void {
             if (passed) "PASS" else "FAIL",
         });
         if (!passed) {
-            std.debug.print("  {s:>25}  {s:>12}  {s:>10}  {s:>10}  劣化 {d}%\n", .{ "", "", "", "", degradation });
+            std.debug.print("  {s:>25}  {s:>12}  {s:>10}  {s:>10}  degraded {d}%\n", .{ "", "", "", "", degradation });
         }
     }
 
     const total = baseline.len;
-    std.debug.print("\n结果: {d}/{d} 通过", .{ total - failures, total });
+    std.debug.print("\nResult: {d}/{d} passed", .{ total - failures, total });
     if (failures > 0) {
-        std.debug.print(", {d} 失败\n", .{failures});
+        std.debug.print(", {d} failed\n", .{failures});
         return error.BaselineFailed;
     }
-    std.debug.print(" 全部通过 ✅\n", .{});
+    std.debug.print(" all passed ✅\n", .{});
+
 }

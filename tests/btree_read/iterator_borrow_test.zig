@@ -1,20 +1,22 @@
-//! iterator_borrow_test.zig — T-29 Phase B: Iterator 借用化契约测试
+//! iterator_borrow_test.zig - T-29 Phase B: contract tests for the borrowed Iterator
 //!
-//! RED 阶段（本文件先落，基于旧全量-dupe Iterator 运行时失败）：
-//! - 借用契约（T5）：next() 后上一 entry 失效——溢出值经迭代器复用缓冲拼接，
-//!   前一 entry 的 value 切片在新 entry 拼接后内容被覆盖（借用语义可观察面）。
-//!   旧实现为堆 dupe（上一 entry 仍有效）→ 本测试失败。
-//! - 零分配扫描（T1）：内联值全量扫描 select+next 全程 0 次分配
-//!   （下推栈 O(深度) 定长、payload 借用、无 per-entry dupe）。旧实现每次
-//!   下降/每叶/每 entry 都 alloc → 本测试失败。
-//! - 快照 pin（T2）：迭代器活跃期间（Db.select）MVCC 读者名额被持有，
-//!   写者提交的 COW 脏页滞留 pending_free 不回收；deinit 后回收。
-//!   旧实现 select 不 pin → 本测试失败。
+//! RED stage (this file landed first, failing at runtime against the old full-dupe Iterator):
+//! - Borrow contract (T5): after next() the previous entry is invalidated - overflow values are
+//!   assembled in a reused iterator buffer, so the previous entry's value slice is overwritten
+//!   once the next entry is assembled (the observable surface of borrow semantics).
+//!   The old implementation heap-duped (previous entry stayed valid) -> this test fails.
+//! - Zero-allocation scan (T1): a full scan of inline values performs 0 allocations across
+//!   select+next (fixed-size descent stack O(depth), borrowed payload, no per-entry dupe).
+//!   The old implementation allocated on every descent/leaf/entry -> this test fails.
+//! - Snapshot pin (T2): while an iterator is open (Db.select) an MVCC reader slot is held;
+//!   COW dirty pages committed by the writer stay in pending_free, unclaimed until deinit.
+//!   The old select did not pin -> this test fails.
 //!
-//! 另含回归锁定（旧实现即过，防借用化引入回归）：
-//! - 范围黄金对照（T4）：多叶/边界/tombstone 语义与逐条 getInto 交叉验证。
-//! - 溢出值迭代（T3）：>3800B 溢出链逐字节正确（含连续多个溢出条目）。
-//! - 快照数据稳定性（T6）：迭代中写者覆写，迭代器仍见快照旧值。
+//! Also regression locks (already passing on the old implementation, guarding against borrow
+//! conversion regressions):
+//! - Range golden comparison (T4): multi-leaf/bounds/tombstone semantics cross-checked against per-key getInto.
+//! - Overflow value iteration (T3): >3800B overflow chains byte-exact (including consecutive overflow entries).
+//! - Snapshot data stability (T6): while iterating, writer overwrites are invisible; the iterator still sees snapshot values.
 const std = @import("std");
 const cube = @import("cube_db");
 const ps = cube.page_store;
@@ -27,7 +29,7 @@ fn newStore() ps.MemPageStore {
     return ps.MemPageStore.init(alloc, 200000);
 }
 
-/// 计数分配器：包 std.testing.allocator，数 alloc 次数（resize/remap 不计——非新分配）
+/// Counting allocator: wraps std.testing.allocator, counts alloc calls (resize/remap don't count - not new allocations)
 const CountingAllocator = struct {
     child: std.mem.Allocator,
     count: usize = 0,
@@ -60,7 +62,7 @@ const CountingAllocator = struct {
     }
 };
 
-// ===== T1: 零分配扫描 =====
+// ===== T1: zero-allocation scan =====
 
 test "iterator borrow: inline-value full scan performs zero allocations" {
     var counter = CountingAllocator{ .child = alloc };
@@ -71,7 +73,7 @@ test "iterator borrow: inline-value full scan performs zero allocations" {
     var db = try Db.open(calloc, ms.store(), .{});
     defer db.close();
 
-    // 200 个内联 entry（跨多叶），先全部写入（写路径随便分配）
+    // 200 inline entries (spanning multiple leaves), written first (write path may allocate freely)
     var i: usize = 0;
     while (i < 200) : (i += 1) {
         var kbuf: [8]u8 = undefined;
@@ -79,7 +81,7 @@ test "iterator borrow: inline-value full scan performs zero allocations" {
         try db.put(k, "inline-value");
     }
 
-    // 复位计数：select + 全量 next 必须 0 分配
+    // reset counter: select + full next must be 0 allocations
     counter.count = 0;
     var it = try db.select(null, null);
     defer it.deinit();
@@ -92,9 +94,9 @@ test "iterator borrow: inline-value full scan performs zero allocations" {
     try std.testing.expectEqual(@as(usize, 0), counter.count);
 }
 
-// ===== T2: 快照 pin（MVCC 读者名额） =====
+// ===== T2: snapshot pin (MVCC reader slot) =====
 
-test "iterator borrow: Db.select pins read snapshot — dirty pages held until deinit" {
+test "iterator borrow: Db.select pins read snapshot - dirty pages held until deinit" {
     var ms = newStore();
     defer ms.deinit();
     var db = try Db.open(alloc, ms.store(), .{});
@@ -104,15 +106,15 @@ test "iterator borrow: Db.select pins read snapshot — dirty pages held until d
     try db.put("k2", "v2");
 
     var it = try db.select(null, null);
-    // pin 已生效：此时读者名额 >= 1
+    // pin is active: reader count >= 1 now
 
-    // 迭代中途写者提交（COW 出新页，旧页成脏页）
+    // writer commits mid-iteration (COW produces new pages, old pages become dirty)
     try db.put("k3", "v3");
 
-    // 脏页必须滞留 pending_free（迭代器仍借用旧页），不得回收
+    // dirty pages must stay in pending_free (iterator still borrows old pages), not reclaimed
     try std.testing.expect(db.state.pendingFreeCount() > 0);
 
-    // 迭代器仍看到快照：k3 不可见（select 时的快照里没有 k3）
+    // iterator still sees the snapshot: k3 invisible (not present in the snapshot taken at select)
     var seen: usize = 0;
     var saw_k3 = false;
     while (try it.next()) |e| {
@@ -122,12 +124,12 @@ test "iterator borrow: Db.select pins read snapshot — dirty pages held until d
     try std.testing.expectEqual(@as(usize, 2), seen);
     try std.testing.expect(!saw_k3);
 
-    // deinit（末位读者退出）→ 脏页回收
+    // deinit (last reader exits) -> dirty pages reclaimed
     it.deinit();
     try std.testing.expectEqual(@as(usize, 0), db.state.pendingFreeCount());
 }
 
-// ===== T3: 溢出值迭代黄金对照 =====
+// ===== T3: overflow value iteration golden comparison =====
 
 test "iterator borrow: overflow values scanned byte-exact (consecutive overflow entries)" {
     var ms = newStore();
@@ -135,7 +137,7 @@ test "iterator borrow: overflow values scanned byte-exact (consecutive overflow 
     var db = try Db.open(alloc, ms.store(), .{});
     defer db.close();
 
-    // 3 个连续溢出条目（值模式互异，防缓冲复用串值）+ 前后内联条目
+    // 3 consecutive overflow entries (distinct value patterns, guarding against buffer-reuse crosstalk) + inline entries around them
     var ov: [4200]u8 = undefined;
     const vals = [3][]const u8{ "A", "B", "C" };
     for (vals, 0..) |tag, vi| {
@@ -155,7 +157,7 @@ test "iterator borrow: overflow values scanned byte-exact (consecutive overflow 
             try std.testing.expectEqual(@as(usize, 4200), e.value.len);
             const want_tag = vals[ov_seen];
             for (e.value) |b| try std.testing.expectEqual(want_tag[0], b);
-            // 逐字节黄金对照 getInto
+            // byte-exact golden comparison against getInto
             var gbuf: [4200]u8 = undefined;
             const gn = (try db.getInto(e.key, &gbuf)).?;
             try std.testing.expectEqualSlices(u8, e.value, gbuf[0..gn]);
@@ -168,15 +170,15 @@ test "iterator borrow: overflow values scanned byte-exact (consecutive overflow 
     try std.testing.expectEqual(@as(usize, 1), inline_seen);
 }
 
-// ===== T4: 范围黄金对照（多叶 + 边界 + tombstone） =====
+// ===== T4: range golden comparison (multi-leaf + bounds + tombstones) =====
 
-test "iterator borrow: range scan golden — bounds, tombstones, multi-leaf" {
+test "iterator borrow: range scan golden - bounds, tombstones, multi-leaf" {
     var ms = newStore();
     defer ms.deinit();
     var db = try Db.open(alloc, ms.store(), .{});
     defer db.close();
 
-    // 300 个 entry（多叶多 branch），偶数 key 存 value=原始 key，奇数 key 删除
+    // 300 entries (multiple leaves and branches), even keys store value=original key, odd keys deleted
     var i: usize = 0;
     while (i < 300) : (i += 1) {
         var kbuf: [8]u8 = undefined;
@@ -190,7 +192,7 @@ test "iterator borrow: range scan golden — bounds, tombstones, multi-leaf" {
         try db.delete(k);
     }
 
-    // 半开区间 [k0100, k0200)：偶数 key 50 个，奇数被 tombstone 排除
+    // half-open range [k0100, k0200): 50 even keys, odd ones excluded by tombstone
     var it = try db.select("k0100", "k0200");
     defer it.deinit();
     var n: usize = 0;
@@ -198,12 +200,12 @@ test "iterator borrow: range scan golden — bounds, tombstones, multi-leaf" {
         var kbuf: [8]u8 = undefined;
         const want = try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{100 + 2 * n});
         try std.testing.expectEqualStrings(want, e.key);
-        try std.testing.expectEqualStrings(want, e.value); // value == key（写入时）
+        try std.testing.expectEqualStrings(want, e.value); // value == key (as written)
         n += 1;
     }
     try std.testing.expectEqual(@as(usize, 50), n);
 
-    // null 边界全量：150 存活
+    // null bounds, full scan: 150 surviving
     var full = try db.select(null, null);
     defer full.deinit();
     var total: usize = 0;
@@ -212,7 +214,7 @@ test "iterator borrow: range scan golden — bounds, tombstones, multi-leaf" {
     try std.testing.expectEqual(db.entryCount(), total);
 }
 
-// ===== T5: 借用契约 —— next() 后上一 entry 失效 =====
+// ===== T5: borrow contract - previous entry invalidated after next() =====
 
 test "iterator borrow: next() invalidates previous entry (overflow buffer reuse)" {
     var ms = newStore();
@@ -220,7 +222,7 @@ test "iterator borrow: next() invalidates previous entry (overflow buffer reuse)
     var db = try Db.open(alloc, ms.store(), .{});
     defer db.close();
 
-    // 两个溢出条目，值模式互异
+    // two overflow entries with distinct value patterns
     var a: [4200]u8 = undefined;
     @memset(&a, 'A');
     var b: [4200]u8 = undefined;
@@ -239,13 +241,13 @@ test "iterator borrow: next() invalidates previous entry (overflow buffer reuse)
     try std.testing.expectEqualStrings("ov2", e2.key);
     for (e2.value) |c| try std.testing.expectEqual(@as(u8, 'B'), c);
 
-    // 借用契约：e1.value 与 e2.value 复用同一拼接缓冲 → e1.value 已被覆盖为 B。
-    // 借用化后这是显式契约（上一 entry 在 next() 后失效，调用方不得再使用）；
-    // 旧堆-dupe 实现里 e1.value 仍是 A → 本断言失败（RED 信号）。
+    // Borrow contract: e1.value and e2.value reuse the same assembly buffer -> e1.value has been overwritten with B.
+    // After borrow conversion this is an explicit contract (previous entry is invalid after next(); callers must not use it);
+    // in the old heap-dupe implementation e1.value was still A -> this assertion failed (RED signal).
     for (e1.value) |c| try std.testing.expectEqual(@as(u8, 'B'), c);
 }
 
-// ===== T6: 快照数据稳定性（迭代中覆写，迭代器见旧值） =====
+// ===== T6: snapshot data stability (mid-iteration overwrite, iterator sees old values) =====
 
 test "iterator borrow: concurrent overwrite invisible to open iterator" {
     var ms = newStore();
@@ -263,11 +265,11 @@ test "iterator borrow: concurrent overwrite invisible to open iterator" {
     const e1 = (try it.next()).?;
     try std.testing.expectEqualStrings("old1", e1.value);
 
-    // 覆写后两 key
+    // overwrite two keys
     try db.put("k2", "new2");
     try db.put("k3", "new3");
 
-    // 迭代器仍见快照旧值
+    // iterator still sees snapshot old values
     const e2 = (try it.next()).?;
     try std.testing.expectEqualStrings("old2", e2.value);
     const e3 = (try it.next()).?;

@@ -1,6 +1,6 @@
-//! profile_commit.zig — #35: commit 路径规模敏感项分解
-//! 计时埋点：dupe / order_detect / sort / dedup / insertBatch / pending_free / meta
-//! 用法：zig build profile-commit -Doptimize=ReleaseFast
+//! profile_commit.zig — #35: scale-sensitive breakdown of the commit path
+//! Timing probes: dupe / order_detect / sort / dedup / insertBatch / pending_free / meta
+//! Usage: zig build profile-commit -Doptimize=ReleaseFast
 const std = @import("std");
 const cube = @import("cube_db");
 const Db = cube.Db;
@@ -13,8 +13,8 @@ fn monoNs() i64 {
     return @as(i64, @intCast(ts.sec)) * 1_000_000_000 + @as(i64, @intCast(ts.nsec));
 }
 
-/// 构建 entries：key 用单个连续缓冲区（模拟真实有序批量导入，避免 TLB 抖动）
-/// 返回 entries + key_buf（调用方负责释放）
+/// Build entries: keys in one contiguous buffer (models a real ordered bulk import, avoids TLB thrash)
+/// Returns entries + key_buf (caller frees)
 fn buildEntries(allocator: std.mem.Allocator, n: usize) !struct { entries: []Entry, key_buf: []u8 } {
     const entries = try allocator.alloc(Entry, n);
     errdefer allocator.free(entries);
@@ -50,17 +50,18 @@ fn runScale(allocator: std.mem.Allocator, n: usize, label: []const u8) !void {
     const apply_total = writer.ProfileStats.txn_total_ns;
     const gap = elapsed - @as(i64, @intCast(apply_total));
 
-    std.debug.print("\n=== {s}: N={d}, 总耗时 {d} ms, {d} ns/entry ({d:.2} us/entry) ===\n", .{ label, n, @divFloor(elapsed, 1_000_000), per_entry, @as(f64, @floatFromInt(per_entry)) / 1000.0 });
+    std.debug.print("\n=== {s}: N={d}, total {d} ms, {d} ns/entry ({d:.2} us/entry) ===\n", .{ label, n, @divFloor(elapsed, 1_000_000), per_entry, @as(f64, @floatFromInt(per_entry)) / 1000.0 });
     std.debug.print("entryCount = {d}\n", .{db.entryCount()});
-    std.debug.print("  applyBatch 内部合计: {d} ns ({d:.1}%)  每 entry {d} ns\n", .{ apply_total, @as(f64, @floatFromInt(apply_total)) / @as(f64, @floatFromInt(elapsed)) * 100.0, @divFloor(@as(i64, @intCast(apply_total)), @as(i64, @intCast(n))) });
-    std.debug.print("  未计量（staging+flushPendingFree+其他）: {d} ns ({d:.1}%)  每 entry {d} ns\n", .{ gap, @as(f64, @floatFromInt(@max(gap, 0))) / @as(f64, @floatFromInt(elapsed)) * 100.0, @divFloor(@max(gap, 0), @as(i64, @intCast(n))) });
+    std.debug.print("  applyBatch internal total: {d} ns ({d:.1}%)  {d} ns/entry\n", .{ apply_total, @as(f64, @floatFromInt(apply_total)) / @as(f64, @floatFromInt(elapsed)) * 100.0, @divFloor(@as(i64, @intCast(apply_total)), @as(i64, @intCast(n))) });
+    std.debug.print("  Unaccounted (staging + flushPendingFree + misc): {d} ns ({d:.1}%)  {d} ns/entry\n", .{ gap, @as(f64, @floatFromInt(@max(gap, 0))) / @as(f64, @floatFromInt(elapsed)) * 100.0, @divFloor(@max(gap, 0), @as(i64, @intCast(n))) });
     writer.ProfileStats.print();
 }
 
 pub fn main() !void {
     const alloc = std.heap.page_allocator;
 
-    // 拐点扫描：100K → 500K（连续 key，有序）
+    // Inflection-point sweep: 100K -> 500K (contiguous keys, ordered)
+
     try runScale(alloc, 100_000, "100K");
     try runScale(alloc, 200_000, "200K");
     try runScale(alloc, 300_000, "300K");

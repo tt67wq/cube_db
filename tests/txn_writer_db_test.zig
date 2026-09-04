@@ -1,6 +1,6 @@
-//! txn_writer_db_test.zig — 领域汇总：writer / MVCC / overflow / compact / db / txn / group_commit / tutorial
-//! comptime @import 聚合子文件，编译单元从 38 降到 6。
-//! 搬运自原 tests/*.zig，逻辑未动。
+//! txn_writer_db_test.zig - domain aggregate: writer / MVCC / overflow / compact / db / txn / group_commit / tutorial
+//! comptime @import aggregates sub-files, reducing compilation units from 38 to 6.
+//! Moved from original tests/*.zig, logic unchanged.
 
 comptime {
     _ = @import("txn_writer_db/writer_test.zig");

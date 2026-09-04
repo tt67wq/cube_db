@@ -36,7 +36,7 @@ test "FilePageStore ordered 1M putBatch" {
     @memset(&v100, 'x');
     var entries = try allocator.alloc(cube.Entry, n);
     defer allocator.free(entries);
-    // 有序 key（顺序递增）
+    // ordered keys (monotonically increasing)
     for (0..n) |i| entries[i] = .{ .key = try std.fmt.allocPrint(allocator, "{d:0>10}", .{i}), .value = &v100 };
     defer for (entries) |e| allocator.free(e.key);
 

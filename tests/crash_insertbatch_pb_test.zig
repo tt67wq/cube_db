@@ -1,6 +1,6 @@
-//! crash_insertbatch_pb_test.zig — 领域汇总：crash 恢复 / stress / insertbatch / putbatch / range_delete / fps 基准
-//! comptime @import 聚合子文件，编译单元从 38 降到 6。
-//! 搬运自原 tests/*.zig，逻辑未动。
+//! crash_insertbatch_pb_test.zig - domain aggregate: crash recovery / stress / insertbatch / putbatch / range_delete / fps benchmark
+//! comptime @import aggregates sub-files, reducing compilation units from 38 to 6.
+//! Moved from original tests/*.zig, logic unchanged.
 
 comptime {
     _ = @import("crash_insertbatch_pb/crash_harness_test.zig");

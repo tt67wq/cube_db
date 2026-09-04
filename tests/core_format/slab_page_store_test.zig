@@ -1,5 +1,5 @@
-//! slab_page_store_test.zig — TDD: MemPageStore slab 页池改造
-//! 验证 ArrayList+freelist 替代 HashMap 后的正确性。
+//! slab_page_store_test.zig - TDD: MemPageStore slab page-pool rework
+//! Verifies correctness after replacing the HashMap with ArrayList+freelist.
 const std = @import("std");
 const cube = @import("cube_db");
 const f2 = cube.format;

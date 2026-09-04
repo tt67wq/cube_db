@@ -1,9 +1,9 @@
-//! bench/mmap_vs_pwrite.zig — Archon 判别式实验：mmap MAP_SHARED vs pwrite 顺序写 100MB
-//! 目的：判别 FPS 1M putBatch 16.9µs/entry 的瓶颈机制
-//!   - 如果 mmap 比 pwrite 慢 10x+ → mmap fault/回写机制问题
-//!   - 如果两者相当 → 问题在 cube_db 的 writePage 调用模式（per-page fstat/ftruncate 等）
-//! 用法：zig build run-mmap-vs-pwrite -Doptimize=ReleaseFast
-//!   或：zig build-exe bench/mmap_vs_pwrite.zig -O ReleaseFast && ./mmap_vs_pwrite
+//! bench/mmap_vs_pwrite.zig — discriminating experiment: mmap MAP_SHARED vs pwrite, 100MB sequential writes
+//! Goal: identify the bottleneck behind FPS 1M putBatch at 16.9us/entry
+//!   - if mmap is 10x+ slower than pwrite -> mmap fault/writeback mechanism
+//!   - if they are comparable -> the problem is cube_db's writePage call pattern (per-page fstat/ftruncate etc.)
+//! Usage: zig build run-mmap-vs-pwrite -Doptimize=ReleaseFast
+//!   or: zig build-exe bench/mmap_vs_pwrite.zig -O ReleaseFast && ./mmap_vs_pwrite
 const std = @import("std");
 const c = @cImport({
     @cInclude("sys/mman.h");
@@ -39,7 +39,7 @@ fn openFile(path: []const u8) !c_int {
     return fd;
 }
 
-/// 实验 1：mmap MAP_SHARED + 顺序 memcpy 写 100MB（每次 4KB 页，模拟 writePage）
+/// Experiment 1: mmap MAP_SHARED + sequential memcpy writing 100MB (4KB pages, mimicking writePage)
 fn runMmapShared(fd: c_int, label: []const u8) !i64 {
     const ptr = c.mmap(null, TOTAL_BYTES, @as(c_int, c.PROT_READ) | @as(c_int, c.PROT_WRITE), @as(c_int, c.MAP_SHARED), fd, 0);
     if (ptr == c.MAP_FAILED) return error.MapFailed;
@@ -63,7 +63,7 @@ fn runMmapShared(fd: c_int, label: []const u8) !i64 {
     return elapsed;
 }
 
-/// 实验 2：pwrite 顺序写 100MB（每次 4KB，模拟 writePage 的 syscall 版本）
+/// Experiment 2: pwrite sequential 100MB (4KB at a time, the syscall version of writePage)
 fn runPwrite(fd: c_int, label: []const u8) !i64 {
     var buf: [PAGE_SIZE]u8 = undefined;
     var x: u8 = 0;
@@ -84,7 +84,7 @@ fn runPwrite(fd: c_int, label: []const u8) !i64 {
     return elapsed;
 }
 
-/// 实验 3：pwrite 大块写（每次 1MB，对比 4KB 小写的影响）
+/// Experiment 3: pwrite large chunks (1MB at a time, to contrast with 4KB small writes)
 fn runPwriteBig(fd: c_int, label: []const u8) !i64 {
     const buf = try std.heap.page_allocator.alloc(u8, 1024 * 1024);
     defer std.heap.page_allocator.free(buf);
@@ -108,9 +108,9 @@ fn runPwriteBig(fd: c_int, label: []const u8) !i64 {
     return elapsed;
 }
 
-/// 实验 4：mmap MAP_SHARED + 先 ftruncate 扩展（模拟 ensureFileGrowth 的稀疏扩展模式）
+/// Experiment 4: mmap MAP_SHARED + ftruncate growth first (mimicking ensureFileGrowth's sparse-growth pattern)
 fn runMmapSparse(fd: c_int, label: []const u8) !i64 {
-    // 模拟 cube_db：每页写前 ftruncate 到覆盖该页（稀疏增长）
+    // Mimic cube_db: ftruncate to cover each page before writing it (sparse growth)
     var x: u8 = 0;
     const start = monoNs();
     for (0..N_PAGES) |p| {
@@ -133,22 +133,22 @@ fn runMmapSparse(fd: c_int, label: []const u8) !i64 {
     return elapsed;
 }
 
-/// 实验 5：精确模拟 cube_db 模式 — mmap 一次 1TB 预留 + 逐页 ftruncate 增长 + 写
-/// （与 FilePageStore 完全一致的调用模式：allocPage→ensureFileGrowth→writePage→ensureFileGrowth）
+/// Experiment 5: exact cube_db pattern — one 1TB reserved mmap + per-page ftruncate growth + writes
+/// (call pattern identical to FilePageStore: allocPage->ensureFileGrowth->writePage->ensureFileGrowth)
 fn runCubeDbPattern(fd: c_int, label: []const u8) !i64 {
-    const REGION: usize = 1 << 40; // 1TB 虚拟预留
+    const REGION: usize = 1 << 40; // 1TB virtual reservation
     const ptr = c.mmap(null, REGION, @as(c_int, c.PROT_READ) | @as(c_int, c.PROT_WRITE), @as(c_int, c.MAP_SHARED), fd, 0);
     if (ptr == c.MAP_FAILED) return error.MapFailed;
     defer _ = c.munmap(@ptrCast(ptr), REGION);
     const buf = @as([*]u8, @ptrCast(ptr));
 
-    const N = N_PAGES; // 25600 页
+    const N = N_PAGES; // 25600 pages
     var x: u8 = 0;
     const start = monoNs();
     var ftruncate_count: u64 = 0;
     var fstat_count: u64 = 0;
     for (0..N) |p| {
-        // --- allocPage: ensureFileGrowth(p) [fstat + 可能 ftruncate] ---
+        // --- allocPage: ensureFileGrowth(p) [fstat + possible ftruncate] ---
         var st: c.struct_stat = undefined;
         if (c.fstat(fd, &st) != 0) return error.FstatFailed;
         fstat_count += 1;
@@ -160,7 +160,7 @@ fn runCubeDbPattern(fd: c_int, label: []const u8) !i64 {
         // --- writePage: ensureFileGrowth(p) [fstat] ---
         if (c.fstat(fd, &st) != 0) return error.FstatFailed;
         fstat_count += 1;
-        // --- 写页 ---
+        // --- write the page ---
         const dst = buf[p * PAGE_SIZE ..][0..PAGE_SIZE];
         @memset(dst, x);
         x +%= 1;
@@ -178,28 +178,28 @@ fn runCubeDbPattern(fd: c_int, label: []const u8) !i64 {
 }
 
 pub fn main() !void {
-    std.debug.print("=== 判别式实验：顺序写 100MB（{d} MB）===\n", .{TOTAL_MB});
-    std.debug.print("机器: {s}\n", .{@tagName(@import("builtin").cpu.arch)});
+    std.debug.print("=== Discriminating experiment: sequential 100MB writes ({d} MB) ===\n", .{TOTAL_MB});
+    std.debug.print("Machine: {s}\n", .{@tagName(@import("builtin").cpu.arch)});
 
     const path1 = ".exp_mmap.db";
     const path2 = ".exp_pwrite.db";
     const path3 = ".exp_pwrite_big.db";
     const path4 = ".exp_sparse.db";
 
-    // 实验 1: mmap MAP_SHARED（一次性 100MB 预留）
+    // Experiment 1: mmap MAP_SHARED (one-shot 100MB reservation)
     {
         unlinkPath(path1);
         const fd = try openFile(path1);
         defer _ = c.close(fd);
         defer unlinkPath(path1);
-        // ftruncate 到 100MB（一次性）
+        // ftruncate to 100MB (one shot)
         if (c.ftruncate(fd, @as(c.off_t, @intCast(TOTAL_BYTES))) != 0) return error.TruncateFailed;
-        const t1 = try runMmapShared(fd, "mmap MAP_SHARED 整区+顺序4KB写");
-        const t2 = try runMmapShared(fd, "mmap MAP_SHARED 第二次(页已fault)");
-        std.debug.print("  首次 vs 二次(缓存) 差异: {d:.1}x\n", .{@as(f64, @floatFromInt(t1)) / @as(f64, @floatFromInt(t2))});
+        const t1 = try runMmapShared(fd, "mmap MAP_SHARED whole-region + sequential 4KB writes");
+        const t2 = try runMmapShared(fd, "mmap MAP_SHARED second pass (pages already faulted)");
+        std.debug.print("  first vs second (cached) difference: {d:.1}x\n", .{@as(f64, @floatFromInt(t1)) / @as(f64, @floatFromInt(t2))});
     }
 
-    // 实验 2: pwrite 4KB
+    // Experiment 2: pwrite 4KB
     {
         unlinkPath(path2);
         const fd = try openFile(path2);
@@ -209,7 +209,7 @@ pub fn main() !void {
         _ = try runPwrite(fd, "pwrite 4KB×25600");
     }
 
-    // 实验 3: pwrite 1MB 大块
+    // Experiment 3: pwrite 1MB chunks
     {
         unlinkPath(path3);
         const fd = try openFile(path3);
@@ -219,28 +219,30 @@ pub fn main() !void {
         _ = try runPwriteBig(fd, "pwrite 1MB×100");
     }
 
-    // 实验 4: 模拟 cube_db 的稀疏扩展模式（per-page ftruncate + mmap + write）
-    // 注: macOS 上逐页 4KB mmap 可能受限，此实验仅作参考，失败不影响 1/2/3 判别
+    // Experiment 4: cube_db's sparse-growth pattern (per-page ftruncate + mmap + write)
+    // Note: per-page 4KB mmap may be limited on macOS; this experiment is
+    // informational only — its failure does not affect the 1/2/3 discrimination
     {
         unlinkPath(path4);
         const fd = try openFile(path4);
         defer _ = c.close(fd);
         defer unlinkPath(path4);
-        _ = runMmapSparse(fd, "稀疏扩展 4KB ftruncate+mmap+write+munmap ×25600") catch |e| blk: {
-            std.debug.print("  [稀疏实验失败: {s} — macOS 4KB mmap 限制，跳过（不影响核心判别）]\n", .{@errorName(e)});
+        _ = runMmapSparse(fd, "sparse growth 4KB ftruncate+mmap+write+munmap x25600") catch |e| blk: {
+            std.debug.print("  [sparse experiment failed: {s} — macOS 4KB mmap limit, skipped (core discrimination unaffected)]\n", .{@errorName(e)});
             break :blk 0;
         };
     }
 
-    // 实验 5: 精确模拟 cube_db 模式（mmap 1TB 预留 + 逐页 ftruncate 增长 + 写）
+    // Experiment 5: exact cube_db pattern (1TB reserved mmap + per-page ftruncate growth + writes)
     {
         const path5 = ".exp_cubedb.db";
         unlinkPath(path5);
         const fd = try openFile(path5);
         defer _ = c.close(fd);
         defer unlinkPath(path5);
-        // 初始 3 页（模拟 FIRST_DATA_PAGE）
+        // Initial 3 pages (mimicking FIRST_DATA_PAGE)
         if (c.ftruncate(fd, @as(c.off_t, @intCast(3 * PAGE_SIZE))) != 0) return error.TruncateFailed;
-        _ = try runCubeDbPattern(fd, "cube_db 模式 1TB预留+逐页ftruncate+写 ×25600");
+        _ = try runCubeDbPattern(fd, "cube_db pattern: 1TB reservation + per-page ftruncate + writes x25600");
+
     }
 }

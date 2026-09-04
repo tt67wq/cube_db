@@ -1,5 +1,5 @@
-//! stress_test.zig — P4 TDD: 大数据集 + 长时运行稳定性
-//! 插入大量 key（堆分配，避免栈缓冲别名），验证全部可读、reopen 持久、无内存泄漏。
+//! stress_test.zig - P4 TDD: large dataset + long-run stability
+//! Insert many keys (heap-allocated, avoiding stack-buffer aliasing), verify all readable, persistence across reopen, no leaks.
 
 const std = @import("std");
 const cube = @import("cube_db");
@@ -14,13 +14,13 @@ test "stress: 1000 sequential keys all readable, heap-allocated" {
     var db = try Db.open(alloc, ms.store(), .{});
     defer db.close();
 
-    // 堆分配 key（避免 bufPrint 复用栈缓冲）
+    // heap-allocated keys (avoid bufPrint reusing a stack buffer)
     const keys = try alloc.alloc([]u8, 1000);
     defer {
         for (keys) |k| alloc.free(k);
         alloc.free(keys);
     }
-    // 批量提交：每个 WriteTxn 提交多个 key（group commit）
+    // batched commits: each WriteTxn commits multiple keys (group commit)
     const batch_size: usize = 100;
     var i: usize = 0;
     while (i < 1000) : (i += batch_size) {
@@ -36,7 +36,7 @@ test "stress: 1000 sequential keys all readable, heap-allocated" {
 
     try std.testing.expectEqual(@as(u64, 1000), db.entryCount());
 
-    // 全部可读
+    // all readable
     for (keys) |k| {
         const v = try db.get(k);
         defer if (v) |val| alloc.free(val);

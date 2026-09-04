@@ -1,5 +1,5 @@
-//! db.zig — Db 句柄：v2 公开 API（open/close/put/get/delete/select/putBatch）
-//! 封装 PageStore + wrt + btree。纯同步接口。
+//! db.zig — Db handle: v2 public API (open/close/put/get/delete/select/putBatch)
+//! Wraps PageStore + wrt + btree. Fully synchronous interface.
 const std = @import("std");
 const zio = @import("zio");
 const f2 = @import("format.zig");
@@ -74,7 +74,7 @@ pub const Db = struct {
         return self.state.entry_count.load(.acquire);
     }
 
-    // ---- 隐式 txn 便捷 API（包隐式 WriteTxn） ----
+    // ---- Implicit-txn convenience API (wraps an implicit WriteTxn) ----
 
     /// Put with optional micro-batching: if batch_threshold > 0, stages the entry;
     /// auto-flushes when threshold reached. Use flush() to force commit.
@@ -134,10 +134,11 @@ pub const Db = struct {
     /// Keys and values are copied internally, so caller's slices only need to be
     /// valid during the putBatch call itself (not after).
     pub fn putBatch(self: *Db, entries: []const Entry) !void {
-        // 直接批量构建：跳过 per-entry staging + arena dupe。
-        // Request 直接引用调用方的 key/value 切片（applyBatch 内 insertBatch 会 dupe 到 leaf，
-        // 切片只需在 putBatch 调用期间有效即可）。
-        // 调用方须保证 entries 的 key/value 在 putBatch 调用期间有效（值语义由调用方保证）。
+        // Build the batch directly: skip per-entry staging + arena dupe.
+        // Requests reference the caller's key/value slices directly (insertBatch
+        // inside applyBatch dupes them into the leaf), so the slices only need
+        // to be valid for the duration of the putBatch call (value semantics are
+        // the caller's job).
         self.write_mutex.lock() catch return error.LockFailed;
         defer self.write_mutex.unlock();
 
@@ -193,32 +194,37 @@ pub const Db = struct {
         try self.putBatch(entries);
     }
 
-    // ---- 读路径（默认快照 = 当前 root） ----
+    // ---- Read path (default snapshot = current root) ----
 
     pub fn get(self: *Db, key: []const u8) !?[]u8 {
         const root = self.state.getRoot();
         return try btree.get(self.allocator, self.store, root, key);
     }
 
-    /// 无拷贝点查（T-29 Phase A）：value 拷入调用方 buffer，返回写入字节数；
-    /// key 不存在 → null；buffer 不足 → error.BufferTooSmall（buffer 不被写入/清空）。
-    /// 高频读调用方（缓存/索引层）用它摆脱 get() 的 per-call alloc/free。
+    /// Zero-copy point read (T-29 Phase A): value is copied into the caller's
+    /// buffer, returning the byte count; missing key -> null; buffer too small
+    /// -> error.BufferTooSmall (buffer untouched). Frees hot-path readers
+    /// (cache/index layers) from get()'s per-call alloc/free.
     pub fn getInto(self: *Db, key: []const u8, buffer: []u8) !?usize {
         const root = self.state.getRoot();
         return try btree.getInto(self.store, root, key, buffer);
     }
 
-    /// 范围查询（T-29 Phase B 借用化）：返回借用迭代器——next() 的 entry 切片
-    /// 仅到下次 next()/deinit() 有效（溢出值经内部复用缓冲拼接）；迭代器 pin 住
-    /// MVCC 读者名额，写者 COW 脏页延迟到 deinit()（末位读者）才回收，迭代中
-    /// 途的写提交不影响已借用页。忘记 deinit 会滞留读者名额（脏页不回收）。
+    /// Range query (T-29 Phase B borrowed iterator): next() returns borrowed
+    /// entry slices, valid only until the next next()/deinit() (overflow values
+    /// are assembled in an internal reuse buffer); the iterator holds an MVCC
+    /// reader slot, so writer COW dirty pages are deferred until deinit() (last
+    /// reader out); mid-iteration commits do not affect already-borrowed pages.
+    /// Forgetting deinit leaks the reader slot (dirty pages never reclaimed).
     pub fn select(self: *Db, min: ?[]const u8, max: ?[]const u8) !btree.Iterator {
-        // T-29 review 发现1（major）：读者名额必须先于 root 快照捕获注册——
-        // 若先 getRoot() 后 beginRead()，两条指令间的窗口内写者 grace-period
-        // 回收（applyBatch 见 reader_count==0 即 flush）可释放快照 root 引用的
-        // 旧页。先注册后捕获：无论读到旧/新 root，其 COW 旧页均滞留 pending_free
-        // 到迭代器 deinit（末位读者）才回收。
-        _ = self.state.beginRead(); // MVCC pin：迭代器借用页的快照保护
+        // T-29 review finding 1 (major): the reader slot must be registered
+        // before capturing the root snapshot — if getRoot() came first, the
+        // writer's grace-period reclaim (applyBatch flushes when
+        // reader_count==0) could free the old pages the snapshot root
+        // references, within the window between the two calls.
+        // Register-then-capture: whichever root is read, its COW old pages stay
+        // in pending_free until the iterator's deinit (last reader out).
+        _ = self.state.beginRead(); // MVCC pin: snapshot protection for the iterator's borrowed pages
         errdefer self.state.endRead();
         const root = self.state.getRoot();
         var it = try btree.select(self.allocator, self.store, root, min, max);
@@ -228,13 +234,14 @@ pub const Db = struct {
     }
 
     pub fn compact(self: *Db) !void {
-        // 与 applyBatch 共享 root/sequence/meta 写，须经写互斥串行（避免 meta 交错写）。
+        // Shares the root/sequence/meta writes with applyBatch; must be
+        // serialized through the write mutex (avoids interleaved meta writes).
         self.write_mutex.lock() catch return error.LockFailed;
         defer self.write_mutex.unlock();
         try self.state.compact();
     }
 
-    /// 显式 sync（async 模式下手动冲刷已提交数据到磁盘）。
+    /// Explicit sync (manually flush committed data to disk in async mode).
     pub fn sync(self: *Db) !void {
         try self.store.sync();
     }
@@ -243,21 +250,24 @@ pub const Db = struct {
         return self.state.dirtCount();
     }
 
-    // ---- 显式事务 API（LMDB 式） ----
+    // ---- Explicit transaction API (LMDB-style) ----
 
-    /// 开写事务：单写者互斥。写暂存缓冲，commit 时 applyBatch+meta 切换+fsync。
+    /// Begin a write txn: single-writer mutex. Writes stage in a buffer; commit
+    /// runs applyBatch + meta switch + fsync.
     pub fn beginWriteTxn(self: *Db) !WriteTxn {
         self.write_mutex.lock() catch return error.LockFailed;
         return .{
             .db = self,
             .staged = .empty,
             .finished = false,
-            // Arena for staging: put/delete dupe 进 arena，commit/abort 统一释放，零 syscall
+            // Arena for staging: put/delete dupe into the arena, freed in one
+            // shot at commit/abort — zero extra syscalls
             .staging_arena = std.heap.ArenaAllocator.init(self.allocator),
         };
     }
 
-    /// 开读事务：取当前 root 快照，不阻写者（MVCC）。结束须调 endReadTxn/ReadTxn.end。
+    /// Begin a read txn: takes the current root snapshot, does not block
+    /// writers (MVCC). Must be ended via endReadTxn/ReadTxn.end.
     pub fn beginReadTxn(self: *Db) !ReadTxn {
         _ = self.state.beginRead();
         return .{ .db = self, .snapshot_root = self.state.getRoot() };
@@ -272,8 +282,10 @@ pub const Db = struct {
     }
 };
 
-/// 写事务（LMDB 式）。单写者互斥；写暂存缓冲，commit 时原子 applyBatch + meta 切换 + fsync。
-/// abort 丢弃暂存，不应用。键/值为调用者拥有切片，put/delete 时立即 dupe 进 staging arena。
+/// Write txn (LMDB-style). Single-writer mutex; writes stage in a buffer;
+/// commit runs an atomic applyBatch + meta switch + fsync. abort discards the
+/// staged writes without applying them. Keys/values are caller-owned slices;
+/// put/delete dupes them into the staging arena immediately.
 pub const WriteTxn = struct {
     db: *Db,
     staged: std.ArrayList(Entry),
@@ -283,7 +295,8 @@ pub const WriteTxn = struct {
 
     pub fn put(self: *WriteTxn, key: []const u8, value: []const u8) !void {
         if (self.finished) return error.TxnFinished;
-        // 复制 key/value 进 arena —— 调用方 slice（如栈 buffer）可能不活到 commit
+        // Copy key/value into the arena — the caller's slice (e.g. a stack
+        // buffer) may not live until commit
         const alloc = self.staging_arena.allocator();
         const k = try alloc.dupe(u8, key);
         const v = try alloc.dupe(u8, value);
@@ -292,15 +305,16 @@ pub const WriteTxn = struct {
 
     pub fn delete(self: *WriteTxn, key: []const u8) !void {
         if (self.finished) return error.TxnFinished;
-        // 复制 key 进 arena —— 调用方 slice 可能不活到 commit
+        // Copy key into the arena — the caller's slice may not live until commit
         const alloc = self.staging_arena.allocator();
         const k = try alloc.dupe(u8, key);
         try self.staged.append(alloc, .{ .key = k, .value = "", .tombstone = true });
     }
 
-    /// 提交：applyBatch + meta 切换 + fsync。完成或出错后 finished=true，释放互斥。
-    /// staging arena 在 commit 完成后统一释放（applyBatch 已把 key/value dupe 进自己的 arena，
-    /// 页面写入是 copy 语义，无残留引用）。
+    /// Commit: applyBatch + meta switch + fsync. On completion or error,
+    /// finished=true and the mutex is released. The staging arena is freed in
+    /// one shot after commit (applyBatch has already duped key/values into its
+    /// own arena; page writes are copy semantics, leaving no lingering references).
     pub fn commit(self: *WriteTxn) !void {
         if (self.finished) return error.TxnFinished;
         self.finished = true;
@@ -331,7 +345,8 @@ pub const WriteTxn = struct {
         if (prof) wrt.ProfileStats.db_futures_wait_ns += @intCast(wrt.ProfileStats.now() - t_wait0);
     }
 
-    /// 中止：丢弃暂存，不应用。释放互斥。arena 整体释放。
+    /// Abort: discard staged writes without applying. Releases the mutex.
+    /// The arena is freed in one shot.
     pub fn abort(self: *WriteTxn) !void {
         if (self.finished) return;
         self.finished = true;
@@ -340,7 +355,7 @@ pub const WriteTxn = struct {
         self.db.write_mutex.unlock();
     }
 
-    /// 析构：未 commit/abort 时调 abort（防止泄漏互斥）。
+    /// Destructor: calls abort if not yet committed/aborted (prevents leaking the mutex).
     pub fn deinit(self: *WriteTxn) void {
         if (!self.arena_freed) {
             self.arena_freed = true;
@@ -353,7 +368,8 @@ pub const WriteTxn = struct {
     }
 };
 
-/// 读事务（LMDB 式）。持有快照 root（MVCC），不阻写者。结束须调 end（或 deinit）。
+/// Read txn (LMDB-style). Holds a snapshot root (MVCC), does not block
+/// writers. Must be ended via end (or deinit).
 pub const ReadTxn = struct {
     db: *Db,
     snapshot_root: u32,
@@ -363,17 +379,21 @@ pub const ReadTxn = struct {
         return try btree.get(self.db.allocator, self.db.store, self.snapshot_root, key);
     }
 
-    /// 无拷贝点查（T-29 Phase A）：语义同 Db.getInto（null=key 不存在，
-    /// BufferTooSmall=buffer 不足且不写入），快照 pin 于本 txn 的 root。
+    /// Zero-copy point read (T-29 Phase A): same semantics as Db.getInto
+    /// (null = key missing, BufferTooSmall = buffer too small, nothing
+    /// written), with the snapshot pinned to this txn's root.
     pub fn getInto(self: *ReadTxn, key: []const u8, buffer: []u8) !?usize {
         return try btree.getInto(self.db.store, self.snapshot_root, key, buffer);
     }
 
-    /// 范围查询（T-29 Phase B 借用化）：借用契约同 Db.select（next() 失效上一 entry）。
-    /// 快照 pin 于本 txn 的 root；迭代器另持独立 MVCC 读者名额（与 txn 的 pin
-    /// 可叠加，读者计数为增量），deinit() 释放——txn 结束前迭代器仍须 deinit。
+    /// Range query (T-29 Phase B borrowed iterator): borrowing contract
+    /// identical to Db.select (next() invalidates the previous entry).
+    /// The snapshot is pinned to this txn's root; the iterator holds its own
+    /// additional MVCC reader slot (stacking with the txn's pin, reader counts
+    /// are incremental), released at deinit() — the iterator must still be
+    /// deinit'd before the txn ends.
     pub fn select(self: *ReadTxn, min: ?[]const u8, max: ?[]const u8) !btree.Iterator {
-        _ = self.db.state.beginRead(); // 迭代器独立 pin（deinit 释放）
+        _ = self.db.state.beginRead(); // iterator's own pin (released at deinit)
         errdefer self.db.state.endRead();
         var it = try btree.select(self.db.allocator, self.db.store, self.snapshot_root, min, max);
         it.pin_ctx = @ptrCast(self.db.state);
@@ -392,8 +412,10 @@ pub const ReadTxn = struct {
     }
 };
 
-/// btree.Iterator 的 MVCC pin 回调（T-29 Phase B）：deinit 时释放读者名额。
-/// btree 层不依赖 wrt.State，经 opaque 回调解耦。
+/// MVCC pin callback for btree.Iterator (T-29 Phase B): releases the reader
+/// slot at deinit. The btree layer does not depend on wrt.State; decoupled
+/// via an opaque callback.
+
 fn endReadPin(ctx: *anyopaque) void {
     const st: *wrt.State = @ptrCast(@alignCast(ctx));
     st.endRead();

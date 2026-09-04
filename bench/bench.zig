@@ -1,7 +1,7 @@
-//! bench.zig — cube_db v2 基准矩阵 runner
-//! 运行：zig build bench -Doptimize=ReleaseFast
-//! 20 格 = 5 op × 2 scale × 2 value。计时 monoNs。
-//! 使用 MemPageStore（内存），测量算法吞吐。
+//! bench.zig — cube_db v2 benchmark matrix runner
+//! Run: zig build bench -Doptimize=ReleaseFast
+//! 20 cells = 5 ops x 2 scales x 2 value sizes. Timed with monoNs.
+//! Uses MemPageStore (in-memory) to measure algorithmic throughput.
 const std = @import("std");
 const Io = std.Io;
 const zio = @import("zio");
@@ -49,7 +49,7 @@ fn keysFor(scale: Scale, v: VSize) usize {
 }
 
 fn mapsizeFor(scale: Scale, v: VSize) u32 {
-    // 足够容纳所有 key 的页数（含溢出页）
+    // Enough pages for all keys (including overflow pages)
     const n = keysFor(scale, v);
     const overflow_pages: u32 = if (v == .b10k) 3 else 0; // 10KB ≈ 3 overflow pages
     return @as(u32, @intCast(cube.page_store.FIRST_DATA_PAGE + n * (1 + overflow_pages) + 10000));
@@ -83,7 +83,7 @@ fn runPutBatch(allocator: std.mem.Allocator, cell: Cell, n: usize, value: []cons
     const entries = try allocator.alloc(Entry, n);
     defer allocator.free(entries);
     for (0..n) |i| {
-        // 每个 entry 独立分配 key —— 共享栈 buffer 会导致所有 key 相同（排序去重后只剩 1 条）
+        // Each entry gets its own heap-allocated key — sharing a stack buffer would make all keys identical (dedup after sort would collapse to 1 entry)
         entries[i] = .{ .key = try std.fmt.allocPrint(allocator, "{d:0>10}", .{i}), .value = value };
     }
     defer {
@@ -104,7 +104,7 @@ fn runPutBatch(allocator: std.mem.Allocator, cell: Cell, n: usize, value: []cons
     const start = monoNs();
     try db.putBatch(entries);
     const ns = monoNs() - start;
-    // sanity check：确保 N 条都插入了（防止共享 buffer 静默 collapse 成 1 条）
+    // Sanity check: all N entries inserted (guards against silent collapse to 1 via a shared buffer)
     const ec = db.entryCount();
     if (ec != n) {
         std.debug.print("WARN: putBatch sanity check failed: expected {d} entries, got {d}\n", .{ n, ec });
@@ -117,7 +117,8 @@ fn runGet(allocator: std.mem.Allocator, cell: Cell, n: usize, value: []const u8)
     defer ms.deinit();
     var db = try Db.open(allocator, ms.store(), .{});
     defer db.close();
-    // 预载
+    // Preload
+
     var kbuf: [12]u8 = undefined;
     for (0..n) |i| {
         const k = try fmtKey(&kbuf, i);

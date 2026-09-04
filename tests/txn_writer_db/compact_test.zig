@@ -1,6 +1,6 @@
-//! compact_test.zig — compact v2 测试（TDD RED）
-//! 覆盖：空库 compact、清除 dirt、保持数据可读、有读者时阻塞、幂等。
-//! 用 MemPageStore，先 fail（compact 尚未实现或非 O(1)）。
+//! compact_test.zig — compact v2 tests (TDD RED)
+//! Covers: compact on an empty DB, clearing dirt, keeping data readable, blocking with readers, idempotence.
+//! Uses MemPageStore; written to fail first (compact not yet implemented or not O(1)).
 const std = @import("std");
 const zio = @import("zio");
 const cube = @import("cube_db");
@@ -17,7 +17,7 @@ test "compact: compact on empty db is no-op" {
     defer ms.deinit();
     var db = try dbi.Db.open(std.testing.allocator, ms.store(), .{});
     defer db.close();
-    // 空库 compact 不应报错
+    // compact on an empty DB must not error
     try db.compact();
     try std.testing.expectEqual(@as(u64, 0), db.entryCount());
 }
@@ -28,20 +28,20 @@ test "compact: compact clears dirt after writes" {
     var db = try dbi.Db.open(std.testing.allocator, ms.store(), .{});
     defer db.close();
 
-    // 写入并覆写，产生脏页
+    // Write and overwrite to produce dirty pages
     try db.put("k", "v1");
-    // 无读者，脏页已自动 flush → dirt = 0
+    // No readers; dirty pages already auto-flushed -> dirt = 0
     try std.testing.expectEqual(@as(u64, 0), db.dirtCount());
 
-    // 开始一个 reader，阻止自动 flush
+    // Start a reader to block the automatic flush
     _ = db.beginRead();
     try db.put("k", "v2");
-    // 有读者 → dirt > 0
+    // With a reader -> dirt > 0
     try std.testing.expect(db.dirtCount() > 0);
     _ = db.endRead();
 
-    // 现在 reader 已结束，dirt 应为 0（自动 flush）
-    // 但为了测试 compact，我们手动 compact 也应清除 dirt
+    // Now the reader has ended; dirt should be 0 (auto flush)
+    // But to test compact, a manual compact should also clear dirt
     try db.compact();
     try std.testing.expectEqual(@as(u64, 0), db.dirtCount());
 }
@@ -56,7 +56,7 @@ test "compact: compact preserves data" {
     try db.put("another", "key");
     try db.compact();
 
-    // 数据仍在
+    // Data is still there
     const v1 = try db.get("persist");
     try std.testing.expectEqualStrings("me", v1.?);
     std.testing.allocator.free(v1.?);
@@ -71,23 +71,23 @@ test "compact: compact with active reader blocks" {
     var db = try dbi.Db.open(std.testing.allocator, ms.store(), .{});
     defer db.close();
 
-    // 先写入初始数据
+    // First write the initial data
     try db.put("k", "v1");
 
-    // 开始 reader
+    // Start a reader
     _ = db.beginRead();
 
-    // 覆写（产生脏页 pending_free）
+    // Overwrite (produces dirty pages in pending_free)
     try db.put("k", "v2");
-    // 有 reader → dirt > 0
+    // With a reader -> dirt > 0
     try std.testing.expect(db.dirtCount() > 0);
 
-    // compact 应等待 reader 结束或不做全量 flush
-    // MVP: compact 只 flush 当前可 flush 的，不阻塞等待 reader
+    // compact should either wait for the reader or skip the full flush
+    // MVP: compact only flushes what is currently flushable; it does not block on the reader
     try db.compact();
-    // compact 后 dirt 应为 0（flush 了所有 pending）
-    // 但 reader 可能阻止了部分 flush → 至少 dirt 应减少
-    // 这里我们只验证 compact 不崩溃且数据可读
+    // After compact, dirt should be 0 (flushed all pending)
+    // But the reader may have blocked part of the flush -> dirt should at least decrease
+    // Here we only verify that compact does not crash and data stays readable
     const v = try db.get("k");
     try std.testing.expectEqualStrings("v2", v.?);
     std.testing.allocator.free(v.?);
@@ -102,8 +102,8 @@ test "compact: multiple compacts are idempotent" {
 
     try db.put("k", "v");
     try db.compact();
-    try db.compact(); // 第二次
-    try db.compact(); // 第三次
+    try db.compact(); // second time
+    try db.compact(); // third time
 
     const v = try db.get("k");
     try std.testing.expectEqualStrings("v", v.?);
@@ -120,13 +120,13 @@ test "compact: after compact, new writes work" {
     try db.put("k", "v1");
     try db.compact();
     try db.put("k", "v2");
-    // 覆写后 dirt 应为 0（无读者自动 flush）
-    // 但为了测试 compact 语义，我们这里用 beginRead 阻止 flush
-    // 然后验证 compact 能清掉 dirt
+    // After overwrite, dirt should be 0 (auto flush with no readers)
+    // But to test compact semantics, use beginRead here to block the flush
+    // then verify that compact can clear dirt
     _ = db.beginRead();
     try db.put("k", "v3");
     try std.testing.expect(db.dirtCount() > 0);
     _ = db.endRead();
-    // reader 结束后自动 flush → dirt = 0
+    // After the reader ends, auto flush -> dirt = 0
     try std.testing.expectEqual(@as(u64, 0), db.dirtCount());
 }

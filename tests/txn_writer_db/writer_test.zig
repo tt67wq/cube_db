@@ -1,6 +1,6 @@
-//! writer_test.zig — wrt applyBatch 测试（TDD RED）
-//! 覆盖：单条 put、批量 put、delete、meta 交替、root 原子更新、dirt 统计。
-//! 用 MemPageStore 模拟存储，先 fail（wrt.zig 不存在）。
+//! writer_test.zig — wrt applyBatch tests (TDD RED)
+//! Covers: single put, batched put, delete, meta alternation, atomic root update, dirt accounting.
+//! Uses MemPageStore to simulate storage; written to fail first (wrt.zig does not exist).
 const std = @import("std");
 const zio = @import("zio");
 const cube = @import("cube_db");
@@ -9,7 +9,7 @@ const ps = cube.page_store;
 const btree = cube.btree;
 const wrt = cube.writer;
 
-// ---- 辅助 ----
+// ---- Helpers ----
 
 const MAPSIZE_PAGES = 10000;
 
@@ -35,7 +35,7 @@ test "writer: applyBatch with single put" {
     try state.applyBatch(&.{req});
     _ = try future.wait();
 
-    // 验证数据在树中
+    // Verify the data is in the tree
     const root = state.root.load(.acquire);
     try std.testing.expect(root != btree.NULL_ROOT);
     const v = try btree.get(std.testing.allocator, s, root, "hello");
@@ -77,14 +77,14 @@ test "writer: applyBatch with delete" {
     var state = wrt.State.init(std.testing.allocator, s, .{});
     defer state.deinit();
 
-    // 先 put
+    // First put
     var f1: zio.Future(wrt.OpResult) = .{};
     try state.applyBatch(&.{.{
         .key = "x", .value = "y", .tombstone = false, .future = &f1,
     }});
     _ = try f1.wait();
 
-    // 再 delete
+    // Then delete
     var f2: zio.Future(wrt.OpResult) = .{};
     try state.applyBatch(&.{.{
         .key = "x", .value = "", .tombstone = true, .future = &f2,
@@ -104,7 +104,7 @@ test "writer: meta page alternates after each applyBatch" {
     var state = wrt.State.init(std.testing.allocator, s, .{});
     defer state.deinit();
 
-    // 第一次 applyBatch → meta page 0
+    // First applyBatch -> meta page 0
     var f1: zio.Future(wrt.OpResult) = .{};
     try state.applyBatch(&.{.{ .key = "k1", .value = "v1", .tombstone = false, .future = &f1 }});
     _ = try f1.wait();
@@ -113,7 +113,7 @@ test "writer: meta page alternates after each applyBatch" {
     try std.testing.expectEqual(@as(u64, 1), meta_after_1.?.sequence);
     try std.testing.expect(meta_after_1.?.root_page != fmt2.NULL_PAGE);
 
-    // 第二次 applyBatch → meta page 1（sequence=2）
+    // Second applyBatch -> meta page 1 (sequence=2)
     var f2: zio.Future(wrt.OpResult) = .{};
     try state.applyBatch(&.{.{ .key = "k2", .value = "v2", .tombstone = false, .future = &f2 }});
     _ = try f2.wait();
@@ -121,7 +121,7 @@ test "writer: meta page alternates after each applyBatch" {
     try std.testing.expect(meta_after_2 != null);
     try std.testing.expectEqual(@as(u64, 2), meta_after_2.?.sequence);
 
-    // 第三次 → meta page 0（sequence=3）
+    // Third -> meta page 0 (sequence=3)
     var f3: zio.Future(wrt.OpResult) = .{};
     try state.applyBatch(&.{.{ .key = "k3", .value = "v3", .tombstone = false, .future = &f3 }});
     _ = try f3.wait();
@@ -161,21 +161,21 @@ test "writer: dirt count reflects pending free pages" {
     var state = wrt.State.init(std.testing.allocator, s, .{});
     defer state.deinit();
 
-    // 第一次 put：新建 leaf → dirt 应为 0（无旧页回收）
+    // First put: creates a new leaf -> dirt should be 0 (no old page to reclaim)
     var f1: zio.Future(wrt.OpResult) = .{};
     try state.applyBatch(&.{.{ .key = "k", .value = "v1", .tombstone = false, .future = &f1 }});
     _ = try f1.wait();
     try std.testing.expectEqual(@as(u64, 0), state.dirt.load(.acquire));
 
-    // 第二次 overwrite：开始读事务，脏页不应立即回收
+    // Second overwrite: start a read txn; dirty pages must not be reclaimed immediately
     _ = state.beginRead();
     var f2: zio.Future(wrt.OpResult) = .{};
     try state.applyBatch(&.{.{ .key = "k", .value = "v2", .tombstone = false, .future = &f2 }});
     _ = try f2.wait();
-    // 有读者 → pending_free > 0，dirt = pending_free
+    // With a reader -> pending_free > 0, dirt = pending_free
     try std.testing.expect(state.pendingFreeCount() > 0);
     try std.testing.expectEqual(state.pendingFreeCount(), state.dirt.load(.acquire));
-    // 结束读 → 脏页释放 → dirt = 0
+    // End the read -> dirty pages released -> dirt = 0
     state.endRead();
     try std.testing.expectEqual(@as(u64, 0), state.dirt.load(.acquire));
 }
@@ -191,7 +191,7 @@ test "writer: entry_count and byte_size updated correctly" {
     try std.testing.expectEqual(@as(u64, 0), state.entry_count.load(.acquire));
     try std.testing.expectEqual(@as(u64, 0), state.byte_size.load(.acquire));
 
-    // put "hello"="world" (5+5+10=20 bytes; 开销 10 与 leafPayloadSize 对齐, T-26)
+    // put "hello"="world" (5+5+10=20 bytes; the 10-byte overhead matches leafPayloadSize, T-26)
     var f1: zio.Future(wrt.OpResult) = .{};
     try state.applyBatch(&.{.{ .key = "hello", .value = "world", .tombstone = false, .future = &f1 }});
     _ = try f1.wait();
@@ -224,9 +224,9 @@ test "writer: batch with mixed ops" {
     for (&futures) |*f| _ = try f.wait();
 
     const root = state.root.load(.acquire);
-    // "a" 被删了
+    // "a" was deleted
     try std.testing.expectEqual(@as(?[]u8, null), try btree.get(std.testing.allocator, s, root, "a"));
-    // "b" 和 "c" 应存在
+    // "b" and "c" should still exist
     const vb = try btree.get(std.testing.allocator, s, root, "b");
     try std.testing.expectEqualStrings("2", vb.?);
     std.testing.allocator.free(vb.?);

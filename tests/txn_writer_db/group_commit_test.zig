@@ -1,5 +1,5 @@
 //! group_commit_test.zig — TDD: micro-batching / group-commit
-//! 测试 db.put/delete 暂存后批量提交的行为。
+//! Tests the behavior of db.put/delete staging followed by batch commit.
 const std = @import("std");
 const cube = @import("cube_db");
 const ps = cube.page_store;

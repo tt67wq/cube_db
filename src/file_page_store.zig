@@ -1,8 +1,10 @@
-//! file_page_store.zig — 文件页 Store（LMDB 式 1TB 预留 mmap 区）
+//! file_page_store.zig — file-backed page store (LMDB-style 1TB reserved mmap region)
 //!
-//! open 时 mmap 1TB MAP_SHARED 预留虚拟区（方案 I，spike_mmap.zig 已验证 macOS 可行）。
-//! 文件按需 ftruncate 增长，reader 经同一 mmap 指针读新数据，无 SIGBUS、无需重 mmap。
-//! 写路径保留 PageStore 页接口（allocPage/freePage/writePage）；读路径零拷贝直接 mmap 指针。
+//! On open, mmaps a 1TB MAP_SHARED reserved virtual region (scheme I;
+//! spike_mmap.zig verified this works on macOS). The file grows via ftruncate
+//! on demand; readers see new data through the same mmap pointer — no SIGBUS,
+//! no re-mmap. The write path keeps the PageStore page interface
+//! (allocPage/freePage/writePage); the read path is zero-copy via the mmap pointer.
 const std = @import("std");
 const f2 = @import("format.zig");
 const ps = @import("page_store.zig");
@@ -15,10 +17,10 @@ const c = @cImport({
 
 const PAGE_SIZE = f2.PAGE_SIZE;
 
-/// 1 TB 预留虚拟区（LMDB 式占位；64-bit 系统虚拟地址空间充裕）
+/// 1 TB reserved virtual region (LMDB-style placeholder; 64-bit address space is plentiful)
 pub const REGION_SIZE: u64 = 1 << 40;
 
-/// #41 FPS 写路径计数器（profile 开关，不进生产热路径）
+/// #41 FPS write-path counters (profile toggle, off the production hot path)
 pub const FpsCounters = struct {
     pub var enable: bool = false;
     pub var write_page_calls: u64 = 0;
@@ -61,14 +63,14 @@ pub const FilePageStore = struct {
     meta0: [PAGE_SIZE]u8,
     meta1: [PAGE_SIZE]u8,
 
-    /// open（或创建）path，mmap 1TB 预留区。文件按需增长。
+    /// Open (or create) path and mmap the 1TB reserved region. The file grows on demand.
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !FilePageStore {
         const path_z = try allocator.dupeZ(u8, path);
         defer allocator.free(path_z);
         const fd = c.open(path_z, @as(c_int, c.O_RDWR | c.O_CREAT), @as(c.mode_t, 0o644));
         if (fd < 0) return error.OpenFailed;
 
-        // 初始文件至少覆盖 meta0 + meta1（3 页）
+        // Initial file must cover at least meta0 + meta1 (3 pages)
         var st: c.struct_stat = undefined;
         if (c.fstat(fd, &st) != 0) {
             _ = c.close(fd);
@@ -82,7 +84,7 @@ pub const FilePageStore = struct {
             }
         }
 
-        // mmap 1TB MAP_SHARED 预留区
+        // mmap the 1TB MAP_SHARED reserved region
         const ptr = c.mmap(null, REGION_SIZE, @as(c_int, c.PROT_READ) | @as(c_int, c.PROT_WRITE), @as(c_int, c.MAP_SHARED), fd, 0);
         if (ptr == c.MAP_FAILED) {
             _ = c.close(fd);
@@ -101,7 +103,8 @@ pub const FilePageStore = struct {
             .meta1 = [_]u8{0} ** PAGE_SIZE,
         };
 
-        // 从 mmap 区加载 meta 缓冲区，再尝试恢复 next_free 和 meta_index
+        // Load the meta buffers from the mmap region, then try to recover
+        // next_free and meta_index
         @memcpy(fps.meta0[0..PAGE_SIZE], fps.pagePtr(f2.META_PAGE_0)[0..PAGE_SIZE]);
         @memcpy(fps.meta1[0..PAGE_SIZE], fps.pagePtr(f2.META_PAGE_1)[0..PAGE_SIZE]);
         // Determine which meta page is active (higher sequence) and set meta_index
@@ -138,7 +141,7 @@ pub const FilePageStore = struct {
         self.freelist.deinit(self.allocator);
     }
 
-    /// 预留虚拟区大小（字节）
+    /// Reserved virtual region size (bytes)
     pub fn regionSize(self: *const FilePageStore) u64 {
         return self.region_size;
     }
@@ -151,14 +154,14 @@ pub const FilePageStore = struct {
         return self.mmap_ptr + @as(usize, @intCast(page_no)) * PAGE_SIZE;
     }
 
-    /// 将 meta 缓冲区刷到文件（mmap 区可见）
+    /// Flush the meta buffers to the file (visible in the mmap region)
     fn flushMetaBuffer(self: *FilePageStore, page_no: u32) void {
         const buf = if (page_no == f2.META_PAGE_0) &self.meta0 else &self.meta1;
         const dst = self.pagePtr(page_no);
         @memcpy(dst[0..PAGE_SIZE], buf[0..PAGE_SIZE]);
     }
 
-    /// 确保文件已增长到覆盖 page_no（含整页）
+    /// Ensure the file has grown to cover page_no (full page)
     fn ensureFileGrowth(self: *FilePageStore, page_no: u32) !void {
         const t0 = if (FpsCounters.enable) FpsCounters.now() else 0;
         const needed: u64 = (@as(u64, page_no) + 1) * PAGE_SIZE;
@@ -216,7 +219,8 @@ pub const FilePageStore = struct {
 
     fn vtReadMeta(ptr: *anyopaque) !?f2.MetaPage {
         const self: *FilePageStore = @ptrCast(@alignCast(ptr));
-        // 先从 mmap 区同步到缓冲区，再读（reader 可能跨进程写）
+        // Sync from the mmap region into the buffers first, then read
+        // (a cross-process writer may have written)
         @memcpy(self.meta0[0..PAGE_SIZE], self.pagePtr(f2.META_PAGE_0)[0..PAGE_SIZE]);
         @memcpy(self.meta1[0..PAGE_SIZE], self.pagePtr(f2.META_PAGE_1)[0..PAGE_SIZE]);
         return f2.readMetaPage(&self.meta0, &self.meta1);
@@ -242,38 +246,51 @@ pub const FilePageStore = struct {
 
     fn vtSync(ptr: *anyopaque) !void {
         const self: *FilePageStore = @ptrCast(@alignCast(ptr));
-        // fsync(fd) flush page cache for the inode（mmap MAP_SHARED 写经页缓存）
+        // fsync(fd) flushes the page cache for the inode (mmap MAP_SHARED writes go through the page cache)
         if (c.fsync(self.fd) != 0) return error.SyncFailed;
     }
 
-    /// 数据页区间落盘（T-27）。语义调研与选择理由：
+    /// Flush the data-page range to stable storage (T-27). Semantics research
+    /// and rationale:
     ///
-    /// 目标：writeMeta 之前把本批数据页（FIRST_DATA_PAGE..next_free-1，即 mmap 区
-    /// 中经 writePage 写脏的页）刷到稳定存储，建立「数据页先于 meta 页」的
-    /// 字节级提交顺序。
+    /// Goal: before writeMeta, flush this batch's data pages
+    /// (FIRST_DATA_PAGE..next_free-1, i.e. pages dirtied via writePage in the
+    /// mmap region) to stable storage, establishing the byte-level commit
+    /// ordering "data pages before the meta page".
     ///
-    /// 候选与取舍：
-    /// - `fdatasync(fd)`：macOS 有此符号，但 POSIX 语义允许不刷 inode 元数据。
-    ///   本引擎文件增长靠 `ftruncate`（ensureFileGrowth）——文件大小是 inode
-    ///   元数据。fdatasync 下可能出现「数据页字节已到盘但文件长度未持久」，
-    ///   超出旧 EOF 的数据页在掉电后不可达，而 meta 页（位于文件头部，不受
-    ///   长度影响）可能已持久 → 恰是要防止的悬垂 root。故不用。
-    /// - `msync(MS_SYNC)` 页区间：可精确到 [FIRST_DATA_PAGE, next_free) 页区间，
-    ///   但同样不保证 ftruncate 的长度元数据落盘，仍需补一次 fsync ——
-    ///   两次系统调用无收益。
-    /// - `fsync(fd)`（选用）：刷数据 + inode 元数据（含 ftruncate 后的长度）。
-    ///   调用时 writeMeta 尚未执行（meta 页在 mmap 中仍是干净的——上次
-    ///   sync 已将其落盘），故此刻 fsync 刷掉的 dirty 页恰为本批数据页，
-    ///   meta 页不可能搭车提前落盘。顺序由此建立，而非依赖运气。
+    /// Candidates and trade-offs:
+    /// - `fdatasync(fd)`: the symbol exists on macOS, but POSIX semantics
+    ///   allow skipping inode metadata. This engine grows the file via
+    ///   `ftruncate` (ensureFileGrowth) — file size is inode metadata. Under
+    ///   fdatasync, "data page bytes on disk but file length not persisted"
+    ///   can occur: data pages beyond the old EOF become unreachable after
+    ///   power loss while the meta page (at the file head, unaffected by
+    ///   length) may already be persisted -> exactly the dangling root we
+    ///   must prevent. Not used.
+    /// - `msync(MS_SYNC)` page range: can target exactly [FIRST_DATA_PAGE,
+    ///   next_free), but likewise does not guarantee the ftruncate length
+    ///   metadata reaches disk — still needs a follow-up fsync, so two
+    ///   syscalls for no gain.
+    /// - `fsync(fd)` (chosen): flushes data + inode metadata (including the
+    ///   post-ftruncate length). At call time writeMeta has not run yet (the
+    ///   meta pages are still clean in the mmap — the previous sync already
+    ///   persisted them), so the dirty pages fsync flushes now are exactly
+    ///   this batch's data pages; the meta pages cannot hitch a ride early.
+    ///   The ordering is established by construction, not by luck.
     ///
-    /// 已知边界（如实记录，不在此修）：macOS 的 fsync 历史上不保证刷透磁盘
-    /// 控制器缓存（需 F_FULLFSYNC）。本实现与既有 vtSync 使用同一原语，
-    /// 「数据页先于 meta」的相对顺序在两种原语下均成立；控制器缓存层面的
-    /// 绝对掉电安全（F_FULLFSYNC）是更高代价的独立选项，见 docs/crash-model.md。
+    /// Known boundary (recorded as-is, not fixed here): macOS fsync has
+    /// historically not guaranteed flushing through the disk controller cache
+    /// (that needs F_FULLFSYNC). This impl uses the same primitive as the
+    /// existing vtSync; the relative "data pages before meta" ordering holds
+    /// under either primitive. Absolute power-loss safety at the controller
+    /// cache level (F_FULLFSYNC) is a separate, costlier option — see
+    /// docs/crash-model.md.
     fn vtSyncDataPages(ptr: *anyopaque) !void {
         const self: *FilePageStore = @ptrCast(@alignCast(ptr));
-        // 数据页区间：FIRST_DATA_PAGE..next_free-1（本批 writePage 可能触及的
-        // 全部页；freelist 复用页亦在该 bump 上限内）。调用时 meta 页未写。
+        // Data-page range: FIRST_DATA_PAGE..next_free-1 (every page this
+        // batch's writePage may touch; freelist-recycled pages are also within
+        // this bump ceiling). The meta pages are unwritten at call time.
+
         if (c.fsync(self.fd) != 0) return error.SyncFailed;
     }
 

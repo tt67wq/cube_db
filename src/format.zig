@@ -1,18 +1,18 @@
-//! format.zig — v2 页格式常量与编解码（页头、meta、freelist、CRC）
-//! 纯函数模块，无 IO。PAGE_SIZE=4096，固定页头 24B，页尾 4B CRC。
+//! format.zig — v2 page format constants and encode/decode (page header, meta, freelist, CRC)
+//! Pure-function module, no IO. PAGE_SIZE=4096, fixed 24B page header, 4B trailing CRC.
 const std = @import("std");
 
 pub const PAGE_SIZE: usize = 4096;
 pub const PAGE_HEADER_SIZE: usize = 24;
 
-/// 页类型
+/// Page types
 pub const PAGE_TYPE_FREE: u8 = 0;
 pub const PAGE_TYPE_META: u8 = 1;
 pub const PAGE_TYPE_BRANCH: u8 = 2;
 pub const PAGE_TYPE_LEAF: u8 = 3;
 pub const PAGE_TYPE_OVERFLOW: u8 = 4;
 
-/// 特殊页号
+/// Special page numbers
 pub const NULL_PAGE: u32 = 0;
 pub const META_PAGE_0: u32 = 1;
 pub const META_PAGE_1: u32 = 2;
@@ -20,16 +20,16 @@ pub const META_PAGE_1: u32 = 2;
 pub const MAGIC_V2: u32 = 0x4355_4232; // "CUB2"
 pub const META_PAGE_PAYLOAD_SIZE: usize = 58;
 
-/// 页头（每个页前 24 字节）
+/// Page header (first 24 bytes of every page)
 pub const PageHeader = struct {
     page_no: u32,
     page_type: u8,
     gen: u64,
     nkeys: u16,
-    free_next: u32, // freelist 链下一页；非 free 页为 0
+    free_next: u32, // next page in the freelist chain; 0 for non-free pages
 };
 
-/// meta page 内容（编码在 payload 区）
+/// Meta page contents (encoded in the payload area)
 pub const MetaPage = struct {
     magic: u32,
     version: u16,
@@ -45,7 +45,7 @@ pub const MetaPage = struct {
 
 const Crc32 = std.hash.crc.Crc32;
 
-// ===== 页头编解码 =====
+// ===== Page header encode/decode =====
 
 comptime {
     std.debug.assert(PAGE_HEADER_SIZE == 24);
@@ -88,13 +88,13 @@ pub fn decodePageHeader(buf: []const u8) PageHeader {
     };
 }
 
-// ===== 页校验和 =====
+// ===== Page checksum =====
 
 const builtin = @import("builtin");
 const crc32_hw = @import("crc32_hw.zig");
 
-/// 计算整页 CRC32（覆盖 bytes [0..PAGE_SIZE-4)）
-/// ARM64 使用硬件 CRC32 指令，其他平台走软件表驱动
+/// Compute the whole-page CRC32 (covers bytes [0..PAGE_SIZE-4))
+/// ARM64 uses the hardware CRC32 instruction; other platforms use the software table
 pub fn computePageChecksum(page: *const [PAGE_SIZE]u8) u32 {
     return switch (builtin.cpu.arch) {
         .aarch64, .aarch64_be => crc32_hw.computePageChecksumHw(page),
@@ -102,26 +102,26 @@ pub fn computePageChecksum(page: *const [PAGE_SIZE]u8) u32 {
     };
 }
 
-/// 软件路径（表驱动 CRC32）
+/// Software path (table-driven CRC32)
 pub fn computePageChecksumSw(page: *const [PAGE_SIZE]u8) u32 {
     var crc = Crc32.init();
     crc.update(page[0 .. PAGE_SIZE - 4]);
     return crc.final();
 }
 
-/// 写入校验和到页尾
+/// Write the checksum to the page tail
 pub fn setPageChecksum(page: *[PAGE_SIZE]u8, cs: u32) void {
     std.mem.writeInt(u32, page[PAGE_SIZE - 4 ..][0..4], cs, .little);
 }
 
-/// 验证整页校验和
+/// Verify the whole-page checksum
 pub fn verifyPageChecksum(page: *const [PAGE_SIZE]u8) bool {
     const stored = std.mem.readInt(u32, page[PAGE_SIZE - 4 ..][0..4], .little);
     const computed = computePageChecksum(page);
     return stored == computed;
 }
 
-// ===== Meta page 编解码 =====
+// ===== Meta page encode/decode =====
 
 pub fn encodeMetaPayload(buf: []u8, meta: *const MetaPage) void {
     std.debug.assert(buf.len >= META_PAGE_PAYLOAD_SIZE);
@@ -187,11 +187,11 @@ pub fn isValidMeta(meta: MetaPage) bool {
     return meta.magic == MAGIC_V2 and meta.version == 2;
 }
 
-/// 将 meta 写入 page 缓冲区（page 索引 0 或 1 → 页号 1 或 2）
+/// Write meta into a page buffer (page index 0 or 1 -> page number 1 or 2)
 pub fn writeMetaPage(page: *[PAGE_SIZE]u8, meta: *const MetaPage, index: u32) void {
     std.debug.assert(index == 0 or index == 1);
     const page_no = if (index == 0) META_PAGE_0 else META_PAGE_1;
-    // 写页头
+    // Write the page header
     const hdr = PageHeader{
         .page_no = page_no,
         .page_type = PAGE_TYPE_META,
@@ -200,14 +200,15 @@ pub fn writeMetaPage(page: *[PAGE_SIZE]u8, meta: *const MetaPage, index: u32) vo
         .free_next = 0,
     };
     encodePageHeader(page[0..PAGE_HEADER_SIZE], &hdr);
-    // 写 meta payload
+    // Write the meta payload
     @memset(page[PAGE_HEADER_SIZE .. PAGE_SIZE - 4], 0);
     encodeMetaPayload(page[PAGE_HEADER_SIZE .. PAGE_SIZE - 4], meta);
-    // 写校验和
+    // Write the checksum
     setPageChecksum(page, computePageChecksum(page));
 }
 
-/// 从单页缓冲区读 meta（校验 checksum / page_type / magic+version，任一不过返回 null）
+/// Read meta from a single page buffer (validates checksum / page_type /
+/// magic+version; returns null if any check fails)
 pub fn readMetaPageSingle(page: *const [PAGE_SIZE]u8) ?MetaPage {
     if (!verifyPageChecksum(page)) return null;
     const hdr = decodePageHeader(page[0..PAGE_HEADER_SIZE]);
@@ -217,7 +218,7 @@ pub fn readMetaPageSingle(page: *const [PAGE_SIZE]u8) ?MetaPage {
     return meta;
 }
 
-/// 从两个 meta page 读取，取 sequence 大者（crash 安全）
+/// Read from the two meta pages and take the higher sequence (crash safe)
 pub fn readMetaPage(page0: *const [PAGE_SIZE]u8, page1: *const [PAGE_SIZE]u8) ?MetaPage {
     const m0 = readMetaPageSingle(page0);
     const m1 = readMetaPageSingle(page1);
@@ -227,13 +228,13 @@ pub fn readMetaPage(page0: *const [PAGE_SIZE]u8, page1: *const [PAGE_SIZE]u8) ?M
     return if (m0.?.sequence >= m1.?.sequence) m0 else m1;
 }
 
-// ===== Freelist 页编解码 =====
+// ===== Freelist page encode/decode =====
 
-/// 空闲页的 payload 区存储 u32 页号数组，后续扩展
-/// 写入 freelist 条目到页（覆盖 payload 区）
+/// A free page's payload area stores an array of u32 page numbers, extensible later
+/// Write freelist entries into the page (overwrites the payload area)
 pub fn writeFreelistEntries(page: *[PAGE_SIZE]u8, entries: []const u32) void {
     const payload = page[PAGE_HEADER_SIZE .. PAGE_SIZE - 4];
-    // 前 4 字节存条目数
+    // First 4 bytes hold the entry count
     std.mem.writeInt(u32, payload[0..4], @intCast(entries.len), .little);
     var pos: usize = 4;
     for (entries) |e| {
@@ -241,28 +242,31 @@ pub fn writeFreelistEntries(page: *[PAGE_SIZE]u8, entries: []const u32) void {
         std.mem.writeInt(u32, payload[pos..][0..4], e, .little);
         pos += 4;
     }
-    // 剩余 payload 区清零
+    // Zero the remaining payload area
     if (pos < payload.len) {
         @memset(payload[pos..], 0);
     }
-    // 更新页校验和
+    // Update the page checksum
     setPageChecksum(page, computePageChecksum(page));
 }
 
-/// 从页读 freelist 条目（返回借用 payload 的切片）
-/// 返回 []align(1) const u32：page 是 u8 数组（1 对齐），payload 偏移 24
-/// 不保证 4 对齐，故借用切片声明真实 align(1)，@alignCast 会 Linux panic。
+/// Read freelist entries from the page (returns a slice borrowing the payload)
+/// Returns []align(1) const u32: page is a u8 array (1-aligned) and the
+/// payload offset of 24 gives no 4-alignment guarantee, so the borrowed slice
+/// honestly declares align(1) — @alignCast would panic on Linux.
 pub fn readFreelistEntries(page: *const [PAGE_SIZE]u8) []align(1) const u32 {
     const payload = page[PAGE_HEADER_SIZE .. PAGE_SIZE - 4];
     const count = std.mem.readInt(u32, payload[0..4], .little);
     const max = @min(count, @as(u32, @intCast((payload.len - 4) / 4)));
-    // ponytail: 跳过前 4 字节 count；[*]align(1) const u32 诚实声明对齐，
-    // 允许非对齐 u32 读取（x86/ARM 原生支持），无需 @alignCast 运行时检查
+    // ponytail: skip the first 4 bytes (count); [*]align(1) const u32 honestly
+    // declares the alignment, allowing unaligned u32 reads (natively supported
+    // on x86/ARM) with no @alignCast runtime check
     const ptr: [*]align(1) const u32 = @ptrCast(payload.ptr);
     return ptr[1..][0..max];
 }
 
-// ===== 测试 =====
+// ===== Tests =====
+
 
 test "format: page header roundtrip" {
     const h = PageHeader{

@@ -1,6 +1,6 @@
-//! btree_storage_test.zig — 领域汇总：B-tree / 读事务 fuzz / 共享 COW
-//! comptime @import 聚合子文件，编译单元从 38 降到 6。
-//! 搬运自原 tests/*.zig，逻辑未动。
+//! btree_storage_test.zig - domain aggregate: B-tree / read-txn fuzz / shared COW
+//! comptime @import aggregates sub-files, reducing compilation units from 38 to 6.
+//! Moved from original tests/*.zig, logic unchanged.
 
 comptime {
     _ = @import("btree_storage/btree_test.zig");

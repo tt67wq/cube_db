@@ -1,6 +1,6 @@
-//! closed_state_test.zig — T-4: applyBatch closed 分支测试
-//! 验证 State.deinit() 后调 applyBatch，所有 future 收到 error.Closed 且无 segfault。
-//! 覆盖 src/writer.zig:261-264 的 closed 守卫分支。
+//! closed_state_test.zig — T-4: applyBatch closed-branch tests
+//! Verify that calling applyBatch after State.deinit() delivers error.Closed to all futures with no segfault.
+//! Covers the closed guard branch at src/writer.zig:261-264.
 const std = @import("std");
 const zio = @import("zio");
 const cube = @import("cube_db");
@@ -14,18 +14,18 @@ fn newStore() ps.MemPageStore {
     return ps.MemPageStore.init(alloc, 10000);
 }
 
-// ---- Test 1: close 后 applyBatch，所有 future 收到 error.Closed ----
+// ---- Test 1: applyBatch after close — all futures receive error.Closed ----
 test "closed: applyBatch after deinit sets error.Closed on all futures" {
     var ms = newStore();
     defer ms.deinit();
     const s = ms.store();
 
     var state = wrt.State.init(alloc, s, .{});
-    // deinit 标记 closed=true，释放 pending_free
+    // deinit marks closed=true and frees pending_free
     state.deinit();
-    // state.deinit 已调用，不调两次（ms.deinit 在 defer 中释放页存储）
+    // state.deinit was already called; do not call it twice (ms.deinit in the defer frees the page store)
 
-    // 构造 batch：3 个请求
+    // Build the batch: 3 requests
     var futures: [3]zio.Future(wrt.OpResult) = .{ .{}, .{}, .{} };
     const reqs = [_]wrt.Request{
         .{ .key = "a", .value = "1", .tombstone = false, .future = &futures[0] },
@@ -33,22 +33,22 @@ test "closed: applyBatch after deinit sets error.Closed on all futures" {
         .{ .key = "c", .value = "3", .tombstone = false, .future = &futures[2] },
     };
 
-    // applyBatch 不返回 error（closed 分支只 set future 后 return）
+    // applyBatch does not return an error (the closed branch just sets futures and returns)
     try state.applyBatch(&reqs);
 
-    // 每个 future 应收到 error.Closed
+    // Each future should receive error.Closed
     for (&futures) |*f| {
         const result = try f.wait();
         try std.testing.expectError(error.Closed, result.value);
     }
 
-    // 状态未被改动：root 仍为 NULL_ROOT，sequence/dirt/entry_count 仍为 0
+    // State untouched: root is still NULL_ROOT; sequence/dirt/entry_count still 0
     try std.testing.expectEqual(btree.NULL_ROOT, state.root.load(.acquire));
     try std.testing.expectEqual(@as(u64, 0), state.sequence.load(.acquire));
     try std.testing.expectEqual(@as(u64, 0), state.entry_count.load(.acquire));
 }
 
-// ---- Test 2: 先正常 putBatch 再 close 再 applyBatch，状态不被改动 ----
+// ---- Test 2: normal putBatch, then close, then applyBatch — state must not change ----
 test "closed: normal applyBatch then deinit then applyBatch — state unchanged" {
     var ms = newStore();
     defer ms.deinit();
@@ -56,7 +56,7 @@ test "closed: normal applyBatch then deinit then applyBatch — state unchanged"
 
     var state = wrt.State.init(alloc, s, .{});
 
-    // 正常路径：applyBatch 3 个 put
+    // Normal path: applyBatch with 3 puts
     var f1: [3]zio.Future(wrt.OpResult) = .{ .{}, .{}, .{} };
     const reqs1 = [_]wrt.Request{
         .{ .key = "x", .value = "1", .tombstone = false, .future = &f1[0] },
@@ -66,7 +66,7 @@ test "closed: normal applyBatch then deinit then applyBatch — state unchanged"
     try state.applyBatch(&reqs1);
     for (&f1) |*f| _ = try f.wait();
 
-    // 记录 close 前的状态
+    // Record the state before close
     const root_before = state.root.load(.acquire);
     const seq_before = state.sequence.load(.acquire);
     const count_before = state.entry_count.load(.acquire);
@@ -74,7 +74,7 @@ test "closed: normal applyBatch then deinit then applyBatch — state unchanged"
     // close
     state.deinit();
 
-    // close 后再 applyBatch
+    // applyBatch again after close
     var f2: [2]zio.Future(wrt.OpResult) = .{ .{}, .{} };
     const reqs2 = [_]wrt.Request{
         .{ .key = "new1", .value = "v", .tombstone = false, .future = &f2[0] },
@@ -82,24 +82,24 @@ test "closed: normal applyBatch then deinit then applyBatch — state unchanged"
     };
     try state.applyBatch(&reqs2);
 
-    // 所有 future 收到 error.Closed
+    // All futures receive error.Closed
     for (&f2) |*f| {
         const result = try f.wait();
         try std.testing.expectError(error.Closed, result.value);
     }
 
-    // 状态未被 close 后的 applyBatch 改动
+    // State unchanged by the post-close applyBatch
     try std.testing.expectEqual(root_before, state.root.load(.acquire));
     try std.testing.expectEqual(seq_before, state.sequence.load(.acquire));
     try std.testing.expectEqual(count_before, state.entry_count.load(.acquire));
 
-    // close 前的数据确实在 btree 中（通过 root 验证）
+    // The pre-close data is indeed in the btree (verified via root)
     const v = try btree.get(alloc, s, root_before, "x");
     try std.testing.expectEqualStrings("1", v.?);
     alloc.free(v.?);
 }
 
-// ---- Test 3: close 后单个请求也收到 error.Closed ----
+// ---- Test 3: a single request after close also receives error.Closed ----
 test "closed: single request after deinit gets error.Closed" {
     var ms = newStore();
     defer ms.deinit();
@@ -124,7 +124,7 @@ test "closed: single request after deinit gets error.Closed" {
     try std.testing.expectEqual(@as(u64, 0), state.sequence.load(.acquire));
 }
 
-// ---- Test 4: close 后空 batch 不崩 ----
+// ---- Test 4: an empty batch after close does not crash ----
 test "closed: empty batch after deinit is no-op, no crash" {
     var ms = newStore();
     defer ms.deinit();
@@ -133,7 +133,7 @@ test "closed: empty batch after deinit is no-op, no crash" {
     var state = wrt.State.init(alloc, s, .{});
     state.deinit();
 
-    // 空 batch：closed 分支 for 循环不执行，直接 return
+    // Empty batch: the closed branch's for loop does not execute; it just returns
     try state.applyBatch(&.{});
 
     try std.testing.expectEqual(btree.NULL_ROOT, state.root.load(.acquire));

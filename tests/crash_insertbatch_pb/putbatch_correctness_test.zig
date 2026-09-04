@@ -1,7 +1,7 @@
-//! putbatch_correctness_test.zig — putBatch 正确性测试
-//! 回归保护：防止 putBatch 数据丢失。
-//! 关键教训：调用方绝不能共享 buffer 生成 batch entries 的 key
-//! （所有 key 会变成最后一个值，insertBatch 排序去重后 collapse 成 1 条）。
+//! putbatch_correctness_test.zig - putBatch correctness tests
+//! Regression protection: guard against putBatch data loss.
+//! Key lesson: callers must never generate batch entry keys from a shared buffer
+//! (all keys would become the last value, and insertBatch sort-dedupe would collapse them into 1 entry).
 const std = @import("std");
 const cube = @import("cube_db");
 const Db = cube.Db;
@@ -11,7 +11,7 @@ fn newStore() MemPageStore {
     return MemPageStore.init(std.testing.allocator, 100000);
 }
 
-// 大批量 putBatch（独立分配 key），验证 N 条全部插入
+// large putBatch (independently allocated keys), verify all N entries inserted
 test "putbatch: heap keys, all N inserted correctly" {
     var ms = newStore();
     defer ms.deinit();
@@ -41,7 +41,7 @@ test "putbatch: heap keys, all N inserted correctly" {
     }
 }
 
-// putBatch 后逐条验证 + delete 全部后 count 归零
+// verify each entry after putBatch + delete all, then count drops to zero
 test "putbatch: 10K entries all inserted, then all deleted" {
     var ms = newStore();
     defer ms.deinit();
@@ -79,7 +79,7 @@ test "putbatch: 10K entries all inserted, then all deleted" {
     try std.testing.expectEqual(@as(u64, 0), db.entryCount());
 }
 
-// 两个 putBatch 连续插入（不同 key 集），验证都能正确插入
+// two consecutive putBatches (distinct key sets), verify both insert correctly
 test "putbatch: two batches with distinct keys" {
     var ms = newStore();
     defer ms.deinit();
@@ -124,7 +124,7 @@ test "putbatch: two batches with distinct keys" {
     }
 }
 
-// putBatch 含 tombstone（delete）
+// putBatch containing tombstones (delete)
 test "putbatch: mixed put + delete in one batch" {
     var ms = newStore();
     defer ms.deinit();

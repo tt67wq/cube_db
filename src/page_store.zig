@@ -1,48 +1,53 @@
-//! page_store.zig — 页 Store 接口（vtable）及内存实现（MemPageStore）。
-//! 生产级 FilePageStore（mmap）后续实现；MemPageStore 用于测试。
+//! page_store.zig — PageStore interface (vtable) and in-memory impl (MemPageStore).
+//! The production FilePageStore (mmap) came later; MemPageStore is for tests.
 const std = @import("std");
 const f2 = @import("format.zig");
 const zio = @import("zio");
 
-/// 数据页起始页号（0=NULL，1=meta0，2=meta1）
+/// First data page number (0=NULL, 1=meta0, 2=meta1)
 pub const FIRST_DATA_PAGE: u32 = 3;
 
-/// 错误
+/// Errors
 pub const Error = error{
     MapFull,
     PageNotFound,
 };
 
-/// 页 Store 运行时多态接口
+/// Page store runtime-polymorphic interface
 pub const PageStore = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// 分配一页：从 freelist 取或 bump。返页号。
+        /// Allocate a page: pop from freelist or bump. Returns the page number.
         allocPage: *const fn (ptr: *anyopaque) anyerror!u32,
-        /// 回收一页到 freelist（LIFO）。不释放页数据。
+        /// Recycle a page onto the freelist (LIFO). Does not free page data.
         freePage: *const fn (ptr: *anyopaque, page_no: u32) void,
-        /// 读页（返借用切片，零拷贝）。
-        /// 借用契约：切片在 Store deinit 前始终有效——页数据地址稳定
-        /// （MemPageStore 独立堆分配 / FilePageStore mmap 预留区），且 COW
-        /// 保证已发布页不被原地修改。实现违反任一前提即违反此接口。
+        /// Read a page (returns a borrowed slice, zero-copy).
+        /// Borrowing contract: the slice stays valid until Store deinit — page
+        /// data addresses are stable (MemPageStore: per-page heap allocation /
+        /// FilePageStore: reserved mmap region), and COW guarantees published
+        /// pages are never modified in place. An implementation violating
+        /// either premise violates this interface.
         readPage: *const fn (ptr: *anyopaque, page_no: u32) anyerror![]const u8,
-        /// 写页（返可变切片）
+        /// Write a page (returns a mutable slice)
         writePage: *const fn (ptr: *anyopaque, page_no: u32) anyerror![]u8,
-        /// 读 meta（双页交替恢复）
+        /// Read meta (dual-page alternating recovery)
         readMeta: *const fn (ptr: *anyopaque) anyerror!?f2.MetaPage,
-        /// 写 meta（交替写 meta0/meta1）
+        /// Write meta (alternating between meta0/meta1)
         writeMeta: *const fn (ptr: *anyopaque, meta: *const f2.MetaPage) anyerror!void,
-        /// 数据页区间落盘（fdatasync 语义）：把已 writePage 的数据页（不含 meta 页）
-        /// 刷到稳定存储。T-27 提交顺序：power_fail 档在 writeMeta 之前调用，
-        /// 保证 meta 指向的数据页先于（或至迟同时于）meta 页持久化——掉电不会
-        /// 恢复到指向悬垂页的 root。调用时 meta 页尚未写入，故此时刷盘的
-        /// dirty 页恰为本批数据页（见 FilePageStore 实现注释）。MemPageStore 为 no-op。
+        /// Flush the data-page range to stable storage (fdatasync semantics):
+        /// pages written via writePage (excluding meta pages). T-27 commit
+        /// ordering: called before writeMeta in power_fail mode so the data
+        /// pages meta points to are persisted no later than the meta page
+        /// itself — a power loss can never recover a root pointing at dangling
+        /// pages. The meta page is not yet written at call time, so the dirty
+        /// pages flushed here are exactly this batch's data pages (see the
+        /// FilePageStore impl comments). No-op for MemPageStore.
         syncDataPages: *const fn (ptr: *anyopaque) anyerror!void,
-        /// sync（fsync 到磁盘）
+        /// sync (fsync to disk)
         sync: *const fn (ptr: *anyopaque) anyerror!void,
-        /// mapsize（页数上限）
+        /// mapsize (max page count)
         mapsize: *const fn (ptr: *anyopaque) u64,
     };
 
@@ -52,9 +57,11 @@ pub const PageStore = struct {
     pub fn freePage(self: PageStore, page_no: u32) void {
         self.vtable.freePage(self.ptr, page_no);
     }
-    /// 读页，返借用切片（零拷贝）。无 allocator 参数 + `[]const u8` 返回值
-    /// 即借用语义（Zig 惯例，无需 Borrowed/Owned 后缀）：切片有效期为 Store
-    /// 生命周期，页内容不可变（COW）。需持有副本的调用方自行 allocator.dupe。
+    /// Read a page, returning a borrowed slice (zero-copy). No allocator
+    /// parameter + `[]const u8` return type is itself the borrowing idiom
+    /// (Zig convention, no Borrowed/Owned suffix needed): the slice is valid
+    /// for the Store's lifetime and page contents are immutable (COW).
+    /// Callers needing a copy do their own allocator.dupe.
     pub fn readPage(self: PageStore, page_no: u32) ![]const u8 {
         return self.vtable.readPage(self.ptr, page_no);
     }
@@ -67,7 +74,7 @@ pub const PageStore = struct {
     pub fn writeMeta(self: PageStore, meta: *const f2.MetaPage) !void {
         return self.vtable.writeMeta(self.ptr, meta);
     }
-    /// 数据页区间落盘（fdatasync 语义，见 VTable.syncDataPages 契约注释）
+    /// Flush the data-page range (fdatasync semantics, see VTable.syncDataPages contract)
     pub fn syncDataPages(self: PageStore) !void {
         return self.vtable.syncDataPages(self.ptr);
     }
@@ -79,20 +86,24 @@ pub const PageStore = struct {
     }
 };
 
-// ===== 测试用内存实现 =====
+// ===== In-memory implementation for tests =====
 
-/// 内存 PageStore（测试用）。页数据为每页独立堆分配（*[PAGE_SIZE]u8），
-/// 页地址在生命期不变 → 读者 readPage 借用的切片不会因扩容悬垂。
-/// 不持久化，不支持跨生命周期恢复。
+/// In-memory PageStore (for tests). Page data is independently heap-allocated
+/// per page (*[PAGE_SIZE]u8); page addresses never change during the lifetime
+/// -> slices borrowed by readPage readers never dangle due to growth.
+/// Not persistent; no cross-lifecycle recovery.
 pub const MemPageStore = struct {
     allocator: std.mem.Allocator,
-    // slab 页池：按页号索引的页指针数组。ArrayList 本身会扩容（指针移动），
-    // 但每页是独立堆分配，页数据地址稳定 → 读者借用切片不悬垂（修复并发
-    // 写者 allocPage 扩容 ArrayList 导致借用切片悬垂的 SEGV）。
+    // Slab page pool: an array of page pointers indexed by page number. The
+    // ArrayList itself grows (pointers move), but each page is an independent
+    // heap allocation with a stable address -> borrowed reader slices never
+    // dangle (fixes the SEGV from a concurrent writer's allocPage growing
+    // the ArrayList under a borrowed slice).
     pages: std.ArrayList(*[f2.PAGE_SIZE]u8),
     freelist: std.ArrayList(u32),
-    /// pages/freelist 互斥锁：串行化写者 allocPage/writePage/ensurePage 与读者
-    /// readPage（仅护指针数组查找；页数据地址稳定，unlock 后借用切片仍有效）。
+    /// pages/freelist mutex: serializes writer allocPage/writePage/ensurePage
+    /// against reader readPage (guards only the pointer-array lookup; page
+    /// data addresses are stable, so borrowed slices stay valid after unlock).
     freelist_mu: zio.Mutex,
     next_free: u32,
     max_pages: u32,
@@ -112,7 +123,8 @@ pub const MemPageStore = struct {
             .meta1 = [_]u8{0} ** f2.PAGE_SIZE,
             .meta_index = 0,
         };
-        // 页按需在 ensurePage 中独立堆分配；页地址稳定 → 读者借用切片不悬垂。
+        // Pages are independently heap-allocated on demand in ensurePage;
+        // stable page addresses -> borrowed reader slices never dangle.
         return self;
     }
 
@@ -126,8 +138,9 @@ pub const MemPageStore = struct {
         return .{ .ptr = self, .vtable = &mem_vtable };
     }
 
-    /// 为 index 分配独立页（堆分配，地址稳定）。扩容 pages 指针数组仅移动指针，
-    /// 不移动页数据 → 读者已借用的页切片不悬垂。调用方须持有 mu。
+    /// Allocate a standalone page for index (heap, stable address). Growing
+    /// the pages pointer array moves only pointers, never page data ->
+    /// already-borrowed page slices never dangle. Caller must hold mu.
     fn ensurePage(self: *MemPageStore, index: u32) !void {
         if (index < self.pages.items.len) return;
         if (index >= self.max_pages) return error.MapFull;
@@ -136,7 +149,9 @@ pub const MemPageStore = struct {
         var i: usize = old_len;
         while (i < self.pages.items.len) : (i += 1) {
             self.pages.items[i] = self.allocator.create([f2.PAGE_SIZE]u8) catch {
-                // 部分失败回滚: 销毁本次已分配的页, 收缩指针数组, 防 deinit destroy undefined 指针 (F1)
+                // Partial-failure rollback: destroy the pages allocated in
+                // this call and shrink the pointer array, so deinit never
+                // destroys undefined pointers (F1)
                 var j: usize = old_len;
                 while (j < i) : (j += 1) self.allocator.destroy(self.pages.items[j]);
                 self.pages.shrinkRetainingCapacity(old_len);
@@ -172,7 +187,8 @@ pub const MemPageStore = struct {
         self.freelist_mu.lockUncancelable();
         defer self.freelist_mu.unlock();
         if (page_no >= self.pages.items.len) return error.PageNotFound;
-        // 页数据为独立堆分配，地址稳定；返回的切片在 unlock 后仍有效。
+        // Page data is independently heap-allocated with a stable address;
+        // the returned slice stays valid after unlock.
         return self.pages.items[page_no][0..];
     }
 
@@ -202,7 +218,7 @@ pub const MemPageStore = struct {
         _ = ptr;
     }
 
-    /// no-op：内存实现，无持久化语义（T-27）
+    /// No-op: in-memory impl, no persistence semantics (T-27)
     fn vtSyncDataPages(ptr: *anyopaque) !void {
         _ = ptr;
     }
@@ -225,8 +241,9 @@ const mem_vtable: PageStore.VTable = .{
     .mapsize = MemPageStore.vtMapSize,
 };
 
-// ===== 内联测试 =====
-// page_store_test.zig 使用 MemPageStore 做功能测试；此处仅留基本测试。
+// ===== Inline tests =====
+// page_store_test.zig covers MemPageStore functionally; only basic tests here.
+
 
 test "page_store: FIRST_DATA_PAGE constant" {
     try std.testing.expectEqual(@as(u32, 3), FIRST_DATA_PAGE);

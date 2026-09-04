@@ -1,11 +1,11 @@
-//! btree_readfast_consistency_test.zig — T-17: readNodePayloadFast vs readNodePayload 一致性
+//! btree_readfast_consistency_test.zig - T-17: readNodePayloadFast vs readNodePayload consistency
 //!
-//! src/btree.zig:49 readNodePayloadFast 跳过 CRC 校验（热读路径），readNodePayload（:39）带 CRC。
-//! 注释称 COW 保证不需校验，但无测试证明 fast 与 full 读出一致。本文件构造 leaf/branch/
-//! overflow/满 leaf 四种页，断言两者返回 payload 内容完全一致（std.mem.eql）。
+//! src/btree.zig:49 readNodePayloadFast skips CRC verification (hot read path); readNodePayload (:39) verifies CRC.
+//! Comments claim COW guarantees make verification unnecessary, but no test proved fast and full reads agree.
+//! This file builds leaf/branch/overflow/full-leaf pages and asserts both return byte-identical payloads (std.mem.eql).
 //!
-//! readNodePayload / readNodePayloadFast / writeNodePage 均 pub，直接构造页后双读对比。
-//! 接入：tests/btree_storage/btree_test.zig comptime 块。
+//! readNodePayload / readNodePayloadFast / writeNodePage are all pub; build pages directly and compare double reads.
+//! Hookup: comptime block in tests/btree_storage/btree_test.zig.
 
 const std = @import("std");
 const cube = @import("cube_db");
@@ -19,7 +19,7 @@ fn newStore(n: u32) ps.MemPageStore {
     return ps.MemPageStore.init(allocator, n);
 }
 
-/// 构造合法 leaf payload（1 entry，内联值，不触发溢出）到 buf，返回实际长度
+/// Build a valid leaf payload (1 entry, inline value, no overflow) into buf, return the actual length
 fn buildLeafPayload(buf: []u8, key: []const u8, value: []const u8) !usize {
     var ms = ps.MemPageStore.init(allocator, 64);
     defer ms.deinit();
@@ -31,7 +31,7 @@ fn buildLeafPayload(buf: []u8, key: []const u8, value: []const u8) !usize {
     return try btree.encodeLeafPayload(buf, &entries, ms.store(), &dirty);
 }
 
-/// 构造合法 branch payload（n children）到 buf，返回实际长度
+/// Build a valid branch payload (n children) into buf, return the actual length
 fn buildBranchPayload(buf: []u8, n_children: u32) usize {
     // n children, n-1 keys "m0","m1"...
     var keys: [8][]const u8 = .{ "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7" };
@@ -39,11 +39,11 @@ fn buildBranchPayload(buf: []u8, n_children: u32) usize {
     return btree.encodeBranchPayload(buf, keys[0 .. n_children - 1], children[0..n_children]);
 }
 
-/// 双读同一页，断言 payload 切片内容完全一致
+/// Double-read the same page, assert the payload slices are byte-identical
 fn assertFastEqFull(store: ps.PageStore, page_no: u32) !void {
     const slow = try btree.readNodePayload(store, page_no);
     const fast = try btree.readNodePayloadFast(store, page_no);
-    // 同一页应返回等长 payload（均 [HEADER_SIZE..PAGE_SIZE-4]）
+    // the same page should return equal-length payloads (both [HEADER_SIZE..PAGE_SIZE-4])
     try std.testing.expectEqual(slow.len, fast.len);
     try std.testing.expect(std.mem.eql(u8, slow, fast));
 }
@@ -62,15 +62,15 @@ test "readfast: leaf page payload consistent" {
 }
 
 test "readfast: full-ish leaf page payload consistent" {
-    // 逼近满 leaf：多个 entry 使 payload 接近上限。LEAF_MAX_ENTRIES=32，
-    // 用 32 个短 key/value 填满（leafPayloadSize 逼近 PAGE_SIZE-28-4）。
+    // near-full leaf: multiple entries push the payload close to the limit. LEAF_MAX_ENTRIES=32,
+    // fill with 32 short key/values (leafPayloadSize approaches PAGE_SIZE-28-4).
     var ms = newStore(64);
     defer ms.deinit();
     const s = ms.store();
     var dirty = std.ArrayList(u32).empty;
     defer dirty.deinit(allocator);
 
-    // 构造 32 个 entry（逼近 LEAF_MAX_ENTRIES）
+    // build 32 entries (close to LEAF_MAX_ENTRIES)
     var entries: [32]btree.LeafEntry = undefined;
     var kbufs: [32][4]u8 = undefined;
     var i: usize = 0;
@@ -80,7 +80,7 @@ test "readfast: full-ish leaf page payload consistent" {
     }
     var payload_buf: [f2.PAGE_SIZE]u8 = undefined;
     const pl = try btree.encodeLeafPayload(&payload_buf, &entries, s, &dirty);
-    try std.testing.expect(pl > 100); // 确实写了内容
+    try std.testing.expect(pl > 100); // content really written
 
     const pn = try s.allocPage();
     try btree.writeNodePage(s, pn, f2.PAGE_TYPE_LEAF, @intCast(entries.len), payload_buf[0..pl]);
@@ -102,7 +102,7 @@ test "readfast: branch page payload consistent" {
 }
 
 test "readfast: overflow page payload consistent" {
-    // overflow 页：raw data chunk 作为 payload，page_type=OVERFLOW
+    // overflow page: raw data chunk as payload, page_type=OVERFLOW
     var ms = newStore(64);
     defer ms.deinit();
     const s = ms.store();
@@ -116,14 +116,14 @@ test "readfast: overflow page payload consistent" {
 
     try assertFastEqFull(s, pn);
 
-    // 额外断言：overflow payload 内容与写入 chunk 一致（fast 与 full 都对得上）
+    // extra assertion: overflow payload content matches the written chunk (both fast and full agree)
     const fast = try btree.readNodePayloadFast(s, pn);
     try std.testing.expect(std.mem.eql(u8, &chunk, fast[0..chunk.len]));
 }
 
 test "readfast: multiple pages in a tree all consistent" {
-    // 建一棵多页 btree（insert 多 key 触发 leaf split + branch），对 root
-    // 及若干页双读对比（验证真实 COW 树的页一致性，而非仅人工构造页）
+    // Build a multi-page btree (inserting many keys triggers leaf split + branch), double-read the root
+    // and several pages (verifying page consistency of a real COW tree, not just hand-built pages)
     var ms = newStore(10000);
     defer ms.deinit();
     const s = ms.store();
@@ -140,12 +140,12 @@ test "readfast: multiple pages in a tree all consistent" {
     }
     try std.testing.expect(root != btree.NULL_ROOT);
 
-    // root 页（可能是 branch 或 leaf）双读一致
+    // root page (branch or leaf) double-read consistent
     try assertFastEqFull(s, root);
 
-    // dirty list 里的页（COW 出的旧/新页）也应双读一致
+    // pages in the dirty list (COW old/new pages) should also double-read consistently
     for (dirty.items, 0..) |pn, idx| {
-        if (idx >= 8) break; // 抽查前 8 页
+        if (idx >= 8) break; // spot-check the first 8 pages
         try assertFastEqFull(s, pn);
     }
 }

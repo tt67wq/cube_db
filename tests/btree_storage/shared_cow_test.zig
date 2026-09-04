@@ -1,6 +1,6 @@
-//! shared_cow_test.zig — TDD: 单 txn 内共享 COW 路径
-//! 测试 batch insert 的正确性：多条 entry 在同一 txn 内提交，
-//! 沿 B-tree 路径一次遍历，到每个 leaf 批量应用。
+//! shared_cow_test.zig - TDD: shared COW path within a single txn
+//! Tests batch insert correctness: multiple entries committed in the same txn,
+//! traversing the B-tree path once and applying in bulk at each leaf.
 const std = @import("std");
 const cube = @import("cube_db");
 const ps = cube.page_store;

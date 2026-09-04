@@ -1,4 +1,4 @@
-//! get_profile.zig — get 分阶段耗时分解
+//! get_profile.zig — phase-by-phase get latency breakdown
 const std = @import("std");
 const cube = @import("cube_db");
 const Db = cube.Db;
@@ -25,7 +25,7 @@ fn pct(part: f64, total: f64) u64 {
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
-    std.debug.print("=== get 分阶段耗时分解 ===\n\n", .{});
+    std.debug.print("=== get phase-by-phase breakdown ===\n\n", .{});
 
     const configs = [_]struct { n: usize, label: []const u8 }{
         .{ .n = 100, .label = "100 keys (depth ~2)" },
@@ -108,8 +108,9 @@ pub fn main() !void {
         const page_read_total = avg_page * est_depth;
         const pr_ns = @as(u64, @intFromFloat(page_read_total));
 
-        std.debug.print("\n  估计：树深 {d:.0} 层，页面读取合计 ~{d} ns（get 的 {d}%，其余为 key 比较 + dupe 分配，无法进一步拆分）\n", .{ est_depth, pr_ns, pct(page_read_total, avg_get) });
-        std.debug.print("  二分查找预期: 线性扫描 O(n) 占 key 比较的主要部分，改为二分后预计可减半\n", .{});
+        std.debug.print("\n  Estimate: tree depth {d:.0} levels, page reads total ~{d} ns ({d}% of get; the rest is key comparison + dupe allocation, not further separable)\n", .{ est_depth, pr_ns, pct(page_read_total, avg_get) });
+        std.debug.print("  Binary search expectation: linear O(n) scan dominates key comparison; switching to binary search should roughly halve it\n", .{});
+
     }
 }
 

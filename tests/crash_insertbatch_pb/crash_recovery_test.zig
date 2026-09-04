@@ -1,8 +1,8 @@
-//! crash_recovery_test.zig — P3 TDD: 崩溃恢复
-//! COW + 原子 meta 切换已崩溃安全（LMDB 无 WAL）。本测试验证恢复路径：
-//! - commit 后 reopen → 已提交数据在（双 meta 选较新有效页）
-//! - 多次交替提交 reopen → 最新版本可见
-//! - 单 meta 页损坏 → 另一页兜底恢复（双 meta 容错）
+//! crash_recovery_test.zig - P3 TDD: crash recovery
+//! COW + atomic meta switching is already crash-safe (LMDB-style, no WAL). These tests verify the recovery paths:
+//! - commit then reopen -> committed data present (dual meta, picking the newer valid page)
+//! - multiple alternating commits then reopen -> latest version visible
+//! - one meta page corrupted -> the other page recovers (dual-meta fault tolerance)
 
 const std = @import("std");
 const cube = @import("cube_db");
@@ -56,7 +56,7 @@ test "recovery: multiple alternating commits, reopen sees latest" {
         defer fps.deinit();
         var db = try Db.open(alloc, fps.store(), .{});
         defer db.close();
-        // 多次提交（触发 meta0/meta1 交替）
+        // multiple commits (triggering meta0/meta1 alternation)
         var i: u8 = 0;
         while (i < 6) : (i += 1) {
             var txn = try db.beginWriteTxn();
@@ -89,7 +89,7 @@ test "recovery: multiple alternating commits, reopen sees latest" {
 test "recovery: one meta page corrupted, other meta recovers" {
     const path = ".test_crash_corrupt.db";
     defer unlinkPath(path);
-    // 两次提交：meta0/meta1 均有效（提交1→meta0, 提交2→meta1 为最新）
+    // two commits: both meta0/meta1 valid (commit 1 -> meta0, commit 2 -> meta1 as latest)
     {
         var fps = try FilePageStore.init(alloc, path);
         defer fps.deinit();
@@ -102,7 +102,7 @@ test "recovery: one meta page corrupted, other meta recovers" {
         try t2.put("k1", "v1");
         try t2.commit();
     }
-    // 损坏 meta0（旧/非活动页），meta1 仍有效 → 恢复用 meta1
+    // corrupt meta0 (old/inactive page), meta1 still valid -> recovery uses meta1
     {
         const pathz = try toZ(alloc, path);
         defer alloc.free(pathz);
@@ -118,7 +118,7 @@ test "recovery: one meta page corrupted, other meta recovers" {
         defer fps.deinit();
         var db = try Db.open(alloc, fps.store(), .{});
         defer db.close();
-        // meta1（最新）在 → survivor 与 k1 均在
+        // meta1 (latest) is present -> both survivor and k1 are there
         const s = try db.get("survivor");
         defer if (s) |val| alloc.free(val);
         try std.testing.expectEqualStrings("yes", s.?);
@@ -135,7 +135,7 @@ fn toZ(allocator: std.mem.Allocator, path: []const u8) ![:0]u8 {
 test "durability: async mode (fsync=false) + explicit sync() persists" {
     const path = ".test_crash_async.db";
     defer unlinkPath(path);
-    // async 模式：commit 不自动 fsync
+    // async mode: commit does not fsync automatically
     {
         var fps = try FilePageStore.init(alloc, path);
         defer fps.deinit();
@@ -144,10 +144,10 @@ test "durability: async mode (fsync=false) + explicit sync() persists" {
         var txn = try db.beginWriteTxn();
         try txn.put("a1", "b1");
         try txn.commit();
-        // async：commit 未 fsync；显式 sync 后才 durable
+        // async: commit did not fsync; durable only after explicit sync
         try db.sync();
     }
-    // 重开：显式 sync 过的数据应在
+    // reopen: data explicitly synced should be present
     {
         var fps = try FilePageStore.init(alloc, path);
         defer fps.deinit();
@@ -165,12 +165,12 @@ test "durability: default (fsync=true) commit is durable on reopen" {
     {
         var fps = try FilePageStore.init(alloc, path);
         defer fps.deinit();
-        var db = try Db.open(alloc, fps.store(), .{}); // fsync 默认 true
+        var db = try Db.open(alloc, fps.store(), .{}); // fsync defaults to true
         defer db.close();
         var txn = try db.beginWriteTxn();
         try txn.put("s1", "t1");
         try txn.commit();
-        // 默认 sync on commit，无需显式 sync
+        // sync on commit by default, no explicit sync needed
     }
     {
         var fps = try FilePageStore.init(alloc, path);

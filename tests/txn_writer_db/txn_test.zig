@@ -1,7 +1,7 @@
-//! txn_test.zig — P2 TDD: 显式事务 API（LMDB 式 WriteTxn / ReadTxn）
-//! WriteTxn: beginWriteTxn → put/delete → commit(meta 切换+fsync) / abort(丢弃)
-//! 单写者互斥：同一时刻只有一个活跃 WriteTxn。
-//! ReadTxn: beginReadTxn → 取快照 → get/select → endReadTxn（MVCC 不阻写者）
+//! txn_test.zig — P2 TDD: explicit transaction API (LMDB-style WriteTxn / ReadTxn)
+//! WriteTxn: beginWriteTxn -> put/delete -> commit (meta switch + fsync) / abort (discard).
+//! Single-writer mutex: at most one active WriteTxn at any time.
+//! ReadTxn: beginReadTxn -> take a snapshot -> get/select -> endReadTxn (MVCC; readers never block writers).
 
 const std = @import("std");
 const cube = @import("cube_db");
@@ -10,7 +10,7 @@ const Db = cube.Db;
 
 const alloc = std.testing.allocator;
 
-// ms 与 db 必须同作用域（ms.store() 持有 &ms，生命周期须 ≥ db）
+// ms and db must share a scope (ms.store() holds &ms; its lifetime must be >= db's)
 
 // ===== WriteTxn =====
 
@@ -103,24 +103,24 @@ test "ReadTxn: snapshot isolation — writer commits, reader still sees old valu
         try w.commit();
     }
     var rt = try db.beginReadTxn();
-    // 写者提交新值（COW 不原地改，旧页保留供 reader）
+    // The writer commits a new value (COW never mutates in place; the old page is kept for readers)
     {
         var w = try db.beginWriteTxn();
         try w.put("k", "v2");
         try w.commit();
     }
-    // reader 仍读快照旧值
+    // The reader still reads the old snapshot value
     const v = try rt.get("k");
     defer if (v) |val| alloc.free(val);
     try std.testing.expectEqualStrings("v1", v.?);
     rt.end();
-    // 结束读后，新值可见
+    // After the read ends, the new value is visible
     const v2 = try db.get("k");
     defer if (v2) |val| alloc.free(val);
     try std.testing.expectEqualStrings("v2", v2.?);
 }
 
-// ===== 并发：多读 + 单写互斥 =====
+// ===== Concurrency: multiple readers + single-writer mutex =====
 
 const ThreadCtx = struct { db: *Db, err: ?anyerror = null };
 
@@ -170,21 +170,21 @@ test "concurrency: 2 writers + 2 readers interleave, no deadlock" {
     try std.testing.expect(w2.err == null);
     try std.testing.expect(r1.err == null);
     try std.testing.expect(r2.err == null);
-    // 2 个写者各 50 个 put → 100 entries（key w0..w49 由两个写者覆盖，同一 key）
-    // 至少 w0 应在
+    // 2 writers x 50 puts each -> 100 entries (keys w0..w49 overwritten by both writers)
+    // At least w0 should be present
     const v = try db.get("w0");
     defer if (v) |val| alloc.free(val);
     try std.testing.expect(v != null);
 }
 
-// ===== group commit：单 txn 多操作 = 一次 applyBatch + 一次 fsync =====
+// ===== group commit: many ops in one txn = one applyBatch + one fsync =====
 test "group commit: 16 puts in one txn = single commit, single fsync batch" {
     var ms = ps.MemPageStore.init(alloc, 4000);
     defer ms.deinit();
     var db = try Db.open(alloc, ms.store(), .{});
     defer db.close();
-    // group commit 语义：单 WriteTxn 中 16 次 put → 一次 commit 走一次 applyBatch + 一次 meta 切换
-    // key 用堆分配（避免 bufPrint 复用栈缓冲的别名 bug）
+    // Group-commit semantics: 16 puts in one WriteTxn -> one commit runs one applyBatch + one meta switch
+    // Keys are heap-allocated (avoids the stack-buffer aliasing bug of a reused bufPrint buffer)
     const keys = try alloc.alloc([]u8, 16);
     defer {
         for (keys) |k| alloc.free(k);
@@ -196,9 +196,9 @@ test "group commit: 16 puts in one txn = single commit, single fsync batch" {
         try txn.put(k.*, "v");
     }
     try txn.commit();
-    // 提交后 entryCount 应=16（一次提交即一致）
+    // After commit, entryCount should be 16 (one commit is atomic)
     try std.testing.expectEqual(@as(u64, 16), db.entryCount());
-    // 全部 key 可读
+    // All keys readable
     for (keys) |k| {
         const v = try db.get(k);
         defer if (v) |val| alloc.free(val);

@@ -1,5 +1,5 @@
-//! insertbatch_capaware_test.zig — TDD: insertBatch leaf-capacity-aware 彻底修复
-//! 验证大 batch（>LEAF_MAX_ENTRIES）落同一 leaf 时正确分裂，不走 fallback。
+//! insertbatch_capaware_test.zig - TDD: thorough fix for leaf-capacity-aware insertBatch
+//! Verifies that large batches (>LEAF_MAX_ENTRIES) landing in the same leaf split correctly, without taking a fallback.
 const std = @import("std");
 const cube = @import("cube_db");
 const ps = cube.page_store;

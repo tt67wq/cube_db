@@ -1,6 +1,6 @@
-//! insertbatch_overflow_test.zig — #26 回归测试
-//! insertBatch leaf 容量溢出修复的验收测试
-//! 覆盖：大批量同 leaf 范围、随机分布、逆序、重复 key
+//! insertbatch_overflow_test.zig - #26 regression tests
+//! Acceptance tests for the insertBatch leaf-capacity overflow fix
+//! Covers: large batches in one leaf range, random distribution, reverse order, duplicate keys
 const std = @import("std");
 const cube = @import("cube_db");
 const Db = cube.Db;
@@ -11,7 +11,7 @@ fn newStore(mapsize: u32) MemPageStore {
     return MemPageStore.init(testing.allocator, mapsize);
 }
 
-// 核心场景 1：大量 key 落在同一 leaf 范围（连续 key，超过 32 条/leaf 上限）
+// core scenario 1: many keys landing in the same leaf range (contiguous keys, beyond the 32-entries/leaf limit)
 test "insertbatch_overflow: 10K sequential keys (dense leaf range)" {
     var ms = newStore(50003);
     defer ms.deinit();
@@ -44,7 +44,7 @@ test "insertbatch_overflow: 10K sequential keys (dense leaf range)" {
     }
 }
 
-// 核心场景 2：随机分布 key（跨多个 leaf，但单个 batch 大）
+// core scenario 2: randomly distributed keys (spanning multiple leaves, but one big batch)
 test "insertbatch_overflow: 10K random keys in one batch" {
     var ms = newStore(50003);
     defer ms.deinit();
@@ -80,7 +80,7 @@ test "insertbatch_overflow: 10K random keys in one batch" {
     }
 }
 
-// 核心场景 3：逆序 key（key 排序与插入顺序相反）
+// core scenario 3: reverse-ordered keys (key order opposite to insertion order)
 test "insertbatch_overflow: 10K reverse-ordered keys" {
     var ms = newStore(50003);
     defer ms.deinit();
@@ -113,7 +113,7 @@ test "insertbatch_overflow: 10K reverse-ordered keys" {
     }
 }
 
-// 场景 4：同一 leaf 内重复 key（最后写入获胜）
+// scenario 4: duplicate keys within one leaf (last write wins)
 test "insertbatch_overflow: duplicate keys in batch, last wins" {
     var ms = newStore(50003);
     defer ms.deinit();
@@ -153,9 +153,9 @@ test "insertbatch_overflow: duplicate keys in batch, last wins" {
     }
 }
 
-// 场景 5：大 batch 顺序 key（10KB value，触发 overflow 页 + 分裂）
+// scenario 5: large batch of sequential keys (10KB values, triggering overflow pages + splits)
 test "insertbatch_overflow: 10K sequential keys with 10KB values" {
-    // 10KB × 10000 ≈ 100MB 数据，mapsize 需要足够大
+    // 10KB x 10000 ~ 100MB of data, mapsize must be large enough
     var ms = newStore(300000000);
     defer ms.deinit();
     var db = try Db.open(testing.allocator, ms.store(), .{});
@@ -188,9 +188,9 @@ test "insertbatch_overflow: 10K sequential keys with 10KB values" {
     }
 }
 
-// 对抗性场景（@archon 要求，guard 移除闭环条件）：
-// 10K 条全部落在密集 leaf 范围 + 混合 tombstone 随机序列，
-// 证明 multi-split 在最坏分布下依然正确。
+// Adversarial scenario (requested by @archon, closing condition for guard removal):
+// 10K entries all in a dense leaf range + a random sequence of mixed tombstones,
+// proving multi-split stays correct under the worst-case distribution.
 test "insertbatch_overflow: adversarial 10K dense range + mixed tombstones" {
     var ms = newStore(1000000);
     defer ms.deinit();
@@ -203,12 +203,12 @@ test "insertbatch_overflow: adversarial 10K dense range + mixed tombstones" {
         for (keys) |k| testing.allocator.free(k);
         testing.allocator.free(keys);
     }
-    // 密集范围：公共前缀 + 5 位后缀，全部 key 落在极窄的排序区间
+    // dense range: common prefix + 5-digit suffix, all keys in a very narrow sort interval
     for (0..n) |i| {
         keys[i] = try std.fmt.allocPrint(testing.allocator, "k{d:0>5}", .{i});
     }
 
-    // 第一批：全部 put
+    // first batch: all puts
     {
         var entries = try testing.allocator.alloc(cube.Entry, n);
         defer testing.allocator.free(entries);
@@ -219,12 +219,12 @@ test "insertbatch_overflow: adversarial 10K dense range + mixed tombstones" {
         try testing.expectEqual(@as(u64, n), db.entryCount());
     }
 
-    // 第二批：随机混合 put/delete（50% tombstone），乱序
+    // second batch: random mix of put/delete (50% tombstones), shuffled
     {
         var prng = std.Random.DefaultPrng.init(0xDEADBEEF);
         const rnd = prng.random();
 
-        // 乱序索引
+        // shuffled indices
         var idx = try testing.allocator.alloc(usize, n);
         defer testing.allocator.free(idx);
         for (0..n) |i| idx[i] = i;
@@ -244,23 +244,23 @@ test "insertbatch_overflow: adversarial 10K dense range + mixed tombstones" {
         try db.putBatch(entries);
     }
 
-    // 验证：50% 删除 → 期望 5000 存活（统计上接近，需精确计算）
-    // 更精确的做法：重新生成同样的随机序列计算期望值
-    // 用确定性验证：逐个 get 检查，统计存活数
+    // verify: 50% deletes -> ~5000 survivors expected (statistically close, needs exact accounting)
+    // more precise approach: replay the same random sequence to compute the expectation
+    // use deterministic verification: per-key get, counting survivors
     var live_count: u64 = 0;
     for (keys) |k| {
         const v = try db.get(k);
         defer if (v) |val| testing.allocator.free(val);
         if (v != null) live_count += 1;
     }
-    // 50% tombstone → 期望 ~5000；允许少量随机偏差（±5%）
+    // 50% tombstones -> ~5000 expected; allow a small random deviation (+/-5%)
     const expected: u64 = n / 2;
     try testing.expect(live_count > expected * 95 / 100);
     try testing.expect(live_count < expected * 105 / 100);
-    // entryCount 必须与逐条 get 一致
+    // entryCount must agree with per-key gets
     try testing.expectEqual(live_count, db.entryCount());
 
-    // 抽查：存活 key 的 value 应为 v2（第二批覆盖）或 v1（未被覆盖）
+    // spot-check: surviving keys' values must be v2 (overwritten by the second batch) or v1 (not overwritten)
     var checked: usize = 0;
     for (keys) |k| {
         const v = try db.get(k);

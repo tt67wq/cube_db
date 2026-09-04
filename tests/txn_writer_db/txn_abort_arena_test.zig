@@ -1,13 +1,13 @@
-//! txn_abort_arena_test.zig — #32 验收：WriteTxn abort 路径正确性
-//! @archon 要求：staging 后 abort，再读验证无脏数据
-//! 覆盖 WriteTxn arena 生命周期风险点
+//! txn_abort_arena_test.zig — #32 acceptance: WriteTxn abort-path correctness
+//! @archon's requirement: stage entries, abort, then read back and verify no dirty data.
+//! Covers WriteTxn arena lifetime risk points.
 const std = @import("std");
 const cube = @import("cube_db");
 const Db = cube.Db;
 const MemPageStore = cube.page_store.MemPageStore;
 const testing = std.testing;
 
-// 基本 abort：put 后 abort，验证数据未应用
+// Basic abort: put then abort; verify the data was not applied
 test "abort: put then abort, no data applied" {
     var ms = MemPageStore.init(testing.allocator, 100000);
     defer ms.deinit();
@@ -27,7 +27,7 @@ test "abort: put then abort, no data applied" {
     try testing.expectEqual(@as(?[]u8, null), v1);
 }
 
-// abort 后继续正常写入，验证互不影响
+// Continue writing normally after an abort; verify no interference
 test "abort: then commit another txn works" {
     var ms = MemPageStore.init(testing.allocator, 100000);
     defer ms.deinit();
@@ -54,7 +54,7 @@ test "abort: then commit another txn works" {
     try testing.expectEqual(@as(?[]u8, null), av);
 }
 
-// 大 batch put 后 abort（staging 大量数据），验证 arena 释放后无残留
+// Abort after a large batch put (lots of staged data); verify no leftovers after arena release
 test "abort: large staging then abort, clean state" {
     var ms = MemPageStore.init(testing.allocator, 100000);
     defer ms.deinit();
@@ -73,7 +73,7 @@ test "abort: large staging then abort, clean state" {
     }
 
     try testing.expectEqual(@as(u64, 0), db.entryCount());
-    // 抽查几个 key 确认无残留
+    // Spot-check several keys to confirm no leftovers
     var vkbuf: [16]u8 = undefined;
     for ([_]usize{ 0, 1, 100, 5000, 9999 }) |i| {
         const k = try std.fmt.bufPrint(&vkbuf, "k{d:0>6}", .{i});
@@ -83,15 +83,15 @@ test "abort: large staging then abort, clean state" {
     }
 }
 
-// putBatch 大量 entries 后 abort（通过 db.putBatch 的 abort 路径）
-// 注意：db.putBatch 内部 commit，不暴露 abort —— 这里用 WriteTxn 手动 abort 模拟
+// Abort after a large putBatch (via WriteTxn to simulate db.putBatch's abort path)
+// Note: db.putBatch commits internally and exposes no abort — here we abort manually via WriteTxn
 test "abort: mixed put/delete staging then abort" {
     var ms = MemPageStore.init(testing.allocator, 100000);
     defer ms.deinit();
     var db = try Db.open(testing.allocator, ms.store(), .{});
     defer db.close();
 
-    // 先 commit 一批
+    // First commit one batch
     {
         var txn = try db.beginWriteTxn();
         try txn.put("base1", "v");
@@ -100,7 +100,7 @@ test "abort: mixed put/delete staging then abort" {
     }
     const count_before = db.entryCount();
 
-    // staging 混合 put/delete 后 abort
+    // Stage a mix of puts/deletes, then abort
     {
         var txn = try db.beginWriteTxn();
         try txn.put("base1", "changed"); // update existing
@@ -109,7 +109,7 @@ test "abort: mixed put/delete staging then abort" {
         try txn.abort();
     }
 
-    // abort 后一切保持原样
+    // After the abort everything is unchanged
     try testing.expectEqual(count_before, db.entryCount());
     const v1 = try db.get("base1");
     defer if (v1) |val| testing.allocator.free(val);

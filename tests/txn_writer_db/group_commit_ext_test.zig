@@ -1,5 +1,5 @@
-//! group_commit_test_ext.zig — #15: group-commit 扩展测试
-//! 覆盖：并发写正确性、flush/close 持久化、数据一致性、边缘场景
+//! group_commit_test_ext.zig — #15: extended group-commit tests
+//! Covers: concurrent write correctness, flush/close persistence, data consistency, edge cases
 const std = @import("std");
 const cube = @import("cube_db");
 const ps = cube.page_store;
@@ -25,7 +25,7 @@ fn newStore() ps.MemPageStore {
     return ps.MemPageStore.init(alloc, 100000);
 }
 
-// ---- flush/close 持久化 ----
+// ---- flush/close persistence ----
 
 test "group_commit_ext: flush then reopen persists data" {
     const path = ".test_gc_flush_reopen.db";
@@ -83,7 +83,7 @@ test "group_commit_ext: close auto-flushes pending, persists" {
     }
 }
 
-// ---- 批处理替代 putBatch 验证 ----
+// ---- micro-batching as an alternative to putBatch ----
 
 test "group_commit_ext: micro-batch produces same result as putBatch" {
     var ms = newStore();
@@ -131,7 +131,7 @@ test "group_commit_ext: mixed put/delete in same batch" {
     try std.testing.expectEqualStrings("new", vc.?);
 }
 
-// ---- 边缘场景 ----
+// ---- edge cases ----
 
 test "group_commit_ext: flush with empty pending is no-op" {
     var ms = newStore();
@@ -209,7 +209,7 @@ test "group_commit_ext: putDirect and deleteDirect work alongside micro-batch" {
     try std.testing.expectEqualStrings("staged", v.?);
 }
 
-// ---- 大 value + micro-batch ----
+// ---- large values + micro-batch ----
 
 test "group_commit_ext: 10KB overflow value with micro-batch" {
     var ms = newStore();
@@ -229,7 +229,7 @@ test "group_commit_ext: 10KB overflow value with micro-batch" {
     try std.testing.expectEqual(@as(usize, 10000), v.?.len);
 }
 
-// ---- 随机 workload + micro-batch ----
+// ---- random workload + micro-batch ----
 
 test "group_commit_ext: random puts with micro-batch, all correct" {
     var ms = newStore();
@@ -262,7 +262,7 @@ test "group_commit_ext: random puts with micro-batch, all correct" {
     }
 }
 
-// ---- 多次 flush + reopen 迭代 ----
+// ---- repeated flush + reopen iterations ----
 
 test "group_commit_ext: 3 rounds of batch-flush-reopen" {
     const path = ".test_gc_3round.db";

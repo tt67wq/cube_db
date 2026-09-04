@@ -1,6 +1,6 @@
-//! format_test.zig — 页格式 v2 编解码测试（TDD RED）
-//! 覆盖：PageHeader roundtrip、MetaPage roundtrip + 交替恢复、CRC 校验 + 损坏回退、freelist 页编码。
-//! 先 fail（format2.zig 尚不存在），实现后全绿。
+//! format_test.zig - page format v2 encode/decode tests (TDD RED)
+//! Covers: PageHeader roundtrip, MetaPage roundtrip + alternating recovery, CRC verification + corruption fallback, freelist page encoding.
+//! Initially failing (format2.zig did not exist yet); all green after implementation.
 const std = @import("std");
 const cube = @import("cube_db");
 const f2 = cube.format;
@@ -74,7 +74,7 @@ test "format: page header zero values" {
 }
 
 test "format: page checksum covers header + payload" {
-    // 构造一个完整页（header + payload + checksum），验证 checksum 覆盖 header+payload
+    // build a full page (header + payload + checksum), verifying the checksum covers header+payload
     var page: [f2.PAGE_SIZE]u8 = undefined;
     @memset(&page, 0xaa);
     const h = f2.PageHeader{
@@ -85,15 +85,15 @@ test "format: page checksum covers header + payload" {
         .free_next = 0,
     };
     f2.encodePageHeader(&page, &h);
-    // 写 payload 区
+    // write the payload region
     @memset(page[f2.PAGE_HEADER_SIZE .. f2.PAGE_SIZE - 4], 0xbb);
-    // 计算并写入 checksum
+    // compute and write the checksum
     const cs = f2.computePageChecksum(&page);
     f2.setPageChecksum(&page, cs);
-    // 验证
+    // verify
     const verified = f2.verifyPageChecksum(&page);
     try std.testing.expect(verified);
-    // 篡改 payload 一字节 → 验证失败
+    // tamper one payload byte -> verification fails
     page[f2.PAGE_HEADER_SIZE + 10] ^= 0xff;
     try std.testing.expect(!f2.verifyPageChecksum(&page));
 }
@@ -104,8 +104,8 @@ test "format: page checksum tampered header fails" {
     const h = f2.PageHeader{ .page_no = 7, .page_type = f2.PAGE_TYPE_LEAF, .gen = 3, .nkeys = 8, .free_next = 0 };
     f2.encodePageHeader(&page, &h);
     f2.setPageChecksum(&page, f2.computePageChecksum(&page));
-    // 篡改 header 域
-    page[0] ^= 0xff; // flip page_no 第一字节
+    // tamper the header region
+    page[0] ^= 0xff; // flip the first byte of page_no
     try std.testing.expect(!f2.verifyPageChecksum(&page));
 }
 
@@ -201,14 +201,14 @@ test "format: meta alternation — take larger sequence" {
         .free_count = 10,
         .last_page = 300,
     };
-    // 编码 meta0 到 page 1，meta1 到 page 2
+    // encode meta0 to page 1, meta1 to page 2
     var page0: [f2.PAGE_SIZE]u8 = undefined;
     var page1: [f2.PAGE_SIZE]u8 = undefined;
     @memset(&page0, 0);
     @memset(&page1, 0);
     f2.writeMetaPage(&page0, &meta0, 0);
     f2.writeMetaPage(&page1, &meta1, 1);
-    // 恢复：取 sequence 大的
+    // recovery: take the larger sequence
     const got = f2.readMetaPage(&page0, &page1);
     try std.testing.expect(got != null);
     try std.testing.expectEqual(@as(u64, 200), got.?.sequence);
@@ -250,7 +250,7 @@ test "format: meta alternation — one corrupt, take other" {
     @memset(&page0, 0);
     @memset(&page1, 0);
     f2.writeMetaPage(&page0, &meta0, 0);
-    // page1 是垃圾（未写过 meta 或写一半崩溃）
+    // page1 is garbage (meta never written, or a half-written crash)
     @memset(page1[0..f2.PAGE_HEADER_SIZE], 0xff);
     f2.setPageChecksum(&page1, f2.computePageChecksum(&page1));
     const got = f2.readMetaPage(&page0, &page1);
@@ -290,13 +290,13 @@ test "format: encode/decode MetaPage from page buffer" {
     var page: [f2.PAGE_SIZE]u8 = undefined;
     @memset(&page, 0);
     f2.writeMetaPage(&page, &meta, 0);
-    // 验证页头 page_no=1(page index 0 → page_no=1 for meta0)
+    // verify the header page_no=1 (page index 0 -> page_no=1 for meta0)
     const hdr = f2.decodePageHeader(page[0..f2.PAGE_HEADER_SIZE]);
     try std.testing.expectEqual(@as(u32, 1), hdr.page_no);
     try std.testing.expectEqual(f2.PAGE_TYPE_META, hdr.page_type);
-    // 验证 checksum
+    // verify checksum
     try std.testing.expect(f2.verifyPageChecksum(&page));
-    // 解回 meta
+    // decode back to meta
     const got = f2.readMetaPageSingle(&page);
     try std.testing.expect(got != null);
     try std.testing.expectEqual(@as(u64, 777), got.?.sequence);
@@ -305,7 +305,7 @@ test "format: encode/decode MetaPage from page buffer" {
 }
 
 test "format: freelist page chain" {
-    // 模拟 freelist 页链：page 100 → page 200 → page 300 (tail)
+    // simulate a freelist page chain: page 100 -> page 200 -> page 300 (tail)
     var page100: [f2.PAGE_SIZE]u8 = undefined;
     var page200: [f2.PAGE_SIZE]u8 = undefined;
     var page300: [f2.PAGE_SIZE]u8 = undefined;
@@ -328,7 +328,7 @@ test "format: freelist page chain" {
     f2.encodePageHeader(&page300, &h300);
     f2.writeFreelistEntries(&page300, &.{60});
 
-    // 读回验证
+    // read back and verify
     const entries1 = f2.readFreelistEntries(&page100);
     try std.testing.expectEqual(@as(usize, 3), entries1.len);
     try std.testing.expectEqual(@as(u32, 10), entries1[0]);
@@ -355,10 +355,10 @@ test "format: freelist page with no entries" {
 }
 
 test "format: freelist page max entries fits in one page" {
-    // 计算一页能装多少 u32 条目（4 字节 count + 剩余放条目）
+    // compute how many u32 entries fit in one page (4-byte count + the rest for entries)
     const max_entries = (f2.PAGE_SIZE - f2.PAGE_HEADER_SIZE - 4 - 4) / 4;
     try std.testing.expectEqual(@as(usize, 1016), max_entries);
-    // 写满一页
+    // fill one page
     var page: [f2.PAGE_SIZE]u8 = undefined;
     @memset(&page, 0);
     var h = f2.PageHeader{ .page_no = 10, .page_type = f2.PAGE_TYPE_FREE, .gen = 0, .nkeys = 0, .free_next = 0 };
@@ -391,7 +391,7 @@ test "format: computePageChecksum is deterministic" {
     const cs2 = f2.computePageChecksum(&page);
     try std.testing.expectEqual(cs1, cs2);
 }
-// T-3: freelist 溢出测试接入（comptime import，test-format 会跑这些 test）
+// T-3: freelist overflow test hookup (comptime import; test-format runs these tests)
 comptime {
     _ = @import("freelist_overflow_test.zig");
 }

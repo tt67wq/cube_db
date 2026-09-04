@@ -1,6 +1,6 @@
-//! bench/crc32_bench.zig — CRC32 硬件 (ARMv8) vs 软件 (表驱动) 单页耗时对比
+//! bench/crc32_bench.zig — CRC32 hardware (ARMv8) vs software (table-driven) single-page latency comparison
 //!
-//! 运行：zig build crc32-bench -Doptimize=ReleaseFast
+//! Run: zig build crc32-bench -Doptimize=ReleaseFast
 const std = @import("std");
 const builtin = @import("builtin");
 const cube = @import("cube_db");
@@ -33,7 +33,8 @@ fn genRandPages(alloc: std.mem.Allocator, n: usize) ![]align(16) [PAGE_SIZE]u8 {
     return pages;
 }
 
-/// 自实现软件 CRC32：运行时生成表 + volatile 读取，防止 LLVM 自动矢量化
+/// Hand-rolled software CRC32: table generated at runtime + volatile reads,
+/// to keep LLVM from auto-vectorizing
 fn crc32TrueSw(init: u32, data: []const u8) u32 {
     var table: [256]u32 = undefined;
     for (&table, 0..) |*entry, i| {
@@ -108,12 +109,12 @@ pub fn main() !void {
     const pages = try genRandPages(alloc, n_pages);
     defer alloc.free(pages);
 
-    std.debug.print("=== cube_db CRC32: 硬件 (ARMv8) vs 软件 单页耗时对比 ===\n\n", .{});
-    std.debug.print("配置: {d} 页 × {d} 轮 × {d} trials · payload={d}B · 本机 {s}\n\n", .{
+    std.debug.print("=== cube_db CRC32: hardware (ARMv8) vs software, single-page latency ===\n\n", .{});
+    std.debug.print("Config: {d} pages x {d} rounds x {d} trials · payload={d}B · host {s}\n\n", .{
         n_pages, iters, trials, PAGE_PAYLOAD, @tagName(builtin.cpu.arch),
     });
 
-    // 正确性校验
+    // Correctness check
     {
         var ok = true;
         for (pages) |*p| {
@@ -123,36 +124,39 @@ pub fn main() !void {
             if (s != h) { ok = false; std.debug.print("❌ module crc32Sw != crc32Hw\n", .{}); }
             if (t != h) { ok = false; std.debug.print("❌ trueSw != crc32Hw\n", .{}); }
         }
-        std.debug.print("正确性: {s}\n\n", .{if (ok) "✅ 全部一致" else "❌ 有不一致"});
+        std.debug.print("Correctness: {s}\n\n", .{if (ok) "✅ all match" else "❌ mismatch found"});
         if (!ok) std.process.exit(1);
     }
 
-    // === 基准测试 ===
+    // === Benchmarks ===
     inline for (.{
-        .{ "crc32Sw  (模块, 表驱动)", cube.crc32_hw.crc32Sw },
-        .{ "crc32Hw  (模块, ARMv8 内联汇编)", cube.crc32_hw.crc32Hw },
-        .{ "crc32TrueSw (自实现, volatile表, 防LLVM优化)", trueSwWrapper },
+        .{ "crc32Sw  (module, table-driven)", cube.crc32_hw.crc32Sw },
+        .{ "crc32Hw  (module, ARMv8 inline asm)", cube.crc32_hw.crc32Hw },
+        .{ "crc32TrueSw (hand-rolled, volatile table, anti-LLVM)", trueSwWrapper },
     }) |spec| {
         const r = try benchModFn(spec.@"0", spec.@"1", pages, iters, trials);
-        std.debug.print("  {s:<46} {d:>8} ns/页  {d:>5.2} GB/s\n", .{ r.name, r.ns_per_page, r.gbps });
+        std.debug.print("  {s:<46} {d:>8} ns/page {d:>5.2} GB/s\n", .{ r.name, r.ns_per_page, r.gbps });
+
     }
 
     inline for (.{
-        .{ "format.computePageChecksumSw (软件)", cube.format.computePageChecksumSw },
-        .{ "format.computePageChecksum (自动硬件)", cube.format.computePageChecksum },
+        .{ "format.computePageChecksumSw (software)", cube.format.computePageChecksumSw },
+        .{ "format.computePageChecksum (auto hardware)", cube.format.computePageChecksum },
     }) |spec| {
         const r = try benchFormatFn(spec.@"0", spec.@"1", pages, iters, trials);
-        std.debug.print("  {s:<46} {d:>8} ns/页  {d:>5.2} GB/s\n", .{ r.name, r.ns_per_page, r.gbps });
+        std.debug.print("  {s:<46} {d:>8} ns/page {d:>5.2} GB/s\n", .{ r.name, r.ns_per_page, r.gbps });
+
     }
 
-    // 加速比
+    // Speedups
     const hw = try benchModFn("hw", cube.crc32_hw.crc32Hw, pages, iters, 3);
     const sw = try benchModFn("sw", trueSwWrapper, pages, iters, 3);
-    std.debug.print("\n加速比: 硬件 vs 真软件 = {d:.1}×\n", .{
+    std.debug.print("\nSpeedup: hardware vs true-software = {d:.1}x\n", .{
         @as(f64, @floatFromInt(sw.ns_per_page)) / @as(f64, @floatFromInt(hw.ns_per_page)),
     });
-    std.debug.print("\n说明:\n", .{});
-    std.debug.print("  - crc32Sw: LLVM 在 ReleaseFast 下可能自动矢量化表驱动 CRC32 为硬件指令\n", .{});
-    std.debug.print("  - crc32TrueSw: 用 volatile 表访问防止 LLVM 模式识别，反映纯软件性能\n", .{});
-    std.debug.print("  - 在非 ARM64 平台，crc32Hw fallback 到软件，与 crc32Sw 性能相同\n", .{});
+    std.debug.print("\nNotes:\n", .{});
+    std.debug.print("  - crc32Sw: LLVM under ReleaseFast may auto-vectorize table-driven CRC32 into hardware instructions\n", .{});
+    std.debug.print("  - crc32TrueSw: volatile table accesses defeat LLVM pattern recognition, reflecting pure software performance\n", .{});
+    std.debug.print("  - On non-ARM64 platforms, crc32Hw falls back to software and matches crc32Sw performance\n", .{});
+
 }

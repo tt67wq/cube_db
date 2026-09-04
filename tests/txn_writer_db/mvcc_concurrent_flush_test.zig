@@ -1,27 +1,27 @@
-//! mvcc_concurrent_flush_test.zig — T-16: MVCC 并发 flush 压测（#10）
+//! mvcc_concurrent_flush_test.zig — T-16: MVCC concurrent flush stress test (#10)
 //!
-//! src/writer.zig:169 State.endRead 末位读者（prev==1）走 flushPendingFree()，
-//! 取 pending_free_mu，与 applyBatch 的 grace-period flush 互斥。这是 MVCC
-//! 回收的核心竞态点（曾因 ArrayList 并发 mutate SEGV，commit 7f4805c 修复）。
+//! src/writer.zig:169 State.endRead: the last reader (prev==1) runs flushPendingFree(),
+//! taking pending_free_mu, mutually exclusive with applyBatch's grace-period flush. This is the
+//! core race point of MVCC reclamation (once an ArrayList concurrent-mutate SEGV, fixed in commit 7f4805c).
 //!
-//! 现有 mvcc_test.zig 全是单线程顺序调用，从未在真实多线程并发下验证末位读者
-//! 与写者的 flush 互斥。本文件：1 写者 + N 读者并发 2-3 秒，断言无 panic +
-//! pendingFreeCount 最终归 0 + dirt 最终归 0 + 无泄漏。
+//! The existing mvcc_test.zig is entirely single-threaded and sequential; the last-reader vs writer
+//! flush mutual exclusion has never been exercised under real multithreading. This file: 1 writer + N readers
+//! concurrently for 2-3 seconds, asserting no panic + pendingFreeCount eventually 0 + dirt eventually 0 + no leaks.
 //!
-//! 设计：
-//! - 写者线程：循环覆写固定 100 个 key（k0..k99），每次 applyBatch 1 entry →
-//!   COW 产生新 leaf，旧 leaf 进 pending_free。key 固定集保证页池不无限增长
-//!   （pending_free 被 flush 后页号回 freelist LIFO 复用，不溢 max_pages）。
-//! - 读者线程：循环 beginRead → 短暂 sleep → endRead，末位读者触发 flushPendingFree，
-//!   与写者 applyBatch 的 grace-period flush 经 pending_free_mu 串行。
-//! - 停止：原子 stop_flag + 时限（~2.5s）。
+//! Design:
+//! - Writer thread: loop overwriting a fixed set of 100 keys (k0..k99), one applyBatch of 1 entry per
+//!   iteration -> COW produces a new leaf, the old leaf enters pending_free. The fixed key set guarantees
+//!   the page pool never grows without bound (flushed pending_free pages return to the freelist LIFO for reuse, never exceeding max_pages).
+//! - Reader threads: loop beginRead -> brief sleep -> endRead; the last reader triggers flushPendingFree,
+//!   serialized with the writer's grace-period flush via pending_free_mu.
+//! - Stop: atomic stop_flag + time limit (~2.5s).
 //!
-//! allocator 安全性：仅写者线程经 arena（ArenaAllocator.init(state.allocator)）
-//! 触碰 state.allocator，单线程内；读者线程的 endRead→flushPendingFree→store.freePage
-//! 只动 MemPageStore.freelist（其 allocator 独立、且 MemPageStore.freelist_mu 保护），
-//! 不触碰 state.allocator。故 std.testing.allocator 可安全检测泄漏。
+//! Allocator safety: only the writer thread touches state.allocator via the arena
+//! (ArenaAllocator.init(state.allocator)) — single-threaded; reader threads' endRead->flushPendingFree->store.freePage
+//! only mutates MemPageStore.freelist (whose allocator is separate and protected by MemPageStore.freelist_mu),
+//! never touching state.allocator. So std.testing.allocator can safely detect leaks.
 //!
-//! 接入：build.zig 注册到 test-db step。
+//! Wiring: registered in build.zig under the test-db step.
 
 const std = @import("std");
 const zio = @import("zio");
@@ -32,14 +32,14 @@ const wrt = cube.writer;
 
 const alloc = std.testing.allocator;
 
-/// 单调纳秒（MONOTONIC clock），用于时限停止
+/// Monotonic nanoseconds (MONOTONIC clock), used for the time-limit stop
 fn monoNs() i64 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &ts);
     return @as(i64, @intCast(ts.sec)) * 1_000_000_000 + @as(i64, @intCast(ts.nsec));
 }
 
-/// 睡眠 ns 纳秒（std.Thread.sleep 在 0.16 已移至 Io，直接用 libc nanosleep）
+/// Sleep ns nanoseconds (std.Thread.sleep moved to Io in 0.16; use libc nanosleep directly)
 fn sleepNs(ns: u64) void {
     var req: std.c.timespec = .{ .sec = @intCast(ns / 1_000_000_000), .nsec = @intCast(ns % 1_000_000_000) };
     _ = std.c.nanosleep(&req, null);
@@ -49,7 +49,7 @@ const WriterCtx = struct {
     state: *wrt.State,
     stop: *std.atomic.Value(bool),
     err: ?anyerror = null,
-    /// 写入次数（用于断言写者确实跑了）
+    /// Number of writes (used to assert the writer actually ran)
     writes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
 
@@ -61,8 +61,8 @@ const ReaderCtx = struct {
 };
 
 fn writerThread(ctx: *WriterCtx) void {
-    // 覆写固定 100 key 集（k0..k99），每次 applyBatch 1 entry。
-    // 固定 key 集 → COW 旧页进 pending_free，flush 后回 freelist 复用，不溢 max_pages。
+    // Overwrite the fixed 100-key set (k0..k99), one applyBatch of 1 entry each time.
+    // Fixed key set -> COW'd old pages enter pending_free, return to the freelist after flush for reuse; never exceeds max_pages.
     var i: u64 = 0;
     while (!ctx.stop.load(.acquire)) : (i += 1) {
         var kbuf: [16]u8 = undefined;
@@ -81,7 +81,7 @@ fn writerThread(ctx: *WriterCtx) void {
             ctx.err = err;
             return;
         };
-        // 等待 future 完成（applyBatch 内部已 set future，wait 取结果）
+        // Wait for the future (applyBatch already set it internally; wait takes the result)
         _ = fut.wait() catch |err| {
             ctx.err = err;
             return;
@@ -94,13 +94,13 @@ fn readerThread(ctx: *ReaderCtx) void {
     while (!ctx.stop.load(.acquire)) {
         const seq = ctx.state.beginRead();
         _ = seq;
-        // 短暂持有读事务，扩大末位读者 flush 竞态窗口
+        // Hold the read txn briefly to widen the last-reader flush race window
         std.Thread.yield() catch {};
-        // 偶尔 sleep 一点，让多个读者交错
+        // Occasionally sleep a bit so multiple readers interleave
         if (ctx.reads.load(.monotonic) % 7 == 0) {
             sleepNs(1_000_000); // 1ms
         }
-        ctx.state.endRead(); // 末位读者触发 flushPendingFree
+        ctx.state.endRead(); // the last reader triggers flushPendingFree
         _ = ctx.reads.fetchAdd(1, .monotonic);
     }
 }
@@ -113,7 +113,7 @@ test "mvcc_concurrent_flush: 1 writer + 3 readers, no panic, pending/dirt zero" 
     var state = wrt.State.init(alloc, s, .{ .fsync = false });
     defer state.deinit();
 
-    // 预热：先写入 100 key 建立初始树（确保后续覆写产生 COW 脏页）
+    // Warm-up: write the 100 keys first to build the initial tree (so later overwrites produce COW dirty pages)
     var i: u32 = 0;
     while (i < 100) : (i += 1) {
         var kbuf: [16]u8 = undefined;
@@ -124,7 +124,7 @@ test "mvcc_concurrent_flush: 1 writer + 3 readers, no panic, pending/dirt zero" 
         _ = try fut.wait();
     }
 
-    // 压测 2.5 秒
+    // Stress for 2.5 seconds
     const duration_ns: i64 = 2_500_000_000;
     var stop = std.atomic.Value(bool).init(false);
 
@@ -140,9 +140,9 @@ test "mvcc_concurrent_flush: 1 writer + 3 readers, no panic, pending/dirt zero" 
     const tr1 = try std.Thread.spawn(.{}, readerThread, .{&rctx1});
     const tr2 = try std.Thread.spawn(.{}, readerThread, .{&rctx2});
 
-    // 主线程等待时限
+    // Main thread waits for the time limit
     while (monoNs() - t_start < duration_ns) {
-        sleepNs(10_000_000); // 10ms 轮询
+        sleepNs(10_000_000); // 10ms polling
     }
     stop.store(true, .release);
 
@@ -153,43 +153,43 @@ test "mvcc_concurrent_flush: 1 writer + 3 readers, no panic, pending/dirt zero" 
 
     const elapsed_ns = monoNs() - t_start;
 
-    // 1. 无 panic / 无 segfault（线程正常 join 即未 crash；此处额外检查线程内未记录 error）
+    // 1. No panic / no segfault (threads joining normally means no crash; additionally check no thread recorded an error)
     try std.testing.expect(wctx.err == null);
     try std.testing.expect(rctx0.err == null);
     try std.testing.expect(rctx1.err == null);
     try std.testing.expect(rctx2.err == null);
 
-    // 2. 运行时间 > 1 秒（证明是压测不是 smoke）
+    // 2. Runtime > 1 second (proves this is a stress test, not a smoke test)
     try std.testing.expect(elapsed_ns > 1_000_000_000);
 
-    // 3. 写者确实跑了多次 + 读者确实跑了多次
+    // 3. The writer actually ran many iterations + readers actually ran many iterations
     try std.testing.expect(wctx.writes.load(.monotonic) > 100);
     const total_reads = rctx0.reads.load(.monotonic) + rctx1.reads.load(.monotonic) + rctx2.reads.load(.monotonic);
     try std.testing.expect(total_reads > 100);
 
-    // 4. 所有读者已退出 → reader_count == 0。做最后一次 applyBatch 触发
-    //    grace-period flush（reader_count==0 分支），确保 pending_free 清空。
+    // 4. All readers have exited -> reader_count == 0. Do one final applyBatch to trigger the
+    //    grace-period flush (reader_count==0 branch), ensuring pending_free is emptied.
     try std.testing.expectEqual(@as(u32, 0), state.reader_count.load(.acquire));
     var fut_final: zio.Future(wrt.OpResult) = .{};
     const final_reqs = [_]wrt.Request{.{ .key = "k_final", .value = "done", .tombstone = false, .future = &fut_final }};
     try state.applyBatch(&final_reqs);
     _ = try fut_final.wait();
 
-    // 5. 断言 pendingFreeCount 最终归 0（所有脏页被回收）
+    // 5. Assert pendingFreeCount eventually reaches 0 (all dirty pages reclaimed)
     try std.testing.expectEqual(@as(usize, 0), state.pendingFreeCount());
 
-    // 6. 断言 dirt 最终归 0
+    // 6. Assert dirt eventually reaches 0
     try std.testing.expectEqual(@as(u64, 0), state.dirt.load(.acquire));
 
-    // 7. 数据正确性抽查：k000 应可读（最后一次覆写它的值在并发中产生）
-    //    旧根快照已被回收，但当前 root 的 k000 可读
+    // 7. Data correctness spot check: k000 must be readable (its last overwrite happened during the race)
+    //    Old root snapshots have been reclaimed, but the current root's k000 is readable
     const root = state.getRoot();
     try std.testing.expect(root != btree.NULL_ROOT);
     const v = try btree.get(alloc, s, root, "k000");
     try std.testing.expect(v != null);
     alloc.free(v.?);
 
-    // std.testing.allocator 在 test 结束时检测泄漏：若有泄漏说明 pending_free
-    // 在并发下丢失页号（未 freePage）或 arena 未释放。state.deinit() 释放剩余
-    // pending_free + arena 在 applyBatch 内 defer deinit。预期无泄漏。
+    // std.testing.allocator detects leaks when the test ends: a leak would mean pending_free
+    // lost page numbers under concurrency (a missing freePage) or the arena was not released.
+    // state.deinit() frees the remaining pending_free; the arena is deinit'd via defer inside applyBatch. No leaks expected.
 }

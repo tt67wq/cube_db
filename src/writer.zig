@@ -1,4 +1,4 @@
-//! writer.zig — v2 batch 应用：COW B-tree (btree)、freelist 回收（MVCC 安全）、meta 交替提交
+//! writer.zig — v2 batch apply: COW B-tree (btree), freelist reclamation (MVCC-safe), alternating meta commit
 const std = @import("std");
 const zio = @import("zio");
 const f2 = @import("format.zig");
@@ -7,39 +7,50 @@ const btree = @import("btree.zig");
 
 const PageStore = ps.PageStore;
 
-// ---- T-30: per-reader 序列注册 + oldest-reader watermark 精确回收 ----
+// ---- T-30: per-reader sequence registration + oldest-reader watermark precise reclamation ----
 
-/// pending_free 条目：页号 + 释放该页的提交序列（该次提交的 new_sequence）。
-/// 回收判定：release_seq < oldest-active-reader watermark 时可安全回收
-/// （所有活跃读者快照都 ≥ watermark > release_seq，无人可能仍引用该页）；
-/// 等于或大于则必须保留（老快照仍有效——正确性底线，含边界保守）。
+/// pending_free entry: page number + the sequence of the commit that freed it
+/// (that commit's new_sequence).
+/// Reclamation rule: safe to reclaim when release_seq < the oldest-active-reader
+/// watermark (every active reader snapshot is >= watermark > release_seq, so
+/// nobody can still reference the page); equal or greater must be kept (old
+/// snapshots remain valid — the correctness floor, conservatively including
+/// the boundary).
 pub const PendingPage = struct {
     page_no: u32,
     release_seq: u64,
 };
 
-/// 每读者快照注册槽数。超出（并发读者 > 64 或 TLS 嵌套溢出）时保守降级为
-/// watermark=0（钉住一切 = 旧全局计数行为），安全不精确。
+/// Per-reader snapshot registration slots. When exceeded (concurrent readers
+/// > 64, or TLS nesting overflow), degrade conservatively to watermark=0
+/// (pin everything = the old global-count behavior) — safe but imprecise.
 const READER_SLOTS = 64;
-/// 单线程嵌套 beginRead 深度上限（ReadTxn + select 嵌套等；实际 ≤ 3）。
+/// Max beginRead nesting depth per thread (ReadTxn + select nesting etc.;
+/// realistically <= 3).
 const MAX_TLS_READERS = 16;
-/// 槽位值编码：0 = 空闲；非 0 = snapshot | CLAIM_BIT（快照序列占用最高位以下）。
+/// Slot value encoding: 0 = free; non-zero = snapshot | CLAIM_BIT (the
+/// snapshot sequence occupies everything below the top bit).
 const CLAIM_BIT: u64 = 1 << 63;
 
-/// 线程本地注册栈：beginRead/endRead 在同线程按 LIFO 配对（现有全部调用方
-/// ——ReadTxn/Iterator pin/测试——均同线程 begin/end，契约不变）。
-/// endRead() 无参数（db.zig 不可改），配对身份 = (State 指针, LIFO)。
+/// Thread-local registration stack: beginRead/endRead pair up LIFO within a
+/// thread (all current callers — ReadTxn/Iterator pin/tests — begin and end
+/// on the same thread; that contract is unchanged).
+/// endRead() takes no argument (db.zig must not change), so pairing identity
+/// = (State pointer, LIFO).
 const TlsEntry = struct {
     state: *const anyopaque,
-    slot: u32, // READER_SLOTS = overflow 注册（非槽位）
+    slot: u32, // READER_SLOTS = overflow registration (not a slot)
 };
 threadlocal var tls_readers: [MAX_TLS_READERS]TlsEntry = undefined;
 threadlocal var tls_readers_len: usize = 0;
 
-/// 占位一个读者快照槽（beginRead 在读 sequence 之前调用，B1 不变式）。
-/// 占位值 = 哨兵快照 0（CLAIM_BIT）：发布真实快照前，watermark 看到 0
-/// → 钉住一切——占位与发布之间的窗口内不放过任何页。返回槽位下标；
-/// 槽位耗尽或 TLS 栈满 → READER_SLOTS（溢出注册，watermark 同样视为 0）。
+/// Claim a reader snapshot slot (called by beginRead before reading
+/// sequence — the B1 invariant).
+/// The claimed value = sentinel snapshot 0 (CLAIM_BIT): until the real
+/// snapshot is published, watermark sees 0 -> pin everything — no page is
+/// released within the claim-to-publish window. Returns the slot index;
+/// slots exhausted or TLS stack full -> READER_SLOTS (overflow registration,
+/// which watermark likewise treats as 0).
 fn claimReaderSlot(self: *State) u32 {
     if (tls_readers_len < MAX_TLS_READERS) {
         var i: usize = 0;
@@ -48,8 +59,9 @@ fn claimReaderSlot(self: *State) u32 {
                 i += 1;
                 continue;
             }
-            // m2：cmpxchgWeak 允许 spurious 失败——失败后重试同一槽位
-            // （重新 load 判忙），不跳过仍空闲的槽位。
+            // m2: cmpxchgWeak may fail spuriously — retry the same slot on
+            // failure (reload to re-check busyness) instead of skipping a
+            // still-free slot.
             if (self.reader_slots[i].cmpxchgWeak(0, CLAIM_BIT, .acq_rel, .acquire) == null) {
                 tls_readers[tls_readers_len] = .{ .state = @ptrCast(self), .slot = @intCast(i) };
                 tls_readers_len += 1;
@@ -57,10 +69,13 @@ fn claimReaderSlot(self: *State) u32 {
             }
         }
     }
-    // 槽位耗尽（或 TLS 栈满）：溢出注册。M1：acq_rel RMW——与 readerWatermark
-    // 的 acquire 读配对，注册被水位看到即有 happens-before 边；水位在有读者
-    // 但无可见槽位时本就保守返回 0（钉住一切），溢出读者因此始终被覆盖。
-    // 栈满时不入栈——对应 endRead 在栈满且栈顶不匹配时饱和退减溢出计数。
+    // Slots exhausted (or TLS stack full): overflow registration. M1:
+    // acq_rel RMW — paired with readerWatermark's acquire read, so once the
+    // watermark sees the registration there is a happens-before edge; when
+    // there are readers but no visible slots, the watermark already returns
+    // 0 conservatively (pin everything), so overflow readers are always
+    // covered. When the stack is full, nothing is pushed — matching endRead's
+    // saturating decrement when the stack is full and the top doesn't match.
     _ = self.overflow_readers.fetchAdd(1, .acq_rel);
     if (tls_readers_len < MAX_TLS_READERS) {
         tls_readers[tls_readers_len] = .{ .state = @ptrCast(self), .slot = READER_SLOTS };
@@ -69,17 +84,20 @@ fn claimReaderSlot(self: *State) u32 {
     return READER_SLOTS;
 }
 
-/// 饱和退减溢出读者计数（m1：不回绕）。欠配对的退减只使计数偏高 →
-/// watermark=0 钉住一切，安全方向；u32 回绕则永久钉住一切，必须避免。
+/// Saturating decrement of the overflow reader count (m1: no wraparound).
+/// An under-paired decrement only inflates the count -> watermark=0 pins
+/// everything, the safe direction; a u32 wraparound would pin everything
+/// permanently and must be avoided.
 fn saturatingOverflowDec(self: *State) void {
     while (true) {
         const cur = self.overflow_readers.load(.acquire);
-        if (cur == 0) return; // 欠配对退减：保守不退（计数偏高 = 多钉，安全）
+        if (cur == 0) return; // under-paired decrement: conservatively don't (inflated count = over-pinning, safe)
         if (self.overflow_readers.cmpxchgWeak(cur, cur - 1, .acq_rel, .acquire) == null) return;
     }
 }
 
-/// 弹出 TLS 栈顶条目并注销其注册（槽位归 0 / 饱和退减溢出计数）。
+/// Pop the TLS stack top and unregister it (slot back to 0 / saturating
+/// decrement of the overflow count).
 fn popTopTlsEntry(self: *State) void {
     const entry = tls_readers[tls_readers_len - 1];
     tls_readers_len -= 1;
@@ -90,19 +108,28 @@ fn popTopTlsEntry(self: *State) void {
     }
 }
 
-/// 注销读者注册（endRead 调用）。配对：栈未满时找本 State 最近一次注册
-/// （同 State 内 LIFO；跨 State 乱序嵌套按 State 指针精确匹配）。
-/// 找不到（跨线程 end / 误用）或栈满且栈顶不匹配 → 饱和退减溢出计数
-/// （m1：不回绕；计数偏高 = watermark 0 = 钉住一切，失败方向永远是安全侧）。
-/// ponytail: >MAX_TLS_READERS(16) 深的同线程嵌套下，未入栈的溢出注册
-/// 无法精确配对（栈满且栈顶匹配时弹栈可能误弹更早的自有注册）——本
-/// 代码库实际嵌套 ≤3（ReadTxn+select），16 深不可达；需支持时升级为
-/// 显式 reader handle API（需改 db.zig 接口）。
+/// Unregister a reader registration (called by endRead). Pairing: with a
+/// non-full stack, find this State's most recent registration (LIFO within
+/// the same State; cross-State out-of-order nesting matches exactly by State
+/// pointer).
+/// Not found (cross-thread end / misuse), or stack full with a non-matching
+/// top -> saturating decrement of the overflow count (m1: no wraparound; an
+/// inflated count = watermark 0 = pin everything — the failure direction is
+/// always the safe side).
+/// ponytail: beyond MAX_TLS_READERS(16)-deep same-thread nesting, unpushed
+/// overflow registrations cannot be paired precisely (when the stack is full
+/// and the top matches, popping could pop an earlier own registration) —
+/// real nesting in this codebase is <=3 (ReadTxn+select), 16 deep is
+/// unreachable; to support it, upgrade to an explicit reader handle API
+/// (requires changing the db.zig interface).
 fn unregisterReaderSlot(self: *State) void {
     if (tls_readers_len == MAX_TLS_READERS) {
-        // m1：栈满时若栈顶属于本 State，弹栈精确注销（解除粘滞：否则栈满
-        // 后每次 endRead 都走保守分支且永不弹栈，溢出计数被错误退减回绕）；
-        // 栈顶不匹配 → 本 end 配对未入栈的溢出注册，饱和退减。
+        // m1: when the stack is full and the top belongs to this State, pop
+        // for an exact unregister (removes the stickiness: otherwise every
+        // endRead after the stack fills takes the conservative branch and
+        // never pops, and the overflow count gets wrongly decremented into
+        // wraparound); non-matching top -> this end pairs with an unpushed
+        // overflow registration, decrement saturatingly.
         if (tls_readers[tls_readers_len - 1].state == @as(*const anyopaque, @ptrCast(self))) {
             popTopTlsEntry(self);
             return;
@@ -115,8 +142,10 @@ fn unregisterReaderSlot(self: *State) void {
         i -= 1;
         if (tls_readers[i].state == @as(*const anyopaque, @ptrCast(self))) {
             const entry = tls_readers[i];
-            // swap-remove：移除的是本 State 最新注册，同 State 其余条目
-            // 相对 LIFO 顺序不变（中间只可能夹其他 State 的条目）。
+            // swap-remove: what is removed is this State's latest
+            // registration; the relative LIFO order of this State's remaining
+            // entries is preserved (only other States' entries can sit
+            // in between).
             tls_readers[i] = tls_readers[tls_readers_len - 1];
             tls_readers_len -= 1;
             if (entry.slot < READER_SLOTS) {
@@ -127,16 +156,19 @@ fn unregisterReaderSlot(self: *State) void {
             return;
         }
     }
-    // 本线程无此 State 的注册记录（跨线程 end / 误用）→ 饱和退减溢出计数
+    // No registration record for this State on this thread (cross-thread
+    // end / misuse) -> saturating decrement of the overflow count
     saturatingOverflowDec(self);
 }
 
-/// 分段耗时剖析（#35）：编译期开启，不进生产热路径。
-/// 用法：profile tool 设置 enable=true，applyBatch 各段累加耗时。
+/// Phase-by-phase timing profile (#35): enabled at compile time, off the
+/// production hot path.
+/// Usage: profile tool sets enable=true; applyBatch accumulates per-phase
+/// timings.
 pub const ProfileStats = struct {
     pub var enable: bool = false;
 
-    // 各段耗时（ns）与调用次数
+    // Per-phase timings (ns) and call counts
     pub var txn_dupe_ns: u64 = 0;
     pub var txn_sort_ns: u64 = 0;
     pub var txn_order_ns: u64 = 0;
@@ -148,7 +180,7 @@ pub const ProfileStats = struct {
     pub var txn_total_ns: u64 = 0;
     pub var txn_count: u64 = 0;
     pub var txn_entries: u64 = 0;
-    // db 层（staging/futures）
+    // db layer (staging/futures)
     pub var db_staging_ns: u64 = 0;
     pub var db_reqs_ns: u64 = 0;
     pub var db_futures_wait_ns: u64 = 0;
@@ -178,12 +210,12 @@ pub const ProfileStats = struct {
 
     pub fn print() void {
         if (txn_count == 0) return;
-        std.debug.print("\n=== applyBatch 分段耗时 (page_allocator) ===\n", .{});
-        std.debug.print("  总批次数: {d}, 总条目数: {d}\n", .{ txn_count, txn_entries });
+        std.debug.print("\n=== applyBatch phase timings (page_allocator) ===\n", .{});
+        std.debug.print("  total batches: {d}, total entries: {d}\n", .{ txn_count, txn_entries });
         const avg = @divFloor(txn_total_ns, txn_count);
-        std.debug.print("  平均每批: {d} ns ({d:.2} ms)\n", .{ avg, @as(f64, @floatFromInt(avg)) / 1_000_000.0 });
+        std.debug.print("  avg per batch: {d} ns ({d:.2} ms)\n", .{ avg, @as(f64, @floatFromInt(avg)) / 1_000_000.0 });
         const per_entry = @divFloor(txn_total_ns, @max(txn_entries, 1));
-        std.debug.print("  每 entry:  {d} ns ({d:.3} us)\n", .{ per_entry, @as(f64, @floatFromInt(per_entry)) / 1000.0 });
+        std.debug.print("  per entry:  {d} ns ({d:.3} us)\n", .{ per_entry, @as(f64, @floatFromInt(per_entry)) / 1000.0 });
         inline for (.{
             .{ "dupe        ", txn_dupe_ns },
             .{ "order_detect", txn_order_ns },
@@ -198,7 +230,7 @@ pub const ProfileStats = struct {
             const p_entry = @divFloor(row[1], @max(txn_entries, 1));
             std.debug.print("  {s}: {d:>12} ns ({d:.1}%)  {d} ns/entry\n", .{ row[0], row[1], pct, p_entry });
         }
-        std.debug.print("  --- db 层 ---\n", .{});
+        std.debug.print("  --- db layer ---\n", .{});
         inline for (.{
             .{ "staging     ", db_staging_ns },
             .{ "reqs+futures", db_reqs_ns },
@@ -210,14 +242,18 @@ pub const ProfileStats = struct {
     }
 };
 
-/// 持久化档位（T-27）：
-/// - `process_crash`（默认）：提交协议 = writeMeta + 单次 sync。进程崩溃
-///   （页缓存完好）模型下已安全且快——bench 主战场的默认行为。
-/// - `power_fail`：提交协议 = syncDataPages（数据页先落盘）→ writeMeta →
-///   sync（meta 落盘），两次 sync 换掉电正确性：meta 页到达稳定存储的
-///   时刻，其指向的数据页必已先于（或至迟同时）落盘。单条 put 延迟约
-///   翻倍，batch 摊销后可接受。此档下提交即双 sync（fsync=false 仅对
-///   process_crash 档有意义——用户自行 Db.sync() 的异步模式）。
+/// Durability levels (T-27):
+/// - `process_crash` (default): commit protocol = writeMeta + one sync.
+///   Safe and fast under the process-crash (page cache intact) model — the
+///   default for the bench battleground.
+/// - `power_fail`: commit protocol = syncDataPages (data pages to disk
+///   first) -> writeMeta -> sync (meta to disk). Two syncs buy power-loss
+///   correctness: at the moment the meta page reaches stable storage, the
+///   data pages it points to have already landed (or land at the same time
+///   at the latest). Single-put latency roughly doubles; amortized over a
+///   batch it is acceptable. In this level every commit is a double sync
+///   (fsync=false only makes sense for process_crash — the async mode where
+///   the user calls Db.sync() manually).
 pub const Durability = enum { process_crash, power_fail };
 
 pub const Options = struct {
@@ -255,19 +291,25 @@ pub const State = struct {
 
     meta_index: u32,
 
-    /// 活跃 reader 计数（0 = 无读者，可安全回收脏页；快路径判据）
+    /// Active reader count (0 = no readers, dirty pages can be reclaimed
+    /// safely; the fast-path predicate)
     reader_count: std.atomic.Value(u32),
 
-    /// T-30 per-reader 快照注册槽：0 = 空闲；非 0 = snapshot|CLAIM_BIT。
-    /// watermark = 活跃槽位快照最小值，驱动 pending_free 增量精确回收。
+    /// T-30 per-reader snapshot registration slots: 0 = free; non-zero =
+    /// snapshot|CLAIM_BIT. watermark = the minimum snapshot across active
+    /// slots, driving incremental precise reclamation of pending_free.
     reader_slots: [READER_SLOTS]std.atomic.Value(u64),
-    /// 超出槽位/无法注册的读者数（>0 → watermark 视为 0，保守钉住一切 = 旧行为）
+    /// Readers beyond the slots / unregistrable (>0 -> watermark treated as
+    /// 0, conservatively pinning everything = the old behavior)
     overflow_readers: std.atomic.Value(u32),
 
-    /// 待回收的脏页（携带释放序列，reader 活跃时按 watermark 增量回收）
+    /// Dirty pages pending reclamation (carrying the release sequence;
+    /// reclaimed incrementally by watermark while readers are active)
     pending_free: std.ArrayList(PendingPage),
-    /// pending_free 互斥锁：串行化写者 append 与读者/compact 的增量回收
-    /// （修复 ArrayList 并发 mutate 的 UB）。读者仅在有积压（dirt>0）时才取此锁。
+    /// pending_free mutex: serializes writer appends against reader/compact
+    /// incremental reclamation (fixes the UB of concurrent ArrayList
+    /// mutation). Readers take this lock only when there is a backlog
+    /// (dirt>0).
     pending_free_mu: zio.Mutex,
 
     pub fn init(allocator: std.mem.Allocator, store: PageStore, opts: Options) State {
@@ -292,22 +334,27 @@ pub const State = struct {
 
     pub fn deinit(self: *State) void {
         self.closed.store(true, .release);
-        // 释放剩余的 pending_free（safe: 写者线程结束，无读者）
+        // Free the remaining pending_free (safe: writer thread done, no readers)
         for (self.pending_free.items) |pp| self.store.freePage(pp.page_no);
         self.pending_free.deinit(self.allocator);
     }
 
-    // ---- MVCC 读者 API ----
+    // ---- MVCC reader API ----
 
-    /// 开始读事务。返回当前的 sequence（用于读一致性快照）。
-    /// T-30 + B1 不变式：占位（哨兵快照 0）→ 读 sequence → 发布真实快照。
-    /// 占位与发布之间的窗口内，watermark 见快照 0 → 钉住一切；发布（release
-    /// store）后任何水位计算要么见哨兵要么见真实快照，恒 ≤ 本读者快照——
-    /// 活跃快照不可能引用已回收页。读者注册先于返回，调用方随后捕获 root
-    /// 快照，无论 root 新旧，其 COW 旧页均滞留 pending_free 到 watermark 放行。
+    /// Begin a read txn. Returns the current sequence (for a consistent
+    /// read snapshot).
+    /// T-30 + B1 invariant: claim (sentinel snapshot 0) -> read sequence ->
+    /// publish the real snapshot. Within the claim-to-publish window,
+    /// watermark sees snapshot 0 -> pin everything; after the publish
+    /// (release store), any watermark computation sees either the sentinel
+    /// or the real snapshot, always <= this reader's snapshot — an active
+    /// snapshot can never reference a reclaimed page. Registration happens
+    /// before returning; the caller then captures the root snapshot, and
+    /// whichever root it sees, its COW old pages stay in pending_free until
+    /// the watermark releases them.
     pub fn beginRead(self: *State) u64 {
         _ = self.reader_count.fetchAdd(1, .acquire);
-        const slot = claimReaderSlot(self); // 先占位（哨兵 0），再读 sequence
+        const slot = claimReaderSlot(self); // claim first (sentinel 0), then read sequence
         const seq = self.sequence.load(.acquire);
         if (slot < READER_SLOTS) {
             self.reader_slots[slot].store(seq | CLAIM_BIT, .release);
@@ -315,11 +362,14 @@ pub const State = struct {
         return seq;
     }
 
-    /// 结束读事务。T-30：注销该读者的快照注册，并立即按 oldest-reader
-    /// watermark 增量回收可安全回收的 pending 页——短命读者退出即释放
-    /// 其钉住的页，不必等末位读者；末位读者退出（reader_count 归 0）
-    /// 仍全量回收（既有快路径语义保留）。无积压（dirt==0）时仅两次 atomic，
-    /// 不取锁——读者热路径不退化为锁。
+    /// End a read txn. T-30: unregisters this reader's snapshot and
+    /// immediately reclaims the now-safe pending pages by oldest-reader
+    /// watermark — a short-lived reader's exit releases its pinned pages
+    /// without waiting for the last reader; the last reader's exit
+    /// (reader_count reaching 0) still reclaims everything (the existing
+    /// fast-path semantics preserved). With no backlog (dirt==0) this is
+    /// just two atomics and no lock — the reader hot path never degrades
+    /// into a lock.
     pub fn endRead(self: *State) void {
         _ = self.reader_count.fetchSub(1, .release);
         unregisterReaderSlot(self);
@@ -328,23 +378,25 @@ pub const State = struct {
         }
     }
 
-    /// 返回当前等待释放的脏页数
+    /// Returns the number of dirty pages currently awaiting release
     pub fn pendingFreeCount(self: *State) usize {
         return self.pending_free.items.len;
     }
 
-    /// 返回当前 root（测试用）
+    /// Returns the current root (for tests)
     pub fn getRoot(self: *State) u32 {
         return self.root.load(.acquire);
     }
 
-    /// compact：回收当前可安全回收的 pending 页（无读者全量；有读者按
-    /// watermark 增量），写 meta。T-30：不再"只清计数"——dirt 始终反映
-    /// 仍被钉住（不可回收）的真实页数。
+    /// compact: reclaim the currently safe pending pages (all of them with
+    /// no readers; incrementally by watermark with readers), then write
+    /// meta. T-30: no more "clear the counter only" — dirt always reflects
+    /// the true count of still-pinned (unreclaimable) pages.
     pub fn compact(self: *State) !void {
-        // 回收（内部按 reader_count/watermark 分派，dirt 设为剩余钉住数）
+        // Reclaim (dispatched internally by reader_count/watermark; dirt set
+        // to the remaining pinned count)
         self.reclaimPendingFree();
-        // 写新 meta
+        // Write the new meta
         const cur_root = self.root.load(.acquire);
         const cur_sequence = self.sequence.load(.acquire);
         const cur_entry_count = self.entry_count.load(.acquire);
@@ -366,19 +418,22 @@ pub const State = struct {
             try self.store.sync();
         }
         self.sequence.store(cur_sequence + 1, .release);
-        // T-30：dirt 不再清零——reclaimPendingFree 已把它设为仍被钉住的页数
+        // T-30: dirt is no longer zeroed — reclaimPendingFree already set it
+        // to the still-pinned page count
     }
 
-    /// 返回 dirt 计数（测试用）
+    /// Returns the dirt count (for tests)
     pub fn dirtCount(self: *State) u64 {
         return self.dirt.load(.acquire);
     }
 
-    // ---- 内部 ----
+    // ---- Internal ----
 
-    /// 全量回收 pending_free：*不*检查 reader_count（由调用方保证安全：
-    /// applyBatch 的 reader_count==0 快路径，单写者上下文）。
-    /// 取 pending_free_mu，串行化写者与读者增量回收对该列表的 mutate。
+    /// Reclaim all of pending_free: does *not* check reader_count (the
+    /// caller guarantees safety: applyBatch's reader_count==0 fast path, a
+    /// single-writer context).
+    /// Takes pending_free_mu, serializing writer and reader incremental
+    /// reclamation mutations of the list.
     fn flushPendingFree(self: *State) void {
         self.pending_free_mu.lockUncancelable();
         defer self.pending_free_mu.unlock();
@@ -392,13 +447,18 @@ pub const State = struct {
         if (prof) ProfileStats.txn_flush_free_ns += @intCast(ProfileStats.now() - t0);
     }
 
-    /// T-30 按 oldest-reader watermark 增量回收 pending 页：
-    /// - 无读者（reader_count==0，锁内复查）→ 全量回收（旧快路径，保留）；
-    /// - 有读者 → 回收 release_seq < watermark 的页；等于或大于的保留
-    ///   （老快照仍可能引用，正确性底线）。
-    /// reader_count 检查在锁内：读者回收与写者 append 经 pending_free_mu 互斥，
-    /// 锁内看到 count==0 才全量——其后注册的新读者快照必 ≥ 全部 pending 的
-    /// release_seq，不可能引用被回收的页。
+    /// T-30 incremental reclamation of pending pages by oldest-reader
+    /// watermark:
+    /// - No readers (reader_count==0, re-checked under the lock) -> reclaim
+    ///   everything (the old fast path, preserved);
+    /// - Readers present -> reclaim pages with release_seq < watermark;
+    ///   keep equal or greater (old snapshots may still reference them —
+    ///   the correctness floor).
+    /// The reader_count check is inside the lock: reader reclamation and
+    /// writer appends are mutually excluded via pending_free_mu; only a
+    /// count==0 seen under the lock triggers the full reclaim — any reader
+    /// registering afterwards has a snapshot >= every pending release_seq
+    /// and cannot reference the reclaimed pages.
     fn reclaimPendingFree(self: *State) void {
         self.pending_free_mu.lockUncancelable();
         defer self.pending_free_mu.unlock();
@@ -428,8 +488,10 @@ pub const State = struct {
         self.dirt.store(keep, .release);
     }
 
-    /// oldest-active-reader watermark：活跃读者快照序列的最小值。
-    /// 返回 0 = 保守下界（溢出读者 / 有读者但快照尚未注册可见）→ 钉住一切。
+    /// Oldest-active-reader watermark: the minimum snapshot sequence across
+    /// active readers. Returning 0 = the conservative floor (overflow
+    /// readers / readers present but snapshot not yet visible) -> pin
+    /// everything.
     fn readerWatermark(self: *State) u64 {
         if (self.overflow_readers.load(.acquire) > 0) return 0;
         var min: u64 = 0;
@@ -446,7 +508,8 @@ pub const State = struct {
         return min;
     }
 
-    /// 应用一批写请求到 B-tree，提交 meta，fsync，更新原子状态
+    /// Apply a batch of write requests to the B-tree, commit meta, fsync,
+    /// update atomic state
     pub fn applyBatch(self: *State, batch: []const Request) !void {
         if (self.closed.load(.acquire)) {
             for (batch) |r| r.future.set(error.Closed);
@@ -456,14 +519,17 @@ pub const State = struct {
         const prof = ProfileStats.enable;
         const t0 = if (prof) ProfileStats.now() else 0;
 
-        // 0. grace-period 回收：若此刻无读者，本批开始前积累的脏页均可安全回收
-        //    （均为历史提交 COW 出的旧页，仅被已退出的读者持有）。与读者 endRead 的
-        //    flush 经 pending_free_mu 互斥（单一可同步 mutator）。
+        // 0. Grace-period reclamation: if there are no readers right now,
+        //    the dirty pages accumulated before this batch can be reclaimed
+        //    safely (all are old pages COW'd out by historical commits, held
+        //    only by readers that already exited). Mutually excluded with
+        //    reader endRead's flush via pending_free_mu (a single
+        //    synchronizable mutator).
         if (self.reader_count.load(.acquire) == 0) {
             self.flushPendingFree();
         }
 
-        // 1. 快照当前 root
+        // 1. Snapshot the current root
         const cur_root = self.root.load(.acquire);
         const cur_sequence = self.sequence.load(.acquire);
         const cur_entry_count = self.entry_count.load(.acquire);
@@ -476,7 +542,7 @@ pub const State = struct {
         defer arena.deinit();
         const arena_alloc = arena.allocator();
 
-        // 收集脏页（arena-backed: btree.insert 用 arena_alloc append）
+        // Collect dirty pages (arena-backed: btree.insert appends via arena_alloc)
         var batch_dirty = std.ArrayList(u32).empty;
         defer batch_dirty.deinit(arena_alloc);
         var batch_entry_delta: i64 = 0;
@@ -495,7 +561,8 @@ pub const State = struct {
         } else {
             // Copy keys/values into arena first (caller slices may not survive — e.g. stack buffer reuse)
 
-        // O(n) 有序性检测：strict（严格递增，无重复）/ non_dec（非递减，含重复）/ unordered
+        // O(n) order detection: strict (strictly increasing, no dups) /
+        // non_dec (non-decreasing, with dups) / unordered
         const t_order0 = if (prof) ProfileStats.now() else 0;
         const Order = enum { strict, non_dec, unordered };
         const order = blk: {
@@ -515,13 +582,14 @@ pub const State = struct {
         const t_dupe0 = if (prof) ProfileStats.now() else 0;
         const arena_entries = try arena_alloc.alloc(btree.LeafEntry, batch.len);
         if (order != .unordered) {
-            // Fast path: 有序输入，跳过 dupe + sort，直接引用 caller 切片
+            // Fast path: ordered input skips dupe + sort, referencing the caller's slices directly
             for (batch, 0..) |req, i| {
                 arena_entries[i] = .{ .tombstone = req.tombstone, .key = req.key, .value = req.value };
             }
             if (prof) ProfileStats.txn_dupe_ns += @intCast(ProfileStats.now() - t_dupe0);
 
-            // O(n) dedup（非递减含重复时去相邻重复，last-write-wins）
+            // O(n) dedup (with non-decreasing duplicates, collapse adjacent
+            // duplicates; last write wins)
             var n: usize = 0;
             for (arena_entries) |e| {
                 if (n > 0 and btree.cmpKey(arena_entries[n - 1].key, e.key) == .eq) {
@@ -543,8 +611,10 @@ pub const State = struct {
             batch_entry_delta += wr.count_delta;
             batch_byte_delta += wr.live_delta;
         } else {
-            // Unordered: 当前路径（dupe + sort + dedup）
-            // 预分配连续 key/value 缓冲区（单次分配），memcpy 进去，排序读取连续内存（热 cache）
+            // Unordered: current path (dupe + sort + dedup)
+            // Pre-allocate one contiguous key/value buffer (single
+            // allocation), memcpy into it, and sort reading contiguous
+            // memory (cache-hot)
             var key_buf_len: usize = 0;
             for (batch) |req| {
                 key_buf_len += req.key.len;
@@ -604,32 +674,37 @@ pub const State = struct {
         } // end unordered path
         } // end else (batch.len > 1)
 
-        // 3. 本批脏页进 pending_free（不立即回收，MVCC 安全）。
-        //    取 pending_free_mu，串行化与末位读者 flush 的并发 mutate（UB 修复）。
+        // 3. This batch's dirty pages go into pending_free (not reclaimed
+        //    immediately — MVCC safe). Take pending_free_mu, serializing
+        //    against the concurrent mutation by reader reclamation (UB fix).
         const t_pf0 = if (prof) ProfileStats.now() else 0;
         {
             self.pending_free_mu.lockUncancelable();
             defer self.pending_free_mu.unlock();
             for (batch_dirty.items) |pn| {
-                // T-30：携带释放序列（本次提交的 new_sequence = cur_sequence+1）。
-                // 该页属于 cur_sequence 时刻的树；快照 ≥ new_sequence 的读者
-                // 不可能引用它（它不在 new_sequence 提交后的树里）。
+                // T-30: carry the release sequence (this commit's
+                // new_sequence = cur_sequence+1). The page belongs to the
+                // tree as of cur_sequence; readers with snapshot >=
+                // new_sequence cannot reference it (it is not in the tree
+                // after the new_sequence commit).
                 self.pending_free.append(self.allocator, .{ .page_no = pn, .release_seq = cur_sequence + 1 }) catch {};
             }
-            // T-30：dirt 在锁内随 append 更新（与读者线程的增量回收互斥，
-            // 避免覆写其结果；原步骤 7 的锁外 store 移入此处）
+            // T-30: dirt is updated under the lock together with the append
+            // (mutually excluded with the reader thread's incremental
+            // reclamation, avoiding overwriting its result; the old step-7
+            // unlocked store moved here)
             self.dirt.store(@intCast(self.pending_free.items.len), .release);
         }
         if (prof) ProfileStats.txn_pending_free_ns += @intCast(ProfileStats.now() - t_pf0);
 
-        // 4. 计算新 meta 值
+        // 4. Compute the new meta values
         const new_sequence = cur_sequence + 1;
         const new_entry_count_signed: i64 = @as(i64, @intCast(cur_entry_count)) + batch_entry_delta;
         const new_entry_count: u64 = @intCast(@max(@as(i64, 0), new_entry_count_signed));
         const new_byte_signed: i64 = @as(i64, @intCast(cur_byte_size)) + batch_byte_delta;
         const new_byte: u64 = @intCast(@max(@as(i64, 0), new_byte_signed));
 
-        // 5. 写 meta
+        // 5. Write meta
         const t_meta0 = if (prof) ProfileStats.now() else 0;
         const meta = f2.MetaPage{
             .magic = f2.MAGIC_V2,
@@ -643,35 +718,42 @@ pub const State = struct {
             .free_count = 0,
             .last_page = 0,
         };
-        // T-27 提交顺序：power_fail 档下，meta 写入前先把本批数据页刷到
-        // 稳定存储（fdatasync 语义），保证 meta 提交为持久的时刻，其指向的
-        // 数据页已先于（或至迟同时）落盘——掉电不会恢复到指向悬垂页的 root。
-        // process_crash 档保持旧行为（页缓存完好的进程崩溃模型下无需前置刷盘）。
+        // T-27 commit ordering: under power_fail, flush this batch's data
+        // pages to stable storage (fdatasync semantics) before writing meta,
+        // guaranteeing that at the moment the meta commit becomes durable,
+        // the data pages it points to have already landed (or land at the
+        // latest simultaneously) — power loss can never recover a root
+        // pointing at dangling pages. The process_crash level keeps the old
+        // behavior (no pre-flush needed under the page-cache-intact
+        // process-crash model).
         if (self.opts.durability == .power_fail) {
             try self.store.syncDataPages();
         }
         try self.store.writeMeta(&meta);
 
-        // 6. fsync（meta 落盘）。power_fail 档无条件 sync（提交即双 sync：
-        // 数据页先、meta 后——见上方 Durability 注释）；fsync=false 仅对
-        // process_crash 档有意义（异步 durability，用户自行 Db.sync()）。
+        // 6. fsync (meta to disk). power_fail syncs unconditionally (every
+        // commit is a double sync: data pages first, meta after — see the
+        // Durability notes above); fsync=false only makes sense for
+        // process_crash (async durability, the user calls Db.sync() manually).
         if (self.opts.fsync or self.opts.durability == .power_fail) {
             try self.store.sync();
         }
         if (prof) ProfileStats.txn_meta_ns += @intCast(ProfileStats.now() - t_meta0);
 
-        // 7. 原子更新状态（dirt 已在步骤 3 锁内随 append 更新）
+        // 7. Atomically update state (dirt was already updated with the
+        // append under the lock in step 3)
         self.root.store(new_root, .release);
         self.sequence.store(new_sequence, .release);
         self.entry_count.store(new_entry_count, .release);
         self.byte_size.store(new_byte, .release);
 
-        // 8. 所有请求成功
+        // 8. All requests succeeded
         for (batch) |req| {
             req.future.set({});
         }
 
-        // 9. 若此时无读者，立即回收脏页
+        // 9. If there are no readers at this point, reclaim dirty pages immediately
+
         if (self.reader_count.load(.acquire) == 0) {
             self.flushPendingFree();
         }

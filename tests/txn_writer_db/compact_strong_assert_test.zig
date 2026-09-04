@@ -1,16 +1,16 @@
-//! compact_strong_assert_test.zig — T-22: compact 强断言测试
+//! compact_strong_assert_test.zig — T-22: compact strong-assertion tests
 //!
-//! 补充 compact_test.zig 中缺失的强断言：不只要"数据可读"，还要断言
-//! dirt / pendingFreeCount 的具体数值，验证 compact 的实际语义。
+//! Supplements compact_test.zig with strong assertions: not just "data readable", but also
+//! exact dirt / pendingFreeCount values, verifying compact's actual semantics.
 //!
-//! 核心语义（src/writer.zig State.compact，T-30 修订）：
-//! - 无读者时：compact → 全量回收 → pending_free 清空, dirt=0
-//! - 有读者时：compact → 按 oldest-reader watermark 回收可安全回收部分；
-//!   无可回收页时 pending_free 不变，dirt 不再静默清零——反映仍被钉住的
-//!   真实页数（旧 MVP "只清计数"行为已于 T-30 移除）
-//! - reader 结束（末位）→ 全量回收 → pending_free 清空
+//! Core semantics (src/writer.zig State.compact, revised by T-30):
+//! - No readers: compact -> full reclamation -> pending_free emptied, dirt=0
+//! - With readers: compact -> reclaims the subset allowed by the oldest-reader watermark;
+//!   when nothing is reclaimable, pending_free is unchanged and dirt is no longer silently zeroed —
+//!   it reflects the true number of still-pinned pages (the old MVP "counter-only reset" was removed in T-30)
+//! - Reader ends (the last one) -> full reclamation -> pending_free emptied
 //!
-//! 不改 src/ 和现有 compact_test.zig。
+//! Does not modify src/ or the existing compact_test.zig.
 
 const std = @import("std");
 const cube = @import("cube_db");
@@ -23,53 +23,53 @@ fn newStore() ps.MemPageStore {
     return ps.MemPageStore.init(alloc, 10000);
 }
 
-// ---- Test 1: compact 有读者时按 watermark 回收，dirt 反映真实钉住页数（T-30 语义） ----
+// ---- Test 1: with a reader, compact reclaims by watermark and dirt reflects the truly pinned page count (T-30 semantics) ----
 // put(k, v1) → beginRead → put(k, v2) → dirt > 0, pendingFree > 0
-// compact() → 无可回收页（release_seq=2 ≮ watermark=1）→ pendingFree 不变，
-//             dirt 不清零（仍反映被钉住的页数；旧 MVP 静默清 0 已移除）
-// endRead → pendingFreeCount == 0（末位读者全量回收）
+// compact() -> nothing reclaimable (release_seq=2 !< watermark=1) -> pendingFree unchanged,
+//             dirt not zeroed (still reflects the pinned page count; the old MVP silent reset to 0 was removed)
+// endRead -> pendingFreeCount == 0 (full reclamation by the last reader)
 test "compact_strong: with reader — compact keeps dirt truthful, pages pinned until reader ends" {
     var ms = newStore();
     defer ms.deinit();
     var db = try cube.Db.open(alloc, ms.store(), .{});
     defer db.close();
 
-    // 初始写入（无读者 → 自动 flush → dirt=0）
+    // Initial write (no readers -> auto flush -> dirt=0)
     try db.put("k", "v1");
     try std.testing.expectEqual(@as(u64, 0), db.dirtCount());
     try std.testing.expectEqual(@as(usize, 0), db.state.pendingFreeCount());
 
-    // 开始 reader，阻止自动 flush
+    // Start a reader to block the automatic flush
     _ = db.beginRead();
 
-    // 覆写产生脏页 → pending_free 积累, dirt > 0
+    // Overwrite to produce dirty pages -> pending_free accumulates, dirt > 0
     try db.put("k", "v2");
     try std.testing.expect(db.dirtCount() > 0);
     try std.testing.expect(db.state.pendingFreeCount() > 0);
 
-    // compact：有读者 → 无可安全回收的页 → pendingFree 不变，dirt 仍 > 0
-    // （T-30：不再静默清计数——dirt 反映仍被钉住的真实页数）
+    // compact: with a reader -> no safely reclaimable page -> pendingFree unchanged, dirt still > 0
+    // (T-30: no more silent counter reset — dirt reflects the true number of still-pinned pages)
     try db.compact();
     try std.testing.expect(db.dirtCount() > 0);
-    // 关键断言：pendingFreeCount 仍 > 0（页未回收）
+    // Key assertion: pendingFreeCount is still > 0 (pages not reclaimed)
     try std.testing.expect(db.state.pendingFreeCount() > 0);
     try std.testing.expectEqual(db.state.pendingFreeCount(), @as(usize, @intCast(db.dirtCount())));
 
-    // 数据仍可读（compact 不影响数据可见性）
+    // Data still readable (compact does not affect data visibility)
     const v = try db.get("k");
     try std.testing.expectEqualStrings("v2", v.?);
     alloc.free(v.?);
 
-    // reader 结束 → 末位读者触发 flushPendingFree
+    // Reader ends -> the last reader triggers flushPendingFree
     _ = db.endRead();
 
-    // 关键断言：reader 结束后 pendingFreeCount 归 0
+    // Key assertion: after the reader ends, pendingFreeCount is 0
     try std.testing.expectEqual(@as(usize, 0), db.state.pendingFreeCount());
     try std.testing.expectEqual(@as(u64, 0), db.dirtCount());
 }
 
-// ---- Test 2: compact 无读者时全 flush ----
-// put(k, v1) → put(k, v2) → dirt == 0（无读者自动 flush）
+// ---- Test 2: compact with no readers flushes everything ----
+// put(k, v1) -> put(k, v2) -> dirt == 0 (auto flush with no readers)
 // compact() → dirt == 0, pendingFreeCount == 0
 test "compact_strong: no reader — compact flushes all pending pages" {
     var ms = newStore();
@@ -77,36 +77,36 @@ test "compact_strong: no reader — compact flushes all pending pages" {
     var db = try cube.Db.open(alloc, ms.store(), .{});
     defer db.close();
 
-    // 写入并覆写（无读者 → 自动 flush）
+    // Write and overwrite (no readers -> auto flush)
     try db.put("k", "v1");
     try db.put("k", "v2");
 
-    // 无读者时 put 已自动 flush → dirt=0, pendingFree=0
+    // With no readers, put already auto-flushed -> dirt=0, pendingFree=0
     try std.testing.expectEqual(@as(u64, 0), db.dirtCount());
     try std.testing.expectEqual(@as(usize, 0), db.state.pendingFreeCount());
 
-    // compact 无读者 → flushPendingFree（无积压可 flush）
+    // compact with no readers -> flushPendingFree (nothing left to flush)
     try db.compact();
 
-    // 关键断言：dirt=0 且 pendingFreeCount=0
+    // Key assertion: dirt=0 and pendingFreeCount=0
     try std.testing.expectEqual(@as(u64, 0), db.dirtCount());
     try std.testing.expectEqual(@as(usize, 0), db.state.pendingFreeCount());
 
-    // 数据可读
+    // Data readable
     const v = try db.get("k");
     try std.testing.expectEqualStrings("v2", v.?);
     alloc.free(v.?);
 }
 
-// ---- Test 3: compact 后 entry_count / byte_size 不变 ----
-// compact 是元数据操作（flush dirty + write meta），不改逻辑数据。
+// ---- Test 3: entry_count / byte_size unchanged after compact ----
+// compact is a metadata operation (flush dirty + write meta); it does not change logical data.
 test "compact_strong: entry_count and byte_size unchanged after compact" {
     var ms = newStore();
     defer ms.deinit();
     var db = try cube.Db.open(alloc, ms.store(), .{});
     defer db.close();
 
-    // 写入多个 key
+    // Write several keys
     try db.put("a", "11111");
     try db.put("b", "22222");
     try db.put("c", "33333");
@@ -119,14 +119,14 @@ test "compact_strong: entry_count and byte_size unchanged after compact" {
 
     try db.compact();
 
-    // 关键断言：compact 不改变逻辑数据量
+    // Key assertion: compact does not change the logical data volume
     try std.testing.expectEqual(entry_count_before, db.entryCount());
     try std.testing.expectEqual(byte_size_before, db.state.byte_size.load(.acquire));
     try std.testing.expectEqual(@as(u64, 0), db.dirtCount());
 }
 
-// ---- Test 4: compact 后 meta 已写入 — reopen 数据可读 ----
-// compact 写新 meta（dirt=0），reopen 后从 meta 恢复正确状态。
+// ---- Test 4: meta written after compact — data readable on reopen ----
+// compact writes a new meta (dirt=0); on reopen, the correct state is restored from meta.
 test "compact_strong: after compact, reopen — meta restored, data readable" {
     var ms = newStore();
     defer ms.deinit();
@@ -134,36 +134,36 @@ test "compact_strong: after compact, reopen — meta restored, data readable" {
 
     {
         var db = try cube.Db.open(alloc, s, .{});
-        // 写入 + 覆写产生脏页
+        // Write + overwrite to produce dirty pages
         try db.put("k1", "v1");
         try db.put("k2", "v2");
-        try db.put("k1", "override"); // 覆写产生脏页
+        try db.put("k1", "override"); // overwrite produces dirty pages
         try db.compact();
         try std.testing.expectEqual(@as(u64, 0), db.dirtCount());
         db.close();
     }
 
-    // Reopen — meta 应恢复正确 root/sequence/entry_count
+    // Reopen — meta should restore the correct root/sequence/entry_count
     var db2 = try cube.Db.open(alloc, s, .{});
     defer db2.close();
 
     try std.testing.expectEqual(@as(u64, 2), db2.entryCount());
     try std.testing.expectEqual(@as(u64, 0), db2.dirtCount());
 
-    // k1 应为覆写后的值
+    // k1 should be the overwritten value
     const v1 = try db2.get("k1");
     try std.testing.expectEqualStrings("override", v1.?);
     alloc.free(v1.?);
 
-    // k2 不受覆写影响
+    // k2 is unaffected by the overwrite
     const v2 = try db2.get("k2");
     try std.testing.expectEqualStrings("v2", v2.?);
     alloc.free(v2.?);
 }
 
-// ---- Test 5: compact 多次覆写后 pendingFree 积累 → reader 中 compact 保持 dirt 真实 → endRead 清空 ----
-// 更复杂场景：多次覆写在 reader 持续期间产生多批 pendingFree
-// T-30：compact 有读者时不再清 dirt 计数；dirt == pendingFreeCount（真实钉住数）
+// ---- Test 5: pendingFree accumulates after multiple overwrites -> compact with a reader keeps dirt truthful -> endRead clears ----
+// A more complex scenario: multiple overwrites produce several batches of pendingFree while a reader is active
+// T-30: compact with a reader no longer clears the dirt counter; dirt == pendingFreeCount (the truly pinned count)
 test "compact_strong: multiple overwrites during reader — compact keeps dirt truthful, endRead clears pages" {
     var ms = newStore();
     defer ms.deinit();
@@ -175,7 +175,7 @@ test "compact_strong: multiple overwrites during reader — compact keeps dirt t
 
     _ = db.beginRead();
 
-    // 多次覆写（每次产生脏页，pending_free 积累）
+    // Multiple overwrites (each produces dirty pages; pending_free accumulates)
     try db.put("k", "v1");
     const dirt_after_v1 = db.dirtCount();
     const pending_after_v1 = db.state.pendingFreeCount();
@@ -186,27 +186,27 @@ test "compact_strong: multiple overwrites during reader — compact keeps dirt t
     try std.testing.expect(db.dirtCount() > 0);
     try std.testing.expect(db.state.pendingFreeCount() > pending_after_v1);
 
-    // compact：有读者 → 无可回收页（watermark=1，全部 release_seq ≥ 2）→ 保持
+    // compact: with a reader -> nothing reclaimable (watermark=1, all release_seq >= 2) -> unchanged
     try db.compact();
     try std.testing.expect(db.dirtCount() > 0);
     try std.testing.expect(db.state.pendingFreeCount() > 0);
     try std.testing.expectEqual(db.state.pendingFreeCount(), @as(usize, @intCast(db.dirtCount())));
 
-    // 再覆写 → 钉住页继续增长（dirt 随 pendingFree 增长）
+    // Overwrite again -> pinned pages keep growing (dirt grows with pendingFree)
     try db.put("k", "v3");
     try std.testing.expect(db.dirtCount() > 0);
 
-    // 第二次 compact
+    // Second compact
     try db.compact();
     try std.testing.expect(db.dirtCount() > 0);
     try std.testing.expect(db.state.pendingFreeCount() > 0);
 
-    // 数据正确
+    // Data correct
     const v = try db.get("k");
     try std.testing.expectEqualStrings("v3", v.?);
     alloc.free(v.?);
 
-    // reader 结束 → flush 所有积压
+    // Reader ends -> flush all accumulated pages
     _ = db.endRead();
     try std.testing.expectEqual(@as(usize, 0), db.state.pendingFreeCount());
     try std.testing.expectEqual(@as(u64, 0), db.dirtCount());

@@ -1,21 +1,21 @@
-//! btree_test.zig — 页号 COW B-tree 测试（TDD RED）
-//! 覆盖：empty get、put/get roundtrip、overwrite、delete、COW old root、
-//! select 有序、select 范围、select 跳 tombstone、随机模型测试。
-//! 全部使用 MemPageStore，先 fail（btree.zig 不存在）。
+//! btree_test.zig - page-numbered COW B-tree tests (TDD RED)
+//! Covers: empty get, put/get roundtrip, overwrite, delete, COW old root,
+//! select ordering, select range, select skipping tombstones, randomized model testing.
+//! All use MemPageStore; initially failing (btree.zig did not exist).
 const std = @import("std");
 const cube = @import("cube_db");
 const f2 = cube.format;
 const ps = cube.page_store;
 const btree = cube.btree;
 
-// ---- 辅助 ----
+// ---- helpers ----
 
 fn newStore() ps.MemPageStore {
-    // 10000 页 ≈ 40MB data，足够 10k key 测试
+    // 10000 pages ~ 40MB data, enough for 10k key tests
     return ps.MemPageStore.init(std.testing.allocator, 10000);
 }
 
-// ---- 测试 ----
+// ---- tests ----
 
 test "btree: empty get -> null" {
     var ms = newStore();
@@ -59,7 +59,7 @@ test "btree: 10k random keys all readable" {
         const k = try std.testing.allocator.dupe(u8, kbuf[0..klen]);
         try keys.append(std.testing.allocator, k);
     }
-    // 排序去重后插入
+    // sort and dedupe, then insert
     std.mem.sort([]u8, keys.items, {}, struct {
         fn lt(_: void, a: []u8, b: []u8) bool { return std.mem.order(u8, a, b) == .lt; }
     }.lt);
@@ -76,7 +76,7 @@ test "btree: 10k random keys all readable" {
         dirty.clearRetainingCapacity();
         root = (try btree.insert(std.testing.allocator, s, root, k, "val", false, &dirty)).new_root;
     }
-    // 验证全部可读
+    // verify all readable
     for (unique.items) |k| {
         const v = try btree.get(std.testing.allocator, s, root, k);
         try std.testing.expect(v != null);
@@ -121,11 +121,11 @@ test "btree: COW old root still points to old version" {
     const r1 = try btree.insert(std.testing.allocator, s, btree.NULL_ROOT, "k", "v1", false, &dirty);
     dirty.clearRetainingCapacity();
     const r2 = try btree.insert(std.testing.allocator, s, r1.new_root, "k", "v2", false, &dirty);
-    // 用旧 root 读到旧值
+    // old root reads old value
     const oldv = try btree.get(std.testing.allocator, s, r1.new_root, "k");
     try std.testing.expectEqualStrings("v1", oldv.?);
     std.testing.allocator.free(oldv.?);
-    // 用新 root 读到新值
+    // new root reads new value
     const newv = try btree.get(std.testing.allocator, s, r2.new_root, "k");
     try std.testing.expectEqualStrings("v2", newv.?);
     std.testing.allocator.free(newv.?);
@@ -271,7 +271,7 @@ test "btree: model test random ops vs StringHashMap (seed 7)" {
                 allocator.free(kv.value);
             }
         }
-        // 验证该 key
+        // verify this key
         const mv = model.get(key);
         const bv = try btree.get(allocator, s, root, key);
         if (mv == null) {
@@ -282,7 +282,7 @@ test "btree: model test random ops vs StringHashMap (seed 7)" {
             allocator.free(bv.?);
         }
     }
-    // 全量比对
+    // full comparison
     var it = try btree.select(allocator, s, root, null, null);
     defer it.deinit();
     var bcount: usize = 0;
@@ -320,25 +320,25 @@ test "btree: insert returns WriteResult with correct live_delta and count_delta"
     const s = ms.store();
     var dirty = std.ArrayList(u32).empty;
     defer dirty.deinit(std.testing.allocator);
-    // 新 key → live_delta > 0, count_delta = 1
+    // new key -> live_delta > 0, count_delta = 1
     const wr1 = try btree.insert(std.testing.allocator, s, btree.NULL_ROOT, "k", "v", false, &dirty);
     try std.testing.expect(wr1.live_delta > 0);
     try std.testing.expectEqual(@as(i64, 1), wr1.count_delta);
-    // overwrite → live_delta ≈ 0（key 已存在）, count_delta = 0
+    // overwrite -> live_delta ~ 0 (key already exists), count_delta = 0
     dirty.clearRetainingCapacity();
     const wr2 = try btree.insert(std.testing.allocator, s, wr1.new_root, "k", "v2", false, &dirty);
     try std.testing.expectEqual(@as(i64, 0), wr2.count_delta);
-    // 删除 → count_delta = -1（降到 0）
+    // delete -> count_delta = -1 (drops to 0)
     dirty.clearRetainingCapacity();
     const wr3 = try btree.insert(std.testing.allocator, s, wr2.new_root, "k", "", true, &dirty);
     try std.testing.expectEqual(@as(i64, -1), wr3.count_delta);
-    // key 不存在再删 → count_delta = 0, live_delta = 0
+    // delete again on missing key -> count_delta = 0, live_delta = 0
     dirty.clearRetainingCapacity();
     const wr4 = try btree.insert(std.testing.allocator, s, wr3.new_root, "k", "", true, &dirty);
     try std.testing.expectEqual(@as(i64, 0), wr4.count_delta);
     try std.testing.expectEqual(@as(i64, 0), wr4.live_delta);
 }
-// T-5/T-8/T-12/T-17: 测试接入（comptime import，test-btree 会跑这些 test）
+// T-5/T-8/T-12/T-17: test hookup (comptime imports; test-btree runs these tests)
 comptime {
     _ = @import("btree_decode_corrupt_test.zig");
     _ = @import("endian_consistency_test.zig");

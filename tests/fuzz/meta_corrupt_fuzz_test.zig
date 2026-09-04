@@ -1,6 +1,6 @@
-//! meta_corrupt_fuzz_test.zig — P4 TDD: meta 页损坏 fuzz 加固
-//! 随机损坏 meta 页字节，验证 recovery 降级正确（不 panic、选有效 meta 或返回 null）。
-//! 属性：对任意损坏，readMetaPage 不 panic；返回值与 decodeMetaPayload 一致性可预测。
+//! meta_corrupt_fuzz_test.zig — P4 TDD: meta-page corruption fuzz hardening
+//! Randomly corrupt meta page bytes and verify recovery degrades correctly (no panic; picks a valid meta or returns null).
+//! Property: for any corruption, readMetaPage must not panic; the return value is predictably consistent with decodeMetaPayload.
 
 const std = @import("std");
 const fuzz = @import("common.zig");
@@ -11,7 +11,7 @@ const alloc = std.testing.allocator;
 
 fn metaCorruptTarget(ctx: *usize, smith: *std.testing.Smith) !void {
     _ = ctx;
-    // 构造一个有效 meta
+    // Build a valid meta
     var meta = f2.MetaPage{
         .magic = f2.MAGIC_V2,
         .version = 2,
@@ -27,7 +27,7 @@ fn metaCorruptTarget(ctx: *usize, smith: *std.testing.Smith) !void {
     var page0: [f2.PAGE_SIZE]u8 = [_]u8{0} ** f2.PAGE_SIZE;
     f2.writeMetaPage(&page0, &meta, 0);
 
-    // 用 smith 输入随机翻转若干字节
+    // Use smith input to randomly flip some bytes
     var buf: [64]u8 = undefined;
     const len = smith.slice(&buf);
     for (buf[0..len]) |b| {
@@ -35,13 +35,13 @@ fn metaCorruptTarget(ctx: *usize, smith: *std.testing.Smith) !void {
         page0[idx] ^= 0xFF;
     }
 
-    // readMetaPageSingle 不得 panic；返回 null（损坏）或一个 MetaPage
+    // readMetaPageSingle must not panic; it returns null (corrupt) or a MetaPage
     const got = f2.readMetaPageSingle(&page0);
     if (got) |m| {
-        // 若返回有效，magic/version 必须匹配 MAGIC_V2/2（isValidMeta 保证）
+        // If it returns a valid page, magic/version must match MAGIC_V2/2 (guaranteed by isValidMeta)
         try std.testing.expect(f2.isValidMeta(m));
     }
-    // 无 panic 即通过
+    // Passing without a panic is the bar
 }
 
 test "fuzz: meta corruption never panics (deterministic)" {

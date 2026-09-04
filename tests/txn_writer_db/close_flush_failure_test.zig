@@ -1,20 +1,20 @@
-//! close_flush_failure_test.zig — T-19: close 时 flush 失败测试
+//! close_flush_failure_test.zig — T-19: flush failure at close tests
 //!
-//! 背景：src/db.zig:55 `Db.close` 的 `self.flush() catch {}` 静默吞 flush 错误。
-//! 若 flush 失败，close 仍继续 free pending 并 deinit。
+//! Background: src/db.zig:55 `Db.close` silently swallows flush errors with `self.flush() catch {}`.
+//! If flush fails, close still proceeds to free pending and deinit.
 //!
 //! note: lock() never returns error in current Zig, catch is dead code.
-//! zio.Mutex.lock() 在同步线程上下文走 lockThread()（futex），返回 void 不返回 error。
-//! 因此 putBatch 的 `catch return error.LockFailed` 永不触发。
+//! zio.Mutex.lock() in a synchronous thread context takes lockThread() (futex) and returns void, not an error.
+//! So putBatch's `catch return error.LockFailed` never triggers.
 //!
-//! flush() 的唯一 error 路径：
-//! - putBatch → applyBatch 在 closed=true 时 set future 为 error.Closed → putBatch 传播
+//! The only error paths of flush():
+//! - putBatch -> applyBatch with closed=true sets futures to error.Closed -> putBatch propagates it
 //! - putBatch → allocator.alloc OOM
-//! 但要在 close 之前安全地触发这些路径需要双 deinit（不安全），因此本测试改为：
-//! 1. 正常路径：micro-batch put → close → flush 成功 → 数据可读
-//! 2. 空 pending close：flush no-op，无泄漏
-//! 3. putDirect 后 close：pending 为空，数据已提交
-//! 4. micro-batch 达到阈值自动 flush：close 时 pending 为空
+//! But safely triggering those paths before close would require a double deinit (unsafe), so this test instead covers:
+//! 1. Normal path: micro-batch put -> close -> flush succeeds -> data readable
+//! 2. Close with empty pending: flush is a no-op, no leaks
+//! 3. Close after putDirect: pending is empty, data already committed
+//! 4. Micro-batch reaching the threshold auto-flushes: pending is empty at close
 
 const std = @import("std");
 const cube = @import("cube_db");
@@ -26,7 +26,7 @@ fn newStore() ps.MemPageStore {
     return ps.MemPageStore.init(alloc, 10000);
 }
 
-// ---- Test 1: 正常路径 — micro-batch put → close → flush 成功 → 数据可读 ----
+// ---- Test 1: normal path — micro-batch put -> close -> flush succeeds -> data readable ----
 test "close_flush: normal micro-batch close flushes pending, data readable" {
     var ms = newStore();
     defer ms.deinit();
@@ -62,10 +62,10 @@ test "close_flush: normal micro-batch close flushes pending, data readable" {
     try std.testing.expectEqual(@as(u64, 2), db2.entryCount());
 }
 
-// ---- Test 2: 空 pending close — flush no-op, 无泄漏 ----
+// ---- Test 2: close with empty pending — flush is a no-op, no leaks ----
 // note: lock() never returns error in current Zig, catch is dead code.
-// flush() 在 pending 为空时直接 return（no-op），不调 putBatch。
-// 因此 close 在空 pending 下永远安全。
+// flush() returns immediately when pending is empty (no-op); it does not call putBatch.
+// So close with empty pending is always safe.
 test "close_flush: empty pending close — flush no-op, no leak" {
     var ms = newStore();
     defer ms.deinit();
@@ -81,9 +81,9 @@ test "close_flush: empty pending close — flush no-op, no leak" {
     db.close();
 }
 
-// ---- Test 3: putDirect 后 close — pending 为空，数据已提交 ----
-// putDirect 绕过 micro-batching 直接提交，pending 保持为空。
-// close 的 flush 是 no-op，数据已在 putDirect 时提交。
+// ---- Test 3: close after putDirect — pending is empty, data already committed ----
+// putDirect bypasses micro-batching and commits directly; pending stays empty.
+// close's flush is a no-op; the data was committed at putDirect time.
 test "close_flush: putDirect then close — pending empty, data committed" {
     var ms = newStore();
     defer ms.deinit();
@@ -116,9 +116,9 @@ test "close_flush: putDirect then close — pending empty, data committed" {
     alloc.free(vy.?);
 }
 
-// ---- Test 4: micro-batch 达阈值自动 flush → close 时 pending 为空 ----
-// put 达到 batch_threshold 时自动调 flush，pending 清空。
-// close 的 flush 是 no-op（pending 已空），无额外副作用。
+// ---- Test 4: micro-batch reaches threshold and auto-flushes -> pending is empty at close ----
+// put triggers flush automatically at batch_threshold; pending is emptied.
+// close's flush is a no-op (pending already empty); no extra side effects.
 test "close_flush: auto-flush at threshold, close with empty pending" {
     var ms = newStore();
     defer ms.deinit();
