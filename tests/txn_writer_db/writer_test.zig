@@ -168,7 +168,7 @@ test "writer: dirt count reflects pending free pages" {
     try std.testing.expectEqual(@as(u64, 0), state.dirt.load(.acquire));
 
     // Second overwrite: start a read txn; dirty pages must not be reclaimed immediately
-    _ = state.beginRead();
+    const r = state.beginRead();
     var f2: zio.Future(wrt.OpResult) = .{};
     try state.applyBatch(&.{.{ .key = "k", .value = "v2", .tombstone = false, .future = &f2 }});
     _ = try f2.wait();
@@ -176,7 +176,7 @@ test "writer: dirt count reflects pending free pages" {
     try std.testing.expect(state.pendingFreeCount() > 0);
     try std.testing.expectEqual(state.pendingFreeCount(), state.dirt.load(.acquire));
     // End the read -> dirty pages released -> dirt = 0
-    state.endRead();
+    state.endRead(r);
     try std.testing.expectEqual(@as(u64, 0), state.dirt.load(.acquire));
 }
 

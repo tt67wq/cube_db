@@ -224,11 +224,11 @@ pub const Db = struct {
         // references, within the window between the two calls.
         // Register-then-capture: whichever root is read, its COW old pages stay
         // in pending_free until the iterator's deinit (last reader out).
-        _ = self.state.beginRead(); // MVCC pin: snapshot protection for the iterator's borrowed pages
-        errdefer self.state.endRead();
+        const reader = self.state.beginRead(); // MVCC pin: snapshot protection for the iterator's borrowed pages
+        errdefer self.state.endRead(reader);
         const root = self.state.getRoot();
         var it = try btree.select(self.allocator, self.store, root, min, max);
-        it.pin_ctx = @ptrCast(self.state);
+        it.pin_ctx = @ptrCast(reader);
         it.pin_deinit = endReadPin;
         return it;
     }
@@ -269,16 +269,16 @@ pub const Db = struct {
     /// Begin a read txn: takes the current root snapshot, does not block
     /// writers (MVCC). Must be ended via endReadTxn/ReadTxn.end.
     pub fn beginReadTxn(self: *Db) !ReadTxn {
-        _ = self.state.beginRead();
-        return .{ .db = self, .snapshot_root = self.state.getRoot() };
+        const reader = self.state.beginRead();
+        return .{ .db = self, .snapshot_root = self.state.getRoot(), .reader = reader };
     }
 
-    pub fn beginRead(self: *Db) u64 {
+    pub fn beginRead(self: *Db) *wrt.Reader {
         return self.state.beginRead();
     }
 
-    pub fn endRead(self: *Db) void {
-        self.state.endRead();
+    pub fn endRead(self: *Db, reader: *wrt.Reader) void {
+        self.state.endRead(reader);
     }
 };
 
@@ -373,6 +373,7 @@ pub const WriteTxn = struct {
 pub const ReadTxn = struct {
     db: *Db,
     snapshot_root: u32,
+    reader: *wrt.Reader,
     ended: bool = false,
 
     pub fn get(self: *ReadTxn, key: []const u8) !?[]u8 {
@@ -393,10 +394,10 @@ pub const ReadTxn = struct {
     /// are incremental), released at deinit() — the iterator must still be
     /// deinit'd before the txn ends.
     pub fn select(self: *ReadTxn, min: ?[]const u8, max: ?[]const u8) !btree.Iterator {
-        _ = self.db.state.beginRead(); // iterator's own pin (released at deinit)
-        errdefer self.db.state.endRead();
+        const reader = self.db.state.beginRead(); // iterator's own pin (released at deinit)
+        errdefer self.db.state.endRead(reader);
         var it = try btree.select(self.db.allocator, self.db.store, self.snapshot_root, min, max);
-        it.pin_ctx = @ptrCast(self.db.state);
+        it.pin_ctx = @ptrCast(reader);
         it.pin_deinit = endReadPin;
         return it;
     }
@@ -404,7 +405,7 @@ pub const ReadTxn = struct {
     pub fn end(self: *ReadTxn) void {
         if (self.ended) return;
         self.ended = true;
-        self.db.state.endRead();
+        self.db.state.endRead(self.reader);
     }
 
     pub fn deinit(self: *ReadTxn) void {
@@ -417,8 +418,8 @@ pub const ReadTxn = struct {
 /// via an opaque callback.
 
 fn endReadPin(ctx: *anyopaque) void {
-    const st: *wrt.State = @ptrCast(@alignCast(ctx));
-    st.endRead();
+    const reader: *wrt.Reader = @ptrCast(@alignCast(ctx));
+    reader.state.endRead(reader);
 }
 test "db: open default state" {
     var ms = ps.MemPageStore.init(std.testing.allocator, 1000);

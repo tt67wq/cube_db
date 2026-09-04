@@ -40,7 +40,7 @@ test "compact_strong: with reader — compact keeps dirt truthful, pages pinned 
     try std.testing.expectEqual(@as(usize, 0), db.state.pendingFreeCount());
 
     // Start a reader to block the automatic flush
-    _ = db.beginRead();
+    const r = db.beginRead();
 
     // Overwrite to produce dirty pages -> pending_free accumulates, dirt > 0
     try db.put("k", "v2");
@@ -61,7 +61,7 @@ test "compact_strong: with reader — compact keeps dirt truthful, pages pinned 
     alloc.free(v.?);
 
     // Reader ends -> the last reader triggers flushPendingFree
-    _ = db.endRead();
+    db.endRead(r);
 
     // Key assertion: after the reader ends, pendingFreeCount is 0
     try std.testing.expectEqual(@as(usize, 0), db.state.pendingFreeCount());
@@ -173,7 +173,7 @@ test "compact_strong: multiple overwrites during reader — compact keeps dirt t
     try db.put("k", "v0");
     try std.testing.expectEqual(@as(u64, 0), db.dirtCount());
 
-    _ = db.beginRead();
+    const r = db.beginRead();
 
     // Multiple overwrites (each produces dirty pages; pending_free accumulates)
     try db.put("k", "v1");
@@ -207,7 +207,7 @@ test "compact_strong: multiple overwrites during reader — compact keeps dirt t
     alloc.free(v.?);
 
     // Reader ends -> flush all accumulated pages
-    _ = db.endRead();
+    db.endRead(r);
     try std.testing.expectEqual(@as(usize, 0), db.state.pendingFreeCount());
     try std.testing.expectEqual(@as(u64, 0), db.dirtCount());
 }

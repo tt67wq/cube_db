@@ -34,11 +34,11 @@ test "compact: compact clears dirt after writes" {
     try std.testing.expectEqual(@as(u64, 0), db.dirtCount());
 
     // Start a reader to block the automatic flush
-    _ = db.beginRead();
+    const r = db.beginRead();
     try db.put("k", "v2");
     // With a reader -> dirt > 0
     try std.testing.expect(db.dirtCount() > 0);
-    _ = db.endRead();
+    db.endRead(r);
 
     // Now the reader has ended; dirt should be 0 (auto flush)
     // But to test compact, a manual compact should also clear dirt
@@ -75,7 +75,7 @@ test "compact: compact with active reader blocks" {
     try db.put("k", "v1");
 
     // Start a reader
-    _ = db.beginRead();
+    const r = db.beginRead();
 
     // Overwrite (produces dirty pages in pending_free)
     try db.put("k", "v2");
@@ -91,7 +91,7 @@ test "compact: compact with active reader blocks" {
     const v = try db.get("k");
     try std.testing.expectEqualStrings("v2", v.?);
     std.testing.allocator.free(v.?);
-    _ = db.endRead();
+    db.endRead(r);
 }
 
 test "compact: multiple compacts are idempotent" {
@@ -123,10 +123,10 @@ test "compact: after compact, new writes work" {
     // After overwrite, dirt should be 0 (auto flush with no readers)
     // But to test compact semantics, use beginRead here to block the flush
     // then verify that compact can clear dirt
-    _ = db.beginRead();
+    const r = db.beginRead();
     try db.put("k", "v3");
     try std.testing.expect(db.dirtCount() > 0);
-    _ = db.endRead();
+    db.endRead(r);
     // After the reader ends, auto flush -> dirt = 0
     try std.testing.expectEqual(@as(u64, 0), db.dirtCount());
 }

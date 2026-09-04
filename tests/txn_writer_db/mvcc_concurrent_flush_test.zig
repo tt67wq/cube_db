@@ -12,7 +12,7 @@
 //! - Writer thread: loop overwriting a fixed set of 100 keys (k0..k99), one applyBatch of 1 entry per
 //!   iteration -> COW produces a new leaf, the old leaf enters pending_free. The fixed key set guarantees
 //!   the page pool never grows without bound (flushed pending_free pages return to the freelist LIFO for reuse, never exceeding max_pages).
-//! - Reader threads: loop beginRead -> brief sleep -> endRead; the last reader triggers flushPendingFree,
+//! - Reader threads: loop beginRead(handle) -> brief sleep -> endRead(handle); the last reader triggers flushPendingFree,
 //!   serialized with the writer's grace-period flush via pending_free_mu.
 //! - Stop: atomic stop_flag + time limit (~2.5s).
 //!
@@ -92,15 +92,15 @@ fn writerThread(ctx: *WriterCtx) void {
 
 fn readerThread(ctx: *ReaderCtx) void {
     while (!ctx.stop.load(.acquire)) {
-        const seq = ctx.state.beginRead();
-        _ = seq;
+        const reader = ctx.state.beginRead();
+        _ = reader;
         // Hold the read txn briefly to widen the last-reader flush race window
         std.Thread.yield() catch {};
         // Occasionally sleep a bit so multiple readers interleave
         if (ctx.reads.load(.monotonic) % 7 == 0) {
             sleepNs(1_000_000); // 1ms
         }
-        ctx.state.endRead(); // the last reader triggers flushPendingFree
+        ctx.state.endRead(reader); // the last reader triggers flushPendingFree
         _ = ctx.reads.fetchAdd(1, .monotonic);
     }
 }

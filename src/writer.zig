@@ -7,10 +7,16 @@ const btree = @import("btree.zig");
 
 const PageStore = ps.PageStore;
 
-// ---- T-30: per-reader sequence registration + oldest-reader watermark precise reclamation ----
+// ---- T-32: explicit Reader handle API ----
+//
+// T-30's design existed only because endRead() took no identity argument:
+// a thread-local stack + a fixed 64-slot array + a top-bit claim encoding +
+// overflow-counter fallback recovered "which slot did my beginRead occupy".
+// The explicit handle deletes all of that: beginRead returns a *Reader,
+// endRead(self, reader) unregisters exactly that reader.
 
-/// pending_free entry: page number + the sequence of the commit that freed it
-/// (that commit's new_sequence).
+/// pending_free entry: page number + the sequence of the commit that freed
+/// it (that commit's new_sequence).
 /// Reclamation rule: safe to reclaim when release_seq < the oldest-active-reader
 /// watermark (every active reader snapshot is >= watermark > release_seq, so
 /// nobody can still reference the page); equal or greater must be kept (old
@@ -21,145 +27,24 @@ pub const PendingPage = struct {
     release_seq: u64,
 };
 
-/// Per-reader snapshot registration slots. When exceeded (concurrent readers
-/// > 64, or TLS nesting overflow), degrade conservatively to watermark=0
-/// (pin everything = the old global-count behavior) — safe but imprecise.
-const READER_SLOTS = 64;
-/// Max beginRead nesting depth per thread (ReadTxn + select nesting etc.;
-/// realistically <= 3).
-const MAX_TLS_READERS = 16;
-/// Slot value encoding: 0 = free; non-zero = snapshot | CLAIM_BIT (the
-/// snapshot sequence occupies everything below the top bit).
-const CLAIM_BIT: u64 = 1 << 63;
+/// A reader registration. Holds the owning State, the snapshot sequence, and
+/// liveness. Allocated by beginRead, must be released by endRead.
+/// Embedded (allocation-free) handle pool depth: covers the realistic
+/// nesting/concurrency of this codebase (ReadTxn + select nesting <= 3,
+/// plus headroom for concurrent iterator scans); deeper concurrency falls
+/// back to heap Readers recycled through the same free list.
+const EMBEDDED_READERS = 8;
 
-/// Thread-local registration stack: beginRead/endRead pair up LIFO within a
-/// thread (all current callers — ReadTxn/Iterator pin/tests — begin and end
-/// on the same thread; that contract is unchanged).
-/// endRead() takes no argument (db.zig must not change), so pairing identity
-/// = (State pointer, LIFO).
-const TlsEntry = struct {
-    state: *const anyopaque,
-    slot: u32, // READER_SLOTS = overflow registration (not a slot)
+pub const Reader = struct {
+    state: *State,
+    seq: u64,
+    active: bool,
+    /// Intrusive active-set links (protected by pending_free_mu)
+    prev_active: ?*Reader = null,
+    next_active: ?*Reader = null,
+    /// Free-list link for the reusable handle pool (protected by pending_free_mu)
+    next_free: ?*Reader = null,
 };
-threadlocal var tls_readers: [MAX_TLS_READERS]TlsEntry = undefined;
-threadlocal var tls_readers_len: usize = 0;
-
-/// Claim a reader snapshot slot (called by beginRead before reading
-/// sequence — the B1 invariant).
-/// The claimed value = sentinel snapshot 0 (CLAIM_BIT): until the real
-/// snapshot is published, watermark sees 0 -> pin everything — no page is
-/// released within the claim-to-publish window. Returns the slot index;
-/// slots exhausted or TLS stack full -> READER_SLOTS (overflow registration,
-/// which watermark likewise treats as 0).
-fn claimReaderSlot(self: *State) u32 {
-    if (tls_readers_len < MAX_TLS_READERS) {
-        var i: usize = 0;
-        while (i < READER_SLOTS) {
-            if (self.reader_slots[i].load(.acquire) != 0) {
-                i += 1;
-                continue;
-            }
-            // m2: cmpxchgWeak may fail spuriously — retry the same slot on
-            // failure (reload to re-check busyness) instead of skipping a
-            // still-free slot.
-            if (self.reader_slots[i].cmpxchgWeak(0, CLAIM_BIT, .acq_rel, .acquire) == null) {
-                tls_readers[tls_readers_len] = .{ .state = @ptrCast(self), .slot = @intCast(i) };
-                tls_readers_len += 1;
-                return @intCast(i);
-            }
-        }
-    }
-    // Slots exhausted (or TLS stack full): overflow registration. M1:
-    // acq_rel RMW — paired with readerWatermark's acquire read, so once the
-    // watermark sees the registration there is a happens-before edge; when
-    // there are readers but no visible slots, the watermark already returns
-    // 0 conservatively (pin everything), so overflow readers are always
-    // covered. When the stack is full, nothing is pushed — matching endRead's
-    // saturating decrement when the stack is full and the top doesn't match.
-    _ = self.overflow_readers.fetchAdd(1, .acq_rel);
-    if (tls_readers_len < MAX_TLS_READERS) {
-        tls_readers[tls_readers_len] = .{ .state = @ptrCast(self), .slot = READER_SLOTS };
-        tls_readers_len += 1;
-    }
-    return READER_SLOTS;
-}
-
-/// Saturating decrement of the overflow reader count (m1: no wraparound).
-/// An under-paired decrement only inflates the count -> watermark=0 pins
-/// everything, the safe direction; a u32 wraparound would pin everything
-/// permanently and must be avoided.
-fn saturatingOverflowDec(self: *State) void {
-    while (true) {
-        const cur = self.overflow_readers.load(.acquire);
-        if (cur == 0) return; // under-paired decrement: conservatively don't (inflated count = over-pinning, safe)
-        if (self.overflow_readers.cmpxchgWeak(cur, cur - 1, .acq_rel, .acquire) == null) return;
-    }
-}
-
-/// Pop the TLS stack top and unregister it (slot back to 0 / saturating
-/// decrement of the overflow count).
-fn popTopTlsEntry(self: *State) void {
-    const entry = tls_readers[tls_readers_len - 1];
-    tls_readers_len -= 1;
-    if (entry.slot < READER_SLOTS) {
-        self.reader_slots[entry.slot].store(0, .release);
-    } else {
-        saturatingOverflowDec(self);
-    }
-}
-
-/// Unregister a reader registration (called by endRead). Pairing: with a
-/// non-full stack, find this State's most recent registration (LIFO within
-/// the same State; cross-State out-of-order nesting matches exactly by State
-/// pointer).
-/// Not found (cross-thread end / misuse), or stack full with a non-matching
-/// top -> saturating decrement of the overflow count (m1: no wraparound; an
-/// inflated count = watermark 0 = pin everything — the failure direction is
-/// always the safe side).
-/// ponytail: beyond MAX_TLS_READERS(16)-deep same-thread nesting, unpushed
-/// overflow registrations cannot be paired precisely (when the stack is full
-/// and the top matches, popping could pop an earlier own registration) —
-/// real nesting in this codebase is <=3 (ReadTxn+select), 16 deep is
-/// unreachable; to support it, upgrade to an explicit reader handle API
-/// (requires changing the db.zig interface).
-fn unregisterReaderSlot(self: *State) void {
-    if (tls_readers_len == MAX_TLS_READERS) {
-        // m1: when the stack is full and the top belongs to this State, pop
-        // for an exact unregister (removes the stickiness: otherwise every
-        // endRead after the stack fills takes the conservative branch and
-        // never pops, and the overflow count gets wrongly decremented into
-        // wraparound); non-matching top -> this end pairs with an unpushed
-        // overflow registration, decrement saturatingly.
-        if (tls_readers[tls_readers_len - 1].state == @as(*const anyopaque, @ptrCast(self))) {
-            popTopTlsEntry(self);
-            return;
-        }
-        saturatingOverflowDec(self);
-        return;
-    }
-    var i = tls_readers_len;
-    while (i > 0) {
-        i -= 1;
-        if (tls_readers[i].state == @as(*const anyopaque, @ptrCast(self))) {
-            const entry = tls_readers[i];
-            // swap-remove: what is removed is this State's latest
-            // registration; the relative LIFO order of this State's remaining
-            // entries is preserved (only other States' entries can sit
-            // in between).
-            tls_readers[i] = tls_readers[tls_readers_len - 1];
-            tls_readers_len -= 1;
-            if (entry.slot < READER_SLOTS) {
-                self.reader_slots[entry.slot].store(0, .release);
-            } else {
-                saturatingOverflowDec(self);
-            }
-            return;
-        }
-    }
-    // No registration record for this State on this thread (cross-thread
-    // end / misuse) -> saturating decrement of the overflow count
-    saturatingOverflowDec(self);
-}
 
 /// Phase-by-phase timing profile (#35): enabled at compile time, off the
 /// production hot path.
@@ -295,13 +180,19 @@ pub const State = struct {
     /// safely; the fast-path predicate)
     reader_count: std.atomic.Value(u32),
 
-    /// T-30 per-reader snapshot registration slots: 0 = free; non-zero =
-    /// snapshot|CLAIM_BIT. watermark = the minimum snapshot across active
-    /// slots, driving incremental precise reclamation of pending_free.
-    reader_slots: [READER_SLOTS]std.atomic.Value(u64),
-    /// Readers beyond the slots / unregistrable (>0 -> watermark treated as
-    /// 0, conservatively pinning everything = the old behavior)
-    overflow_readers: std.atomic.Value(u32),
+    /// Active-reader set: intrusive doubly-linked list (protected by
+    /// pending_free_mu). Watermark = min seq across this set.
+    readers_head: ?*Reader = null,
+    /// Reusable handle pool: a small embedded array (lazily linked into the
+    /// free list on first use — init returns by value, so self-referencing
+    /// pointers cannot be set up there) plus a heap fallback for deeper
+    /// concurrency. Bounded by peak concurrent readers — handles are
+    /// recycled, never grown per begin/end cycle. The embedded array keeps
+    /// the select() reader hot path allocation-free.
+    reader_free: ?*Reader = null,
+    embedded_readers: [EMBEDDED_READERS]Reader = undefined,
+    readers_linked: bool = false,
+    reader_pool: std.ArrayList(*Reader) = .empty,
 
     /// Dirty pages pending reclamation (carrying the release sequence;
     /// reclaimed incrementally by watermark while readers are active)
@@ -325,8 +216,6 @@ pub const State = struct {
             .closed = std.atomic.Value(bool).init(false),
             .meta_index = 0,
             .reader_count = std.atomic.Value(u32).init(0),
-            .reader_slots = @splat(std.atomic.Value(u64).init(0)),
-            .overflow_readers = std.atomic.Value(u32).init(0),
             .pending_free = .empty,
             .pending_free_mu = .{},
         };
@@ -337,42 +226,90 @@ pub const State = struct {
         // Free the remaining pending_free (safe: writer thread done, no readers)
         for (self.pending_free.items) |pp| self.store.freePage(pp.page_no);
         self.pending_free.deinit(self.allocator);
+        for (self.reader_pool.items) |r| self.allocator.destroy(r);
+        self.reader_pool.deinit(self.allocator);
     }
 
     // ---- MVCC reader API ----
 
-    /// Begin a read txn. Returns the current sequence (for a consistent
-    /// read snapshot).
-    /// T-30 + B1 invariant: claim (sentinel snapshot 0) -> read sequence ->
-    /// publish the real snapshot. Within the claim-to-publish window,
-    /// watermark sees snapshot 0 -> pin everything; after the publish
-    /// (release store), any watermark computation sees either the sentinel
-    /// or the real snapshot, always <= this reader's snapshot — an active
-    /// snapshot can never reference a reclaimed page. Registration happens
-    /// before returning; the caller then captures the root snapshot, and
-    /// whichever root it sees, its COW old pages stay in pending_free until
-    /// the watermark releases them.
-    pub fn beginRead(self: *State) u64 {
+    /// Begin a read txn. Allocates and registers a Reader (from the reusable
+    /// pool), returns its handle. The Reader stays valid until
+    /// endRead(self, reader).
+    /// B1 invariant (preserved by the lock): reader_count is incremented
+    /// (acquire) *before* taking pending_free_mu, so applyBatch's lock-free
+    /// reader_count==0 flush fast path can never observe 0 here; the
+    /// snapshot seq is loaded *while holding* the lock and the reader is
+    /// inserted into the active set in the same critical section — no
+    /// reclamation can interleave between the seq load and the registration,
+    /// so a watermark can never exceed an in-flight reader's eventual seq.
+    /// Registration happens before returning; the caller then captures the
+    /// root snapshot, and whichever root it sees, its COW old pages stay in
+    /// pending_free until the watermark releases them.
+    pub fn beginRead(self: *State) *Reader {
         _ = self.reader_count.fetchAdd(1, .acquire);
-        const slot = claimReaderSlot(self); // claim first (sentinel 0), then read sequence
-        const seq = self.sequence.load(.acquire);
-        if (slot < READER_SLOTS) {
-            self.reader_slots[slot].store(seq | CLAIM_BIT, .release);
+        self.pending_free_mu.lockUncancelable();
+        defer self.pending_free_mu.unlock();
+        if (!self.readers_linked) {
+            // Lazy link of the embedded pool: State.init returns by value, so
+            // self-referencing free-list pointers can only be wired up here,
+            // once the State has reached its final address.
+            var i: usize = 0;
+            while (i < EMBEDDED_READERS) : (i += 1) {
+                self.embedded_readers[i].next_free = self.reader_free;
+                self.reader_free = &self.embedded_readers[i];
+            }
+            self.readers_linked = true;
         }
-        return seq;
+        const r = self.reader_free orelse blk: {
+            const nr = self.allocator.create(Reader) catch @panic("beginRead: out of memory");
+            nr.next_free = null;
+            self.reader_pool.append(self.allocator, nr) catch {
+                self.allocator.destroy(nr);
+                @panic("beginRead: out of memory");
+            };
+            break :blk nr;
+        };
+        self.reader_free = r.next_free;
+        r.* = .{
+            .state = self,
+            .seq = self.sequence.load(.acquire),
+            .active = true,
+            .prev_active = null,
+            .next_active = self.readers_head,
+            .next_free = null,
+        };
+        if (self.readers_head) |h| h.prev_active = r;
+        self.readers_head = r;
+        return r;
     }
 
-    /// End a read txn. T-30: unregisters this reader's snapshot and
-    /// immediately reclaims the now-safe pending pages by oldest-reader
+    /// End a read txn. Unregisters the exact Reader, returns it to the pool,
+    /// and immediately reclaims the now-safe pending pages by oldest-reader
     /// watermark — a short-lived reader's exit releases its pinned pages
     /// without waiting for the last reader; the last reader's exit
     /// (reader_count reaching 0) still reclaims everything (the existing
-    /// fast-path semantics preserved). With no backlog (dirt==0) this is
-    /// just two atomics and no lock — the reader hot path never degrades
-    /// into a lock.
-    pub fn endRead(self: *State) void {
-        _ = self.reader_count.fetchSub(1, .release);
-        unregisterReaderSlot(self);
+    /// fast-path semantics preserved). Guards: double-end is a no-op
+    /// (checked via .active); cross-state misuse (reader.state != self) is a
+    /// guarded no-op — neither State's registry nor reader_count is touched.
+    pub fn endRead(self: *State, reader: *Reader) void {
+        if (reader.state != self) return; // cross-state misuse: guarded no-op
+        if (!reader.active) return; // double-end: no-op
+        {
+            self.pending_free_mu.lockUncancelable();
+            defer self.pending_free_mu.unlock();
+            // unlink from the active set
+            if (reader.prev_active) |p| {
+                p.next_active = reader.next_active;
+            } else {
+                self.readers_head = reader.next_active;
+            }
+            if (reader.next_active) |n| n.prev_active = reader.prev_active;
+            reader.active = false;
+            // return to the free list
+            reader.next_free = self.reader_free;
+            self.reader_free = reader;
+            _ = self.reader_count.fetchSub(1, .release);
+        }
         if (self.dirt.load(.acquire) > 0) {
             self.reclaimPendingFree();
         }
@@ -489,19 +426,16 @@ pub const State = struct {
     }
 
     /// Oldest-active-reader watermark: the minimum snapshot sequence across
-    /// active readers. Returning 0 = the conservative floor (overflow
-    /// readers / readers present but snapshot not yet visible) -> pin
-    /// everything.
+    /// the active-reader set. Empty set -> 0 (a reader is mid-registration,
+    /// its seq not yet visible — the conservative floor, pin everything).
+    /// Caller must hold pending_free_mu.
     fn readerWatermark(self: *State) u64 {
-        if (self.overflow_readers.load(.acquire) > 0) return 0;
         var min: u64 = 0;
         var found = false;
-        for (&self.reader_slots) |*slot| {
-            const v = slot.load(.acquire);
-            if (v == 0) continue;
-            const snap = v & ~CLAIM_BIT;
-            if (!found or snap < min) {
-                min = snap;
+        var cur = self.readers_head;
+        while (cur) |r| : (cur = r.next_active) {
+            if (!found or r.seq < min) {
+                min = r.seq;
                 found = true;
             }
         }

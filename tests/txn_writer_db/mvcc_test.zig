@@ -52,8 +52,8 @@ test "mvcc: active reader prevents dirty page recycling" {
     // At this point leaf 1 is at page FIRST_DATA_PAGE
 
     // Begin a read txn (simulating a reader holding a snapshot of the old root)
-    const reader_seq = state.beginRead();
-    try std.testing.expect(reader_seq > 0);
+    const reader = state.beginRead();
+    try std.testing.expect(reader.seq > 0);
 
     // Overwrite the key (COW creates new leaf 2, frees old leaf 1)
     var f2: zio.Future(wrt.OpResult) = .{};
@@ -64,7 +64,7 @@ test "mvcc: active reader prevents dirty page recycling" {
     try std.testing.expect(state.pendingFreeCount() > 0);
 
     // End the read txn
-    state.endRead();
+    state.endRead(reader);
 
     // Now pending_free should be fully released
     try std.testing.expectEqual(@as(usize, 0), state.pendingFreeCount());
@@ -85,8 +85,6 @@ test "mvcc: multiple readers all release before pages freed" {
     // Two readers active at the same time
     const r1 = state.beginRead();
     const r2 = state.beginRead();
-    _ = r1;
-    _ = r2;
 
     // Overwrite
     var f2: zio.Future(wrt.OpResult) = .{};
@@ -95,11 +93,11 @@ test "mvcc: multiple readers all release before pages freed" {
     try std.testing.expect(state.pendingFreeCount() > 0);
 
     // Release one reader -> pages must still not be freed (the other reader remains)
-    state.endRead();
+    state.endRead(r1);
     try std.testing.expect(state.pendingFreeCount() > 0);
 
     // Release the second reader -> pages should be freed
-    state.endRead();
+    state.endRead(r2);
     try std.testing.expectEqual(@as(usize, 0), state.pendingFreeCount());
 }
 
@@ -115,7 +113,7 @@ test "mvcc: dirt counter reflects pending pages" {
     try state.applyBatch(&.{.{ .key = "k", .value = "v1", .tombstone = false, .future = &f1 }});
     _ = try f1.wait();
 
-    _ = state.beginRead();
+    const r = state.beginRead();
 
     var f2: zio.Future(wrt.OpResult) = .{};
     try state.applyBatch(&.{.{ .key = "k", .value = "v2", .tombstone = false, .future = &f2 }});
@@ -124,7 +122,7 @@ test "mvcc: dirt counter reflects pending pages" {
     // dirt should equal the pending_free count (not yet freed)
     try std.testing.expectEqual(state.pendingFreeCount(), state.dirt.load(.acquire));
 
-    state.endRead();
+    state.endRead(r);
     // After the reader ends, dirt should be 0 (freed)
     try std.testing.expectEqual(@as(u64, 0), state.dirt.load(.acquire));
 }
@@ -144,7 +142,7 @@ test "mvcc: old root still readable during concurrent write" {
     const root_v1 = state.getRoot();
 
     // Begin a read (simulating a reader holding a snapshot of the old root)
-    _ = state.beginRead();
+    const r = state.beginRead();
 
     // Write key="k"="v2" (COW produces a new root; the old root's page must not be reclaimed)
     var f2: zio.Future(wrt.OpResult) = .{};
@@ -163,7 +161,7 @@ test "mvcc: old root still readable during concurrent write" {
     try std.testing.expectEqualStrings("v2", newv.?);
     std.testing.allocator.free(newv.?);
 
-    state.endRead();
+    state.endRead(r);
 }
 
 test "mvcc: beginRead/endRead nesting" {
@@ -182,15 +180,13 @@ test "mvcc: beginRead/endRead nesting" {
 
     const r1 = state.beginRead();
     const r2 = state.beginRead();
-    _ = r1;
-    _ = r2;
-    state.endRead(); // release the second one
+    state.endRead(r2); // release the second one
     var f1: zio.Future(wrt.OpResult) = .{};
     try state.applyBatch(&.{.{ .key = "k", .value = "v", .tombstone = false, .future = &f1 }});
     _ = try f1.wait();
     // A reader is still active (the first one); pages must not be freed
     try std.testing.expect(state.pendingFreeCount() > 0);
-    state.endRead(); // release the first one
+    state.endRead(r1); // release the first one
     try std.testing.expectEqual(@as(usize, 0), state.pendingFreeCount());
 }
 // ---- T-30: per-reader sequence registration + oldest-reader watermark precise reclamation ----
@@ -215,25 +211,24 @@ fn applyPut(state: *wrt.State, key: []const u8, value: []const u8) !void {
 }
 
 // Short-lived reader thread context: begin -> signal started -> wait for exit command -> end -> signal exited.
-// B runs on its own thread: its begin/end occupy its own thread-local registration stack, so endRead
-// pairs precisely (B's exit unregisters B's snapshot slot — the real shape of concurrent readers; see
-// the thread pattern in mvcc_concurrent_flush_test. endRead takes no identity argument, so same-thread
-// out-of-order ends can only pair conservatively; cross-thread is the precise pairing.)
+// B runs on its own thread with its own Reader handle (T-32: beginRead returns an explicit
+// handle, so B's exit unregisters exactly B's registration — the real shape of concurrent readers;
+// see the thread pattern in mvcc_concurrent_flush_test).
 const ShortReaderCtx = struct {
     state: *wrt.State,
-    snapshot: u64 = 0,
+    reader: *wrt.Reader = undefined,
     started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     may_exit: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     exited: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
 fn shortReaderThread(ctx: *ShortReaderCtx) void {
-    ctx.snapshot = ctx.state.beginRead();
+    ctx.reader = ctx.state.beginRead();
     ctx.started.store(true, .release);
     while (!ctx.may_exit.load(.acquire)) {
         std.Thread.yield() catch {};
     }
-    ctx.state.endRead();
+    ctx.state.endRead(ctx.reader);
     ctx.exited.store(true, .release);
 }
 
@@ -256,7 +251,7 @@ test "mvcc watermark: short-lived reader exit reclaims pages while long-lived re
     while (!bctx.started.load(.acquire)) {
         std.Thread.yield() catch {};
     }
-    try std.testing.expectEqual(@as(u64, 3), bctx.snapshot);
+    try std.testing.expectEqual(@as(u64, 3), bctx.reader.seq);
 
     // Overwrite a -> seq 4, old leaf freed (release_seq=4)
     try applyPut(&state, "a", "2");
@@ -266,8 +261,8 @@ test "mvcc watermark: short-lived reader exit reclaims pages while long-lived re
     try std.testing.expectEqual(@as(usize, 2), pending_before);
 
     // A: long-lived reader, starts late (snapshot 5), captures its snapshot root
-    const seq_a = state.beginRead();
-    try std.testing.expectEqual(@as(u64, 5), seq_a);
+    const ra = state.beginRead();
+    try std.testing.expectEqual(@as(u64, 5), ra.seq);
     const root_a = state.getRoot();
 
     // B exits (A still active): tell thread B to end and wait for completion.
@@ -303,7 +298,7 @@ test "mvcc watermark: short-lived reader exit reclaims pages while long-lived re
     std.testing.allocator.free(vc2.?);
 
     // A exits (last reader) -> full reclamation (existing fast path)
-    state.endRead();
+    state.endRead(ra);
     try std.testing.expectEqual(@as(usize, 0), state.pendingFreeCount());
     try std.testing.expectEqual(@as(u64, 0), state.dirt.load(.acquire));
 }
@@ -319,8 +314,8 @@ test "mvcc watermark: compact keeps dirt truthful with active reader" {
     try applyPut(&state, "k", "v1"); // seq 1
 
     // A: long-lived reader (snapshot 1)
-    const seq_a = state.beginRead();
-    try std.testing.expectEqual(@as(u64, 1), seq_a);
+    const ra = state.beginRead();
+    try std.testing.expectEqual(@as(u64, 1), ra.seq);
 
     try applyPut(&state, "k", "v2"); // seq 2, old leaf freed (release_seq=2)
     try std.testing.expect(state.pendingFreeCount() > 0);
@@ -341,7 +336,7 @@ test "mvcc watermark: compact keeps dirt truthful with active reader" {
     std.testing.allocator.free(v.?);
 
     // A exits (last reader) -> full reclamation, dirt back to 0
-    state.endRead();
+    state.endRead(ra);
     try std.testing.expectEqual(@as(usize, 0), state.pendingFreeCount());
     try std.testing.expectEqual(@as(u64, 0), state.dirt.load(.acquire));
 }

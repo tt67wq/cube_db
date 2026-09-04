@@ -116,10 +116,10 @@ test "T04 MVCC reader deferred reclamation" {
     }
 
     // Start the reader
-    const snap = state.beginRead();
-    defer state.endRead();
+    const reader = state.beginRead();
+    defer state.endRead(reader);
 
-    try std.testing.expect(snap >= 0);
+    try std.testing.expect(reader.seq > 0);
     try std.testing.expectEqual(@as(u32, 1), state.reader_count.load(.acquire));
 
     var future: zio.Future(wrt.OpResult) = .{};
