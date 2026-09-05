@@ -382,10 +382,12 @@ db.put("k", "v") catch |err| switch (err) {
 - **MVCC reader**: writers defer reclaiming dirty pages while readers are active:
 
 ```zig
-const reader_seq = db.beginRead(); // begin read, returns current sequence
-const v = try db.get("k");          // read a consistent snapshot
-db.endRead();                        // end read, release dirty pages
+const reader = db.beginRead(); // begin read, returns an explicit Reader handle (carrying the snapshot)
+const v = try db.get("k");     // read a consistent snapshot
+db.endRead(reader);            // end read (pass the handle to unregister), release dirty pages
 ```
+
+> `beginRead` returns a **Reader handle** (not a sequence number); `endRead` must be given the same handle to pair the unregister.
 
 - **With no active readers**: dirty pages are reclaimed automatically after each commit.
 - **Do not share a single iterator across threads**; each thread opens its own `select`.
@@ -473,9 +475,9 @@ while (try it.next()) |e| { /* e.key, e.value borrowed, invalid after next(); it
 // Compact
 try db.compact();                     // O(1) meta switch
 
-// MVCC reader
-db.beginRead();
-db.endRead();
+// MVCC reader (explicit handle pairing)
+const reader = db.beginRead();
+db.endRead(reader);
 
 // Explicit transactions (LMDB-style)
 var w = try db.beginWriteTxn();          // single-writer mutex

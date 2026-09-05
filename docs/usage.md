@@ -361,10 +361,12 @@ db.put("k", "v") catch |err| switch (err) {
 - **MVCC reader**：写入器在 reader 活跃时延迟回收脏页：
 
 ```zig
-const reader_seq = db.beginRead(); // 开始读，返回当前序列号
-const v = try db.get("k");          // 读一致性快照
-db.endRead();                        // 结束读，释放脏页
+const reader = db.beginRead(); // 开始读，返回显式 Reader 句柄（携带快照）
+const v = try db.get("k");     // 读一致性快照
+db.endRead(reader);            // 结束读（带句柄注销），释放脏页
 ```
+
+> `beginRead` 返回的是 **Reader 句柄**（不是序列号）；`endRead` 必须传入同一句柄以配对注销。
 
 - **没有活跃 reader 时**：脏页在每次 commit 后自动回收。
 - **不要跨线程共享一个迭代器**；每个线程各开各的 `select`。
@@ -452,9 +454,9 @@ while (try it.next()) |e| { /* e.key, e.value 借用，next() 后失效；it pin
 // 压缩
 try db.compact();                     // O(1) meta 切换
 
-// MVCC reader
-db.beginRead();
-db.endRead();
+// MVCC reader（显式句柄配对）
+const reader = db.beginRead();
+db.endRead(reader);
 
 // 显式事务（LMDB 式）
 var w = try db.beginWriteTxn();          // 单写者互斥
