@@ -358,7 +358,7 @@ db.put("k", "v") catch |err| switch (err) {
 
 ## 5. 并发与 MVCC
 
-- **多线程读**：安全。`get`/`select` 读原子 root 快照，无锁无 fsync。
+- **多线程读**：安全。`get`/`select` 读原子 root 快照，无锁无 fsync。点读（`get`/`getInto`）与 `select` 一样在读取期间持有 MVCC reader pin（register-then-capture），在途读取引用的 COW 旧页不会被并发提交回收。
 - **MVCC reader**：写入器在 reader 活跃时延迟回收脏页：
 
 ```zig

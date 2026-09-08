@@ -197,6 +197,16 @@ pub const Db = struct {
     // ---- Read path (default snapshot = current root) ----
 
     pub fn get(self: *Db, key: []const u8) !?[]u8 {
+        // Register-then-capture (same pattern as select / ReadTxn, T-29
+        // review finding 1): the reader must be registered BEFORE the root
+        // snapshot is taken — an unregistered in-flight get is invisible to
+        // the watermark, so a concurrent commit's reclaimPendingFree
+        // (reader_count==0 fast path) could free the COW old pages the
+        // snapshot still references, and the next alloc would overwrite them
+        // mid-descent (silent misread). Whichever root is read, its COW old
+        // pages stay in pending_free until endRead releases the pin.
+        const reader = self.state.beginRead();
+        defer self.state.endRead(reader);
         const root = self.state.getRoot();
         return try btree.get(self.allocator, self.store, root, key);
     }
@@ -206,6 +216,11 @@ pub const Db = struct {
     /// -> error.BufferTooSmall (buffer untouched). Frees hot-path readers
     /// (cache/index layers) from get()'s per-call alloc/free.
     pub fn getInto(self: *Db, key: []const u8, buffer: []u8) !?usize {
+        // Register-then-capture, identical to get() above: pin the snapshot
+        // before capturing the root so concurrent reclamation cannot free
+        // pages the in-flight descent still references.
+        const reader = self.state.beginRead();
+        defer self.state.endRead(reader);
         const root = self.state.getRoot();
         return try btree.getInto(self.store, root, key, buffer);
     }
