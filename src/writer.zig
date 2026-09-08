@@ -346,6 +346,9 @@ pub const State = struct {
             .root_page = cur_root,
             .entry_count = cur_entry_count,
             .byte_size = cur_byte_size,
+            // free_head/free_count are placeholders: FilePageStore.vtWriteMeta
+            // overrides them with the persisted chain values (same pattern as
+            // last_page). MemPageStore has no persistence and keeps them 0.
             .free_head = 0,
             .free_count = 0,
             .last_page = 0,
@@ -366,23 +369,15 @@ pub const State = struct {
 
     // ---- Internal ----
 
-    /// Reclaim all of pending_free: does *not* check reader_count (the
-    /// caller guarantees safety: applyBatch's reader_count==0 fast path, a
-    /// single-writer context).
-    /// Takes pending_free_mu, serializing writer and reader incremental
-    /// reclamation mutations of the list.
-    fn flushPendingFree(self: *State) void {
-        self.pending_free_mu.lockUncancelable();
-        defer self.pending_free_mu.unlock();
-        const prof = ProfileStats.enable;
-        const t0 = if (prof) ProfileStats.now() else 0;
-        for (self.pending_free.items) |pp| {
-            self.store.freePage(pp.page_no);
-        }
-        self.pending_free.clearRetainingCapacity();
-        self.dirt.store(0, .release);
-        if (prof) ProfileStats.txn_flush_free_ns += @intCast(ProfileStats.now() - t0);
-    }
+    // flushPendingFree (T-33 P0 fix): deleted. The old lock-free full-free
+    // checked reader_count OUTSIDE pending_free_mu, leaving a coherence race:
+    // a reader whose fetchAdd had not yet propagated could register with the
+    // old sequence while the writer's step-0/step-9 flush freed pages that
+    // reader's root still referenced (release_seq == seq+1). Both call sites
+    // now route through reclaimPendingFree, which re-checks reader_count
+    // under the lock (B1: count is incremented before the lock, so any
+    // reader visible in real time is visible under the lock) and otherwise
+    // reclaims only release_seq < watermark — airtight.
 
     /// T-30 incremental reclamation of pending pages by oldest-reader
     /// watermark:
@@ -405,13 +400,20 @@ pub const State = struct {
             ProfileStats.txn_flush_free_ns += @intCast(ProfileStats.now() - t0);
         };
 
-        if (self.reader_count.load(.acquire) == 0) {
-            for (self.pending_free.items) |pp| self.store.freePage(pp.page_no);
-            self.pending_free.clearRetainingCapacity();
-            self.dirt.store(0, .release);
-            return;
+        // T-33 P0 fix: watermark = min(oldest active reader, sequence+1).
+        // The sequence+1 floor is load-bearing: the commit IN FLIGHT has its
+        // COW victims in pending_free with release_seq = sequence+1, and a
+        // reader registering right now (seq = sequence, root = tree(sequence))
+        // still references those pages. The old count==0 full-free ignored
+        // release_seq entirely — a reader's endRead during the in-flight
+        // commit (count momentarily 0) handed live pages to the pool, and the
+        // next data alloc or chain persist overwrote them mid-descent. With
+        // the floor, "no readers" still frees everything with release_seq <=
+        // sequence (the old fast path, minus the in-flight hole).
+        var watermark = self.sequence.load(.acquire) + 1;
+        if (self.reader_count.load(.acquire) > 0) {
+            watermark = @min(watermark, self.readerWatermark());
         }
-        const watermark = self.readerWatermark();
         var keep: usize = 0;
         for (self.pending_free.items) |pp| {
             if (pp.release_seq < watermark) {
@@ -460,7 +462,7 @@ pub const State = struct {
         //    reader endRead's flush via pending_free_mu (a single
         //    synchronizable mutator).
         if (self.reader_count.load(.acquire) == 0) {
-            self.flushPendingFree();
+            self.reclaimPendingFree();
         }
 
         // 1. Snapshot the current root
@@ -648,6 +650,9 @@ pub const State = struct {
             .root_page = new_root,
             .entry_count = new_entry_count,
             .byte_size = new_byte,
+            // free_head/free_count are placeholders: FilePageStore.vtWriteMeta
+            // overrides them with the persisted chain values (same pattern as
+            // last_page). MemPageStore has no persistence and keeps them 0.
             .free_head = 0,
             .free_count = 0,
             .last_page = 0,
@@ -689,7 +694,7 @@ pub const State = struct {
         // 9. If there are no readers at this point, reclaim dirty pages immediately
 
         if (self.reader_count.load(.acquire) == 0) {
-            self.flushPendingFree();
+            self.reclaimPendingFree();
         }
 
         if (prof) {

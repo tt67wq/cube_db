@@ -20,6 +20,14 @@ pub const META_PAGE_1: u32 = 2;
 pub const MAGIC_V2: u32 = 0x4355_4232; // "CUB2"
 pub const META_PAGE_PAYLOAD_SIZE: usize = 58;
 
+/// Max free-page entries per FREE page: payload = PAGE_SIZE - PAGE_HEADER_SIZE(24) - CRC(4);
+/// first 4 bytes hold the count, the rest holds u32 entries. T-33: single source of truth
+/// for the chain split (persistChain) and the restore walk bound (restoreFreeList).
+pub const MAX_FREE_ENTRIES_PER_PAGE: usize = (PAGE_SIZE - PAGE_HEADER_SIZE - 4 - 4) / 4;
+comptime {
+    std.debug.assert(MAX_FREE_ENTRIES_PER_PAGE == 1016);
+}
+
 /// Page header (first 24 bytes of every page)
 pub const PageHeader = struct {
     page_no: u32,
@@ -234,11 +242,14 @@ pub fn readMetaPage(page0: *const [PAGE_SIZE]u8, page1: *const [PAGE_SIZE]u8) ?M
 /// Write freelist entries into the page (overwrites the payload area)
 pub fn writeFreelistEntries(page: *[PAGE_SIZE]u8, entries: []const u32) void {
     const payload = page[PAGE_HEADER_SIZE .. PAGE_SIZE - 4];
+    // T-33(T1): count = actually written (was entries.len — the overflow count-mismatch bug
+    // pinned by freelist_overflow_test.zig). Callers chunk by MAX_FREE_ENTRIES_PER_PAGE, so
+    // the truncation path is defense-only; readFreelistEntries keeps its @min clamp.
+    const n = @min(entries.len, MAX_FREE_ENTRIES_PER_PAGE);
     // First 4 bytes hold the entry count
-    std.mem.writeInt(u32, payload[0..4], @intCast(entries.len), .little);
+    std.mem.writeInt(u32, payload[0..4], @intCast(n), .little);
     var pos: usize = 4;
-    for (entries) |e| {
-        if (pos + 4 > payload.len) break;
+    for (entries[0..n]) |e| {
         std.mem.writeInt(u32, payload[pos..][0..4], e, .little);
         pos += 4;
     }

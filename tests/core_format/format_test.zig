@@ -394,4 +394,8 @@ test "format: computePageChecksum is deterministic" {
 // T-3: freelist overflow test hookup (comptime import; test-format runs these tests)
 comptime {
     _ = @import("freelist_overflow_test.zig");
+    // T-33 RED: freelist persistence (T2/T3/T4/T6) + T7 partition helper
+    _ = @import("freelist_persist_test.zig");
+    // T-33 RED: P0 FilePageStore freelist lock (1 writer + N readers churn)
+    _ = @import("freelist_concurrent_test.zig");
 }

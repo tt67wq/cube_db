@@ -16,4 +16,6 @@ comptime {
     _ = @import("crash_insertbatch_pb/pb_fps_scale_test.zig");
     _ = @import("crash_insertbatch_pb/crash_meta_midwrite_test.zig");
     _ = @import("crash_insertbatch_pb/durability_order_test.zig");
+    // T-33 RED: freelist persistence crash injection (T5 + T5-b + T5-r)
+    _ = @import("crash_insertbatch_pb/freelist_persist_crash_test.zig");
 }

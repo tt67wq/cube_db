@@ -1,13 +1,20 @@
-//! freelist_overflow_test.zig - T-3: pin down writeFreelistEntries over-capacity behavior
+//! freelist_overflow_test.zig - T-3 / T-33(T1): writeFreelistEntries over-capacity contract
 //!
-//! When src/format.zig:234 writeFreelistEntries writes entries exceeding a single page's capacity,
-//! `if (pos + 4 > payload.len) break` silently drops the overflow entries, but the count field is
-//! written as the original entries.len (not the number actually written). readFreelistEntries
-//! (src/format.zig:255) clamps with `@min(count, max)`, masking the count != actually-written inconsistency.
+//! Original T-3 finding: given more entries than one FREE page holds, writeFreelistEntries'
+//! `if (pos + 4 > payload.len) break` silently dropped the overflow while the count field was
+//! written as the original entries.len — count != actually-written, masked on the read side by
+//! readFreelistEntries' `@min(count, max)` clamp.
 //!
-//! This file asserts the current actual behavior (entries read back), and marks the spots where count
-//! mismatches the actually-written count with `// FIXME: known bug - write count mismatch`, keeping the
-//! tests green without hiding the problem.
+//! T-33 (freelist persistence) turns that into the contract asserted here:
+//!
+//!     stored count == @min(entries.len, MAX_FREE_ENTRIES_PER_PAGE)
+//!
+//! The count field always tells the truth about what is physically on the page; the read-side clamp
+//! stays as defense-in-depth against a corrupt count field. Entries beyond one page are the caller's
+//! job — it chains another FREE page (freelist_persist_test.zig T2) — never a silent truncation.
+//!
+//! The two former `// FIXME: known bug - write count mismatch` assertions are reversed below: RED
+//! against main (93ec9fc), GREEN with T-33 step 1 (src/format.zig).
 //!
 //! Hookup: comptime @import of this file at the end of tests/core_format/format_test.zig.
 
@@ -28,7 +35,7 @@ fn newFreePage() [f2.PAGE_SIZE]u8 {
     return page;
 }
 
-test "freelist_overflow: max+1 entries — read-back clamped to max, count mismatch" {
+test "freelist_overflow: max+1 entries — count truthful (min(len,cap)), read-back = cap" {
     // max+1 entries: the write side's break drops the last 1, but the count field is written as max+1
     var page = newFreePage();
     const allocator = std.testing.allocator;
@@ -45,20 +52,20 @@ test "freelist_overflow: max+1 entries — read-back clamped to max, count misma
     // entries read back: readFreelistEntries @min(count=max+1, max) = max
     try std.testing.expectEqual(MAX_ENTRIES, @as(u32, @intCast(got.len)));
 
-    // FIXME: known bug - write count mismatch
-    // writeFreelistEntries writes count as entries.len (max+1), but only max entries were actually written.
-    // The read returns max due to @min clamping; the count field (1017) is inconsistent with the actually-written count (1016).
-    // verify the count field really was written as max+1 (i.e. the bug exists):
+    // T-33(T1) reversed FIXME: count field must tell the truth — the page physically holds
+    // MAX_ENTRIES entries, so stored count == @min(entries.len, MAX_ENTRIES) == MAX_ENTRIES,
+    // never entries.len (MAX_ENTRIES+1). RED on main (format.zig still writes entries.len);
+    // GREEN with T-33 step 1.
     const payload = page[f2.PAGE_HEADER_SIZE .. f2.PAGE_SIZE - 4];
     const stored_count = std.mem.readInt(u32, payload[0..4], .little);
-    try std.testing.expectEqual(MAX_ENTRIES + 1, stored_count);
+    try std.testing.expectEqual(MAX_ENTRIES, stored_count);
 
     // read-back content: the first max entries intact, the max+1-th (dropped by break) is unreachable
     try std.testing.expectEqual(@as(u32, 1000), got[0]);
     try std.testing.expectEqual(@as(u32, 1000 + MAX_ENTRIES - 1), got[got.len - 1]);
 }
 
-test "freelist_overflow: max+10 entries — read-back still clamped to max" {
+test "freelist_overflow: max+10 entries — count still truthful, read-back = cap" {
     var page = newFreePage();
     const allocator = std.testing.allocator;
     var entries = std.ArrayList(u32).empty;
@@ -74,10 +81,11 @@ test "freelist_overflow: max+10 entries — read-back still clamped to max" {
     // even with 10 more dropped, read-back is still = max (@min clamp)
     try std.testing.expectEqual(MAX_ENTRIES, @as(u32, @intCast(got.len)));
 
-    // FIXME: known bug - write count mismatch
+    // T-33(T1) reversed FIXME: count == actually written == @min(entries.len, cap) == MAX_ENTRIES,
+    // never entries.len (MAX_ENTRIES+10). RED on main.
     const payload = page[f2.PAGE_HEADER_SIZE .. f2.PAGE_SIZE - 4];
     const stored_count = std.mem.readInt(u32, payload[0..4], .little);
-    try std.testing.expectEqual(MAX_ENTRIES + 10, stored_count);
+    try std.testing.expectEqual(MAX_ENTRIES, stored_count);
 }
 
 test "freelist_overflow: corrupt count 0xFFFFFFFF — no crash, clamped to max" {
@@ -132,4 +140,63 @@ test "freelist_overflow: zero entries — empty read-back, count 0" {
     const payload = page[f2.PAGE_HEADER_SIZE .. f2.PAGE_SIZE - 4];
     const stored_count = std.mem.readInt(u32, payload[0..4], .little);
     try std.testing.expectEqual(@as(u32, 0), stored_count);
+}
+
+// ===== T-33(T1) additions =====
+
+test "freelist_overflow: exactly 1016 entries — count==1016 and header untouched" {
+    // A FREE page's header carries the chain link (free_next) and, per T-33 H1, the gen stamp
+    // (= the sequence of the meta that points at this chain). writeFreelistEntries owns the payload
+    // + CRC only: if it clobbered the header, chaining and gen validation would break silently.
+    var page: [f2.PAGE_SIZE]u8 = undefined;
+    @memset(&page, 0);
+    const chain_next: u32 = 0x00BE_EEFC;
+    const gen_stamp: u64 = 0x1122_3344_5566_7788;
+    var hdr = f2.PageHeader{
+        .page_no = 77,
+        .page_type = f2.PAGE_TYPE_FREE,
+        .gen = gen_stamp,
+        .nkeys = 0,
+        .free_next = chain_next,
+    };
+    f2.encodePageHeader(&page, &hdr);
+
+    const allocator = std.testing.allocator;
+    var entries = std.ArrayList(u32).empty;
+    defer entries.deinit(allocator);
+    var i: u32 = 0;
+    while (i < MAX_ENTRIES) : (i += 1) {
+        try entries.append(allocator, 5000 + i);
+    }
+
+    f2.writeFreelistEntries(&page, entries.items);
+
+    // count == exactly the capacity (the boundary case: nothing dropped, nothing inflated)
+    const payload = page[f2.PAGE_HEADER_SIZE .. f2.PAGE_SIZE - 4];
+    const stored_count = std.mem.readInt(u32, payload[0..4], .little);
+    try std.testing.expectEqual(MAX_ENTRIES, stored_count);
+    const got = f2.readFreelistEntries(&page);
+    try std.testing.expectEqual(MAX_ENTRIES, @as(u32, @intCast(got.len)));
+    try std.testing.expectEqual(@as(u32, 5000), got[0]);
+    try std.testing.expectEqual(@as(u32, 5000 + MAX_ENTRIES - 1), got[got.len - 1]);
+
+    // header (chain link + gen stamp + identity) survives the payload write
+    const got_hdr = f2.decodePageHeader(&page);
+    try std.testing.expectEqual(chain_next, got_hdr.free_next);
+    try std.testing.expectEqual(gen_stamp, got_hdr.gen);
+    try std.testing.expectEqual(@as(u32, 77), got_hdr.page_no);
+    try std.testing.expectEqual(f2.PAGE_TYPE_FREE, got_hdr.page_type);
+
+    // the payload write must leave a valid whole-page CRC (it recomputes over header+payload)
+    try std.testing.expect(f2.verifyPageChecksum(&page));
+}
+
+test "freelist_overflow: format exposes MAX_FREE_ENTRIES_PER_PAGE == single-page capacity" {
+    // T-33 contract: the per-page capacity becomes a named format constant so the persistence layer
+    // (chain split, restore walk bound) and these tests share one source of truth instead of each
+    // recomputing (PAGE_SIZE - PAGE_HEADER_SIZE - 4 - 4) / 4. RED on main.
+    try std.testing.expect(@hasDecl(f2, "MAX_FREE_ENTRIES_PER_PAGE"));
+    if (@hasDecl(f2, "MAX_FREE_ENTRIES_PER_PAGE")) {
+        try std.testing.expectEqual(MAX_ENTRIES, @as(u32, @intCast(f2.MAX_FREE_ENTRIES_PER_PAGE)));
+    }
 }
