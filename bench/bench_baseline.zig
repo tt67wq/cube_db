@@ -22,15 +22,17 @@ const MetricList = []const Metric;
 
 fn currentBaseline() MetricList {
     return &.{
-        // Recalibrated 2026-07-31: put/delete explanation = write-path dupe
-        // overhead (hypothesis, to be verified by a commit-path breakdown task)
-        .{ .name = "put 100B", .store = "mem", .value_ns = 123721, .threshold_pct = 25, .note = "MemPageStore, 5K keys, recalibrated (dupe hypothesis)" },
-        .{ .name = "putBatch 100B", .store = "mem", .value_ns = 13240, .threshold_pct = 25, .note = "MemPageStore, 30 keys (fast path), recalibrated (old value had 1-key bug)" },
-        .{ .name = "get 100B", .store = "mem", .value_ns = 2907, .threshold_pct = 15, .note = "MemPageStore, 5K keys, A/B confirmed no regression" },
-        .{ .name = "delete 100B", .store = "mem", .value_ns = 117093, .threshold_pct = 25, .note = "MemPageStore, 5K keys, recalibrated (dupe hypothesis)" },
-        .{ .name = "put 100B", .store = "file-fsync", .value_ns = 167499, .threshold_pct = 20, .note = "FilePageStore+fsync, 1K keys, recalibrated" },
-        .{ .name = "putBatch 100B", .store = "file-fsync", .value_ns = 15233, .threshold_pct = 25, .note = "FilePageStore+fsync, 30 keys, recalibrated (old value had 1-key bug)" },
-        .{ .name = "get 100B", .store = "file-fsync", .value_ns = 3100, .threshold_pct = 25, .note = "FilePageStore+fsync, 1K keys, noise-sensitive" },
+        // Recalibrated 2026-09-08: HEAD a3283b2 (T-34). Previous baseline was
+        // 2026-07-31; the T-27..T-34 optimization lines (COW/Shared/fast path/
+        // zero-copy/CRC) put every metric 4~12x faster, so the old baselines no
+        // longer catch real regressions. Values below = 2026-09-08 measured medians.
+        .{ .name = "put 100B", .store = "mem", .value_ns = 13133, .threshold_pct = 25, .note = "MemPageStore, 5K keys, recalibrated 2026-09-08 (T-34)" },
+        .{ .name = "putBatch 100B", .store = "mem", .value_ns = 720, .threshold_pct = 25, .note = "MemPageStore, 30 keys (fast path), recalibrated 2026-09-08" },
+        .{ .name = "get 100B", .store = "mem", .value_ns = 2564, .threshold_pct = 15, .note = "MemPageStore, 5K keys, recalibrated 2026-09-08" },
+        .{ .name = "delete 100B", .store = "mem", .value_ns = 13923, .threshold_pct = 25, .note = "MemPageStore, 5K keys, recalibrated 2026-09-08" },
+        .{ .name = "put 100B", .store = "file-fsync", .value_ns = 78479, .threshold_pct = 20, .note = "FilePageStore+fsync, 1K keys, recalibrated 2026-09-08" },
+        .{ .name = "putBatch 100B", .store = "file-fsync", .value_ns = 1900, .threshold_pct = 25, .note = "FilePageStore+fsync, 30 keys, recalibrated 2026-09-08" },
+        .{ .name = "get 100B", .store = "file-fsync", .value_ns = 2884, .threshold_pct = 25, .note = "FilePageStore+fsync, 1K keys, noise-sensitive" },
     };
 }
 
@@ -176,7 +178,7 @@ pub fn main() !void {
 
     std.debug.print("=== benchmark regression baseline check ===\n", .{});
     std.debug.print("Machine: Apple M1 Pro (8 cores)\n", .{});
-    std.debug.print("Date: 2026-07-31\n\n", .{});
+    std.debug.print("Date: 2026-09-08\n\n", .{});
 
     std.debug.print("  {s:>25}  {s:>12}  {s:>10}  {s:>10}  {s:>6}  {s}\n", .{ "op", "store", "base(ns)", "actual(ns)", "thresh", "result" });
     std.debug.print("  {s:->25}  {s:->12}  {s:->10}  {s:->10}  {s:->6}  {s:->6}\n", .{ "", "", "", "", "", "" });

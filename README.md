@@ -80,6 +80,7 @@ Latest benchmark data: [`bench/results/`](bench/results/)
 
 | Doc | Highlight |
 |------|------|
+| [`20260908_bench.md`](bench/results/20260908_bench.md) | 🆕 HEAD a3283b2 full matrix — put 100B 15.7µs (**32×**), get 4.7µs (**7.6×**), select 4.4µs (**224×**) vs 2026-07-30 |
 | [`20260803_ordered_fastpath.md`](bench/results/20260803_ordered_fastpath.md) | 🏆 Write-path finale — ordered fast path, 1M **0.47µs (1.27× LMDB)** |
 | [`20260803_arena_opt.md`](bench/results/20260803_arena_opt.md) | WriteTxn staging arena — putBatch 10K **0.6µs (27× improvement)** |
 | [`20260730_shared_cow.md`](bench/results/20260730_shared_cow.md) | Shared COW path — putBatch 100B **619× faster, beats LMDB** |
