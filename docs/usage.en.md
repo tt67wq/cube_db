@@ -379,7 +379,7 @@ db.put("k", "v") catch |err| switch (err) {
 
 ## 5. Concurrency & MVCC
 
-- **Multi-threaded reads**: safe. `get`/`select` read an atomic root snapshot, lock-free and fsync-free.
+- **Multi-threaded reads**: safe. `get`/`select` read an atomic root snapshot, lock-free and fsync-free. Point reads (`get`/`getInto`) hold an MVCC reader pin for the duration of the read (register-then-capture, same as `select`): COW old pages referenced by an in-flight read are never reclaimed by a concurrent commit.
 - **MVCC reader**: writers defer reclaiming dirty pages while readers are active:
 
 ```zig
