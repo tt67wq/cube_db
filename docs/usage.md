@@ -345,6 +345,7 @@ compact 是 O(1) 的（meta 页切换，不重写数据）。
 | `OutOfMemory` | 分配失败 |
 | `PageNotFound` | 页号无效（文件损坏） |
 | `MapFull` | 页空间耗尽（mapsize 不足） |
+| `FileLocked` | 文件已被另一个打开者锁定（T-34 多进程防护，见下节） |
 
 ```zig
 db.put("k", "v") catch |err| switch (err) {
@@ -370,6 +371,16 @@ db.endRead(reader);            // 结束读（带句柄注销），释放脏页
 
 - **没有活跃 reader 时**：脏页在每次 commit 后自动回收。
 - **不要跨线程共享一个迭代器**；每个线程各开各的 `select`。
+
+### 多进程语义（T-34）
+
+- **同一数据库文件同时只允许一个打开者**：`FilePageStore.init` 在 open 后立即取 advisory
+  排他锁（`flock(fd, LOCK_EX | LOCK_NB)`）。第二个进程（或同进程的另一个 fd）对同一路径
+  open 将得到 `error.FileLocked`。
+- 锁随持有者的 fd 关闭释放：正常 `deinit()`/进程退出，或持有进程崩溃/被 kill —— 内核关闭
+  fd，锁自动消失，无死锁残留。fork 出的子进程继承父进程 fd（共享同一 open file description），
+  不会与父进程自冲突；若子进程自己重新 open 同一路径，则按第二个打开者被拒。
+- **NFS 等网络文件系统上 flock 语义不保证**，仅支持本地文件系统。
 
 ---
 

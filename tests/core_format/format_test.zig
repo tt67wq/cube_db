@@ -398,4 +398,6 @@ comptime {
     _ = @import("freelist_persist_test.zig");
     // T-33 RED: P0 FilePageStore freelist lock (1 writer + N readers churn)
     _ = @import("freelist_concurrent_test.zig");
+    // T-34 RED: advisory file lock (multi-process open protection)
+    _ = @import("filelock_test.zig");
 }

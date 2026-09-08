@@ -15,6 +15,7 @@ const c = @cImport({
     @cInclude("sys/stat.h");
     @cInclude("fcntl.h");
     @cInclude("unistd.h");
+    @cInclude("errno.h"); // T-34: EWOULDBLOCK/EAGAIN for the flock error path
 });
 
 const PAGE_SIZE = f2.PAGE_SIZE;
@@ -93,6 +94,24 @@ pub const FilePageStore = struct {
         defer allocator.free(path_z);
         const fd = c.open(path_z, @as(c_int, c.O_RDWR | c.O_CREAT), @as(c.mode_t, 0o644));
         if (fd < 0) return error.OpenFailed;
+
+        // T-34: advisory exclusive lock — one writer process per file.
+        // flock binds to the open file description: a second open (any process,
+        // or the same process via a different fd) fails with EWOULDBLOCK.
+        // fork'd children inheriting this fd share the OFD and never self-conflict;
+        // the lock releases when the LAST fd of the OFD closes (deinit's c.close
+        // suffices, crash included). NFS: flock semantics not guaranteed — local
+        // filesystems only (documented in usage.md).
+        if (c.flock(fd, c.LOCK_EX | c.LOCK_NB) != 0) {
+            const errno: *c_int = std.c._errno();
+            if (errno.* == c.EWOULDBLOCK or errno.* == c.EAGAIN) {
+                _ = c.close(fd);
+                return error.FileLocked;
+            }
+            // other flock failures (EBADF/EINTR/ENOLCK...): treat as open failure
+            _ = c.close(fd);
+            return error.OpenFailed;
+        }
 
         // Initial file must cover at least meta0 + meta1 (3 pages)
         var st: c.struct_stat = undefined;

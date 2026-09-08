@@ -366,6 +366,7 @@ All read/write operations return `!T` (error union). Common errors:
 | `OutOfMemory` | allocation failed |
 | `PageNotFound` | invalid page number (corrupt file) |
 | `MapFull` | page space exhausted (insufficient mapsize) |
+| `FileLocked` | the file is already locked by another opener (T-34 multi-process guard, see below) |
 
 ```zig
 db.put("k", "v") catch |err| switch (err) {
@@ -391,6 +392,17 @@ db.endRead(reader);            // end read (pass the handle to unregister), rele
 
 - **With no active readers**: dirty pages are reclaimed automatically after each commit.
 - **Do not share a single iterator across threads**; each thread opens its own `select`.
+
+### Multi-process semantics (T-34)
+
+- **One opener per database file at a time**: `FilePageStore.init` takes an advisory exclusive
+  lock (`flock(fd, LOCK_EX | LOCK_NB)`) right after open. A second process (or another fd in the
+  same process) opening the same path gets `error.FileLocked`.
+- The lock releases when the holder's fd closes: a normal `deinit()`/process exit, or the holder
+  crashing/being killed — the kernel closes the fd and the lock evaporates; no stale locks. A fork'd
+  child inherits the parent's fd (sharing the same open file description) and never self-conflicts
+  with it; if the child opens the same path itself, it is rejected as a second opener.
+- **flock semantics are not guaranteed on NFS and other network filesystems** — local filesystems only.
 
 ---
 

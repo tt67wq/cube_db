@@ -93,7 +93,7 @@ fn writerThread(ctx: *WriterCtx) void {
 fn readerThread(ctx: *ReaderCtx) void {
     while (!ctx.stop.load(.acquire)) {
         const reader = ctx.state.beginRead();
-        _ = reader;
+        // reader is used below by endRead — no discard needed (T-32 leftover, broke test-db step compile)
         // Hold the read txn briefly to widen the last-reader flush race window
         std.Thread.yield() catch {};
         // Occasionally sleep a bit so multiple readers interleave
