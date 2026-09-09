@@ -87,6 +87,22 @@ pub fn writeNodePage(store: PageStore, page_no: u32, page_type: u8, nkeys: u16, 
 /// Max inline value size (leaves headroom for the page header and multiple entries)
 pub const MAX_INLINE_VALUE: usize = 3800;
 
+/// Max key size (T-33 / U-6). Derivation — a leaf must hold at least ONE
+/// entry with the smallest possible encoding of its value:
+///   usable leaf payload = PAGE_SIZE - PAGE_HEADER_SIZE - 4 (trailing CRC)
+///   leaf header         = 3 (kind + nkeys)
+///   per-entry minimum   = tombstone(1) + klen(4) + key + vlen(4) + flags(1)
+///                         + overflow page_no(4) — a value can always escape
+///                         to an overflow chain (4 bytes in-leaf); a key has
+///                         no such escape, so key is the hard bound:
+///   MAX_KEY_SIZE = usable - 3 - (1 + 4 + 4 + 1 + 4)
+/// Enforced at the Db/WriteTxn entry points (graceful error.KeyTooLarge,
+/// see db.zig) and re-checked at insert/insertBatch entry as defense in
+/// depth for direct btree callers (error, never assert).
+/// Known ceiling: several *combined* legal-size entries can still exceed one
+/// leaf/branch page — pre-existing count-based split logic, out of T-33 scope.
+pub const MAX_KEY_SIZE: usize = f2.PAGE_SIZE - f2.PAGE_HEADER_SIZE - 4 - 3 - (1 + 4 + 4 + 1 + 4);
+
 /// Max payload bytes an overflow page can hold
 const OVERFLOW_PAYLOAD: usize = f2.PAGE_SIZE - f2.PAGE_HEADER_SIZE - 4;
 
@@ -1192,6 +1208,9 @@ pub fn insert(
     tombstone: bool,
     dirty: *std.ArrayList(u32),
 ) !WriteResult {
+    // T-33 (U-6): oversized key can never fit a leaf page even with the
+    // value escaped to overflow — reject before touching the tree.
+    if (key.len > MAX_KEY_SIZE) return error.KeyTooLarge;
     if (root == NULL_ROOT) {
         const new_page = try store.allocPage();
         var entries: [1]LeafEntry = .{.{ .tombstone = tombstone, .key = try allocator.dupe(u8, key), .value = try allocator.dupe(u8, if (tombstone) "" else value) }};
@@ -1256,6 +1275,10 @@ pub fn insertBatch(
 ) !WriteResult {
     if (entries.len == 0) {
         return .{ .new_root = root, .live_delta = 0, .count_delta = 0 };
+    }
+    // T-33 (U-6): per-entry key size gate (same bound as insert).
+    for (entries) |e| {
+        if (e.key.len > MAX_KEY_SIZE) return error.KeyTooLarge;
     }
 
     if (root == NULL_ROOT) {
@@ -2083,6 +2106,7 @@ pub fn select(allocator: std.mem.Allocator, store: PageStore, root: u32, min: ?[
 // ===== Errors =====
 
 pub const Error = error{
+    KeyTooLarge,
     OutOfMemory,
     Truncated,
     CorruptCrc,

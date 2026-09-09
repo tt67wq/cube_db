@@ -16,6 +16,18 @@ pub const Entry = struct {
     tombstone: bool = false,
 };
 
+/// T-33 (U-6): key size gate. Keys beyond the single-leaf minimum encoding
+/// (see btree.MAX_KEY_SIZE derivation) are rejected before any staging or
+/// allocation, with error.KeyTooLarge — never an assert, never a page-buffer
+/// overflow. Tombstones carry the key too, so deletes use the same limit
+/// (a tombstone could theoretically be 4B shorter; one uniform bound keeps
+/// the user contract simple). deleteRange needs no gate: its min/max are
+/// select bounds only (never stored) and its tombstone keys come from
+/// already-stored keys (already <= MAX_KEY_SIZE).
+fn checkKeySize(key: []const u8) !void {
+    if (key.len > btree.MAX_KEY_SIZE) return error.KeyTooLarge;
+}
+
 pub const Db = struct {
     allocator: std.mem.Allocator,
     state: *State,
@@ -80,6 +92,7 @@ pub const Db = struct {
     /// auto-flushes when threshold reached. Use flush() to force commit.
     /// Use putDirect() to bypass micro-batching entirely.
     pub fn put(self: *Db, key: []const u8, value: []const u8) !void {
+        try checkKeySize(key); // T-33: reject before staging (micro-batch too)
         if (self.batch_threshold == 0) return self.putDirect(key, value);
         // Copy key and value — caller's slices may not live until flush
         const k = try self.allocator.dupe(u8, key);
@@ -92,6 +105,7 @@ pub const Db = struct {
 
     /// Delete with optional micro-batching (same logic as put).
     pub fn delete(self: *Db, key: []const u8) !void {
+        try checkKeySize(key); // T-33: tombstone carries the key
         if (self.batch_threshold == 0) return self.deleteDirect(key);
         const k = try self.allocator.dupe(u8, key);
         try self.pending.append(self.allocator, .{ .key = k, .value = "", .tombstone = true });
@@ -134,6 +148,8 @@ pub const Db = struct {
     /// Keys and values are copied internally, so caller's slices only need to be
     /// valid during the putBatch call itself (not after).
     pub fn putBatch(self: *Db, entries: []const Entry) !void {
+        // T-33: validate the whole batch first — atomic reject, nothing applied.
+        for (entries) |e| try checkKeySize(e.key);
         // Build the batch directly: skip per-entry staging + arena dupe.
         // Requests reference the caller's key/value slices directly (insertBatch
         // inside applyBatch dupes them into the leaf), so the slices only need
@@ -309,6 +325,7 @@ pub const WriteTxn = struct {
     arena_freed: bool = false,
 
     pub fn put(self: *WriteTxn, key: []const u8, value: []const u8) !void {
+        try checkKeySize(key); // T-33: reject at put time, not at commit
         if (self.finished) return error.TxnFinished;
         // Copy key/value into the arena — the caller's slice (e.g. a stack
         // buffer) may not live until commit
@@ -319,6 +336,7 @@ pub const WriteTxn = struct {
     }
 
     pub fn delete(self: *WriteTxn, key: []const u8) !void {
+        try checkKeySize(key); // T-33
         if (self.finished) return error.TxnFinished;
         // Copy key into the arena — the caller's slice may not live until commit
         const alloc = self.staging_arena.allocator();
