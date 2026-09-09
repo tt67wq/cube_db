@@ -34,6 +34,19 @@ pub const Db = struct {
     store: PageStore,
     store_owned: bool,
     write_mutex: Mutex,
+    /// T-34 (U-13): staging lock — protects `pending` append / steal / threshold
+    /// decision ONLY. Lock discipline (zio.Mutex is non-recursive):
+    ///   - never hold staging_mutex while acquiring write_mutex (flush steals
+    ///     under staging_mutex, releases it, THEN commits via putBatch) — no
+    ///     nesting, no self-deadlock when threshold-triggered flush runs inside
+    ///     a staging critical section's aftermath;
+    ///   - put/delete: append + threshold check under staging_mutex, then call
+    ///     flush() AFTER releasing it;
+    ///   - flush: atomically steal the whole pending list under staging_mutex
+    ///     (swap in a fresh empty list), release, then commit the stolen batch
+    ///     via write_mutex. Concurrent flushes are safe: one steals, the rest
+    ///     no-op — no duplicate commits, no lost entries.
+    staging_mutex: Mutex,
 
     /// Micro-batching: staged entries pending commit
     batch_threshold: usize,
@@ -58,6 +71,7 @@ pub const Db = struct {
             .store = store,
             .store_owned = false,
             .write_mutex = .{},
+            .staging_mutex = .{},
             .batch_threshold = opts.micro_batch.batch_threshold,
             .pending = .empty,
         };
@@ -65,13 +79,18 @@ pub const Db = struct {
     }
 
     pub fn close(self: *Db) void {
-        // Auto-flush any pending entries before closing
+        // Auto-flush any pending entries before closing (thread-safe steal, T-34)
         self.flush() catch {};
-        // If flush failed, still free pending to avoid leak
+        // If flush failed, still free any residual pending under the staging
+        // lock to avoid a leak / racing free (T-34). lockUncancelable: close is
+        // a void destructor path — there is nothing to cancel into.
+        self.staging_mutex.lockUncancelable();
         for (self.pending.items) |e| {
             self.allocator.free(e.key);
             if (!e.tombstone) self.allocator.free(e.value);
         }
+        self.pending.clearRetainingCapacity();
+        self.staging_mutex.unlock();
         self.pending.deinit(self.allocator);
         _ = self.state.deinit();
         self.allocator.destroy(self.state);
@@ -97,23 +116,31 @@ pub const Db = struct {
         // Copy key and value — caller's slices may not live until flush
         const k = try self.allocator.dupe(u8, key);
         const v = try self.allocator.dupe(u8, value);
-        try self.pending.append(self.allocator, .{ .key = k, .value = v, .tombstone = false });
-        if (self.pending.items.len >= self.batch_threshold) {
-            try self.flush();
+        // T-34: append + threshold decision under staging_mutex; the flush runs
+        // AFTER the lock is released (never inside — see staging_mutex doc).
+        var do_flush = false;
+        {
+            self.staging_mutex.lock() catch return error.LockFailed;
+            defer self.staging_mutex.unlock();
+            try self.pending.append(self.allocator, .{ .key = k, .value = v, .tombstone = false });
+            do_flush = self.pending.items.len >= self.batch_threshold;
         }
+        if (do_flush) try self.flush();
     }
-
-    /// Delete with optional micro-batching (same logic as put).
     pub fn delete(self: *Db, key: []const u8) !void {
         try checkKeySize(key); // T-33: tombstone carries the key
         if (self.batch_threshold == 0) return self.deleteDirect(key);
         const k = try self.allocator.dupe(u8, key);
-        try self.pending.append(self.allocator, .{ .key = k, .value = "", .tombstone = true });
-        if (self.pending.items.len >= self.batch_threshold) {
-            try self.flush();
+        // T-34: same staging_mutex discipline as put (see above).
+        var do_flush = false;
+        {
+            self.staging_mutex.lock() catch return error.LockFailed;
+            defer self.staging_mutex.unlock();
+            try self.pending.append(self.allocator, .{ .key = k, .value = "", .tombstone = true });
+            do_flush = self.pending.items.len >= self.batch_threshold;
         }
+        if (do_flush) try self.flush();
     }
-
     /// Direct put — bypasses micro-batching, commits immediately.
     pub fn putDirect(self: *Db, key: []const u8, value: []const u8) !void {
         var txn = try self.beginWriteTxn();
@@ -132,16 +159,29 @@ pub const Db = struct {
 
     /// Flush pending staged entries via a single batch commit.
     /// No-op if nothing pending. Frees copied key/value strings after commit.
+    /// T-34: thread-safe. Atomically STEALS the pending list under staging_mutex
+    /// (swap in a fresh empty list), releases the lock, then commits the stolen
+    /// batch via putBatch (write_mutex). Concurrent flushers are safe: exactly
+    /// one of them gets each batch — no duplicate commits, no lost entries.
+    /// The stolen entries' key/value slices are owned here, so they stay valid
+    /// for the whole putBatch call (which only borrows them).
     pub fn flush(self: *Db) !void {
-        if (self.pending.items.len == 0) return;
+        var stolen: std.ArrayList(Entry) = undefined;
+        {
+            self.staging_mutex.lock() catch return error.LockFailed;
+            defer self.staging_mutex.unlock();
+            if (self.pending.items.len == 0) return;
+            stolen = self.pending;
+            self.pending = .empty;
+        }
         defer {
-            for (self.pending.items) |e| {
+            for (stolen.items) |e| {
                 self.allocator.free(e.key);
                 if (!e.tombstone) self.allocator.free(e.value);
             }
-            self.pending.clearRetainingCapacity();
+            stolen.deinit(self.allocator);
         }
-        try self.putBatch(self.pending.items);
+        try self.putBatch(stolen.items);
     }
 
     /// Batch put: commit all entries in one WriteTxn (bypasses micro-batching).
