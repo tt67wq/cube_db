@@ -16,6 +16,7 @@ const c = @cImport({
     @cInclude("fcntl.h");
     @cInclude("unistd.h");
     @cInclude("errno.h"); // T-34: EWOULDBLOCK/EAGAIN for the flock error path
+    @cInclude("sys/file.h"); // T-34: flock()/LOCK_* — Linux defines these here, not in fcntl.h
 });
 
 const PAGE_SIZE = f2.PAGE_SIZE;
