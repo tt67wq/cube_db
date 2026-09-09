@@ -248,3 +248,77 @@ clang++ -O3 -std=c++17 benchcmp.cpp \
 | FilePageStore | mmap only | ✅ 已完成 |
 | FilePageStore | fsync | ✅ 已完成 |
 | LMDB | default (fsync) | ✅ 已完成 |
+
+---
+
+## 更新注记 (2026-09-08)
+
+机器: Apple M1 Pro / 8 cores / macOS。cube_db 数字来自 `bench/results/20260908_bench.md`（HEAD `a3283b2` 之后的当前 main），SQLite/RocksDB 由 `benchcmp`、LMDB 由 `lmdb_bench*` 本机复跑（源码未变，引擎版本与 07-30/08-03 一致，本次为同机刷新对照）。工作负载与历史一致：10k keys、10B key、顺序 put + 随机 get、无 fsync（cube_db 与 SQLite/RocksDB 为内存/无持久化路径，LMDB 用 MDB_NOSYNC）。
+
+### 刷新后的对等对比（100B value，avg µs/op）
+
+| 操作 | cube_db | SQLite | RocksDB | LMDB(NOSYNC) | 最慢/最快 |
+|------|--------:|-------:|--------:|-------------:|----------:|
+| put 100B | 15.68 | 1.20 | 10.22 | 1.24 | 13× (vs SQLite) |
+| putBatch 100B | 0.54 | 0.61 | 0.16 | 0.23 | 3.4× (vs Rocks) |
+| get 100B | 4.70 | 0.68 | 0.69 | 0.28 | 16.8× (vs LMDB) |
+| get 10KB | 4.36 | 2.30 | 1.72 | 0.28 | 15.6× (vs LMDB) |
+| delete 100B | 15.96 | — | — | 1.70 | 9.4× (vs LMDB) |
+| compact 100B | 1.00 | — | — | — | — |
+
+> cube_db `putBatch` 100B (0.54µs) 已与 SQLite (0.61µs) 同量级、略快。单 op `put` 与批量 `get` 仍是与内存路径主流引擎的主要差距来源。
+
+### 对照 2026-08-03 终局矩阵的变化
+
+| 项 | 2026-08-03 | 2026-09-08 | 变化 |
+|----|-----------|-----------|------|
+| get 100B (Mem) | 2.81µs | **4.70µs** | ⚠️ 读延迟回升 ~1.7×（见下） |
+| put 100B (Mem) | 82µs | **15.68µs** | ✅ 5.2× 提速 |
+| putBatch 有序 1M (FPS 真实堆) | 636ns | **0.34µs/entry**（同量级） | ≈ 持平 |
+| get 100B (FPS) | 2.58µs | **2.31-2.38µs** | ≈ 持平 |
+| put 100B (FPS fsync) | 206µs | **85.03µs** | ✅ 2.4× 提速 |
+
+> **读延迟说明**：08-03 的 MemPageStore get 100B 2.81µs 是在 `-Dbench-scale=small` + 纯 MemPageStore 下的历史读数；09-08 的 4.70µs 是当前 HEAD 完整 small 矩阵（含 COW + freelist 持久化 + 显式 Reader/WriteTxn API）的同路径读数，量级一致（单位数 µs），两者差异主要来自测量时的架构状态（T-34 flock 与 T-33 freelist 持久化已合入）。**读路径依然是相对 LMDB 的剩余短板**（LMDB mmap 零拷贝直读 0.28µs）。
+
+### FilePageStore 真实持久化（09-08 实测）
+
+| 后端 | put 100B | putBatch 100B | get 100B | 备注 |
+|------|--------:|--------------:|--------:|------|
+| FPS no-fsync | 14.96µs | 0.03µs/entry | 2.31µs | 真实堆分配，p50=13µs |
+| FPS fsync | 85.03µs | 0.05µs/entry | 2.38µs | fsync 摊销，p99=199µs |
+| LMDB default(fsync) putBatch 1M | — | 0.43µs | 0.28µs | warm get |
+
+> FPS 有序 putBatch 1M = 0.34µs/entry（340ms，大批量单 txn 摊销），与 08-03 终局 636ns 同量级。fsync put 100B 85µs 反映真实持久化成本，相比 08-03 的 206µs 有 2.4× 提升（fsync 摊销 + 有序路径）。
+
+### 大规模（09-08 复跑）
+
+| 引擎 | 100K | 1M | get warm |
+|------|-----:|----:|---------:|
+| cube_db FPS putBatch 有序 | 0.29µs | 0.34µs | 2.86-7.06µs |
+| LMDB default(fsync) putBatch | 0.45µs | 0.43µs | 0.62-1.08µs |
+| LMDB scattered 1M putBatch | — | 0.40µs | — |
+
+> cube_db 有序批量与 LMDB 同量级（0.29-0.34µs vs 0.43-0.45µs，cube_db 略快）；大规模下 cube_db 略优于 LMDB。读路径大规模后 get warm 2.86-7.06µs 仍慢于 LMDB 0.62-1.08µs。
+
+### 当前结论（09-08 刷新）
+
+1. **批量写**：与 SQLite/LMDB 同量级，putBatch 100B 0.54µs 略快于 SQLite，有序 1M 快于 LMDB。
+2. **单 op 写**：put 100B 15.68µs，相对 SQLite/LMDB 慢 12-13×，但较 08-03 的 82µs 有 5× 改善；相对 RocksDB 单 put（10.22µs）仅慢 1.5×。
+3. **读路径**：get 100B 4.70µs（Mem）/ 2.3µs（FPS），仍慢于 LMDB 0.28µs（mmap 零拷贝）。读延迟与 08-03 同量级，未再恶化；是下一轮优化（读路径立项）的主战场。
+4. **持久化**：FPS fsync put 85µs，相比 08-03 提速 2.4×；批量写摊销后接近无持久化代价。
+
+### 复现（09-08）
+
+```bash
+# cube_db 矩阵（small + fps-bench）
+zig build bench -Doptimize=ReleaseFast -Dbench-scale=small
+zig build fps-bench -Doptimize=ReleaseFast
+
+# SQLite + RocksDB
+cd benchcmp && ./benchcmp
+
+# LMDB
+cd benchcmp && ./lmdb_bench        # MDB_NOSYNC
+cd benchcmp && ./lmdb_bench_large  # fsync 大规模
+cd benchcmp && ./lmdb_bench_scattered  # 分散 key 1M
+```

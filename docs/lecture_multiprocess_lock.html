@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>cube_db · 多进程打开防护（flock）讲义 · commit a3283b2</title>
+<link rel="stylesheet" href="lecture.css">
+</head>
+<body>
+<button class="sidenav-toggle" id="navToggle" aria-label="目录" aria-expanded="false">☰ 目录</button>
+<nav class="sidenav" id="sidenav" aria-label="章节导航">
+  <h4>目录 · 章节导航</h4>
+  <ul>
+    <li class="part"><a href="#part1">第一部分 · 问题与动机</a></li>
+    <li class="sub"><a href="#s11">1.1 为什么需要"多进程打开防护"</a></li>
+    <li class="sub"><a href="#s12">1.2 并发打开如何静默损坏数据</a></li>
+    <li class="sub"><a href="#s13">1.3 为什么选 flock（advisory 排他锁）</a></li>
+    <li class="part"><a href="#part2">第二部分 · init 加锁实现</a></li>
+    <li class="sub"><a href="#s21">2.1 @cInclude errno.h</a></li>
+    <li class="sub"><a href="#s22">2.2 open 后立即 flock</a></li>
+    <li class="sub"><a href="#s23">2.3 错误路径：EWOULDBLOCK / EAGAIN → FileLocked</a></li>
+    <li class="sub"><a href="#s24">2.4 其他 flock 错误 → OpenFailed</a></li>
+    <li class="sub"><a href="#s25">2.5 deinit 零改动：锁随 OFD 释放</a></li>
+    <li class="part"><a href="#part3">第三部分 · 语义与边界</a></li>
+    <li class="sub"><a href="#s31">3.1 锁的粒度：open file description</a></li>
+    <li class="sub"><a href="#s32">3.2 fork 子进程的 OFD 继承</a></li>
+    <li class="sub"><a href="#s33">3.3 崩溃/kill -9 无死锁残留</a></li>
+    <li class="sub"><a href="#s34">3.4 NFS 等网络文件系统边界</a></li>
+    <li class="part"><a href="#part4">第四部分 · TDD 与测试</a></li>
+    <li class="sub"><a href="#s41">4.1 RED：filelock_test.zig 四个用例</a></li>
+    <li class="sub"><a href="#s42">4.2 A1 / A2：进程内双 OFD</a></li>
+    <li class="sub"><a href="#s43">4.3 A1-fork：真实跨进程</a></li>
+    <li class="sub"><a href="#s44">4.4 A3：kill -9 后锁释放</a></li>
+    <li class="sub"><a href="#s45">4.5 三方签字与全量验证</a></li>
+    <li class="sub"><a href="#s46">4.6 风险清单与设计总结</a></li>
+  </ul>
+</nav>
+<main class="wrap">
+
+<header class="hero">
+  <h1>cube_db · <code>commit a3283b2</code> 讲义：多进程打开防护</h1>
+  <div class="sub">T-34 —— FilePageStore.init 加 flock 排他锁，同一数据库文件同时只允许一个打开者</div>
+  <div style="margin-top:12px">
+    <span class="tag">Zig 0.16</span>
+    <span class="tag">flock</span>
+    <span class="tag">advisory lock</span>
+    <span class="tag">TDD</span>
+    <span class="tag">崩溃安全</span>
+  </div>
+</header>
+
+<p class="muted">本讲义由开发团队协作生成，讲解 commit a3283b2（T-34：多进程打开防护）的动机、flock 实现、
+语义边界与 TDD 测试过程。代码块附逐行解释。</p>
+
+<section class="lecture" id="part1">
+<h2><span class="no">第一部分</span>问题与动机：为什么需要一个进程锁</h2>
+
+<p>cube_db 是单进程写入数据库：<code>FilePageStore</code> 用 <code>O_RDWR | O_CREAT</code> 打开数据库文件，
+再 <code>mmap MAP_SHARED</code> 出 1TB 预留区。此前 `init` <b>没有任何跨进程互斥</b>——两个进程并发打开
+同一路径，各自拿到独立的 open file description（OFD）与内存池副本，交叉写 meta 与 freelist，
+最终<b>静默损坏</b>数据。</p>
+
+<h3 id="s11">1.1 为什么需要"多进程打开防护"</h3>
+
+<div class="card">
+<p><b>要防的威胁：两个写者同时写一个文件。</b></p>
+<ul>
+<li><b>每个打开者独立 mmap。</b> <code>MAP_SHARED</code> 让两个进程各自映射到同一文件，但各自维护
+    进程内的 <code>meta0/meta1</code> 缓冲、<code>next_free</code>、<code>freelist</code>——彼此不可见。</li>
+<li><b>页号对撞。</b> 两个进程各自 bump 分配，可能分到同一页号，互相覆盖对方刚写的数据。</li>
+<li><b>meta 槽互踩。</b> 双页交替写的崩溃安全机制假设<b>只有一位写者</b>；两个写者会让 sequence
+    判活与 <code>next_free</code> 恢复全部错乱。</li>
+</ul>
+</div>
+
+<div class="note danger" role="alert">🔴 危险 <b>为什么是"静默"损坏：</b>并发写不会立即报错——两次写入都"成功"，
+到 reopen 时 CRC 校验往往仍能通过（两进程写的是完整页），只是内容互相覆盖，读出来的是错乱数据。
+这种损坏<b>必然而非概率性</b>：只要两个写者都真正写盘，冲突就一定会发生。</div>
+
+<h3 id="s12">1.2 并发打开如何静默损坏数据</h3>
+
+<div class="flow">
+<span class="step">进程 A open + mmap</span>
+<span class="arrow">→</span>
+<span class="step">进程 B open + mmap（各自 OFD / 各自缓冲）</span>
+<span class="arrow">→</span>
+<span class="step">A 写 meta0、B 也写 meta0</span>
+<span class="arrow">→</span>
+<span class="step">页号对撞、freelist 链互相覆盖</span>
+<span class="arrow">→</span>
+<span class="step">reopen 读到错乱数据（CRC 仍可能通过）</span>
+</div>
+
+<div class="note warn" role="note">⚠️ 注意 <b>T-33 放大了损坏面：</b>T-33（freelist 持久化）把 freelist 链写到磁盘上。
+T-34 之前，freelist 只在内存里，两进程并发写最多互相覆盖数据页；T-33 之后，freelist 链本身也落盘，
+两个写者会破坏链式结构——损坏从"数据错乱"升级为"结构损坏"，reopen 恢复 freelist 时可能读到断裂的链。</div>
+
+<h3 id="s13">1.3 为什么选 flock（advisory 排他锁）</h3>
+
+<div class="card">
+<p><b>方案对比与取舍：</b></p>
+<table>
+<tr><th>方案</th><th>是否选用</th><th>理由</th></tr>
+<tr><td><code>flock(fd, LOCK_EX | LOCK_NB)</code></td><td>✅ 选用</td><td>~20 行；锁绑定 OFD，最后一个 fd 关闭即释放（含崩溃）；fork 继承不自杀冲突</td></tr>
+<tr><td>fcntl POSIX record lock</td><td>否</td><td>语义复杂（按进程、fork 后子进程锁行为特殊）；本库只需整文件排他</td></tr>
+<tr><td>单独锁文件 + 原子创建</td><td>否</td><td>锁文件残留处理繁琐，崩溃清理不可靠</td></tr>
+<tr><td>进程内单例 / 环境变量</td><td>否</td><td>只防同进程，防不了跨进程</td></tr>
+</table>
+</div>
+
+<p class="muted">第一部分小结：<code>init</code> 当前打开文件的方式让"第二个写者"能合法进入，造成必然而静默的损坏。
+选 flock 是因为它是"误用即损坏"这一全项目唯一入口的最低成本堵漏手段，且崩溃时自动释放、无需清理。</p>
+</section>
+
+
+<section class="lecture" id="part2">
+<h2><span class="no">第二部分</span>init 加锁实现</h2>
+
+<p>T-34 的核心改动集中在 <code>FilePageStore.init</code>：open 成功后<b>立即</b>取 advisory 排他锁，
+先于任何 <code>fstat</code>/<code>ftruncate</code>/<code>mmap</code> 副作用。锁失败时关闭 fd 并按 errno
+区分返回 <code>error.FileLocked</code> 或 <code>error.OpenFailed</code>。</p>
+
+<h3 id="s21">2.1 @cInclude errno.h</h3>
+
+<pre><code><span class="kw">const</span> c = @cImport({
+    @cInclude(<span class="st">"sys/mman.h"</span>);
+    @cInclude(<span class="st">"sys/stat.h"</span>);
+    @cInclude(<span class="st">"fcntl.h"</span>);
+    @cInclude(<span class="st">"unistd.h"</span>);
+    @cInclude(<span class="st">"errno.h"</span>); <span class="cm">// T-34: EWOULDBLOCK/EAGAIN for the flock error path</span>
+});</code></pre>
+
+<p>新增 <code>@cInclude("errno.h")</code> 以使用 <code>EWOULDBLOCK</code>/<code>EAGAIN</code> 两个 errno 常量。
+在 macOS 上二者同值（均等于 35）；Linux 上 <code>EWOULDBLOCK</code> 与 <code>EAGAIN</code> 也同值。实现里双检
+是为了可移植性——不同平台/实现可能分别使用其一，同时判断最稳妥。</p>
+
+<h3 id="s22">2.2 open 后立即 flock</h3>
+
+<pre><code>    <span class="kw">const</span> fd = c.open(path_z, @as(c_int, c.O_RDWR | c.O_CREAT), @as(c.mode_t, <span class="nu">0o644</span>));
+    <span class="kw">if</span> (fd &lt; <span class="nu">0</span>) <span class="kw">return error</span>.OpenFailed;
+
+    <span class="cm">// T-34: advisory exclusive lock — one writer process per file.</span>
+    <span class="cm">// flock binds to the open file description: a second open (any process,</span>
+    <span class="cm">// or the same process via a different fd) fails with EWOULDBLOCK.</span>
+    <span class="kw">if</span> (c.flock(fd, c.LOCK_EX | c.LOCK_NB) != <span class="nu">0</span>) {
+        <span class="kw">const</span> errno: *c_int = std.c._errno();
+        <span class="kw">if</span> (errno.* == c.EWOULDBLOCK <span class="kw">or</span> errno.* == c.EAGAIN) {
+            _ = c.close(fd);
+            <span class="kw">return error</span>.FileLocked;
+        }
+        <span class="cm">// other flock failures (EBADF/EINTR/ENOLCK...): treat as open failure</span>
+        _ = c.close(fd);
+        <span class="kw">return error</span>.OpenFailed;
+    }</code></pre>
+
+<div class="flow">
+<span class="step">open(O_RDWR|O_CREAT, 0644)</span>
+<span class="arrow">→</span>
+<span class="step">flock(fd, LOCK_EX | LOCK_NB)</span>
+<span class="arrow">→ 0</span>
+<span class="step">继续 fstat/ftruncate/mmap</span>
+<span class="arrow">→ 非 0</span>
+<span class="step">读 errno 分流</span>
+<span class="arrow">→ EWOULDBLOCK/EAGAIN</span>
+<span class="step">close + error.FileLocked</span>
+<span class="arrow">→ 其他</span>
+<span class="step">close + error.OpenFailed</span>
+</div>
+
+<div class="note" role="note">💡 说明 <b>为什么"立即"加锁：</b>在 open 成功、<b>尚未</b>做任何 <code>fstat</code>/<code>ftruncate</code>/
+<code>mmap</code> 副作用之前取锁。若先 mmap 再发现被锁，就必须处理"已映射区的释放"；现在锁失败直接
+<code>close(fd)</code> 返回，不留半初始化状态。这也让锁语义与"打开即独占"完全一致。</div>
+
+<h3 id="s23">2.3 错误路径：EWOULDBLOCK / EAGAIN → error.FileLocked</h3>
+
+<pre><code>        <span class="kw">const</span> errno: *c_int = std.c._errno();
+        <span class="kw">if</span> (errno.* == c.EWOULDBLOCK <span class="kw">or</span> errno.* == c.EAGAIN) {
+            _ = c.close(fd);
+            <span class="kw">return error</span>.FileLocked;
+        }</code></pre>
+
+<p><code>LOCK_NB</code>（non-blocking）保证 flock 在锁被占用时<b>立即返回失败</b>而不是阻塞等待。
+此时 <code>errno</code> 为 <code>EWOULDBLOCK</code>（或同值的 <code>EAGAIN</code>）。实现先关 fd（避免泄漏），
+再返回新错误 <code>error.FileLocked</code>——调用方可用 <code>catch |err| switch (err) { error.FileLocked =&gt; ... }</code>
+识别"文件正被他人打开"。</p>
+
+<div class="note ok" role="note">✅ 提示 <b>EWOULDBLOCK/EAGAIN 双检：</b>评审 note 指出两者同值，双检冗余但无害。
+保留双检是为了表达意图（涵盖不同平台各自偏好的写法），并保持可移植性，不构成问题。</div>
+
+<h3 id="s24">2.4 其他 flock 错误 → error.OpenFailed</h3>
+
+<pre><code>        <span class="cm">// other flock failures (EBADF/EINTR/ENOLCK...): treat as open failure</span>
+        _ = c.close(fd);
+        <span class="kw">return error</span>.OpenFailed;
+    }</code></pre>
+
+<p>除 <code>EWOULDBLOCK/EAGAIN</code> 之外的 flock 失败（<code>EBADF</code>、<code>EINTR</code>、<code>ENOLCK</code>、
+<code>EINVAL</code> 等）统一当作打开失败处理：关 fd 后返回 <code>error.OpenFailed</code>。这些错误多是环境/参数异常，
+不是"文件被占用"，因此不返回 <code>FileLocked</code>，避免调用方误判。</p>
+
+<h3 id="s25">2.5 deinit 零改动：锁随 OFD 释放</h3>
+
+<p>T-34 对 <code>deinit</code> <b>零改动</b>——这是 flock 绑定 OFD 带来的天然好处：</p>
+
+<pre><code><span class="kw">pub fn</span> <span class="fn">deinit</span>(self: *<span class="ty">FilePageStore</span>) <span class="kw">void</span> {
+    _ = c.munmap(@ptrCast(self.mmap_ptr), REGION_SIZE);
+    _ = c.close(self.fd);
+    self.freelist.deinit(self.allocator);
+}</code></pre>
+
+<div class="note ok" role="note">✅ 提示 <b>锁的生命周期由 OFD 决定：</b>flock 加在文件描述符（更准确说，该 OFD）上。
+<code>deinit</code> 的 <code>c.close(self.fd)</code> 关闭最后一个引用该 OFD 的 fd，内核即释放锁——无需显式
+<code>flock(fd, LOCK_UN)</code>。同理，进程崩溃或被 <code>kill -9</code> 时内核回收 fd，锁自动蒸发，<b>无死锁残留</b>。</div>
+
+<p class="muted">第二部分小结：加锁逻辑只有约 19 行，插在 open 与 fstat 之间；错误路径都先 <code>close(fd)</code>
+再返回，避免 fd 泄漏；锁的释放完全依赖内核的 OFD 关闭语义，因此 deinit 与崩溃路径都不需要额外处理。</p>
+</section>
+
+
+<section class="lecture" id="part3">
+<h2><span class="no">第三部分</span>语义与边界</h2>
+
+<p>理解 flock 的正确用法，关键在于认清它的<b>锁粒度是 open file description（OFD）而非进程或线程</b>。
+这一节厘清由此推出的几个重要语义，以及 fork / 崩溃 / NFS 下的边界行为。</p>
+
+<h3 id="s31">3.1 锁的粒度：open file description</h3>
+
+<div class="card">
+<p><b>flock 的关键事实：</b></p>
+<ul>
+<li>锁挂在 OFD 上，不是挂在内核线程或进程上。</li>
+<li><b>同一 OFD 的所有 fd 共享这把锁</b>（dup、fork 继承的 fd 属于同一 OFD）。</li>
+<li><b>第二个独立的 OFD</b>（另一个进程、或同进程另开一个 fd）来抢锁时，因 <code>LOCK_NB</code> 立即失败。</li>
+</ul>
+</div>
+
+<div class="note warn" role="note">⚠️ 注意 <b>同进程第二 fd 也会冲突：</b>测试 A1 专门验证了这一点——在<b>同一进程内</b>对同一路径
+再 <code>init</code> 一次（第二个 fd = 第二个 OFD），同样返回 <code>error.FileLocked</code>。这不是"多余"，
+而是与跨进程行为一致的正确边界：任何"第二个打开者"都被拒。</div>
+
+<h3 id="s32">3.2 fork 子进程的 OFD 继承</h3>
+
+<pre><code><span class="cm">// fork'd children inheriting this fd share the OFD and never self-conflict;</span>
+<span class="cm">// the lock releases when the LAST fd of the OFD closes (deinit's c.close</span>
+<span class="cm">// suffices, crash included).</span></code></pre>
+
+<p>fork 的子进程<b>继承父进程的 fd</b>，这些 fd 与父进程的 fd 指向<b>同一 OFD</b>，因此它们<b>共享同一把锁</b>、
+不会自冲突。真正需要防的是"子进程自己重新 <code>open</code> 同一路径"——那会产生<b>新的 OFD</b>，被当作第二个
+打开者拒绝（测试 A1-fork 验证了这一行为）。</p>
+
+<h3 id="s33">3.3 崩溃 / kill -9 无死锁残留</h3>
+
+<div class="flow">
+<span class="step">持有者崩溃 / 被 kill -9</span>
+<span class="arrow">→</span>
+<span class="step">内核回收该进程所有 fd</span>
+<span class="arrow">→</span>
+<span class="step">OFD 最后一个 fd 关闭</span>
+<span class="arrow">→</span>
+<span class="step">flock 自动释放</span>
+<span class="arrow">→</span>
+<span class="step">他人可立即重新打开</span>
+</div>
+
+<p>这是 flock 相比"锁文件"方案的核心优势：<b>无需清理残留锁文件</b>。测试 A3 用一个 fork 出的子进程持锁，
+父进程 <code>kill -9</code> 后验证 <code>waitpid</code> 确认被 SIGKILL 终止、再重新打开成功——证明锁随进程消亡释放。</p>
+
+<h3 id="s34">3.4 NFS 等网络文件系统边界</h3>
+
+<div class="note danger" role="alert">🔴 危险 <b>NFS 上 flock 语义不保证：</b>flock 在本地文件系统（ext4、APFS、btrfs、tmpfs 等）
+语义可靠；但在 NFS 及其他网络文件系统上，flock 的跨主机互斥<b>不被保证</b>。文档（usage.md / usage.en.md）明确声明
+<b>仅支持本地文件系统</b>。若部署在 NFS 上，此防护可能失效——这是已知边界，不是 bug。</div>
+
+<p class="muted">第三部分小结：锁粒度是 OFD；fork 继承共享不自杀冲突、同进程第二 fd 也算第二打开者；
+崩溃由内核自动释放；NFS 等网络文件系统是明确声明的不支持边界。</p>
+</section>
+
+
+<section class="lecture" id="part4">
+<h2><span class="no">第四部分</span>TDD 与测试</h2>
+
+<p>T-34 按红-绿-评审-测试三方法走完整 TDD 流程。RED 阶段先写了 4 个测试用例（未实现 flock 时 50/52 红），
+GREEN 阶段实现后全绿，最后三方签字（独立测试报告 + 评审 APPROVE）。</p>
+
+<h3 id="s41">4.1 RED：filelock_test.zig 四个用例</h3>
+
+<p><code>tests/core_format/filelock_test.zig</code> 新建，挂到 <code>format_test.zig</code>。四个用例各司其职：</p>
+
+<table>
+<tr><th>用例</th><th>验证点</th><th>实现前状态</th></tr>
+<tr><td><code>A1</code></td><td>同进程第二个并发 open 被拒</td><td>失败（RED）</td></tr>
+<tr><td><code>A1-fork</code></td><td>真实跨进程第二个打开者被拒</td><td>失败（RED）</td></tr>
+<tr><td><code>A2</code></td><td>deinit 后同一路径可立即重开</td><td>已通过（控制组）</td></tr>
+<tr><td><code>A3</code></td><td>kill -9 持有者后锁被内核释放</td><td>已通过（控制组）</td></tr>
+</table>
+
+<div class="note" role="note">💡 说明 <b>控制组（A2/A3）已绿：</b>这两个用例在没有 flock 的 main 上就通过，它们验证的不是
+"加锁"本身，而是"锁不阻止正常重开"与"锁崩溃自动释放"这两个反向契约——确保 GREEN 实现不破坏正常打开流程。</div>
+
+<h3 id="s42">4.2 A1 / A2：进程内双 OFD</h3>
+
+<pre><code><span class="kw">test</span> <span class="st">"filelock A1: second concurrent open of the same path returns error.FileLocked"</span> {
+    <span class="kw">const</span> path = <span class="st">".test_filelock_a1.db"</span>;
+    <span class="kw">defer</span> <span class="fn">unlinkPath</span>(path);
+
+    <span class="kw">var</span> a = <span class="kw">try</span> <span class="ty">FilePageStore</span>.<span class="fn">init</span>(alloc, path);
+    <span class="kw">defer</span> a.<span class="fn">deinit</span>();
+
+    <span class="kw">var</span> second = <span class="ty">FilePageStore</span>.<span class="fn">init</span>(alloc, path) <span class="kw">catch</span> |err| {
+        <span class="kw">try</span> std.testing.<span class="fn">expectEqual</span>(<span class="ty">error</span>.FileLocked, err);
+        <span class="kw">return</span>;
+    };
+    <span class="cm">// RED on main: control reaches here — second open had no lock at all.</span>
+    second.<span class="fn">deinit</span>();
+    <span class="kw">return error</span>.TestUnexpectedResult;
+}</code></pre>
+
+<p>A1 先在 <code>a</code> 持锁的前提下对同一路径再 <code>init</code> 一次。若被拒且错误恰为 <code>FileLocked</code>，
+测试通过。若 <code>init</code> 成功（RED 状态），控制流落入清理 + <code>return error.TestUnexpectedResult</code>
+使测试失败。A2 则先显式 <code>a.deinit()</code> 再重开，验证锁已释放。</p>
+
+<h3 id="s43">4.3 A1-fork：真实跨进程</h3>
+
+<pre><code>    <span class="kw">const</span> pid = c.fork();
+    <span class="kw">if</span> (pid &lt; <span class="nu">0</span>) <span class="kw">return error</span>.ForkFailed;
+    <span class="kw">if</span> (pid == <span class="nu">0</span>) {
+        <span class="cm">// Child: fresh open → fresh OFD. Post-GREEN this must hit the flock held</span>
+        <span class="cm">// by the parent's (inherited but unused) fd.</span>
+        <span class="kw">var</span> s = <span class="ty">FilePageStore</span>.<span class="fn">init</span>(std.heap.page_allocator, pz) <span class="kw">catch</span> |err| {
+            c._exit(<span class="kw">if</span> (err == <span class="ty">error</span>.FileLocked) exit_got_lock <span class="kw">else</span> exit_other);
+        };
+        s.<span class="fn">deinit</span>();
+        c._exit(exit_opened);
+    }
+    <span class="cm">// parent: waitpid 后检查子进程退出码</span>
+    <span class="kw">try</span> std.testing.<span class="fn">expectEqual</span>(exit_got_lock, code);</code></pre>
+
+<p>父进程持锁（<code>a</code>），fork 出子进程；子进程用 <code>page_allocator</code> 对同一路径<b>重新 open</b>
+（新的 OFD），应命中父进程持的锁。子进程以退出码传达判定：42=<code>FileLocked</code>（期望）、7=意外打开成功、
+3=其他错误。父进程 <code>waitpid</code> 校验退出码。这样即使子进程崩溃，父进程也能根据退出码/信号正确断言。
+<b>子进程只用 <code>page_allocator</code></b>（不用 <code>std.testing.allocator</code>），避免共享 testing allocator 内部状态。</p>
+
+<h3 id="s44">4.4 A3：kill -9 后锁释放</h3>
+
+<pre><code>    <span class="cm">// Pipe: 子进程 init 成功后写一个字节，父进程据此确认锁已持有再 kill</span>
+    ...
+    <span class="cm">// SIGKILL the holder: the kernel closes its fds, the flock must evaporate.</span>
+    _ = c.kill(pid, c.SIGKILL);
+    ...
+    <span class="kw">try</span> std.testing.<span class="fn">expectEqual</span>(@as(c_int, c.SIGKILL), status & <span class="nu">0x7f</span>);
+    <span class="cm">// The parent held nothing; the sole holder is dead. Reopen must succeed.</span>
+    <span class="kw">var</span> b = <span class="kw">try</span> <span class="ty">FilePageStore</span>.<span class="fn">init</span>(alloc, pz);
+    b.<span class="fn">deinit</span>();</code></pre>
+
+<p>用 pipe 做同步：子进程 <code>init</code> 成功（持锁）后向 pipe 写一字节，父进程读到该字节才确定锁已持有，
+再 <code>kill -9</code>。随后 <code>waitpid</code> 确认子进程确被 SIGKILL 终止，父进程（此间未持锁）重新 <code>init</code>
+必须成功——证明崩溃后被锁自动释放。</p>
+
+<h3 id="s45">4.5 三方签字与全量验证</h3>
+
+<div class="card">
+<p><b>验证结果（commits 与签字）：</b></p>
+<ul>
+<li><b>RED</b>：未实现 flock 时 <code>test-format</code> 50/52，A1/A1-fork 失败。</li>
+<li><b>GREEN 独立测试报告 PASS</b>：flock 专项 4/4，全量 362/362×2，fuzz 13/13，crash 70/70。</li>
+<li><b>评审 APPROVE</b>：0 blocker / 0 minor / 3 note（n1 vtReadMeta 注释过时；n2 EWOULDBLOCK/EAGAIN 双检冗余无害；
+    n3 build.zig test 自动发现只扫顶层 <code>tests/*.zig</code>）。</li>
+<li><b>附带修复</b>：T-32 遗留的 <code>test-db</code> 编译错（<code>mvcc_concurrent_flush_test</code> 的
+    <code>_ = reader</code> 后文又用 reader），一行删除恢复编译，独立复现属实。</li>
+</ul>
+</div>
+
+<h3 id="s46">4.6 风险清单与设计总结</h3>
+
+<table>
+<tr><th>风险 / 边界</th><th>说明</th><th>缓解</th></tr>
+<tr><td>NFS / 网络文件系统</td><td>flock 跨主机互斥不保证</td><td>文档声明仅支持本地文件系统</td></tr>
+<tr><td>同进程第二 fd 误伤</td><td>同进程再 open 也被拒（锁粒度是 OFD）</td><td>符合"单打开者"契约，A1 固定</td></tr>
+<tr><td>fork 后子进程自开</td><td>子进程重新 open 同一路径被拒</td><td>A1-fork 固定；继承 fd 共享不冲突</td></tr>
+<tr><td>崩溃残留</td><td>持有者崩溃/kill -9</td><td>内核关 fd 自动释放，A3 固定</td></tr>
+<tr><td>deinit 前未 commit</td><td>锁与持久化无关</td><td>锁只防并发打开，不替 sync 语义</td></tr>
+</table>
+
+<div class="card">
+<p><strong>设计亮点：</strong></p>
+<ol>
+<li><strong>最低成本堵住"误用即损坏"入口</strong>：~19 行，插在 open 与副作用之间，先锁后初始化。</li>
+<li><strong>锁随 OFD 生命周期自动管理</strong>：deinit 零改动、崩溃自动释放、无死锁残留、无需清理锁文件。</li>
+<li><strong>错误语义清晰</strong>：<code>EWOULDBLOCK/EAGAIN</code> → <code>FileLocked</code>（可识别"被占用"），
+    其他 → <code>OpenFailed</code>（环境异常）。</li>
+<li><strong>TDD 三方法</strong>：A1/A1-fork 钉住正向契约，A2/A3 钉住"不误伤正常流程"的反向契约。</li>
+</ol>
+</div>
+
+<p class="muted">T-34 用一把 advisory 排他锁，堵住了 cube_db 唯一"误用即静默损坏"的入口。理解 flock 绑定 OFD
+的语义，是读懂这个提交的关键——锁的加、释、fork 继承与崩溃自动释放，全都从这一条语义推出，因此
+实现才能如此简洁、deinit 才能零改动。</p>
+</section>
+
+
+<footer>
+  <p>cube_db — 多进程打开防护（T-34, commit a3283b2）讲义 · 由 herdr 多 agent 团队协作生成（conductor + RED + GREEN + review + test）</p>
+</footer>
+
+</main>
+<script src="lecture.js"></script>
+</body>
+</html>
