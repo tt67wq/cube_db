@@ -69,7 +69,22 @@ B-tree 树深在 put-flush-deleteRange 长循环下**单调增长、永不收缩
 ## 状态跟踪
 
 - [x] 独立复现（wf-pi-2 诊断期 + wf-pi-4 在 `4d7b1c8` 实测）
-- [ ] 确定性 RED 测试用例
-- [ ] 根因定位与修复（GREEN）
-- [ ] 回归测试 + 评审
-- [ ] 验收门稳定后关闭
+- [x] 确定性 RED 测试用例（`tests/txn_writer_db/tree_depth_regression_test.zig`，HEAD 上 round 32 必现 `error.Truncated`）
+- [x] 根因定位与修复（GREEN）——`insertBatch` 溢出路径由「嵌套子树」改为「flat splice 到父层」，高度只在根溢出时以最小高度增长；见 `ad82cb2`/`296d454`
+- [x] 回归测试 + 评审——独立评审 verdict=approve；全量 `zig build test` 通过，T-37 测试已注册进 `test` 步
+- [x] 验收门稳定后关闭
+
+## 验收落点（RED→GREEN 结果）
+
+- **RED**：HEAD `5b50abb` 上，固定循环（round i: putBatch 4000 新 key → deleteRange 前半区间）round 32（累计 132k/存 64k）时 `select(null,null)`/`deleteRange` 返回 `error.Truncated`（`btree.zig:2170 selectChecked`）。
+- **GREEN**：修复后同测试 40 轮全绿，全程无 `error.Truncated`，精确 live key 集一致；深度不变量成立。
+- **深度观测**：回归形状 40 轮，depth 在 round 31 前恒为 3，round 32（跨过 64×64×32≈131k 平衡容量界）升为 4——平衡增长，非被掩盖。
+- **新增观测面**：`Db.treeDepth()`（`db.zig`）+ `btree.treeDepth()`（`btree.zig`），MVCC pin 保护，诚实上报深树（1000 守卫计数值）。
+- **既有套件**：`zig build test` 全绿（T-37 的 2 个测试已注册进默认 test 步）；`test-btree/test-db/test-writer/test-mvcc/test-compact/test-overflow/test-ps/test-slab/test-format/test-crc32` 全部 PASS。
+- **守卫不变**：`Iterator.MAX_DEPTH = 64` 与各 `error.Truncated` 判定（`descendLeftmost`/`selectChecked`）未改动。
+
+## 关闭时遗留（非阻塞，已单独立项跟踪）
+
+- 根 splice 路径错误分支缺 `errdefer`（非 arena 分配器下的小泄漏）——见 follow-up issue。
+- 叶子/分支按「计数」而非「payload 尺寸」分块，近 `MAX_KEY_SIZE` key 可能在编码时超 `PAGE_SIZE` 触发 assert——pre-existing，单独 issue。
+- 修复停止「只增不减」，但 delete 密集型 churn 不主动缩高（tombstone 骨架保留深度）；深度不变量按 live leaves 计算，tombstone 积压极端态可能突破——属 T-38 范围，其需知晓该 live-count 假设。
