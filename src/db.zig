@@ -101,6 +101,19 @@ pub const Db = struct {
         return self.state.getRoot();
     }
 
+    /// T-37-B: root→leaf height of the CURRENT COMMITTED root (consistent
+    /// with getRoot()/select). 0 = empty tree, 1 = single-leaf tree, else
+    /// branch levels + 1. Deep or unreadable trees are reported honestly
+    /// (btree.treeDepth returns its 1000 guard count) — this exists to
+    /// observe/monitor the depth invariant (T-37), not to validate it.
+    /// Holds an MVCC read pin for the walk so a concurrent commit cannot
+    /// recycle the snapshot's pages mid-descent.
+    pub fn treeDepth(self: *Db) usize {
+        const reader = self.state.beginRead();
+        defer self.state.endRead(reader);
+        return btree.treeDepth(self.store, self.state.getRoot());
+    }
+
     pub fn entryCount(self: *Db) u64 {
         return self.state.entry_count.load(.acquire);
     }
@@ -501,4 +514,8 @@ test "db: open default state" {
     defer db.close();
     try std.testing.expectEqual(@as(u32, btree.NULL_ROOT), db.getRoot());
     try std.testing.expectEqual(@as(u64, 0), db.entryCount());
+    // T-37-B treeDepth contract: 0 = empty tree, 1 = single-leaf tree.
+    try std.testing.expectEqual(@as(usize, 0), db.treeDepth());
+    try db.putDirect("k", "v");
+    try std.testing.expectEqual(@as(usize, 1), db.treeDepth());
 }

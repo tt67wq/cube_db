@@ -713,6 +713,24 @@ const InsertSub = struct {
     split_right: u32 = 0,
     live_delta: i64 = 0,
     count_delta: i64 = 0,
+    splice: ?Splice = null,
+};
+
+/// T-37-B: multi-way splice for the batch overflow path. When set, the old
+/// child is replaced by `splice.children` (whose [0] is also `new_child`),
+/// separated by `splice.keys` — keys[i] is the first key of children[i+1]'s
+/// subtree, so all separators lie inside the old child's key range. The
+/// consumer (parent branch / new root) integrates them AT ITS OWN LEVEL:
+/// this is what stops the depth ratchet (the old overflow path returned a
+/// nested subtree, stacking ~2 branch levels under the parent per churn;
+/// with splices, height only grows when the root itself overflows).
+/// Ownership: keys are producer-duped; the branch consumer moves the
+/// pointers into Branch.keys (freed by Branch.deinit) and frees only the
+/// arrays; the root consumer (insertBatch) frees keys + arrays after
+/// encoding. In practice applyBatch passes an arena, so frees are no-ops.
+const Splice = struct {
+    keys: [][]u8,
+    children: []u32,
 };
 
 /// Scan branch payload to find child index and children-section byte offset for a key.
@@ -1342,6 +1360,22 @@ pub fn insertBatch(
     else
         try insertBatchIntoBranch(store, allocator, root, entries, dirty);
 
+
+    if (sub.splice) |sp| {
+        // Root overflow (T-37-B): the root was rebuilt into multiple nodes —
+        // build packed levels up to a new root. Height grows HERE and only
+        // here (minimum possible height for the new child count). sp.keys
+        // are owned by this splice — freed after encoding.
+        const new_root = try buildBranchLevels(allocator, store, sp.children, sp.keys);
+        for (sp.keys) |k| allocator.free(k);
+        allocator.free(sp.keys);
+        allocator.free(sp.children);
+        return .{
+            .new_root = new_root,
+            .live_delta = sub.live_delta,
+            .count_delta = sub.count_delta,
+        };
+    }
     if (sub.split_key) |sk| {
         // Root split: create new root branch
         var keys: [1][]const u8 = .{sk};
@@ -1425,19 +1459,35 @@ fn insertBatchSplitLeaves(
         pos += chunk_len;
     }
 
-    // Build branch tree from leaf pages
-    // Simple case: if only 2 leaves, single branch
-    if (leaf_pages.items.len <= BRANCH_MAX_CHILDREN) {
-        const new_root = try store.allocPage();
-        const pl = branchPayloadSize(split_keys.items, leaf_pages.items);
+    return .{ .new_root = try buildBranchLevels(allocator, store, leaf_pages.items, split_keys.items), .live_delta = live, .count_delta = count };
+}
+
+/// T-37-B (factored from insertBatchSplitLeaves): build a minimum-height
+/// packed branch tree over `children` (leaves or branches) with `keys` as
+/// separators (keys.len == children.len - 1). `keys` are BORROWED — only
+/// encoded into pages here, never freed. Chunks of BRANCH_MAX_CHILDREN per
+/// branch page, T-36 tail fix (no 1-child branches), one root page on top.
+/// This is the single place the "rebuild levels" shape exists now; the
+/// batch overflow path (insertBatchIntoLeaf/insertBatchIntoBranch) splices
+/// its overflow into the PARENT instead of nesting subtrees under it, so
+/// height only ever grows when the root itself overflows (T-37 root cause:
+/// nested overflow rebuilds ratcheted depth ~+2 per churn round).
+fn buildBranchLevels(
+    allocator: std.mem.Allocator,
+    store: PageStore,
+    children: []const u32,
+    keys: []const []const u8,
+) !u32 {
+    if (children.len <= BRANCH_MAX_CHILDREN) {
+        const page = try store.allocPage();
+        const pl = branchPayloadSize(keys, children);
         var buf: [f2.PAGE_SIZE]u8 = undefined;
-        _ = encodeBranchPayload(buf[0..pl], split_keys.items, leaf_pages.items);
-        try writeNodePage(store, new_root, f2.PAGE_TYPE_BRANCH, @intCast(leaf_pages.items.len), buf[0..pl]);
-        return .{ .new_root = new_root, .live_delta = live, .count_delta = count };
+        _ = encodeBranchPayload(buf[0..pl], keys, children);
+        try writeNodePage(store, page, f2.PAGE_TYPE_BRANCH, @intCast(children.len), buf[0..pl]);
+        return page;
     }
-    // Multiple branches needed — build multi-level tree
-    var current_pages = leaf_pages.items;
-    var current_keys = split_keys.items;
+    var current_pages = children;
+    var current_keys = keys;
     var level_pages_a = std.ArrayList(u32).empty;
     defer level_pages_a.deinit(allocator);
     var level_keys_a = std.ArrayList([]const u8).empty;
@@ -1457,19 +1507,15 @@ fn insertBatchSplitLeaves(
             var chunk_len = @min(BRANCH_MAX_CHILDREN, current_pages.len - i);
             // T-36: a tail chunk of exactly 1 child would encode an illegal
             // 1-child branch (encodeBranchPayload asserts children.len >= 2).
-            // Happens when the page count is >64 and == 1 (mod 64) — e.g. 65
-            // leaves chunk as 64+1. Lend one child from this chunk so the tail
-            // keeps >= 2. (chunk_len is only ever 64 here when lending: for a
-            // remaining count <= 64 the chunk takes all of them, leaving no
-            // tail.)
+            // Lend one child from this chunk so the tail keeps >= 2.
             if (current_pages.len - i - chunk_len == 1) chunk_len -= 1;
-            const children = current_pages[i .. i + chunk_len];
-            const keys = current_keys[i .. i + chunk_len - 1];
+            const chunk_children = current_pages[i .. i + chunk_len];
+            const chunk_keys = current_keys[i .. i + chunk_len - 1];
             const page = try store.allocPage();
-            const pl = branchPayloadSize(keys, children);
+            const pl = branchPayloadSize(chunk_keys, chunk_children);
             var buf: [f2.PAGE_SIZE]u8 = undefined;
-            _ = encodeBranchPayload(buf[0..pl], keys, children);
-            try writeNodePage(store, page, f2.PAGE_TYPE_BRANCH, @intCast(children.len), buf[0..pl]);
+            _ = encodeBranchPayload(buf[0..pl], chunk_keys, chunk_children);
+            try writeNodePage(store, page, f2.PAGE_TYPE_BRANCH, @intCast(chunk_children.len), buf[0..pl]);
             try new_pages.append(allocator, page);
             if (i + chunk_len < current_pages.len) {
                 try new_keys.append(allocator, current_keys[i + chunk_len - 1]);
@@ -1481,12 +1527,12 @@ fn insertBatchSplitLeaves(
         use_a = !use_a;
     }
     // Final root branch
-    const new_root = try store.allocPage();
+    const page = try store.allocPage();
     const pl = branchPayloadSize(current_keys, current_pages);
     var buf: [f2.PAGE_SIZE]u8 = undefined;
     _ = encodeBranchPayload(buf[0..pl], current_keys, current_pages);
-    try writeNodePage(store, new_root, f2.PAGE_TYPE_BRANCH, @intCast(current_pages.len), buf[0..pl]);
-    return .{ .new_root = new_root, .live_delta = live, .count_delta = count };
+    try writeNodePage(store, page, f2.PAGE_TYPE_BRANCH, @intCast(current_pages.len), buf[0..pl]);
+    return page;
 }
 
 /// Find the range of entries that belong to a given leaf (by scanning branch keys)
@@ -1639,10 +1685,21 @@ fn insertBatchIntoLeaf(
         try writeNodePage(store, new_page, f2.PAGE_TYPE_LEAF, @intCast(merged_entries.len), buf[0..pl]);
         return .{ .new_child = new_page, .live_delta = live_delta, .count_delta = count_delta };
     }
-    // Multiple pages needed — chunk into LEAF_MAX_ENTRIES, build leaf pages + branch tree
+    // Multiple pages needed — chunk into LEAF_MAX_ENTRIES and SPLICE the
+    // leaves into the parent (T-37-B). The old path built a nested branch
+    // subtree and returned its root as new_child; every overflow stacked
+    // ~2 more branch levels under the parent (put+deleteRange churn
+    // ratcheted depth past Iterator.MAX_DEPTH=64 -> error.Truncated). The
+    // splice lets the parent integrate the leaves at its own level; the
+    // parent's own overflow is handled by ITS packed rebuild, so height
+    // only grows when the root overflows (see Splice doc).
     var leaf_pages = std.ArrayList(u32).empty;
     defer leaf_pages.deinit(allocator);
-    var split_keys = std.ArrayList([]const u8).empty;
+    var split_keys = std.ArrayList([]u8).empty;
+    errdefer {
+        for (split_keys.items) |k| allocator.free(k);
+        split_keys.deinit(allocator);
+    }
     defer split_keys.deinit(allocator);
     var pos: usize = 0;
     while (pos < merged_entries.len) {
@@ -1655,62 +1712,20 @@ fn insertBatchIntoLeaf(
         try writeNodePage(store, page, f2.PAGE_TYPE_LEAF, @intCast(chunk_len), buf[0..pl]);
         try leaf_pages.append(allocator, page);
         if (pos + chunk_len < merged_entries.len) {
-            try split_keys.append(allocator, merged_entries[pos + chunk_len].key);
+            // separator = first key of the next leaf; duped because merged
+            // entries (and their keys) die at function exit
+            try split_keys.append(allocator, try allocator.dupe(u8, merged_entries[pos + chunk_len].key));
         }
         pos += chunk_len;
     }
-    // Build branch tree from leaf pages
-    var current_pages = leaf_pages.items;
-    var current_keys = split_keys.items;
-    // Intermediate arrays for multi-level branch building. We manage their
-    // lifetime manually — defer inside the while body would free them before
-    // the next iteration reads current_pages/current_keys (use-after-free).
-    var level_pages_a = std.ArrayList(u32).empty;
-    defer level_pages_a.deinit(allocator);
-    var level_keys_a = std.ArrayList([]const u8).empty;
-    defer level_keys_a.deinit(allocator);
-    var level_pages_b = std.ArrayList(u32).empty;
-    defer level_pages_b.deinit(allocator);
-    var level_keys_b = std.ArrayList([]const u8).empty;
-    defer level_keys_b.deinit(allocator);
-    var use_a = true;
-    while (current_pages.len > BRANCH_MAX_CHILDREN) {
-        var new_pages = if (use_a) &level_pages_a else &level_pages_b;
-        var new_keys = if (use_a) &level_keys_a else &level_keys_b;
-        new_pages.clearRetainingCapacity();
-        new_keys.clearRetainingCapacity();
-        var i: usize = 0;
-        while (i < current_pages.len) {
-            var chunk_len = @min(BRANCH_MAX_CHILDREN, current_pages.len - i);
-            // T-36: a tail chunk of exactly 1 child would encode an illegal
-            // 1-child branch (encodeBranchPayload asserts children.len >= 2).
-            // Same mod-64 tail defect as insertBatchSplitLeaves — lend one
-            // child so the tail keeps >= 2.
-            if (current_pages.len - i - chunk_len == 1) chunk_len -= 1;
-            const children = current_pages[i .. i + chunk_len];
-            const keys = current_keys[i .. i + chunk_len - 1];
-            const page = try store.allocPage();
-            const pl = branchPayloadSize(keys, children);
-            var buf: [f2.PAGE_SIZE]u8 = undefined;
-            _ = encodeBranchPayload(buf[0..pl], keys, children);
-            try writeNodePage(store, page, f2.PAGE_TYPE_BRANCH, @intCast(children.len), buf[0..pl]);
-            try new_pages.append(allocator, page);
-            if (i + chunk_len < current_pages.len) {
-                try new_keys.append(allocator, current_keys[i + chunk_len - 1]);
-            }
-            i += chunk_len;
-        }
-        current_pages = new_pages.items;
-        current_keys = new_keys.items;
-        use_a = !use_a;
-    }
-    // Final root branch
-    const new_page = try store.allocPage();
-    const pl = branchPayloadSize(current_keys, current_pages);
-    var buf: [f2.PAGE_SIZE]u8 = undefined;
-    _ = encodeBranchPayload(buf[0..pl], current_keys, current_pages);
-    try writeNodePage(store, new_page, f2.PAGE_TYPE_BRANCH, @intCast(current_pages.len), buf[0..pl]);
-    return .{ .new_child = new_page, .live_delta = live_delta, .count_delta = count_delta };
+    const children = try allocator.alloc(u32, leaf_pages.items.len);
+    @memcpy(children, leaf_pages.items);
+    return .{
+        .new_child = children[0],
+        .splice = .{ .keys = try split_keys.toOwnedSlice(allocator), .children = children },
+        .live_delta = live_delta,
+        .count_delta = count_delta,
+    };
 }
 
 /// Fallback: when batch is too large for shared COW path, use per-entry insert.
@@ -1844,6 +1859,28 @@ fn insertBatchIntoBranch(
             count_delta += sub.count_delta;
             branch.children[ci] = sub.new_child;
 
+            if (sub.splice) |sp| {
+                // T-37-B multi-way splice: the child was rebuilt into
+                // sp.children (leaves or branches) — integrate them at THIS
+                // level instead of nesting a subtree (the depth ratchet).
+                // Key pointers move into branch.keys (freed by deinit);
+                // only the arrays are freed here.
+                const add = sp.keys.len; // == sp.children.len - 1
+                const new_keys = try allocator.alloc([]u8, branch.keys.len + add);
+                const new_children = try allocator.alloc(u32, branch.children.len + add);
+                @memcpy(new_keys[0..ci], branch.keys[0..ci]);
+                @memcpy(new_keys[ci..][0..add], sp.keys);
+                @memcpy(new_keys[ci + add ..], branch.keys[ci..]);
+                @memcpy(new_children[0..ci], branch.children[0..ci]);
+                for (sp.children, 0..) |c, j| new_children[ci + j] = c;
+                @memcpy(new_children[ci + sp.children.len ..], branch.children[ci + 1 ..]);
+                allocator.free(branch.keys);
+                allocator.free(branch.children);
+                allocator.free(sp.keys);
+                allocator.free(sp.children);
+                branch.keys = new_keys;
+                branch.children = new_children;
+            }
             if (sub.split_key) |sk| {
                 // Child split: insert new key + child
                 const new_keys = try allocator.alloc([]u8, branch.keys.len + 1);
@@ -1875,38 +1912,54 @@ fn insertBatchIntoBranch(
         try writeNodePage(store, new_page, f2.PAGE_TYPE_BRANCH, @intCast(branch.children.len), buf[0..pl]);
         return .{ .new_child = new_page, .live_delta = live_delta, .count_delta = count_delta };
     }
-    // Split branch
-    const mid = branch.keys.len / 2;
-    const up_key = try allocator.dupe(u8, branch.keys[mid]);
-    const right_keys = branch.keys[mid + 1 ..];
-    const right_children = branch.children[mid + 1 ..];
-    const right_page = try store.allocPage();
-    const rkeys_slice = try allocator.alloc([]const u8, right_keys.len);
-    defer allocator.free(rkeys_slice);
-    for (right_keys, 0..) |k, i| rkeys_slice[i] = k;
-    var rbuf: [f2.PAGE_SIZE]u8 = undefined;
-    const rpl = branchPayloadSize(rkeys_slice, right_children);
-    _ = encodeBranchPayload(rbuf[0..rpl], rkeys_slice, right_children);
-    try writeNodePage(store, right_page, f2.PAGE_TYPE_BRANCH, @intCast(right_children.len), rbuf[0..rpl]);
-    const left_keys = branch.keys[0..mid];
-    const left_children = branch.children[0 .. mid + 1];
-    const left_page = try store.allocPage();
-    const lkeys_slice = try allocator.alloc([]const u8, left_keys.len);
-    defer allocator.free(lkeys_slice);
-    for (left_keys, 0..) |k, i| lkeys_slice[i] = k;
-    var lbuf: [f2.PAGE_SIZE]u8 = undefined;
-    const lpl = branchPayloadSize(lkeys_slice, left_children);
-    _ = encodeBranchPayload(lbuf[0..lpl], lkeys_slice, left_children);
-    try writeNodePage(store, left_page, f2.PAGE_TYPE_BRANCH, @intCast(left_children.len), lbuf[0..lpl]);
-    return .{ .new_child = left_page, .split_key = up_key, .split_right = right_page, .live_delta = live_delta, .count_delta = count_delta };
+    // Overflow (T-37-B): rebuild this level into PACKED branch pages and
+    // splice them up. A splice can push children well past BRANCH_MAX_CHILDREN
+    // (a 4000-entry batch overflows a leaf into ~126 leaves); chunking into
+    // 64-child pages keeps every page legal and the subtree minimum-height,
+    // and the outgoing splice is <= ceil(N/64) children, so each level up
+    // shrinks the fan-in by 64x — height only grows when the root overflows.
+    var chunk_pages = std.ArrayList(u32).empty;
+    defer chunk_pages.deinit(allocator);
+    var chunk_keys = std.ArrayList([]u8).empty;
+    errdefer {
+        for (chunk_keys.items) |k| allocator.free(k);
+        chunk_keys.deinit(allocator);
+    }
+    defer chunk_keys.deinit(allocator);
+    {
+        var i: usize = 0;
+        while (i < branch.children.len) {
+            var clen = @min(BRANCH_MAX_CHILDREN, branch.children.len - i);
+            // T-36: no 1-child tail chunk (encodeBranchPayload asserts >= 2)
+            if (branch.children.len - i - clen == 1) clen -= 1;
+            const children = branch.children[i .. i + clen];
+            const keys = branch.keys[i .. i + clen - 1];
+            const page = try store.allocPage();
+            const keys_slice = try allocator.alloc([]const u8, keys.len);
+            defer allocator.free(keys_slice);
+            for (keys, 0..) |k, j| keys_slice[j] = k;
+            const pl = branchPayloadSize(keys_slice, children);
+            var buf: [f2.PAGE_SIZE]u8 = undefined;
+            _ = encodeBranchPayload(buf[0..pl], keys_slice, children);
+            try writeNodePage(store, page, f2.PAGE_TYPE_BRANCH, @intCast(children.len), buf[0..pl]);
+            try chunk_pages.append(allocator, page);
+            if (i + clen < branch.children.len) {
+                // separator between chunk j and j+1 = the old branch key at
+                // the boundary; duped — branch.keys dies at deinit
+                try chunk_keys.append(allocator, try allocator.dupe(u8, branch.keys[i + clen - 1]));
+            }
+            i += clen;
+        }
+    }
+    const children = try allocator.alloc(u32, chunk_pages.items.len);
+    @memcpy(children, chunk_pages.items);
+    return .{
+        .new_child = children[0],
+        .splice = .{ .keys = try chunk_keys.toOwnedSlice(allocator), .children = children },
+        .live_delta = live_delta,
+        .count_delta = count_delta,
+    };
 }
-
-// ===== Range iterator (T-29 Phase B: borrowed) =====
-
-/// Borrowing contract (T-29 Phase B, callers must read):
-/// 1. The key/value of the entry returned by `next()` are borrowed slices —
-///    valid only until the next `next()` or `deinit()`. Inline value/key are
-///    borrowed from the leaf payload; overflow values are assembled in the
 ///    iterator's internal reuse buffer (with consecutive overflow entries,
 ///    the previous entry's value is overwritten by the new one — this is the
 ///    observable invalidation surface, locked by contract tests).
@@ -2176,6 +2229,30 @@ pub fn selectChecked(allocator: std.mem.Allocator, store: PageStore, root: u32, 
 }
 
 // ===== Errors =====
+
+/// T-37-B: root→leaf height (node count on the leftmost path): 0 for an
+/// empty tree (NULL_ROOT), 1 for a single-leaf tree, branch levels + 1
+/// otherwise. Walks child[0] to the leftmost leaf through the same
+/// PageStore the readers use. Honest-deep reporting: a corrupt/unreadable
+/// page or a tree deeper than the 1000-step guard returns 1000 (the guard
+/// count) — this is an observability surface for the depth invariant, not
+/// a validator; deep trees must be visible, never masked.
+pub fn treeDepth(store: PageStore, root: u32) usize {
+    if (root == NULL_ROOT) return 0;
+    var cur = root;
+    var depth: usize = 0;
+    var guard: usize = 0;
+    while (guard < 1000) : (guard += 1) {
+        const payload = readNodePayloadFast(store, cur) catch return 1000;
+        if (payload.len == 0) return 1000;
+        depth += 1;
+        if (payload[0] == LEAF_KIND) return depth;
+        const br = branchChildren(payload) catch return 1000;
+        if (br.count == 0) return 1000;
+        cur = std.mem.readInt(u32, br.payload[br.children_offset..][0..4], .little);
+    }
+    return 1000;
+}
 
 pub const Error = error{
     KeyTooLarge,
