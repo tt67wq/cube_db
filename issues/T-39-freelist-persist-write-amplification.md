@@ -1,6 +1,13 @@
 # Issue T-39 — freelist 持久化写放大：每次 commit 整链重写 + O(pool) 去重扫描
 
-- **状态**: proposed（演进点提案，待立项 TDD）
+- **状态**: 部分交付（去重/观测痛点已闭合并验收；写放大痛点不可在现有崩溃模型下安全闭合，
+  拆分至 `issues/T-39-C-followup-append-only-freelist.md` 后续立项）
+- **交付注记**: 本次 TDD 完成"去重收敛 + 静默吞错可观测化 + FreelistStats 观测 API"
+  （T-39-B），并独立评审通过（review.md verdict=approve）+ T-27 崩溃注入矩阵稳定全绿
+  （T-39-D，test-report.md）。增量/append-only 链持久化（写放大痛点）经论证在不改
+  T-33 崩溃安全模型（两代退休 + 统一 gen 戳 + INV-F1/INV-F2）硬约束下**不可安全落地**
+  （页复用下无 freshness proof 时无法区分陈旧合法内页与当前页，torn-sync 窗口会导致
+  双重分配损坏），故降级记录为 follow-up issue 交回 conductor 立项。
 - **优先级**: **medium-high**（持久化/性能梯队；3/4 worker 独立提出，代码自身注释已承认升级路径）
 - **梯队**: 持久化/性能（尚未成为暴露瓶颈，但随空闲页数必然放大）
 - **来源**: 演进点征集（roadmap-evo）wf-pi-1-E3、wf-pi-2-E3、wf-pi-3-E2
@@ -62,7 +69,11 @@ memcpy+CRC；且 `pushPoolLocked` 每次 free 都对池做 `std.mem.indexOfScala
 ## 状态跟踪
 
 - [x] 现状核验（3 worker 独立确认 U-2/U-3 在当前 HEAD 成立）
-- [ ] 确定性 RED 测试（空闲池规模 vs commit 成本曲线）
-- [ ] 根因定位与修复（GREEN：增量持久化 + 去重收敛）
-- [ ] 回归测试（含 T-27 崩溃注入矩阵）+ 评审
-- [ ] 验收门稳定后关闭
+- [x] 确定性 RED 测试（`tests/core_format/freelist_amp_red_test.zig`，T-39-A，HEAD 上 4 fail 确定性验证有效）
+- [x] 去重收敛修复（T-39-B：`pushPoolLocked` O(pool)→O(1) HashSet 镜像；静默吞错可观测化
+  `dropped_pages_oom`；`FreelistStats` 观测 API）—— 已合并 main，RED #2/#3/命名契约全绿
+- [x] 回归测试（T-39-D 独立评审 approve + T-27 崩溃矩阵 T5 全注入点/T6 夹具/T5-b/r 稳定全绿，
+  零 flake；10 套件确定性套件 exit 0）
+- [ ] 写放大（增量/append-only 链持久化）—— **未闭合**：现有崩溃模型下不可安全落地，
+  拆分至 `issues/T-39-C-followup-append-only-freelist.md`，RED #1 仍红（20/20 链页）为其遗留断言
+- [ ] 验收门（RED #1 绿 + 新格式全矩阵语义等价）稳定后关闭（见 follow-up issue）

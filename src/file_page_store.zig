@@ -56,7 +56,34 @@ pub const FpsCounters = struct {
     }
 };
 
+/// T-39-B: freelist observability counters (fixed names per contract with
+/// T-39-A). All fields are per-FilePageStore, reset via resetFreelistStats.
+const FreelistStatsImpl = struct {
+    /// Chain pages written by persistChainLocked. Skeleton accounting for
+    /// now (+= pages per persisted chain); the real semantics are T-39-C's.
+    chain_pages_written: u64 = 0,
+    /// Dedup scan work per free into the pool. Under the structured (hash
+    /// mirror) dedup this equals one per membership operation — i.e. it
+    /// grows ~linearly with the number of frees, NOT with pool size (the
+    /// old indexOfScalar path scanned pool.len entries per free).
+    dedup_scans: u64 = 0,
+    /// Membership probes per free (one hash probe each in the structured
+    /// solution). Lets tests tell O(pool) from O(1)/O(log) directly.
+    dedup_membership_probe: u64 = 0,
+    /// Pages dropped because the pool (or its mirror) could not grow on
+    /// OOM. Dropped pages leak (never mis-reclaimed) — the established
+    /// leak-direction-safe freePage semantics, now visible instead of
+    /// silently swallowed.
+    dropped_pages_oom: u64 = 0,
+};
+
+/// T-39-B: the public stats type (also reachable as FilePageStore.FreelistStats).
+pub const FreelistStats = FreelistStatsImpl;
+
 pub const FilePageStore = struct {
+    /// T-39-B: re-export so both file_page_store.FreelistStats and
+    /// FilePageStore.FreelistStats resolve (API-shape insurance for T-39-A).
+    pub const FreelistStats = FreelistStatsImpl;
     allocator: std.mem.Allocator,
     fd: c_int,
     region_size: u64,
@@ -80,6 +107,22 @@ pub const FilePageStore = struct {
     /// True when open-time chain restore rejected the persisted freelist (INV-F2:
     /// leak, never mis-reclaim). Written once in init, read-only afterwards.
     free_list_discarded: bool = false,
+
+    /// T-39-B: membership mirror of `freelist` — pushPoolLocked dedup in
+    /// O(1) instead of the old O(pool) indexOfScalar scan. Sync contract:
+    /// the pool stays the single source of truth for ORDER and CONTENT;
+    /// this set is maintained 1:1 by the *Locked pool primitives
+    /// (pushPoolLocked/popPoolLocked) and rebuilt by restoreFreeList, all
+    /// under freelist_mu (restoreFreeList is single-threaded init). Set
+    /// missing an entry the pool has is the DANGEROUS direction (a re-free
+    /// would double-list -> double allocation), so any OOM keeping the two
+    /// out of sync drops the page / discards the chain (leak direction,
+    /// INV-F2).
+    pool_set: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// T-39-B: per-store freelist observability (fixed API, see FreelistStats).
+    /// Mutated only inside freelist_mu critical sections; read via
+    /// freelistStats() which takes the same lock.
+    freelist_stats: FreelistStatsImpl = .{},
 
     /// T-33(T5): crash-injection points of the commit write-order matrix.
     pub const CrashTag = enum { before_chain, mid_chain, after_chain_before_meta, after_meta };
@@ -203,6 +246,7 @@ pub const FilePageStore = struct {
         _ = c.munmap(@ptrCast(self.mmap_ptr), REGION_SIZE);
         _ = c.close(self.fd);
         self.freelist.deinit(self.allocator);
+        self.pool_set.deinit(self.allocator);
         self.chain_cur.deinit(self.allocator);
         self.chain_prev.deinit(self.allocator);
     }
@@ -248,9 +292,13 @@ pub const FilePageStore = struct {
     // the vtable shells below would re-lock (zio.Mutex is not recursive).
 
     /// Pop a free page from the pool (LIFO, from the end). null = pool empty.
+    /// T-39-B: also removes the page from the pool_set mirror — the set and
+    /// the pool must stay 1:1 for the O(1) dedup to be sound.
     fn popPoolLocked(self: *FilePageStore) ?u32 {
         if (self.freelist.items.len == 0) return null;
-        return self.freelist.pop().?;
+        const pn = self.freelist.pop().?;
+        _ = self.pool_set.remove(pn);
+        return pn;
     }
 
     /// Return a page to the pool. Idempotent: a page already pooled is not
@@ -260,13 +308,35 @@ pub const FilePageStore = struct {
     /// later COWs such a page, reclaim legitimately frees a page the restore
     /// already pooled — without dedupe the pool would list it twice and hand
     /// it out twice. On clean runs every COW victim is freed exactly once, so
-    /// the scan never hits. OOM on grow leaks the page (leak direction is
-    /// always safe — the established freePage semantics).
-    /// ponytail: O(pool) scan per free; upgrade to a HashSet-backed pool if
-    /// huge-pool churn ever shows this in a profile.
+    /// the dedup probe never hits. OOM on grow leaks the page (leak direction
+    /// is always safe — the established freePage semantics) — T-39-B: the
+    /// drop is now counted in freelist_stats.dropped_pages_oom instead of
+    /// being silently swallowed.
+    ///
+    /// T-39-B: dedup is a single hash probe into pool_set (O(1)), replacing
+    /// the O(pool) indexOfScalar scan. NOTE: binary search over the pool was
+    /// rejected because the pool is only ascending right after restore —
+    /// runtime pushes APPEND and pop is LIFO, so no sorted invariant holds
+    /// mid-session; the hash mirror keeps the pool's exact order semantics
+    /// (freePagesSnapshot output, LIFO alloc order) unchanged.
     fn pushPoolLocked(self: *FilePageStore, page_no: u32) void {
-        if (std.mem.indexOfScalar(u32, self.freelist.items, page_no) != null) return;
-        self.freelist.append(self.allocator, page_no) catch {};
+        self.freelist_stats.dedup_scans += 1;
+        self.freelist_stats.dedup_membership_probe += 1;
+        const gop = self.pool_set.getOrPut(self.allocator, page_no) catch {
+            // OOM growing the mirror set: drop the page (leak direction).
+            self.freelist_stats.dropped_pages_oom += 1;
+            return;
+        };
+        if (gop.found_existing) return; // INV-F1: duplicate free stays a no-op
+        self.freelist.append(self.allocator, page_no) catch {
+            // OOM growing the pool: undo the set insert to keep set ⊆ pool
+            // truth (a set entry with no pool entry would let the next free
+            // of this page silently vanish — the unsafe direction), then
+            // drop the page (leak direction).
+            _ = self.pool_set.remove(page_no);
+            self.freelist_stats.dropped_pages_oom += 1;
+            return;
+        };
     }
 
     /// Extend the high-water mark by one page (never touches the pool).
@@ -376,6 +446,9 @@ pub const FilePageStore = struct {
             f2.writeFreelistEntries(arr, entries[lo..hi]);
             if (j + 1 == half) fireCrashHook(.mid_chain);
         }
+        // T-39-B: basic chain-pages-written accounting (skeleton semantics —
+        // T-39-C owns the real one). k pages landed in the mmap this call.
+        self.freelist_stats.chain_pages_written += k;
 
         return .{ .head = chain.items[0], .count = n - k, .owned = chain };
     }
@@ -503,6 +576,21 @@ pub const FilePageStore = struct {
         // Success. The pool stays ASCENDING: allocPage pops from the end, so the
         // highest page numbers are reused first and low-numbered pages (which a
         // damaged chain is most likely to poison, see T6 v2) are handed out last.
+        //
+        // T-39-B: rebuild the pool_set mirror BEFORE adopting the pool — if the
+        // set cannot grow, discard the whole chain (free_list_discarded, leak
+        // direction, INV-F2) rather than adopt a pool whose dedup mirror is
+        // incomplete (a re-free of a mirrored-missing page would double-list it
+        // -> double allocation, the unsafe direction). entries are validated
+        // duplicate-free above, so the puts cannot collide.
+        self.pool_set.clearRetainingCapacity();
+        for (entries.items) |p| {
+            self.pool_set.put(self.allocator, p, {}) catch {
+                self.pool_set.clearRetainingCapacity();
+                self.free_list_discarded = true;
+                return;
+            };
+        }
         self.freelist = entries;
         entries = .empty; // ownership moved; the defer above frees nothing
         // The restored chain belongs to the LIVE meta (generation cur): it may
@@ -527,6 +615,25 @@ pub const FilePageStore = struct {
     /// init, read-only afterwards — no lock needed.
     pub fn freeListDiscarded(self: *const FilePageStore) bool {
         return self.free_list_discarded;
+    }
+
+    // ---- T-39-B: freelist observability (fixed names per contract) ----
+
+    /// Zero all FreelistStats counters (test/monitoring reset).
+    pub fn resetFreelistStats(self: *FilePageStore) void {
+        self.freelist_mu.lockUncancelable();
+        defer self.freelist_mu.unlock();
+        self.freelist_stats = .{};
+    }
+
+    /// Snapshot of the freelist stats counters. Takes freelist_mu (same
+    /// pattern as freePageCount: the counters are mutated inside the pool
+    /// critical sections, so the read must not race them).
+    pub fn freelistStats(self: *const FilePageStore) FreelistStatsImpl {
+        const mutable: *FilePageStore = @constCast(self); // lock-only read; logically const
+        mutable.freelist_mu.lockUncancelable();
+        defer mutable.freelist_mu.unlock();
+        return mutable.freelist_stats;
     }
 
     /// Pool contents snapshot (T7 partition helper). Caller owns the memory.
@@ -756,4 +863,58 @@ test "file_page_store: alloc grows file, read-back visible" {
     @memcpy(w[0..4], "ABCD");
     const r = try s.readPage(pn);
     try std.testing.expectEqualStrings("ABCD", r[0..4]);
+}
+
+test "T-39-B: pushPoolLocked O(1) dedup, INV-F1 idempotency, observability" {
+    const allocator = std.testing.allocator;
+    const path = ".fps_t39b_stats_test.db";
+    defer unlinkPath(path);
+    var fps = try FilePageStore.init(allocator, path);
+    defer fps.deinit();
+    const s = fps.store();
+
+    // 8 distinct pages into the pool, then one duplicate re-free (P0-A shape).
+    var pages: [8]u32 = undefined;
+    for (&pages) |*p| p.* = try s.allocPage();
+    for (pages) |p| s.freePage(p);
+    s.freePage(pages[3]); // INV-F1: duplicate free must not double-list
+    try std.testing.expectEqual(@as(usize, 8), fps.freePageCount());
+
+    // Structured dedup: one scan + one membership probe per free, independent
+    // of pool size (the old indexOfScalar path scanned pool.len per free).
+    const st = fps.freelistStats();
+    try std.testing.expectEqual(@as(u64, 9), st.dedup_scans);
+    try std.testing.expectEqual(@as(u64, 9), st.dedup_membership_probe);
+    try std.testing.expectEqual(@as(u64, 0), st.dropped_pages_oom);
+    try std.testing.expectEqual(@as(u64, 0), st.chain_pages_written);
+
+    // Pop re-enables freeing the same page (pool_set mirror stays 1:1 with
+    // the pool; a stale set entry would silently swallow the re-free).
+    const popped = try s.allocPage();
+    try std.testing.expectEqual(@as(usize, 7), fps.freePageCount());
+    s.freePage(popped);
+    try std.testing.expectEqual(@as(usize, 8), fps.freePageCount());
+
+    fps.resetFreelistStats();
+    try std.testing.expectEqual(FreelistStats{}, fps.freelistStats());
+}
+
+test "T-39-B: OOM during pool push is counted, not silently swallowed" {
+    // fail_index=1: allocation #0 (path dupe in init) succeeds; the NEXT
+    // allocation — the pool_set grow on the first freePage — fails, so the
+    // page must be dropped (leak direction, the safe semantics) AND counted.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    const fa = failing.allocator();
+    const path = ".fps_t39b_oom_test.db";
+    defer unlinkPath(path);
+    var fps = try FilePageStore.init(fa, path);
+    defer fps.deinit();
+    const s = fps.store();
+
+    const pn = try s.allocPage(); // bump path: no allocator use (pool empty)
+    s.freePage(pn); // pool_set grow OOMs -> page dropped, leak direction
+    try std.testing.expectEqual(@as(usize, 0), fps.freePageCount());
+    const st = fps.freelistStats();
+    try std.testing.expectEqual(@as(u64, 1), st.dedup_membership_probe);
+    try std.testing.expectEqual(@as(u64, 1), st.dropped_pages_oom);
 }
