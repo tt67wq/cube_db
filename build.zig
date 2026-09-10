@@ -418,6 +418,26 @@ pub fn build(b: *std.Build) void {
     const db_test_step = b.step("test-db", "Run db tests only");
     db_test_step.dependOn(&run_db_test.step);
 
+    // ponytail: zig build test-treedepth runs only the T-37 tree-depth tests
+    // (deterministic RED regression + depth-invariant bound). Registered here
+    // (not auto-discovered — auto-discovery only scans top-level tests/*.zig)
+    // so `zig build test` includes it.
+    const tree_depth_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/txn_writer_db/tree_depth_regression_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    const run_tree_depth_test = b.addRunArtifact(tree_depth_test);
+    const tree_depth_test_step = b.step("test-treedepth", "Run T-37 tree-depth tests only");
+    tree_depth_test_step.dependOn(&run_tree_depth_test.step);
+    test_step.dependOn(&run_tree_depth_test.step);
+
     // closed_state_test — applyBatch closed-branch tests (T-4)
     const closed_state_test = b.addTest(.{
         .root_module = b.createModule(.{
