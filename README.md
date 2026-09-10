@@ -20,7 +20,7 @@ with freelist page reuse, no WAL, crash-safe via atomic meta-page switch.
 - **Async/sync durability** — `Options{fsync}` (default sync-on-commit) + explicit `Db.sync()` for async mode
 - Pure synchronous API — no runtime setup needed
 
-**Usage manual: [`docs/usage.en.md`](docs/usage.en.md).** · **Chinese: [`docs/usage.md`](docs/usage.md).** · **Benchmark data: [`bench/results/`](bench/results/).**
+**Usage manual: [`docs/usage.en.md`](docs/usage.en.md).** · **Chinese: [`docs/usage.md`](docs/usage.md).** · **Offline integrity tool: [`docs/cube-check.md`](docs/cube-check.md).** · **Benchmark data: [`bench/results/`](bench/results/).**
 
 ## Dependencies
 
@@ -142,6 +142,7 @@ cube_db/
 ├── docs/
 │   ├── usage.md           # Usage manual (Chinese)
 │   ├── usage.en.md        # Usage manual (English)
+│   ├── cube-check.md      # cube_check offline integrity tool guide
 │   ├── fuzz-testing.md    # Fuzz testing guide
 │   └── tutorial/          # Tutorial (5 chapters)
 ├── src/

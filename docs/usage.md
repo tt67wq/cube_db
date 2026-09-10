@@ -10,6 +10,8 @@ cube_db 是一个用 Zig 0.16.0 编写的嵌入式键值存储引擎。固定页
 
 纯同步 API，调用方无需准备 runtime。
 
+> 相关工具：离线完整性校验 **`cube_check`** 使用见 [cube-check.md](cube-check.md)。
+
 ---
 
 ## 目录
