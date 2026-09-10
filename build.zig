@@ -21,6 +21,33 @@ pub fn build(b: *std.Build) void {
     mod.addImport("zio", zio_mod);
     mod.link_libc = true; // T1: mmap wrapper uses @cImport libc
 
+    // T-35 Part B: cube_check offline integrity tool — module shared by the
+    // executable below and the tests/ auto-discovery (tests import "cube_check"
+    // to reach cube_check.scrub without going through the CLI).
+    const cube_check_mod = b.addModule("cube_check", .{
+        .root_source_file = b.path("src/cube_check.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    cube_check_mod.addImport("cube_db", mod);
+    cube_check_mod.addImport("zio", zio_mod);
+    cube_check_mod.link_libc = true; // FilePageStore: libc mmap/flock
+
+    // T-35 Part B: cube_check executable — `cube_check scrub <db-path>`.
+    // Exit codes: 0 = all pages pass, 1 = usage/open/no-meta error, 2 = corruption found.
+    const cube_check_exe = b.addExecutable(.{
+        .name = "cube_check",
+        .root_module = cube_check_mod,
+    });
+    b.installArtifact(cube_check_exe);
+
+    const cube_check_step = b.step("cube-check", "Run cube_check (args after -- : scrub <db-path>)");
+    const cube_check_cmd = b.addRunArtifact(cube_check_exe);
+    cube_check_step.dependOn(&cube_check_cmd.step);
+    if (b.args) |args| {
+        cube_check_cmd.addArgs(args);
+    }
+
     const exe = b.addExecutable(.{
         .name = "cube_db",
         .root_module = b.createModule(.{
@@ -253,6 +280,7 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{
                     .{ .name = "cube_db", .module = mod },
                     .{ .name = "zio", .module = zio_mod },
+                    .{ .name = "cube_check", .module = cube_check_mod },
                 },
             }),
         });

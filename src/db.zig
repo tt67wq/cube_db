@@ -264,7 +264,7 @@ pub const Db = struct {
         const reader = self.state.beginRead();
         defer self.state.endRead(reader);
         const root = self.state.getRoot();
-        return try btree.get(self.allocator, self.store, root, key);
+        return try btree.getChecked(self.allocator, self.store, root, key, self.state.opts.crc_check);
     }
 
     /// Zero-copy point read (T-29 Phase A): value is copied into the caller's
@@ -278,7 +278,7 @@ pub const Db = struct {
         const reader = self.state.beginRead();
         defer self.state.endRead(reader);
         const root = self.state.getRoot();
-        return try btree.getInto(self.store, root, key, buffer);
+        return try btree.getIntoChecked(self.store, root, key, buffer, self.state.opts.crc_check);
     }
 
     /// Range query (T-29 Phase B borrowed iterator): next() returns borrowed
@@ -298,7 +298,7 @@ pub const Db = struct {
         const reader = self.state.beginRead(); // MVCC pin: snapshot protection for the iterator's borrowed pages
         errdefer self.state.endRead(reader);
         const root = self.state.getRoot();
-        var it = try btree.select(self.allocator, self.store, root, min, max);
+        var it = try btree.selectChecked(self.allocator, self.store, root, min, max, self.state.opts.crc_check);
         it.pin_ctx = @ptrCast(reader);
         it.pin_deinit = endReadPin;
         return it;
@@ -450,14 +450,14 @@ pub const ReadTxn = struct {
     ended: bool = false,
 
     pub fn get(self: *ReadTxn, key: []const u8) !?[]u8 {
-        return try btree.get(self.db.allocator, self.db.store, self.snapshot_root, key);
+        return try btree.getChecked(self.db.allocator, self.db.store, self.snapshot_root, key, self.db.state.opts.crc_check);
     }
 
     /// Zero-copy point read (T-29 Phase A): same semantics as Db.getInto
     /// (null = key missing, BufferTooSmall = buffer too small, nothing
     /// written), with the snapshot pinned to this txn's root.
     pub fn getInto(self: *ReadTxn, key: []const u8, buffer: []u8) !?usize {
-        return try btree.getInto(self.db.store, self.snapshot_root, key, buffer);
+        return try btree.getIntoChecked(self.db.store, self.snapshot_root, key, buffer, self.db.state.opts.crc_check);
     }
 
     /// Range query (T-29 Phase B borrowed iterator): borrowing contract
@@ -469,7 +469,7 @@ pub const ReadTxn = struct {
     pub fn select(self: *ReadTxn, min: ?[]const u8, max: ?[]const u8) !btree.Iterator {
         const reader = self.db.state.beginRead(); // iterator's own pin (released at deinit)
         errdefer self.db.state.endRead(reader);
-        var it = try btree.select(self.db.allocator, self.db.store, self.snapshot_root, min, max);
+        var it = try btree.selectChecked(self.db.allocator, self.db.store, self.snapshot_root, min, max, self.db.state.opts.crc_check);
         it.pin_ctx = @ptrCast(reader);
         it.pin_deinit = endReadPin;
         return it;

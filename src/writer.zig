@@ -141,10 +141,19 @@ pub const ProfileStats = struct {
 ///   the user calls Db.sync() manually).
 pub const Durability = enum { process_crash, power_fail };
 
+/// Hot-read CRC check tier (T-35 Part A). Defined in btree.zig (where the
+/// read path lives) and re-exported here so `Options` can carry it without a
+/// writer<->btree import cycle.
+pub const CrcCheck = btree.CrcCheck;
+
 pub const Options = struct {
     fsync: bool = true,
     micro_batch: MicroBatchConfig = .{},
     durability: Durability = .process_crash,
+    /// Hot-read CRC tier (T-35 Part A): off = historical skip (default,
+    /// zero added work); sample = deterministic page_no%64 sampling;
+    /// full = verify every hot-path page read. See btree.CrcCheck.
+    crc_check: CrcCheck = .off,
 };
 
 /// Micro-batching config: stage puts/deletes and commit in batches

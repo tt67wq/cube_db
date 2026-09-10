@@ -56,12 +56,48 @@ pub fn readNodePayload(store: PageStore, page_no: u32) ![]const u8 {
     return page[f2.PAGE_HEADER_SIZE .. f2.PAGE_SIZE - 4];
 }
 
-/// Fast read: skip CRC verification for hot read path.
-/// COW guarantees pages are never modified while being read,
-/// so CRC check is only needed on crash recovery / reopen.
-pub fn readNodePayloadFast(store: PageStore, page_no: u32) ![]const u8 {
+/// Hot-read CRC policy (T-35 Part A). `.off` keeps the historical skip-CRC
+/// hot path; `.full` verifies every page read on the hot read path;
+/// `.sample` verifies only pages selected by the deterministic `sampleHit`
+/// predicate. Defined here (btree) and re-exported by writer.zig next to
+/// `Options` (which carries it) to avoid a writer<->btree import cycle.
+pub const CrcCheck = enum { off, sample, full };
+
+/// Deterministic sampling interval for `.sample`: a page is verified when
+/// `page_no % SAMPLE_INTERVAL == 0`.
+pub const SAMPLE_INTERVAL: u32 = 64;
+
+/// Pure sampling predicate (no store access, trivially testable): the SAME
+/// page_no always gets the SAME verdict — no randomness — so sampling is
+/// reproducible across runs (tests / cube_check can rely on it).
+pub fn sampleHit(page_no: u32) bool {
+    return page_no % SAMPLE_INTERVAL == 0;
+}
+
+/// Policy-gated hot read: the single choke point every hot-path page read
+/// (get/getInto/iterator descent + overflow chains) goes through.
+/// `.off` costs one enum compare per page (the historical behavior, not
+/// measurably different); `.full`/`.sample` verify the page checksum and
+/// return error.CorruptCrc instead of silently returning damaged data.
+pub fn readNodePayloadPolicy(store: PageStore, page_no: u32, crc: CrcCheck) ![]const u8 {
     const page = try store.readPage(page_no);
+    const verify = switch (crc) {
+        .off => false,
+        .full => true,
+        .sample => sampleHit(page_no),
+    };
+    if (verify) {
+        const arr: *const [f2.PAGE_SIZE]u8 = @ptrCast(page.ptr);
+        if (!f2.verifyPageChecksum(arr)) return error.CorruptCrc;
+    }
     return page[f2.PAGE_HEADER_SIZE .. f2.PAGE_SIZE - 4];
+}
+
+/// Fast read: skip CRC verification (policy-less = `.off`) — kept for the
+/// write path and legacy callers; the hot read path uses
+/// readNodePayloadPolicy with the Db's configured tier.
+pub fn readNodePayloadFast(store: PageStore, page_no: u32) ![]const u8 {
+    return readNodePayloadPolicy(store, page_no, .off);
 }
 
 /// Write a node page (page header + payload + CRC)
@@ -162,13 +198,13 @@ fn writeOverflowPages(store: PageStore, value: []const u8) !u32 {
 /// (readNodePayload public API). The old implementation read the chain with
 /// CRC but descended without — two different disciplines within a single get,
 /// observably inconsistent with getInto (review N1); now unified to fast.
-fn readOverflowValue(allocator: std.mem.Allocator, store: PageStore, first_page: u32, vlen: u32) ![]u8 {
+fn readOverflowValue(allocator: std.mem.Allocator, store: PageStore, first_page: u32, vlen: u32, crc: CrcCheck) ![]u8 {
     const result = try allocator.alloc(u8, vlen);
     errdefer allocator.free(result);
     var offset: usize = 0;
     var cur = first_page;
     while (cur != 0 and offset < vlen) {
-        const payload = try readNodePayloadFast(store, cur);
+        const payload = try readNodePayloadPolicy(store, cur, crc);
         const chunk = @min(vlen - offset, payload.len);
         @memcpy(result[offset..][0..chunk], payload[0..chunk]);
         offset += chunk;
@@ -378,7 +414,7 @@ pub const Leaf = struct {
                 // Read the overflow chain for the full value; add the old overflow pages to dirty
                 const ov_page = std.mem.readInt(u32, d.value[0..4], .little);
                 freeOverflowPages(store, ov_page, dirty, allocator);
-                const full_val = try readOverflowValue(allocator, store, ov_page, d.vlen);
+                const full_val = try readOverflowValue(allocator, store, ov_page, d.vlen, .off); // write-path decode: policy off
                 entries[i] = .{
                     .tombstone = d.tombstone,
                     .key = try allocator.dupe(u8, d.key),
@@ -462,14 +498,20 @@ pub const Branch = struct {
 // ===== get =====
 
 pub fn get(allocator: std.mem.Allocator, store: PageStore, root: u32, key: []const u8) !?[]u8 {
+    return getChecked(allocator, store, root, key, .off);
+}
+
+/// Policy-aware get (T-35 Part A): Db/ReadTxn pass their configured
+/// `Options.crc_check` here; the legacy `get` above stays `.off`.
+pub fn getChecked(allocator: std.mem.Allocator, store: PageStore, root: u32, key: []const u8, crc: CrcCheck) !?[]u8 {
     if (root == NULL_ROOT) return null;
     var cur = root;
     var depth: u32 = 0;
     while (depth < 1000) : (depth += 1) {
-        const payload = try readNodePayloadFast(store, cur);
+        const payload = try readNodePayloadPolicy(store, cur, crc);
         if (payload.len == 0) return error.Truncated;
         if (payload[0] == LEAF_KIND) {
-            return findInLeaf(allocator, store, payload, key);
+            return findInLeaf(allocator, store, payload, key, crc);
         } else {
             cur = try findInBranchPayload(payload, key);
         }
@@ -477,7 +519,7 @@ pub fn get(allocator: std.mem.Allocator, store: PageStore, root: u32, key: []con
     return error.Truncated;
 }
 
-fn findInLeaf(allocator: std.mem.Allocator, store: PageStore, payload: []const u8, key: []const u8) !?[]u8 {
+fn findInLeaf(allocator: std.mem.Allocator, store: PageStore, payload: []const u8, key: []const u8, crc: CrcCheck) !?[]u8 {
     if (payload.len < 3) return error.Truncated;
     if (payload[0] != LEAF_KIND) return error.CorruptCrc;
     const count = std.mem.readInt(u16, payload[1..3], .little);
@@ -514,7 +556,7 @@ fn findInLeaf(allocator: std.mem.Allocator, store: PageStore, payload: []const u
                 if (tombstone) return null;
                 if (flags & LEAF_FLAG_OVERFLOW != 0) {
                     const ov_page = std.mem.readInt(u32, payload[pos..][0..4], .little);
-                    return @as(?[]u8, try readOverflowValue(allocator, store, ov_page, @intCast(vlen)));
+                    return @as(?[]u8, try readOverflowValue(allocator, store, ov_page, @intCast(vlen), crc));
                 }
                 if (pos + vlen > payload.len) return error.Truncated;
                 const ev = payload[pos .. pos + vlen];
@@ -540,14 +582,19 @@ fn findInLeaf(allocator: std.mem.Allocator, store: PageStore, payload: []const u
 /// converging CRC onto recovery/audit paths is the settled trade-off, see the
 /// T-27/T-29 background).
 pub fn getInto(store: PageStore, root: u32, key: []const u8, buffer: []u8) !?usize {
+    return getIntoChecked(store, root, key, buffer, .off);
+}
+
+/// Policy-aware getInto (T-35 Part A): see getChecked.
+pub fn getIntoChecked(store: PageStore, root: u32, key: []const u8, buffer: []u8, crc: CrcCheck) !?usize {
     if (root == NULL_ROOT) return null;
     var cur = root;
     var depth: u32 = 0;
     while (depth < 1000) : (depth += 1) {
-        const payload = try readNodePayloadFast(store, cur);
+        const payload = try readNodePayloadPolicy(store, cur, crc);
         if (payload.len == 0) return error.Truncated;
         if (payload[0] == LEAF_KIND) {
-            return findInLeafInto(store, payload, key, buffer);
+            return findInLeafInto(store, payload, key, buffer, crc);
         } else {
             cur = try findInBranchPayload(payload, key);
         }
@@ -560,7 +607,7 @@ pub fn getInto(store: PageStore, root: u32, key: []const u8, buffer: []u8) !?usi
 /// paths behaviorally identical); on a hit it copies straight into the buffer
 /// instead of duping; an insufficient buffer is intercepted before any write
 /// (no partial writes; the buffer is untouched on failure).
-fn findInLeafInto(store: PageStore, payload: []const u8, key: []const u8, buffer: []u8) !?usize {
+fn findInLeafInto(store: PageStore, payload: []const u8, key: []const u8, buffer: []u8, crc: CrcCheck) !?usize {
     if (payload.len < 3) return error.Truncated;
     if (payload[0] != LEAF_KIND) return error.CorruptCrc;
     const count = std.mem.readInt(u16, payload[1..3], .little);
@@ -598,7 +645,7 @@ fn findInLeafInto(store: PageStore, payload: []const u8, key: []const u8, buffer
                 if (buffer.len < vlen) return error.BufferTooSmall; // intercept before any write
                 if (flags & LEAF_FLAG_OVERFLOW != 0) {
                     const ov_page = std.mem.readInt(u32, payload[pos..][0..4], .little);
-                    try readOverflowValueInto(store, ov_page, buffer[0..vlen]);
+                    try readOverflowValueInto(store, ov_page, buffer[0..vlen], crc);
                     return @as(usize, vlen);
                 }
                 if (pos + vlen > payload.len) return error.Truncated;
@@ -618,11 +665,11 @@ fn findInLeafInto(store: PageStore, payload: []const u8, key: []const u8, buffer
 /// trade-off as the get descent path: under COW, published pages are never
 /// modified in place). vlen comes from the in-leaf entry; buffer.len == vlen
 /// is already guaranteed by the caller.
-fn readOverflowValueInto(store: PageStore, first_page: u32, buffer: []u8) !void {
+fn readOverflowValueInto(store: PageStore, first_page: u32, buffer: []u8, crc: CrcCheck) !void {
     var offset: usize = 0;
     var cur = first_page;
     while (cur != 0 and offset < buffer.len) {
-        const payload = try readNodePayloadFast(store, cur);
+        const payload = try readNodePayloadPolicy(store, cur, crc);
         const chunk = @min(buffer.len - offset, payload.len);
         @memcpy(buffer[offset..][0..chunk], payload[0..chunk]);
         offset += chunk;
@@ -1407,7 +1454,15 @@ fn insertBatchSplitLeaves(
         new_keys.clearRetainingCapacity();
         var i: usize = 0;
         while (i < current_pages.len) {
-            const chunk_len = @min(BRANCH_MAX_CHILDREN, current_pages.len - i);
+            var chunk_len = @min(BRANCH_MAX_CHILDREN, current_pages.len - i);
+            // T-36: a tail chunk of exactly 1 child would encode an illegal
+            // 1-child branch (encodeBranchPayload asserts children.len >= 2).
+            // Happens when the page count is >64 and == 1 (mod 64) — e.g. 65
+            // leaves chunk as 64+1. Lend one child from this chunk so the tail
+            // keeps >= 2. (chunk_len is only ever 64 here when lending: for a
+            // remaining count <= 64 the chunk takes all of them, leaving no
+            // tail.)
+            if (current_pages.len - i - chunk_len == 1) chunk_len -= 1;
             const children = current_pages[i .. i + chunk_len];
             const keys = current_keys[i .. i + chunk_len - 1];
             const page = try store.allocPage();
@@ -1626,7 +1681,12 @@ fn insertBatchIntoLeaf(
         new_keys.clearRetainingCapacity();
         var i: usize = 0;
         while (i < current_pages.len) {
-            const chunk_len = @min(BRANCH_MAX_CHILDREN, current_pages.len - i);
+            var chunk_len = @min(BRANCH_MAX_CHILDREN, current_pages.len - i);
+            // T-36: a tail chunk of exactly 1 child would encode an illegal
+            // 1-child branch (encodeBranchPayload asserts children.len >= 2).
+            // Same mod-64 tail defect as insertBatchSplitLeaves — lend one
+            // child so the tail keeps >= 2.
+            if (current_pages.len - i - chunk_len == 1) chunk_len -= 1;
             const children = current_pages[i .. i + chunk_len];
             const keys = current_keys[i .. i + chunk_len - 1];
             const page = try store.allocPage();
@@ -1882,6 +1942,10 @@ pub const Iterator = struct {
     /// layer does not depend on wrt.State).
     pin_ctx: ?*anyopaque = null,
     pin_deinit: ?*const fn (*anyopaque) void = null,
+    /// Hot-read CRC policy (T-35 Part A): set by selectChecked from the
+    /// Db's Options; every page this iterator reads (branch re-reads in
+    /// stepToNextLeaf, descents, overflow chains) goes through it.
+    crc: CrcCheck = .off,
 
     /// ponytail: fixed-size pushdown stack. With 4KB pages / 32-way fanout,
     /// 1TB is roughly depth 7 — 64 is plenty; pathologically deep trees
@@ -1956,7 +2020,7 @@ pub const Iterator = struct {
                         const ov_page = std.mem.readInt(u32, payload[ev.value_pos..][0..4], .little);
                         self.ov_buf.clearRetainingCapacity();
                         try self.ov_buf.resize(self.allocator, ev.vlen);
-                        try readOverflowValueInto(self.store, ov_page, self.ov_buf.items);
+                        try readOverflowValueInto(self.store, ov_page, self.ov_buf.items, self.crc);
                         return .{ .tombstone = false, .key = ev.key, .value = self.ov_buf.items };
                     }
                     if (ev.value_pos + ev.vlen > payload.len) return error.Truncated;
@@ -1974,7 +2038,7 @@ pub const Iterator = struct {
         while (self.depth > 0) {
             const top = &self.frames[self.depth - 1];
             top.child_idx += 1;
-            const br = try readBranchChildren(self.store, top.page_no);
+            const br = try readBranchChildren(self.store, top.page_no, self.crc);
             if (top.child_idx < br.count) {
                 const child = std.mem.readInt(u32, br.payload[br.children_offset + top.child_idx * 4 ..][0..4], .little);
                 return try self.descendLeftmost(child);
@@ -1990,7 +2054,7 @@ pub const Iterator = struct {
         var cur = page_no;
         var guard: u32 = 0;
         while (guard < 1000) : (guard += 1) {
-            const payload = try readNodePayloadFast(self.store, cur);
+            const payload = try readNodePayloadPolicy(self.store, cur, self.crc);
             if (payload.len == 0) return error.Truncated;
             if (payload[0] == LEAF_KIND) {
                 try self.loadLeaf(payload);
@@ -2024,8 +2088,8 @@ pub const Iterator = struct {
 
     /// Read a branch page and skip past the keys area (no decoded copies, no
     /// key dupes).
-    fn readBranchChildren(store: PageStore, page_no: u32) !BranchView {
-        const payload = try readNodePayloadFast(store, page_no);
+    fn readBranchChildren(store: PageStore, page_no: u32, crc: CrcCheck) !BranchView {
+        const payload = try readNodePayloadPolicy(store, page_no, crc);
         return try branchChildren(payload);
     }
 };
@@ -2053,6 +2117,12 @@ fn branchChildren(payload: []const u8) !Iterator.BranchView {
 /// borrowing contract). Raw page-store callers guarantee Store stability
 /// themselves; the Db/ReadTxn layer injects the MVCC pin via db.zig.
 pub fn select(allocator: std.mem.Allocator, store: PageStore, root: u32, min: ?[]const u8, max: ?[]const u8) !Iterator {
+    return selectChecked(allocator, store, root, min, max, .off);
+}
+
+/// Policy-aware select (T-35 Part A): see getChecked. The iterator carries
+/// the policy for every page it reads lazily during next().
+pub fn selectChecked(allocator: std.mem.Allocator, store: PageStore, root: u32, min: ?[]const u8, max: ?[]const u8, crc: CrcCheck) !Iterator {
     var it: Iterator = .{
         .allocator = allocator,
         .store = store,
@@ -2065,6 +2135,7 @@ pub fn select(allocator: std.mem.Allocator, store: PageStore, root: u32, min: ?[
         .leaf_pos = 0,
         .entry_i = 0,
         .ov_buf = .empty,
+        .crc = crc,
     };
     if (root == NULL_ROOT) return it;
     var cur = root;
@@ -2074,8 +2145,9 @@ pub fn select(allocator: std.mem.Allocator, store: PageStore, root: u32, min: ?[
         // (get/getInto/iterator) uniformly use readNodePayloadFast, skipping
         // CRC; CRC stays on write-path reads and recovery/audit
         // (readNodePayload public API). COW guarantees published pages are
-        // never modified in place.
-        const payload = try readNodePayloadFast(store, cur);
+        // never modified in place. T-35 Part A: the skip is now the `.off`
+        // tier of Options.crc_check; `.full`/`.sample` verify here.
+        const payload = try readNodePayloadPolicy(store, cur, crc);
         if (payload.len == 0) return error.Truncated;
         if (payload[0] == LEAF_KIND) {
             try it.loadLeaf(payload);
