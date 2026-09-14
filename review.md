@@ -1,87 +1,173 @@
-# T-39-D review — T-39-B 去重 O(1) + 静默吞错可观测化（崩溃安全复验）
+# T-40 review — 批量分块 payload-size-aware（f608c10 + 924c733 + 3e0831a + e94d49f）
 
-- **Reviewer**: cube_db-pi-1（T-39-A 测试作者；T-39-B/C 实现者为 cube_db-pi-2 — 独立性成立）
-- **Reviewed SHA**: `a384334`（T-39-B），评审分支 **T-39-integration** head `7c428c2`
-  （= a384334 + 55e58f6 RED gate 合入 + 7c428c2 T-39-C 降级 issue；`ad82cb2..HEAD` 的 src 改动仅 a384334）
-- **范围调整（conductor）**: T-39-C append-only 已论证不可安全闭合、降级为
-  `issues/T-39-C-followup-append-only-freelist.md`。本次评审**无磁盘格式改动**，
-  硬门槛 = T-39-B 不破坏 T-33/T-27 崩溃安全模型 + T-39-A 去重/观测断言绿 + 矩阵稳定。
-- **Verdict**: **approve**
+- **Reviewer**: cube_db-pi-1（T-40-A RED 测试原作者 + tester；实现者 cube_db-pi-2 —— 独立性成立）
+- **Reviewed SHA**: `f608c10`（实现）+ `924c733`（RED 测试修复）+ `3e0831a`（issue 更新）
+  + **`e94d49f`（GAP A/B 修复，针对 review 34e5afb 的 changes-requested）**，
+  基线 `e0e6c9e`；分支 cube_db-pi-2-rebuilt
+- **契约**: `/.agents/tasks/T-40/task-B`（4 处分块点字节预算）+ issue
+  `issues/T-40-batch-chunking-count-vs-payload-size.md`（批量分块按计数不看字节 → panic）
+- **Verdict**: **approve**（初判 changes-requested（34e5afb）的 Finding 1 已由 e94d49f
+  完全闭合：两处早返回字节预算正中靶心、两条回归真实先红后绿、issue 附注修正属实、
+  GAP C 如实转 T-43 立项。见 §5 复核，初判全文保留于下供溯源。）
 
 ---
 
-## 1. 变更范围确认（崩溃模型未触碰）
+## 0. 证据基础（详见 test-report.md，全部 reviewer 独立复跑/探针）
 
-`src/file_page_store.zig` 唯一 src diff 是 a384334（+168/−7）。逐项核对：
+- RED（e0e6c9e）2 crash、GREEN（924c733）2/2、全量 422/423 + 1 skip 无回归 —— 属实。
+- 独立探针 P1（orphan-promote + 深树二次批量，pi-2 未测的分支）—— **PASS**。
+- 独立探针 PA/PC/PD —— **3 个仍可触发的崩溃**（GAP A/B/C，见 §3）。
 
-- **磁盘格式零改动**：FREE 页字节布局、`MAX_FREE_ENTRIES_PER_PAGE`、`persistChainLocked`
-  的整链重写算法、链页写入循环、gen 戳（`gen = seq`）、meta 字段覆盖、两代轮转
-  （chain_prev→chain_cur）全部原样。
-- **崩溃注入点零改动**：5 个 `fireCrashHook`（before_chain `:708`、mid_chain `:447`/`:724`、
-  after_chain_before_meta `:749`、after_meta `:758`）位置逐一比对未动；
-  `git diff ad82cb2..HEAD` 中唯一相关新增是 `freelist_stats.chain_pages_written += k` 统计行
-  （persistChainLocked 尾部，不参与任何写序）。
-- **restoreFreeList 判定链零改动**：XOR gate / bound1 / bound2 / revisit guard / CRC / type /
-  page_no / gen 戳 / total 匹配 / 排序后 range+dup+self-ref 检查 —— 全部原样，v0..v10 的
-  接受/丢弃语义由测试原断言锁定（复验全绿，见 test-report.md）。
+## 1. f608c10 实现审计 — 4 处分块点本身正确
 
-## 2. pool_set 镜像同步审计（核心风险面）
+### 1.1 字节记账与编码器精确对齐（逐项核算）
 
-T-39-B 的正确性关键是"池唯一真值 + set 镜像 1:1"，危险方向是 **set 漏收**（池有 set 无 →
-re-free 双列 → 双分配）。逐个写点审计：
+- `leafChunkLen`（`:346`）：`n=3 + Σ(10+klen+value_sz)`，`value_sz` 用
+  `value.len > MAX_INLINE_VALUE → 4` —— 与 `leafPayloadSize`（`:237`）逐字节一致。✓
+- `branchChunkLen`（`:366`）：`n = 3+4（头+首 child 槽）+ Σ(4+klen)` —— 与
+  `branchPayloadSize`（`:327`：`3 + Σ(4+klen) + 4×children`）一致。✓
+- 单 entry 地板：`3 + 10 + MAX_KEY_SIZE(4051) + 4 = 4068 = NODE_PAYLOAD_CAP` 恰好 ——
+  首条目免检（`len > 0` 才判停）保证贪婪永不卡死。✓ 2-child chunk 地板：
+  `3+8+4+4051 = 4066 ≤ 4068` ✓（doc comment 声明与数学一致）。
+- `max` 参数保留 `LEAF_MAX_ENTRIES`/`BRANCH_MAX_CHILDREN` 计数上限 —— 字节预算只会
+  切更小，不会放大既有计数界。✓
 
-- `pushPoolLocked`（`:321-339`）：getOrPut OOM → 丢页计数，池/集双未动 ✓；
-  found_existing → no-op（INV-F1 幂等保持）✓；池 append OOM → 先回滚 set 插入再丢页计数
-  （保持 set ⊆ pool，注释明确指出反向是 unsafe 方向）✓。
-- `popPoolLocked`（`:296-301`）：池 pop + set remove 同步，remove 无失败路径 ✓。
-- **全部 `self.freelist` 写点核对**：grep 确认除 restoreFreeList 的整体赋值（`:594`）外，
-  池的所有增删都走 *Locked 原语 — 无旁路写点。
-- `restoreFreeList`（`:575-594`）：set 重建在**全部校验之后、采纳池之前**；OOM → 整链丢弃
-  （free_list_discarded，INV-F2 泄漏方向），池保持空 ✓。entries 在 T6 v3 已验证无重复，
-  put 无碰撞前提成立 ✓。init 单线程段，无并发窗口 ✓。
-- 失败方向一致性：所有 OOM 路径都是**泄漏方向**（丢页/丢链），无一处引入误回收方向 ✓。
+### 1.2 4 处分块点逐一
 
-## 3. 语义保持
+1. `insertBatchSplitLeaves :1496` — `leafChunkLen(entries[pos..], 32)` ✓
+2. `insertBatchIntoLeaf :1781` — 同上（merged）✓
+3. `buildBranchLevels :1535/:1554` — 早返回加 `branchPayloadSize(...) <= CAP`，
+   层循环条件 `> 64 OR bytes > CAP`（两个维度都触发分层）✓
+4. `insertBatchIntoBranch :1980`（非溢出返回加字节校验）+ `:2009`（溢出 splice chunk
+   循环用 `branchChunkLen`）✓
 
-- **allocPage 取出顺序**：池仍是 LIFO 尾弹，freePagesSnapshot 输出序不变（实现者否决
-  二分/有序插入方案的理由成立——池只在 restore 后升序，运行期无序，且改序会破坏契约
-  四函数语义；hash 镜像是零语义改动的选择）✓。
-- **INV-F1（幂等 free）**：单次 getOrPut 探测，found_existing 短路，与旧 indexOfScalar
-  判重语义等价 ✓（T-39-B 自测 + T-39-A RED #2 双向锁定）。
-- **pushPoolLocked 的 P0-A 依赖**（restore 接受含 tree 页的链 → reclaim 合法 re-free）：
-  镜像方案下 re-free 同样被去重，语义保持 ✓。
-- **并发**：stats 增减全在 freelist_mu 临界区内；resetFreelistStats/freelistStats 取同锁
-  （freelistStats 用 freePageCount 同款 constCast 模式）✓。reset 与进行中 commit 的竞争
-  由锁串行化 ✓。
+### 1.3 T-36 1-child 规则 + orphan promote
 
-## 4. 可观测 API（T-39-A 契约比对）
+- 借道保留：`rem - chunk_len == 1 且 chunk > 2` → 借 1（`:1573`/`:2015`）✓
+- **字节地板新路径**（chunk==2 且 rem==3）：把尾部 orphan 子页**本身**提升到上一层/
+  出向 splice（`:1576-1590`/`:2017-2032`）。正确性核对：
+  - orphan 是已编码完成的合法页（leaf 或既有 child 页），提升 = 父层直接持有，指针
+    遍历不依赖均匀深度 ✓
+  - 分隔符追加 `current_keys[i+chunk_len-1]`（= chunk 末 child 与 orphan 的边界键）
+    在 promote 前完成，splice/层列表保持有序 ✓
+  - 不可达 1-child chunk 证明：进入层循环时 children ≥ 2；归纳每轮迭代后 rem ∈ {0,2}
+    （borrow 路径尾部留 2、promote 路径整段消费），故 `branchChunkLen` 的 rem==1 返回值
+    分支不可达 ✓
+  - **P1 探针实证**：131 个 4000B key（奇数叶子 → 末块 2+1 orphan promote）+ 深树二次
+    批量，entryCount/采样点查/全序扫描全过 ✓
+- `branchChunkLen` 首 child 免检 + rem≥2 时数学上 ≥2（第 2 个 child 超 CAP 需
+  klen > 4057 > MAX_KEY_SIZE，不可能）✓
 
-- 命名与 T-39-A 固定契约完全一致：`FreelistStats{chain_pages_written, dedup_scans,
-  dedup_membership_probe, dropped_pages_oom}` + `resetFreelistStats`/`freelistStats`，
-  且 `FilePageStore.FreelistStats` 与 `file_page_store.FreelistStats` 双路径可达。
-- **非空转验证**：dedup_scans/dedup_membership_probe 每次 free 恰 +1（T-39-A RED #2
-  实测 64 次 re-free = 64 探测，与池大小无关）；dropped_pages_oom 在 FailingAllocator
-  强制 OOM 下真实 +1（实现者自测），健康路径 0。
-- **chain_pages_written 口径**：`+= k`（每次 persistChainLocked 实际写的链页数，含整链
-  重写的 k 页）。在整链重写策略下 small commit 恒写满链 — 这正是 RED #1 红着的真实
-  度量，不是空转计数。真实消减归 T-39-C-followup。
+### 1.4 性能
 
-## 5. 发现（非阻塞）
+- 两个 helper 为 chunk 前缀扫描 O(chunk_len)，总量 O(n)/level，无渐近变化；常数比
+  `@min` 略增，全套件运行时长与基线相当（含 FPS 微基准输出正常）。层循环每层重算一次
+  `branchPayloadSize` O(level) —— 每层一次，可忽略。✓
 
-1. **Minor（口径备注）**：`chain_pages_written += k` 在 persistChainLocked 的 fallback
-   早退路径（链页写一半 OOM 回滚）不计数 — 已写的部分链页不计。骨架口径下无碍，
-   follow-up 落地增量语义时建议同步明确 torn 路径的计数口径。
-2. **Minor（内存放大备注）**：pool_set 为每空闲页 ~1.5-2 slot 的哈希镜像（20k 池
-   ≈ 200KB 量级）— 可接受，follow-up 若引入 dirty-flag/skip 路径可顺带评估合并。
-3. **观察（既有）**：`zig build test` 下个别 run 步骤打印 freelist/T7 诊断 stderr 并在
-   步骤树里渲染为 `w`，但 Build Summary 均为 success（zig 0.16 server 模式的 stderr
-   回放渲染，T-37-C 已分析过）— 与 T-39-B 无关，不构成发现。
+## 2. 924c733（改我的 RED 测试）— 无放水（详细逐条见 test-report.md §2）
 
-## 6. 结论
+三处 authoring bug **全部属实**（本人自证：prev 泄漏 119 块 / 'a'-'z' filler 错配使
+test 2 对任何正确实现不可满足 / 采样区间错位）。修复最小、诚实：filler 参数化、后缀
+对齐、dupe 前 free。**全部断言保留，强度不降反升**（恢复可满足性）。未发现任何借改
+测试降低覆盖的行为。✓
 
-T-39-B 是一次**纯内存层**改动：磁盘格式、写序、注入点、恢复判定零触碰；镜像同步在
-每个写点上朝安全方向闭合；观测 API 命名与 T-39-A 契约逐字一致且度量真实。崩溃矩阵
-（T5 全注入点 + T5-b/r + T6 v0..v10 + 全 crash 聚合 70 测试）多轮复验全绿零 flake
-（详见 test-report.md）。
+## 3. Findings
 
-**Verdict: approve**
+### Finding 1（blocker）：GAP A/B —— 批量路径两个「按 count 切」单叶早返回漏改
+
+issue 总结句：「叶子/分支分块以**条目数**为界……而不看 payload 的**字节尺寸**」。
+f608c10 只转换了 4 处 chunk **循环**，但同一批量流程里还有两个同族按-count 决策：
+
+- **GAP A** `src/btree.zig:1458`（`insertBatchFresh`）：`entries.len <= LEAF_MAX_ENTRIES`
+  → 单叶编码，无字节校验。**实测**（探针 PA）：空库 `putBatch` 3 个 4000B key →
+  `:1463` panic `index 12033, len 4096`。
+- **GAP B** `src/btree.zig:1753`（`insertBatchIntoLeaf`）：`merged_entries.len <=
+  LEAF_MAX_ENTRIES` → 单叶重编码，无字节校验。**实测**（探针 PC）：3 小 key 叶上
+  `putBatch` 2 个 4000B key → `:1757` panic `index 8062`。**该函数本次已被 f608c10
+  修改**（`:1781` 的 chunk 循环），漏改自己函数 24 行之上的同族早返回。
+
+后果：**修复后，「一批 2..32 个近 MAX_KEY_SIZE 的 key」仍崩库** —— 比 RED 场景
+（120 key）更容易触发。issue 的核心主张（批量大 key 不崩）在 HEAD 不成立，
+`3e0831a` 的 issue 状态「修复 → 待评审关闭」为时过早（其附注只声明了单 key 路径
+GAP C，未提及 A/B）。
+
+**要求（changes-requested 的全部内容）**：
+1. `:1458` 与 `:1753` 两处早返回加字节预算（`leafPayloadSize(...) <= NODE_PAYLOAD_CAP`，
+   超限走 split/splice 路径 —— 与 4 处 chunk 点同一模式，预计各 1-2 行）；
+2. 补两条 RED→GREEN 回归（可直接用 test-report.md §3 的 PA/PC 场景：空库 3 大 key
+   putBatch；小叶上 2 大 key putBatch）；
+3. 修正 `3e0831a` 的 issue 附注：把 GAP A/B 与 GAP C 分开记录（A/B 属本 issue 修复
+   范围，C 转立项）。
+
+### Finding 2（non-blocking，转立项）：GAP C —— 单 key 路径同族溢出
+
+`insertIntoLeafSplit :1178`（mid-split 半叶可超 CAP，探针 PD 实测 panic
+`index 4229`）与 `insertBranch :1260`（≤64 仅计数）。属 T-26 族遗留、契约外；
+`3e0831a` 已自行声明待立项 —— 认可该归类，随 GAP A/B 修复时一并立 issue 即可。
+
+### Finding 3（nit）：`NODE_PAYLOAD_CAP` 与 T-26 precheck 的 `payload_cap` 重复定义
+
+`:1017` 后 T-26 precheck 内联算 `f2.PAGE_SIZE - f2.PAGE_HEADER_SIZE - 4`，与
+`NODE_PAYLOAD_CAP` 相同 —— 建议后续统一引用常量（不 block）。
+
+## 4. 验收核对单
+
+- [x] 4 处契约分块点全部字节化且正确（§1.1-1.2）
+- [x] T-36 规则保留，orphan-promote 新路径正确（§1.3 + P1 实证）
+- [x] `zig build test-batchpayload` 2/2 绿（独立复跑）
+- [x] `zig build test` 422/423, 1 skip，无回归（独立复跑）
+- [x] 924c733 无放水、断言语义保留（test-report §2）
+- [x] **issue 核心主张闭合：批量大 key 不崩 —— e94d49f 修复 GAP A/B，PA/PC 回归绿（复核见 §5）**
+- [x] 单 key 路径缺口已如实声明转立项（3e0831a）
+
+**初判 Verdict: changes-requested** — Finding 1（GAP A/B，两处早返回 + 两条回归 + issue
+附注修正）完成后即可转 approve；其余不 block。
+
+---
+
+## 5. 复核 e94d49f（changes-requested → **approve**）
+
+针对 34e5afb Finding 1 的三项要求逐项复核（全部 reviewer 独立验证。方法：独立 worktree
+checkout 34e5afb（fix 前 src）叠加 e94d49f 的测试文件验证先红；checkout e94d49f 验证后绿）：
+
+### 5.1 要求 1：两处早返回字节预算 — 正中靶心 ✓
+
+- `insertBatchFresh :1458`：`entries.len <= LEAF_MAX_ENTRIES and
+  leafPayloadSize(entries) <= NODE_PAYLOAD_CAP` —— 与 4 处 chunk 点同一模式。
+  超限自然落入 `insertBatchSplitLeaves`（f608c10 已字节分块；单 entry 数学上必然放下，
+  贪婪永不卡死）✓
+- `insertBatchIntoLeaf :1754`：`merged_entries.len <= LEAF_MAX_ENTRIES and
+  leafPayloadSize(merged_entries) <= NODE_PAYLOAD_CAP` —— 同款。超限落入 splice
+  chunk 路径（已字节分块；超过 CAP 的 merged 必切 ≥ 2 叶 → splice ≥ 1 separator 合法；
+  根叶场景上行 buildBranchLevels / 非根场景上行 insertBatchIntoBranch，两路均字节感知）✓
+- src diff 共 2 hunks / +6 行，最小修复，无 scope creep ✓
+
+### 5.2 要求 2：两条回归真实先红后绿 ✓（reviewer 独立复跑）
+
+- **红**（34e5afb src + e94d49f 测试文件）：test 3（空库 3 大 key）crash
+  `insertBatchFresh :1463` panic `index 12033, len 4096`；test 4（3 小 key 叶 +
+  2 大 key）crash `insertBatchIntoLeaf :1757` panic `index 8089, len 4096`；
+  旧 test 1/2 不受影响（2 pass, 2 crash）—— 与 commit message 声明、与本人探针
+  PA/PC 完全一致 ✓
+- **绿**（e94d49f）：`zig build test-batchpayload` **4/4**；`zig build test`
+  **424/425 passed, 1 skipped**（= 基线 422/423 + 2 新测试）**无回归** ✓
+- 回归场景与探针 PA/PC 等价（test 4 的小叶改用 putBatch 构建——走同一
+  insertBatchFresh 单叶路径，等价成立），verify 断言完整（计数/采样/全序扫描/
+  小 key 存活），无放水 ✓
+
+### 5.3 要求 3：issue 附注修正 + T-43 立项 ✓
+
+- T-40 issue：GAP A/B 归入本 issue 并标注闭合（行号与 panic 索引与实测一致）；
+  回归计数更新 4/4、424/425 ✓
+- `issues/T-43-single-insert-payload-overflow.md`：GAP C（`insertIntoLeafSplit`
+  mid-split + `insertBranch` ≤64 仅计数）如实立项，含 PD 探针实证（panic 4229）、
+  修复方向（复用 leafChunkLen/NODE_PAYLOAD_CAP + 同 T-40 模式）合理 ✓
+  - nit（不 block）：T-43 触发条件写「需既有叶/枝已含近-MAX_KEY_SIZE key」——实际
+    PD 场景只需「近满叶 + 单条大 key 插入」（split 后右半叶 16 小 + 1 大即超限），
+    触发面比描述略宽；优先级结论不变。
+
+### 5.4 复核结论
+
+Finding 1 三项要求全部满足，无新发现。
+
+**最终 Verdict: approve** — T-40 关闭；GAP C 隔离在 T-43（open，待 conductor 立项）。

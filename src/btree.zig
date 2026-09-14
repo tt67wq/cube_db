@@ -332,6 +332,48 @@ pub fn branchPayloadSize(keys: []const []const u8, children: []const u32) usize 
     return n;
 }
 
+/// T-40: max payload bytes for one encoded node page (payload area only;
+/// same cap as the T-26 insertIntoLeaf fast-path precheck).
+pub const NODE_PAYLOAD_CAP: usize = f2.PAGE_SIZE - f2.PAGE_HEADER_SIZE - 4;
+
+/// T-40: greedy leaf chunk length — the max entry count (bounded by `max`)
+/// whose cumulative encoded size fits one page. Accounting mirrors
+/// leafPayloadSize: header 3 + per-entry 10 + klen + value_sz (overflow
+/// values count as a 4B page pointer). A single entry always fits
+/// (MAX_KEY_SIZE is derived from this bound), so the result is >= 1
+/// whenever there is at least one entry left.
+pub fn leafChunkLen(entries: []const LeafEntry, max: usize) usize {
+    var n: usize = 3;
+    var len: usize = 0;
+    while (len < @min(max, entries.len)) {
+        const e = entries[len];
+        const value_sz = if (e.value.len > MAX_INLINE_VALUE) @as(usize, 4) else e.value.len;
+        const need = 10 + e.key.len + value_sz;
+        if (len > 0 and n + need > NODE_PAYLOAD_CAP) break;
+        n += need;
+        len += 1;
+    }
+    return len;
+}
+
+/// T-40: greedy branch chunk length — the max child count (bounded by `max`)
+/// whose cumulative encoded size fits one page. `keys` must be the separator
+/// slice starting at the chunk's first child; a chunk of L children carries
+/// keys[0..L-1]. Returns >= 2 when at least 2 children remain: a 2-child
+/// chunk costs 3 + 8 + 4 + klen <= 3 + 8 + 4 + MAX_KEY_SIZE <= cap.
+pub fn branchChunkLen(keys: []const []const u8, children_rem: usize, max: usize) usize {
+    var n: usize = 3 + 4; // header + first child's 4B slot
+    var len: usize = 1;
+    while (len < @min(max, children_rem)) {
+        const k = keys[len - 1]; // separator between child len-1 and len
+        const need = 4 + k.len; // separator + next child's 4B slot
+        if (n + need > NODE_PAYLOAD_CAP) break;
+        n += need;
+        len += 1;
+    }
+    return len;
+}
+
 pub fn encodeBranchPayload(buf: []u8, keys: []const []const u8, children: []const u32) usize {
     const need = branchPayloadSize(keys, children);
     std.debug.assert(buf.len >= need);
@@ -1413,7 +1455,9 @@ fn insertBatchFresh(
     entries: []const LeafEntry,
     dirty: *std.ArrayList(u32),
 ) !WriteResult {
-    if (entries.len <= LEAF_MAX_ENTRIES) {
+    // T-40: byte budget as well as count — a few near-MAX_KEY_SIZE entries
+    // overflow a single leaf payload.
+    if (entries.len <= LEAF_MAX_ENTRIES and leafPayloadSize(entries) <= NODE_PAYLOAD_CAP) {
         // Fits in one leaf
         const new_page = try store.allocPage();
         const pl = leafPayloadSize(entries);
@@ -1449,7 +1493,9 @@ fn insertBatchSplitLeaves(
 
     var pos: usize = 0;
     while (pos < entries.len) {
-        const chunk_len = @min(LEAF_MAX_ENTRIES, entries.len - pos);
+        // T-40: chunk by cumulative payload bytes, not just entry count —
+        // 32 near-MAX_KEY_SIZE entries overflow a page.
+        const chunk_len = leafChunkLen(entries[pos..], LEAF_MAX_ENTRIES);
         const chunk = entries[pos .. pos + chunk_len];
         const page = try store.allocPage();
         const pl = leafPayloadSize(chunk);
@@ -1486,7 +1532,9 @@ fn buildBranchLevels(
     children: []const u32,
     keys: []const []const u8,
 ) !u32 {
-    if (children.len <= BRANCH_MAX_CHILDREN) {
+    // T-40: a page must fit by bytes as well as by count — near-MAX_KEY_SIZE
+    // separators overflow the payload area even under 64 children.
+    if (children.len <= BRANCH_MAX_CHILDREN and branchPayloadSize(keys, children) <= NODE_PAYLOAD_CAP) {
         const page = try store.allocPage();
         const pl = branchPayloadSize(keys, children);
         var buf: [f2.PAGE_SIZE]u8 = undefined;
@@ -1505,18 +1553,30 @@ fn buildBranchLevels(
     var level_keys_b = std.ArrayList([]const u8).empty;
     defer level_keys_b.deinit(allocator);
     var use_a = true;
-    while (current_pages.len > BRANCH_MAX_CHILDREN) {
+    while (current_pages.len > BRANCH_MAX_CHILDREN or
+        branchPayloadSize(current_keys, current_pages) > NODE_PAYLOAD_CAP)
+    {
         var new_pages = if (use_a) &level_pages_a else &level_pages_b;
         var new_keys = if (use_a) &level_keys_a else &level_keys_b;
         new_pages.clearRetainingCapacity();
         new_keys.clearRetainingCapacity();
         var i: usize = 0;
         while (i < current_pages.len) {
-            var chunk_len = @min(BRANCH_MAX_CHILDREN, current_pages.len - i);
+            // T-40: chunk by cumulative payload bytes, not just child count.
+            var chunk_len = branchChunkLen(current_keys[i..], current_pages.len - i, BRANCH_MAX_CHILDREN);
             // T-36: a tail chunk of exactly 1 child would encode an illegal
             // 1-child branch (encodeBranchPayload asserts children.len >= 2).
-            // Lend one child from this chunk so the tail keeps >= 2.
-            if (current_pages.len - i - chunk_len == 1) chunk_len -= 1;
+            // Lend one child from this chunk so the tail keeps >= 2; if the
+            // chunk is already at the byte-floor of 2, promote the tail child
+            // page itself to the parent level instead (it is last in key
+            // order, so appending after this chunk keeps the level list
+            // ordered — the tree becomes one level shallower along that path,
+            // which traversal handles: pages are followed by pointer, not by
+            // depth).
+            var promote_orphan = false;
+            if (current_pages.len - i - chunk_len == 1) {
+                if (chunk_len > 2) chunk_len -= 1 else promote_orphan = true;
+            }
             const chunk_children = current_pages[i .. i + chunk_len];
             const chunk_keys = current_keys[i .. i + chunk_len - 1];
             const page = try store.allocPage();
@@ -1528,7 +1588,14 @@ fn buildBranchLevels(
             if (i + chunk_len < current_pages.len) {
                 try new_keys.append(allocator, current_keys[i + chunk_len - 1]);
             }
-            i += chunk_len;
+            if (promote_orphan) {
+                // the boundary key above is the orphan's separator; append
+                // the child page itself (chunk_len == 2 always fits)
+                try new_pages.append(allocator, current_pages[i + chunk_len]);
+                i += chunk_len + 1;
+            } else {
+                i += chunk_len;
+            }
         }
         current_pages = new_pages.items;
         current_keys = new_keys.items;
@@ -1684,8 +1751,9 @@ fn insertBatchIntoLeaf(
     // Mark old page as dirty
     dirty.append(allocator, page_no) catch {};
 
-    // Split check
-    if (merged_entries.len <= LEAF_MAX_ENTRIES) {
+    // Split check (T-40: byte budget as well as count — a few
+    // near-MAX_KEY_SIZE entries overflow a single leaf payload)
+    if (merged_entries.len <= LEAF_MAX_ENTRIES and leafPayloadSize(merged_entries) <= NODE_PAYLOAD_CAP) {
         const new_page = try store.allocPage();
         const pl = leafPayloadSize(merged_entries);
         var buf: [f2.PAGE_SIZE]u8 = undefined;
@@ -1711,7 +1779,9 @@ fn insertBatchIntoLeaf(
     defer split_keys.deinit(allocator);
     var pos: usize = 0;
     while (pos < merged_entries.len) {
-        const chunk_len = @min(LEAF_MAX_ENTRIES, merged_entries.len - pos);
+        // T-40: chunk by cumulative payload bytes, not just entry count —
+        // 32 near-MAX_KEY_SIZE entries overflow a page.
+        const chunk_len = leafChunkLen(merged_entries[pos..], LEAF_MAX_ENTRIES);
         const chunk = merged_entries[pos .. pos + chunk_len];
         const page = try store.allocPage();
         const pl = leafPayloadSize(chunk);
@@ -1908,8 +1978,9 @@ fn insertBatchIntoBranch(
         ci += 1;
     }
 
-    // Check branch split
-    if (branch.children.len <= BRANCH_MAX_CHILDREN) {
+    // Check branch split (T-40: byte budget as well as count — big
+    // separators overflow the payload area even under 64 children)
+    if (branch.children.len <= BRANCH_MAX_CHILDREN and branchPayloadSize(branch.keys, branch.children) <= NODE_PAYLOAD_CAP) {
         const new_page = try store.allocPage();
         const keys_slice = try allocator.alloc([]const u8, branch.keys.len);
         defer allocator.free(keys_slice);
@@ -1937,9 +2008,19 @@ fn insertBatchIntoBranch(
     {
         var i: usize = 0;
         while (i < branch.children.len) {
-            var clen = @min(BRANCH_MAX_CHILDREN, branch.children.len - i);
-            // T-36: no 1-child tail chunk (encodeBranchPayload asserts >= 2)
-            if (branch.children.len - i - clen == 1) clen -= 1;
+            // T-40: chunk by cumulative payload bytes, not just child count.
+            var clen = branchChunkLen(branch.keys[i..], branch.children.len - i, BRANCH_MAX_CHILDREN);
+            // T-36: no 1-child tail chunk (encodeBranchPayload asserts >= 2).
+            // Lend one child so the tail keeps >= 2; if the chunk is already
+            // at the byte-floor of 2, promote the tail child page itself into
+            // the outgoing splice instead (last in key order -> appending
+            // after this chunk keeps the splice ordered; the parent
+            // integrates it at its own level, one level shallower along that
+            // path).
+            var promote_orphan = false;
+            if (branch.children.len - i - clen == 1) {
+                if (clen > 2) clen -= 1 else promote_orphan = true;
+            }
             const children = branch.children[i .. i + clen];
             const keys = branch.keys[i .. i + clen - 1];
             const page = try store.allocPage();
@@ -1956,7 +2037,14 @@ fn insertBatchIntoBranch(
                 // the boundary; duped — branch.keys dies at deinit
                 try chunk_keys.append(allocator, try allocator.dupe(u8, branch.keys[i + clen - 1]));
             }
-            i += clen;
+            if (promote_orphan) {
+                // the separator above is the orphan's; append the child page
+                // itself (clen == 2 always fits)
+                try chunk_pages.append(allocator, branch.children[i + clen]);
+                i += clen + 1;
+            } else {
+                i += clen;
+            }
         }
     }
     const children = try allocator.alloc(u32, chunk_pages.items.len);

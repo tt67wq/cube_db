@@ -546,6 +546,23 @@ pub fn build(b: *std.Build) void {
     const overflow_test_step = b.step("test-overflow", "Run overflow tests only");
     overflow_test_step.dependOn(&run_overflow_test.step);
 
+    // batch_payload_chunking_test — T-40 RED: count-vs-payload-size batch chunking
+    const batch_payload_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/txn_writer_db/batch_payload_chunking_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    const run_batch_payload_test = b.addRunArtifact(batch_payload_test);
+    const batch_payload_test_step = b.step("test-batchpayload", "Run batch payload chunking tests only");
+    batch_payload_test_step.dependOn(&run_batch_payload_test.step);
+    test_step.dependOn(&run_batch_payload_test.step);
+
     // mvcc_concurrent_flush_test — MVCC concurrent flush stress test (T-16)
     const mvcc_concurrent_flush_test = b.addTest(.{
         .root_module = b.createModule(.{
