@@ -1365,7 +1365,15 @@ pub fn insertBatch(
         // Root overflow (T-37-B): the root was rebuilt into multiple nodes —
         // build packed levels up to a new root. Height grows HERE and only
         // here (minimum possible height for the new child count). sp.keys
-        // are owned by this splice — freed after encoding.
+        // are owned by this splice — freed after encoding (success) and via
+        // errdefer on error (T-41: buildBranchLevels allocPage/writeNodePage
+        // failure must not leak them under a non-arena allocator; mirrors the
+        // producer-side errdefer in insertBatchIntoLeaf/insertBatchIntoBranch).
+        errdefer {
+            for (sp.keys) |k| allocator.free(k);
+            allocator.free(sp.keys);
+            allocator.free(sp.children);
+        }
         const new_root = try buildBranchLevels(allocator, store, sp.children, sp.keys);
         for (sp.keys) |k| allocator.free(k);
         allocator.free(sp.keys);

@@ -1,6 +1,6 @@
 # Issue T-41 — T-37-B 根 splice 路径缺 errdefer：`buildBranchLevels` 中途失败时泄漏 splice keys/children
 
-- **状态**: open（minor；当前写路径均走 arena，无实际影响）
+- **状态**: closed（errdefer 已补，经独立评审 approve 合入 main）
 - **优先级**: low
 - **来源**: T-37-C 评审（`review.md` Finding #1）
 - **关联**: `src/btree.zig` `insertBatch` 的 root-splice 路径（`:1364`–`:1376`）
@@ -32,5 +32,7 @@ separator keys 不会被释放——对非 arena 分配器是一次错误路径�
 
 ## 状态跟踪
 
-- [ ] 补 `errdefer`（极小改动）
-- [ ] 回归 + 关闭
+- [x] 补 `errdefer` — `edea340`（impl 分支 cube_db-pi-2-rebuilt）
+- [x] 回归（zig build test 420/421, 1 skip，无回归）+ 待评审关闭。先红后绿证据在提交
+      `1b5f248`（RED: 6 allocations leaked）与 `edea340`（GREEN: 43/43）
+- 顺带发现 issues/T-42-insertbatchintoleaf-merged-dupes-leak.md（同路径另一个更深的泄漏，待立项）

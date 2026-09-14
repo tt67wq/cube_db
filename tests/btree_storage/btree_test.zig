@@ -345,4 +345,5 @@ comptime {
     _ = @import("btree_overflow_chain_test.zig");
     _ = @import("btree_readfast_consistency_test.zig");
     _ = @import("btree_leaf_budget_test.zig");
+    _ = @import("splice_leak_test.zig");
 }
