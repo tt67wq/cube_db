@@ -7,7 +7,7 @@
 //! `error.Truncated` while point `get` still works.
 //!
 //! Repro shape (deterministic, no RNG — matches the independently confirmed shapes
-//! in issues/T-37-tree-depth-unbounded-growth-error-Truncated.md):
+//! in issues/archived/T-37-tree-depth-unbounded-growth-error-Truncated.md):
 //!   round i (single-threaded, MemPageStore):
 //!     1. putBatch 4000 NEW monotonic keys: [i*4000, (i+1)*4000)
 //!     2. deleteRange the first half of that round: [i*4000, i*4000+2000)
