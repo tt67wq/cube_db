@@ -63,5 +63,12 @@ T-41 独立评审（pi-1）发现，产端两个位置用了**坏模式**：同�
 
 ## 状态跟踪
 
-- [ ] conductor 立项决策
-- [ ] 修复 + 回归（禁止照抄 :1707/:1932 现有 errdefer+defer 组合；按 edea340 纯 errdefer 写法）
+- [x] conductor 立项决策（T-42 立项，impl=cube_db-pi-1）
+- [x] 修复 + 回归（统一 dupe 所有权解耦 + 纯 errdefer，未照抄 :1707/:1932 坏模式；
+      同族一并修复：递归 splice/split_key 消费点所有权、内联 append-dupe 孤儿、
+      Leaf/Branch.fromPayload 错误路径——均为 sweep 实测暴露的同一泄漏面）
+- [x] 回归：tests/btree_storage/insertbatch_owned_test.zig 4 条（成功路径零泄漏 ×2 +
+      FailingAllocator 逐点 sweep ×2）；RED 44/47（2 泄漏 + 2 UAF crash，208 leaks）→
+      GREEN 47/47 零泄漏；全量 428/429 + 1 skip 无回归
+- 附注：insertBatch 根 split 路径 `sk` 在 PageStore 写失败时泄漏（sweep 不可达，
+  超出本 issue 两产端范围），建议随 T-43 处理

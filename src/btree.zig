@@ -451,24 +451,37 @@ pub const Leaf = struct {
         defer allocator.free(dec_slice);
         try decodeLeafPayload(payload, dec_slice);
         const entries = try allocator.alloc(LeafEntry, count);
+        // T-42: error path ownership — a failed dupe/readOverflowValue below
+        // must not leak the entries already built (nor the array).
+        var filled: usize = 0;
+        errdefer {
+            for (entries[0..filled]) |e| {
+                allocator.free(e.key);
+                allocator.free(e.value);
+            }
+            allocator.free(entries);
+        }
         for (dec_slice, 0..) |d, i| {
             if (d.flags & LEAF_FLAG_OVERFLOW != 0) {
                 // Read the overflow chain for the full value; add the old overflow pages to dirty
                 const ov_page = std.mem.readInt(u32, d.value[0..4], .little);
                 freeOverflowPages(store, ov_page, dirty, allocator);
                 const full_val = try readOverflowValue(allocator, store, ov_page, d.vlen, .off); // write-path decode: policy off
+                const key = try allocator.dupe(u8, d.key);
+                errdefer allocator.free(key);
                 entries[i] = .{
                     .tombstone = d.tombstone,
-                    .key = try allocator.dupe(u8, d.key),
+                    .key = key,
                     .value = full_val,
                 };
             } else {
-                entries[i] = .{
+                entries[i] = try dupeEntry(allocator, .{
                     .tombstone = d.tombstone,
-                    .key = try allocator.dupe(u8, d.key),
-                    .value = try allocator.dupe(u8, d.value),
-                };
+                    .key = d.key,
+                    .value = d.value,
+                });
             }
+            filled = i + 1;
         }
         return .{ .entries = entries, .allocator = allocator };
     }
@@ -515,9 +528,20 @@ pub const Branch = struct {
         const children_tmp = try allocator.alloc(u32, count);
         defer allocator.free(children_tmp);
         try decodeBranchPayload(payload, keys_tmp, children_tmp);
+        // T-42: error path ownership — a failed separator dupe must not leak
+        // the separators already built (nor the keys/children arrays).
         const keys = try allocator.alloc([]u8, count - 1);
+        var filled: usize = 0;
+        errdefer {
+            for (keys[0..filled]) |k| allocator.free(k);
+            allocator.free(keys);
+        }
         const children = try allocator.alloc(u32, count);
-        for (keys_tmp, 0..) |k, i| keys[i] = try allocator.dupe(u8, k);
+        errdefer allocator.free(children);
+        for (keys_tmp, 0..) |k, i| {
+            keys[i] = try allocator.dupe(u8, k);
+            filled = i + 1;
+        }
         @memcpy(children, children_tmp);
         return .{ .keys = keys, .children = children, .allocator = allocator };
     }
@@ -1650,6 +1674,16 @@ fn entriesForChild(entries: []const LeafEntry, branch_keys: [][]u8, ci: usize) [
     return entries[lo..hi];
 }
 
+/// T-42: fully-own a copy of a LeafEntry. Field-level errdefer so a failed
+/// value dupe never orphans the key dupe. Tombstone values are the empty
+/// string (freeing a zero-length slice is a no-op).
+fn dupeEntry(allocator: std.mem.Allocator, e: LeafEntry) !LeafEntry {
+    const key = try allocator.dupe(u8, e.key);
+    errdefer allocator.free(key);
+    const value = try allocator.dupe(u8, if (e.tombstone) "" else e.value);
+    return .{ .tombstone = e.tombstone, .key = key, .value = value };
+}
+
 /// Batch insert into leaf node
 fn insertBatchIntoLeaf(
     store: PageStore,
@@ -1671,9 +1705,22 @@ fn insertBatchIntoLeaf(
 
     // O(n+m) merge: both old leaf entries and batch entries are sorted.
     // Merge with overwrite (batch entries win = last write wins).
+    //
+    // T-42: every merged entry is OWNED here (uniform dupe via dupeEntry,
+    // old entries included — the old mixed-ownership scheme borrowed old
+    // entries from `leaf` and owned the batch dupes, so nobody freed the
+    // dupes after encoding: success-path leak of 2 allocations per batch
+    // entry). The defer below releases them exactly once on BOTH success
+    // and error paths; `leaf.deinit()` still owns the originals (untouched).
     const merged = try allocator.alloc(LeafEntry, leaf.entries.len + entries.len);
-    defer allocator.free(merged);
     var mi: usize = 0;
+    defer {
+        for (merged[0..mi]) |e| {
+            allocator.free(e.key);
+            allocator.free(e.value);
+        }
+        allocator.free(merged);
+    }
 
     var oi: usize = 0; // old leaf entries index
     var bi: usize = 0; // batch entries index
@@ -1682,44 +1729,27 @@ fn insertBatchIntoLeaf(
         const new_e = entries[bi];
         switch (cmpKey(old_e.key, new_e.key)) {
             .lt => {
-                // Old entry not in batch — keep as-is
-                merged[mi] = old_e;
+                // Old entry not in batch — dupe it (T-42: uniform ownership)
+                merged[mi] = try dupeEntry(allocator, old_e);
                 mi += 1;
                 oi += 1;
             },
             .gt => {
                 // New entry not in old — insert
-                merged[mi] = .{
-                    .tombstone = new_e.tombstone,
-                    .key = try allocator.dupe(u8, new_e.key),
-                    .value = if (new_e.tombstone) try allocator.dupe(u8, "") else try allocator.dupe(u8, new_e.value),
-                };
+                merged[mi] = try dupeEntry(allocator, new_e);
                 live_delta += @as(i64, @intCast(new_e.key.len + (if (new_e.tombstone) @as(usize, 0) else new_e.value.len) + 10));
                 if (!new_e.tombstone) count_delta += 1;
                 mi += 1;
                 bi += 1;
             },
             .eq => {
-                // Overwrite: batch entry wins (last write wins)
-                const old = old_e;
-                live_delta -= @as(i64, @intCast(old.key.len + old.value.len + 10));
-                if (!old.tombstone and new_e.tombstone) count_delta -= 1;
-                if (old.tombstone and !new_e.tombstone) count_delta += 1;
-                // Free old entry's key/value (they're owned by leaf, which we'll deinit)
-                // We can't free here because leaf.deinit() will try to free them too.
-                // Instead, we replace the old entry in leaf.entries so deinit won't double-free.
-                leaf.entries[oi] = .{
-                    .tombstone = false,
-                    .key = &[_]u8{},
-                    .value = &[_]u8{},
-                };
-                allocator.free(old.key);
-                allocator.free(old.value);
-                merged[mi] = .{
-                    .tombstone = new_e.tombstone,
-                    .key = try allocator.dupe(u8, new_e.key),
-                    .value = if (new_e.tombstone) try allocator.dupe(u8, "") else try allocator.dupe(u8, new_e.value),
-                };
+                // Overwrite: batch entry wins (last write wins).
+                // T-42: the old entry stays owned by `leaf` (its deinit
+                // frees it exactly once); the old null-out dance is gone.
+                live_delta -= @as(i64, @intCast(old_e.key.len + old_e.value.len + 10));
+                if (!old_e.tombstone and new_e.tombstone) count_delta -= 1;
+                if (old_e.tombstone and !new_e.tombstone) count_delta += 1;
+                merged[mi] = try dupeEntry(allocator, new_e);
                 live_delta += @as(i64, @intCast(new_e.key.len + (if (new_e.tombstone) @as(usize, 0) else new_e.value.len) + 10));
                 mi += 1;
                 oi += 1;
@@ -1729,18 +1759,14 @@ fn insertBatchIntoLeaf(
     }
     // Remaining old entries
     while (oi < leaf.entries.len) {
-        merged[mi] = leaf.entries[oi];
+        merged[mi] = try dupeEntry(allocator, leaf.entries[oi]);
         mi += 1;
         oi += 1;
     }
     // Remaining batch entries
     while (bi < entries.len) {
         const new_e = entries[bi];
-        merged[mi] = .{
-            .tombstone = new_e.tombstone,
-            .key = try allocator.dupe(u8, new_e.key),
-            .value = if (new_e.tombstone) try allocator.dupe(u8, "") else try allocator.dupe(u8, new_e.value),
-        };
+        merged[mi] = try dupeEntry(allocator, new_e);
         live_delta += @as(i64, @intCast(new_e.key.len + (if (new_e.tombstone) @as(usize, 0) else new_e.value.len) + 10));
         if (!new_e.tombstone) count_delta += 1;
         mi += 1;
@@ -1772,11 +1798,16 @@ fn insertBatchIntoLeaf(
     var leaf_pages = std.ArrayList(u32).empty;
     defer leaf_pages.deinit(allocator);
     var split_keys = std.ArrayList([]u8).empty;
+    // T-42: pure errdefer — NO `defer deinit` alongside. The old
+    // errdefer+defer pair double-released on error (plain defer ran first,
+    // fields -> undefined, then the errdefer iterated `items` -> UAF
+    // segfault at 0xaaaa...). On success, buffer AND separator dupes hand
+    // off to the splice via toOwnedSlice; the consumer (insertBatch root
+    // splice / parent integration) frees them.
     errdefer {
         for (split_keys.items) |k| allocator.free(k);
         split_keys.deinit(allocator);
     }
-    defer split_keys.deinit(allocator);
     var pos: usize = 0;
     while (pos < merged_entries.len) {
         // T-40: chunk by cumulative payload bytes, not just entry count —
@@ -1791,12 +1822,21 @@ fn insertBatchIntoLeaf(
         try leaf_pages.append(allocator, page);
         if (pos + chunk_len < merged_entries.len) {
             // separator = first key of the next leaf; duped because merged
-            // entries (and their keys) die at function exit
-            try split_keys.append(allocator, try allocator.dupe(u8, merged_entries[pos + chunk_len].key));
+            // entries (and their keys) die at function exit.
+            // T-42: dupe first, errdefer, THEN append — the old inline
+            // `append(allocator, try dupe(...))` orphaned the dupe when the
+            // append's own allocation failed.
+            const sep = try allocator.dupe(u8, merged_entries[pos + chunk_len].key);
+            errdefer allocator.free(sep);
+            try split_keys.append(allocator, sep);
         }
         pos += chunk_len;
     }
+    // T-42: errdefer (not defer) — on success the splice owns `children`
+    // (consumer frees); freed here only if the return expression below
+    // fails after this alloc (e.g. toOwnedSlice OOM).
     const children = try allocator.alloc(u32, leaf_pages.items.len);
+    errdefer allocator.free(children);
     @memcpy(children, leaf_pages.items);
     return .{
         .new_child = children[0],
@@ -1943,9 +1983,21 @@ fn insertBatchIntoBranch(
                 // level instead of nesting a subtree (the depth ratchet).
                 // Key pointers move into branch.keys (freed by deinit);
                 // only the arrays are freed here.
+                //
+                // T-42: we take ownership of the recursive splice here — the
+                // pure errdefer releases its owned separators + arrays if
+                // the allocs below fail (after the integration the pointer
+                // ownership lives in branch.keys -> branch.deinit).
                 const add = sp.keys.len; // == sp.children.len - 1
+                errdefer {
+                    for (sp.keys) |k| allocator.free(k);
+                    allocator.free(sp.keys);
+                    allocator.free(sp.children);
+                }
                 const new_keys = try allocator.alloc([]u8, branch.keys.len + add);
+                errdefer allocator.free(new_keys);
                 const new_children = try allocator.alloc(u32, branch.children.len + add);
+                errdefer allocator.free(new_children);
                 @memcpy(new_keys[0..ci], branch.keys[0..ci]);
                 @memcpy(new_keys[ci..][0..add], sp.keys);
                 @memcpy(new_keys[ci + add ..], branch.keys[ci..]);
@@ -1960,9 +2012,16 @@ fn insertBatchIntoBranch(
                 branch.children = new_children;
             }
             if (sub.split_key) |sk| {
-                // Child split: insert new key + child
+                // Child split: insert new key + child.
+                // T-42: `sk` is an owned dupe from the child split — on a
+                // failed alloc below it must be freed, not leaked (on
+                // success its pointer migrates into branch.keys). Pure
+                // errdefer; release points are mutually exclusive.
+                errdefer allocator.free(sk);
                 const new_keys = try allocator.alloc([]u8, branch.keys.len + 1);
+                errdefer allocator.free(new_keys);
                 const new_children = try allocator.alloc(u32, branch.children.len + 1);
+                errdefer allocator.free(new_children);
                 @memcpy(new_keys[0..ci], branch.keys[0..ci]);
                 new_keys[ci] = sk;
                 @memcpy(new_keys[ci + 1 ..], branch.keys[ci..]);
@@ -2000,11 +2059,13 @@ fn insertBatchIntoBranch(
     var chunk_pages = std.ArrayList(u32).empty;
     defer chunk_pages.deinit(allocator);
     var chunk_keys = std.ArrayList([]u8).empty;
+    // T-42: pure errdefer — NO `defer deinit` alongside (the old pair
+    // double-released on error -> UAF). On success, buffer AND separator
+    // dupes hand off to the splice via toOwnedSlice; consumer frees.
     errdefer {
         for (chunk_keys.items) |k| allocator.free(k);
         chunk_keys.deinit(allocator);
     }
-    defer chunk_keys.deinit(allocator);
     {
         var i: usize = 0;
         while (i < branch.children.len) {
@@ -2034,8 +2095,12 @@ fn insertBatchIntoBranch(
             try chunk_pages.append(allocator, page);
             if (i + clen < branch.children.len) {
                 // separator between chunk j and j+1 = the old branch key at
-                // the boundary; duped — branch.keys dies at deinit
-                try chunk_keys.append(allocator, try allocator.dupe(u8, branch.keys[i + clen - 1]));
+                // the boundary; duped — branch.keys dies at deinit.
+                // T-42: dupe first, errdefer, THEN append (see the leaf
+                // producer's split_keys fix — same inline-append orphan).
+                const sep = try allocator.dupe(u8, branch.keys[i + clen - 1]);
+                errdefer allocator.free(sep);
+                try chunk_keys.append(allocator, sep);
             }
             if (promote_orphan) {
                 // the separator above is the orphan's; append the child page
@@ -2047,7 +2112,11 @@ fn insertBatchIntoBranch(
             }
         }
     }
+    // T-42: errdefer (not defer) — on success the splice owns `children`
+    // (consumer frees); freed here only if the return expression below
+    // fails after this alloc (e.g. toOwnedSlice OOM).
     const children = try allocator.alloc(u32, chunk_pages.items.len);
+    errdefer allocator.free(children);
     @memcpy(children, chunk_pages.items);
     return .{
         .new_child = children[0],
