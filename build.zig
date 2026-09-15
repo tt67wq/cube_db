@@ -370,6 +370,23 @@ pub fn build(b: *std.Build) void {
     const btree_test_step = b.step("test-btree", "Run btree tests only");
     btree_test_step.dependOn(&run_btree_test.step);
 
+    // T-38-P: range-tombstone probe (spike, no src/ changes) — design doc
+    // docs/design/T-38-range-tombstone-probe.md. Exit 0 = all assertions pass.
+    const rangetomb_probe = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("spike/rangetomb_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    const run_rangetomb_probe = b.addRunArtifact(rangetomb_probe);
+    const rangetomb_probe_step = b.step("test-rangetomb-probe", "Run T-38-P range-tombstone probe (spike)");
+    rangetomb_probe_step.dependOn(&run_rangetomb_probe.step);
+
     // ponytail: zig build test-writer runs only writer tests
     const writer_test = b.addTest(.{
         .root_module = b.createModule(.{
