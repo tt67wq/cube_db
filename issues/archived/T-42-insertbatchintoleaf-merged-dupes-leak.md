@@ -1,6 +1,6 @@
 # Issue T-42 — 批量产端错误路径 UAF 崩溃 + merged dupes 泄漏（非 arena 分配器）
 
-- **状态**: open（T-41/T-40 评审实证发现，待 conductor 立项）
+- **状态**: closed（T-42 验收合入 main `f356bd3`，评审 approve；sk 残留转 T-43）
 - **优先级**: high（错误路径 use-after-free 崩溃 + 成功路径泄漏；生产写路径走 arena 实际无
   影响，但 `btree.insertBatch` 对非 arena 调用方既崩又漏）
 - **来源**: T-41 实施探针 + T-41 独立评审（`review.md` Finding 2，reviewer=pi-1）
@@ -72,3 +72,8 @@ T-41 独立评审（pi-1）发现，产端两个位置用了**坏模式**：同�
       GREEN 47/47 零泄漏；全量 428/429 + 1 skip 无回归
 - 附注：insertBatch 根 split 路径 `sk` 在 PageStore 写失败时泄漏（sweep 不可达，
   超出本 issue 两产端范围），建议随 T-43 处理
+- [x] 独立评审（pi-2，判定者≠实现者 pi-1）：`review.md` APPROVE；独立复跑 RED
+      （父提交 208 leaks + 2 UAF crash，栈与子问题 A/B 逐条对上）+ GREEN（47/47、
+      428/429 无回归）；diff 所有权链路逐点核对无泄漏/无双释放，硬约束全满足
+- [x] conductor 验收：fast-forward 合入 main `f356bd3`；sk 残留已在 T-43 任务包
+      立项一并处理

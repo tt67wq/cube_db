@@ -1,6 +1,6 @@
 # Issue T-43 — 单 key insert 路径同族 payload 溢出：insertIntoLeafSplit mid-split / insertIntoBranch ≤64 返回无字节预算
 
-- **状态**: open（T-40 评审 34e5afb Finding 2 转立项；non-blocking）
+- **状态**: closed（T-43 验收合入 main `1154260`，评审 approve；评审发现预存缺陷已立 T-44）
 - **优先级**: low-medium（正确性边角：需在既有近-MAX_KEY_SIZE key 的叶/枝上单条插入大 key 才触发；
   批量路径已在 T-40 修复，本 issue 只剩 `insert`/`put` 单条路径）
 - **来源**: T-40 评审（pi-1，探针 PD 实证）；3e0831a 附注首次声明
@@ -40,3 +40,13 @@ T-40 把批量路径全部「按 count 切」的决策点改成 payload-size-awa
       overwrite 先 free 后 dupe 的悬垂条目）——均由新故障 sweep 首次覆盖单条路径后暴露；
       T-42 残留 sk errdefer 已补（防御性，见 test-report 可达性说明）；
       RED：2 panic（leaf mid-split 4155B / branch 重编码 4297B）+ sweep 30 leaks + overwrite Double free → GREEN：47→51/51，0 泄漏，全量 432/433+skip 无回归）
+- [x] 独立评审（pi-1，判定者≠实现者 pi-2）：`review.md` APPROVE；独立复跑 RED
+      （父提交 47/51、4 crash，panic index 4155/4297 与声明逐字一致）+ GREEN（51/51、
+      432/433 无回归）；所有权/错误路径静态审查 + 探针验证通过；sk errdefer 可达性
+      独立追踪证实（`InsertSub.split_key` 产端为死代码，机制已全程 vestigial）
+- [x] conductor 验收：fast-forward 合入 main `1154260`；全量 `zig build test` 绿
+- **评审发现（F1，预存缺陷 → 已立 T-44）**：近-MAX key 下单条/微批路径深度棘轮
+  （depth 线性 +1，~64 次 put 后 select 报 Truncated），根因在共享
+  `buildBranchLevels`/`promote_orphan` 增量根 splice 机制，父提交 `f356bd3` 即复现，
+  非 T-43 引入。F2（测试仅断言计数）/F3（sweep stale root）/F4（split_key 机制
+  vestigial）转 T-44 或清理 issue
