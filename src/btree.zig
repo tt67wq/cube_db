@@ -377,7 +377,12 @@ pub fn branchChunkLen(keys: []const []const u8, children_rem: usize, max: usize)
 pub fn encodeBranchPayload(buf: []u8, keys: []const []const u8, children: []const u32) usize {
     const need = branchPayloadSize(keys, children);
     std.debug.assert(buf.len >= need);
-    std.debug.assert(children.len >= 2);
+    // T-44: relaxed from >= 2. A byte-floor tail chunk (near-MAX separators
+    // cap a branch at 2 children) can legally hold a single child: a 1-child
+    // page keeps every splice's children list HEIGHT-HOMOGENEOUS, which is
+    // what keeps incremental-rebuild depth O(log n) (the old raw-orphan
+    // promote mixed heights and ratcheted depth +1 per write, T-44).
+    std.debug.assert(children.len >= 1);
     std.debug.assert(keys.len == children.len - 1);
     var pos: usize = 0;
     buf[pos] = BRANCH_KIND;
@@ -1426,15 +1431,23 @@ fn insertIntoBranch(
         while (i < branch.children.len) {
             // T-40: chunk by cumulative payload bytes, not just child count.
             var clen = branchChunkLen(branch.keys[i..], branch.children.len - i, BRANCH_MAX_CHILDREN);
-            // T-36: no 1-child tail chunk (encodeBranchPayload asserts >= 2).
-            // Lend one child so the tail keeps >= 2; if the chunk is already
-            // at the byte-floor of 2, promote the tail child page itself
-            // into the outgoing splice instead (last in key order -> the
-            // splice stays ordered; the parent integrates it at its own
-            // level, one level shallower along that path).
-            var promote_orphan = false;
+            // T-36/T-44: no 1-child tail chunk when avoidable — lend one
+            // child so the tail keeps >= 2 (normal keys; unchanged).
+            // T-44: at the byte floor (clen == 2, near-MAX separators cap a
+            // branch at 2 children) lending is impossible, and the OLD raw
+            // promote — appending the orphan child page itself to the
+            // outgoing splice — mixed page heights in the splice (chunk
+            // pages are one level taller than the orphan). The parent
+            // re-chunked that mixed list on every subsequent overflow,
+            // deepening the tall side by one per write: a staircase whose
+            // depth grew linearly until select hit MAX_DEPTH (T-44).
+            // Instead, leave clen alone: the next loop iteration sees one
+            // remaining child and encodes it as its own 1-child branch page
+            // (keys.len == 0). Every chunk page then has the same height,
+            // so splice children stay height-homogeneous and incremental
+            // rebuilds converge like a binary counter: depth O(log n).
             if (branch.children.len - i - clen == 1) {
-                if (clen > 2) clen -= 1 else promote_orphan = true;
+                if (clen > 2) clen -= 1;
             }
             const children = branch.children[i .. i + clen];
             const keys = branch.keys[i .. i + clen - 1];
@@ -1453,14 +1466,7 @@ fn insertIntoBranch(
                 errdefer allocator.free(sep);
                 try chunk_keys.append(allocator, sep);
             }
-            if (promote_orphan) {
-                // the separator above is the orphan's; append the child page
-                // itself (clen == 2 always fits)
-                try chunk_pages.append(allocator, branch.children[i + clen]);
-                i += clen + 1;
-            } else {
-                i += clen;
-            }
+            i += clen;
         }
     }
     // T-42: errdefer (not defer) — on success the splice owns `children`
@@ -1767,15 +1773,15 @@ fn buildBranchLevels(
             // T-36: a tail chunk of exactly 1 child would encode an illegal
             // 1-child branch (encodeBranchPayload asserts children.len >= 2).
             // Lend one child from this chunk so the tail keeps >= 2; if the
-            // chunk is already at the byte-floor of 2, promote the tail child
-            // page itself to the parent level instead (it is last in key
-            // order, so appending after this chunk keeps the level list
-            // ordered — the tree becomes one level shallower along that path,
-            // which traversal handles: pages are followed by pointer, not by
-            // depth).
-            var promote_orphan = false;
+            // T-36/T-44: lend one child so the tail keeps >= 2 when the
+            // chunk can spare it (normal keys; unchanged). At the byte floor
+            // (chunk_len == 2) lending is impossible — the T-44 shape: let
+            // the next iteration encode the single remaining child as its
+            // own 1-child page so this level's page list stays
+            // height-homogeneous (raw promotion mixed heights and ratcheted
+            // depth linearly under incremental root splices — T-44).
             if (current_pages.len - i - chunk_len == 1) {
-                if (chunk_len > 2) chunk_len -= 1 else promote_orphan = true;
+                if (chunk_len > 2) chunk_len -= 1;
             }
             const chunk_children = current_pages[i .. i + chunk_len];
             const chunk_keys = current_keys[i .. i + chunk_len - 1];
@@ -1788,14 +1794,7 @@ fn buildBranchLevels(
             if (i + chunk_len < current_pages.len) {
                 try new_keys.append(allocator, current_keys[i + chunk_len - 1]);
             }
-            if (promote_orphan) {
-                // the boundary key above is the orphan's separator; append
-                // the child page itself (chunk_len == 2 always fits)
-                try new_pages.append(allocator, current_pages[i + chunk_len]);
-                i += chunk_len + 1;
-            } else {
-                i += chunk_len;
-            }
+            i += chunk_len;
         }
         current_pages = new_pages.items;
         current_keys = new_keys.items;
@@ -2247,16 +2246,23 @@ fn insertBatchIntoBranch(
         while (i < branch.children.len) {
             // T-40: chunk by cumulative payload bytes, not just child count.
             var clen = branchChunkLen(branch.keys[i..], branch.children.len - i, BRANCH_MAX_CHILDREN);
-            // T-36: no 1-child tail chunk (encodeBranchPayload asserts >= 2).
-            // Lend one child so the tail keeps >= 2; if the chunk is already
-            // at the byte-floor of 2, promote the tail child page itself into
-            // the outgoing splice instead (last in key order -> appending
-            // after this chunk keeps the splice ordered; the parent
-            // integrates it at its own level, one level shallower along that
-            // path).
-            var promote_orphan = false;
+            // T-36/T-44: no 1-child tail chunk when avoidable — lend one
+            // child so the tail keeps >= 2 (normal keys; unchanged).
+            // T-44: at the byte floor (clen == 2, near-MAX separators cap a
+            // branch at 2 children) lending is impossible, and the OLD raw
+            // promote — appending the orphan child page itself to the
+            // outgoing splice — mixed page heights in the splice (chunk
+            // pages are one level taller than the orphan). The parent
+            // re-chunked that mixed list on every subsequent overflow,
+            // deepening the tall side by one per write: a staircase whose
+            // depth grew linearly until select hit MAX_DEPTH (T-44).
+            // Instead, leave clen alone: the next loop iteration sees one
+            // remaining child and encodes it as its own 1-child branch page
+            // (keys.len == 0). Every chunk page then has the same height,
+            // so splice children stay height-homogeneous and incremental
+            // rebuilds converge like a binary counter: depth O(log n).
             if (branch.children.len - i - clen == 1) {
-                if (clen > 2) clen -= 1 else promote_orphan = true;
+                if (clen > 2) clen -= 1;
             }
             const children = branch.children[i .. i + clen];
             const keys = branch.keys[i .. i + clen - 1];
@@ -2278,14 +2284,7 @@ fn insertBatchIntoBranch(
                 errdefer allocator.free(sep);
                 try chunk_keys.append(allocator, sep);
             }
-            if (promote_orphan) {
-                // the separator above is the orphan's; append the child page
-                // itself (clen == 2 always fits)
-                try chunk_pages.append(allocator, branch.children[i + clen]);
-                i += clen + 1;
-            } else {
-                i += clen;
-            }
+            i += clen;
         }
     }
     // T-42: errdefer (not defer) — on success the splice owns `children`

@@ -1,105 +1,97 @@
-# T-43 test report — 单条 insert 路径 payload 溢出 + 单条路径错误路径所有权（TDD）
+# T-44 test report — 近-MAX key 深度棘轮修复（字节下限尾块 1-child 页，层高同质）
 
-- **Task**: T-43（impl，TDD；含 T-42 残留 sk errdefer）
-- **Implementer**: cube_db-pi-2（worktree cube-db-pi-2-rebuilt，基线 main `f356bd3`）
+- **Task**: T-44（impl，TDD；授权彻底重构重建形状）
+- **Implementer**: cube_db-pi-1（worktree cube-db-pi-1-rebuilt，基线 main `7b725c7`）
 - **Env**: zig 0.16.0（asdf），macOS
-- **测试文件**: `tests/btree_storage/insert_split_budget_test.zig`（4 条测试，经 `btree_test.zig`
-  comptime import 挂 test-btree step——与 splice_leak_test / insertbatch_owned_test 同惯例）
+- **测试文件**: `tests/btree_storage/near_max_depth_regression_test.zig`（4 条测试，经
+  `btree_test.zig` comptime import 挂 test-btree step——与 insert_split_budget_test 同惯例）
 
-## 1. RED（修复前，测试单独先行）
+## 1. 根因确认
 
-`zig build test-btree`：**47/51 pass，4 crash**
+`src/btree.zig` 三处同构的枝层打包循环（`insertIntoBranch` 尾部、`buildBranchLevels` 内层、
+`insertBatchIntoBranch` 尾部）在「尾部只剩 1 子且 chunk 已在字节下限 2」（近-MAX separator
+把枝页字节上限压到 2 子）时，把孤儿子节点页**原样提升**进 outgoing splice（`i += clen+1`）。
+chunk 页比孤儿子节点**高一层**，splice 的 children 因此**层高混居**；父层随后每次溢出都对
+这个混居列表重新 chunk，把高的一侧再包一层——左棘轮逐次 +1，深度随写入次数线性增长，
+~64 次后越过 `Iterator.MAX_DEPTH`，`select`/`deleteRange` 报 `error.Truncated`。
 
-| 测试 | 结果 | 证据 |
-|---|---|---|
-| 1. 单条 insert 进字节重的叶（mid-split） | **crash** | `panic: index out of bounds: index 4155, len 4096`，`btree.zig:1202 in insertIntoLeafSplit`（`encodeLeafPayload(right_buf[0..right_pl])` 右半 4155B > 4096） |
-| 2. 枝重编码字节预算 | **crash** | `panic: index out of bounds: index 4297, len 4096`，`btree.zig:1291 in insertIntoBranch`（`buf[0..pl]` 切片越界——`children.len <= 64` 仅计数返回，4297B payload 超页） |
-| 3. leaf 故障 sweep | **crash** | 同 #1 panic（fail_index 高于场景总分配数时走干净路径复现） |
-| 4. branch 故障 sweep | **crash** | 同 #2 panic |
+设计验证（Python 结构仿真，模拟真实 COW 传播：溢出必 splice 上行、根 splice 走
+buildBranchLevels、仅插入路径上的节点重构）：
 
-RED 与 issue 探针 PD（`index 4229`）同族：均为 count-only 决策点在近-MAX_KEY_SIZE key 下超
-`NODE_PAYLOAD_CAP`（4068B）。
+```
+current (原始提升): n=130 depth=130  ← 线性棘轮（与实测一致）
+D (1-child 尾块):  n=130 depth=9    ← O(log n)，与一次性批量同形
+```
 
-RED 场景构造（确定性，无 RNG）：
+## 2. 修复（Rule D：字节下限尾块改 1-child 页，层高同质）
 
-- **leaf**：insertBatch 建单叶（6×4B 'a' key + 5×678B 'z' key = 3538B ≤ cap），单条 insert
-  696B 'm' key → T-26 precheck 重定向 split 路径 → 旧 `mid = 12/2 = 6` 右半 = m+5×z =
-  3+707+3445 = 4155B → 越界。
-- **branch**：insertBatch 建 2 层树（20×850B key，5 叶×4 条，根枝 payload 3439B ≤ cap），
-  单条 insert 850B 'zz' key → 最右叶字节满（3447B）→ 叶 split → 根枝 +1 separator =
-  4297B > 4096 → ≤64 快速返回切片越界。
+三处循环同构修改：`rem - clen == 1` 且 `clen > 2` 时**保留** T-36 借位（正常键行为不变）；
+`clen == 2`（字节下限）时**不再原始提升**——保持 clen，让下一轮迭代把仅剩的 1 子编码为
+**合法的 1-child 枝页**（keys.len == 0）。所有 chunk 页层高一致 → splice children
+**层高同质** → 增量重建像二进制计数器一样进位收敛，深度 O(log n)。
 
-## 2. 实现中途 RED（同族缺陷，新 sweep 首次覆盖单条路径后暴露）
+配套（1-child 页合法化的不变量松弛，均有注释）：
 
-主修复后 `zig build test-btree`：**51/51 pass 但 30 leaks**（sweep 3/4 失败）——T-42 的
-sweep 只覆盖批量路径，单条路径的错误路径从未被扫过：
+- `encodeBranchPayload`：`assert(children.len >= 2)` → `>= 1`（T-44 理由注释）；
+- `tests/core_format/page_partition.zig` 树遍历器：`count < 2 → walk_errors` 改
+  `count < 1`（count==0 仍报错；正常键树永不产生 1-child 页，T-36 借位路径未动）。
 
-| 缺陷（均为存量，非本次引入） | 证据 | 修复 |
-|---|---|---|
-| `insertIntoLeafSplit` not-found 路径内联 `try dupe` | leak 栈 `:1178 new_entries` / `:1182 .key dupe` | 字段级 errdefer（dupe 先行、块级 scoped errdefer、正常退出移交 `leaf` 所有权的 T-42 形态） |
-| `insertIntoBranch`：子代 splice 返回与集成块之间 `Branch.fromPayload` 失败 | leak 栈 `:1243 children`（子叶 splice 数组无人释放） | 显式 catch：失败时释放 `sub.splice`/`sub.split_key` 再传播 |
-| `insertIntoLeafSplit` **overwrite（found）路径先 free 旧条目再 dupe 新值** | 隔离复现（临时还原旧代码跑 sweep）：`Double free detected`（dupe 失败 → `leaf.entries[pos]` 悬垂 → `leaf.deinit` 双释放） | dupe 先行 + errdefer，再 free 旧条目再赋值 |
+消费端逐路径审计（1-child 页安全）：`findChildIdxAndOffset`（count=1 → child_idx=0，
+children_offset=3）、`cowBranchNoSplit`（字节补丁）、`Branch.fromPayload`（alloc(0) keys）、
+`findChild`、Iterator 下降、`treeDepth`——均无需改动即正确。`cube_check` 只做 CRC/页类
+校验，`compact` 只回收空闲页，均不受影响。
 
-overwrite 路径的 RED 是单独取证：临时把 found 块还原为旧实现（其余修复保留），leaf sweep
-即报 `Double free detected`（3 error logs）；恢复修复后干净。隔离实验代码已还原，最终
-提交不含。
+错误路径所有权：修复未新增任何分配点（仅删除 promote 分支、保留 T-42 errdefer 形态），
+释放点互斥不变。
 
-## 3. GREEN（修复后）
+## 3. TDD 证据
+
+### RED（修复前，测试先行）
+
+`zig build test-btree`：**52/55 pass，3 fail**
+
+```
+[T-44 RED] single-insert depth=130 > bound=20 (linear ratchet)
+[T-44 RED] batch-1-by-1 depth=130 > bound=20 (linear ratchet)
+T-44: Db put + deleteRange + select ... error.Truncated (it.depth >= Iterator.MAX_DEPTH)
+```
+
+（小 key 控制组在 RED 下即通过——它是防止修复破坏正常键形态的守卫断言。）
+
+### GREEN（修复后）
 
 ```
 $ zig build test-btree --summary all
-Build Summary: 4/4 steps succeeded; 51/51 tests passed
+Build Summary: 4/4 steps succeeded; 55/55 tests passed   (0 leak, 0 crash)
 
 $ zig build test --summary all
-Build Summary: 34/34 steps succeeded; 432/433 tests passed (1 skipped)
+Build Summary: 34/34 steps succeeded; 436/437 tests passed (1 skipped)
 ```
 
-- test-btree：基线 47 + 4 新测试 = 51，全绿、0 泄漏、0 crash。
-- 全量：基线 428/429 + 1 skip，+4 新测试 = 432/433 + 1 skip，无回归（T-37 depth 回归、
-  T-40 预算、T-41/T-42 所有权测试全数通过）。
+实测深度（scratch 探针，未提交）：
 
-## 4. 修复内容（src/btree.zig，4 处 + 同族）
+| 场景（4000B key，n=130） | 修复前 | 修复后 | 参考 |
+|---|---|---|---|
+| 单条 `btree.insert` 逐条写入 | **130**（线性棘轮） | **9** | bound=20 |
+| 逐条 `insertBatch`（putBatch 微批形态） | **130** | **9** | bound=20 |
+| 一次性 `insertBatch`（批量参考） | 9 | **9** | — |
+| 小 key 控制组 N=5000 | 3 | **3**（不变） | ≤4 |
 
-1. **insertIntoLeafSplit**：`mid = len/2` 对半切 → `leafChunkLen` 累计字节 chunk 循环；
-   ≥2 chunk 返回 **splice**（T-37-B 形态；消费端在父层集成，高度只在根增长）；1 chunk
-   （overwrite 缩小后重新放得下）直接返回单页。产端纯 errdefer、toOwnedSlice 移交——
-   逐字对齐 T-42 insertBatchIntoLeaf 尾部形态。
-2. **insertIntoBranch**：
-   - 快速路径条件 `sub.split_key == null` → 追加 `and sub.splice == null`；
-   - 新增 splice 集成块（镜像 insertBatchIntoBranch 的 T-42 块：指针迁入 branch.keys →
-     branch.deinit 释放）；
-   - ≤64 快速返回追加 `branchPayloadSize(...) <= NODE_PAYLOAD_CAP` 校验（对齐 T-40）；
-   - 二元 mid-split 尾部整体替换为 T-40/T-42 形态的 chunk+splice 尾部（branchChunkLen +
-     T-36 promote_orphan 尾块处理）——大 separator 下二元对半切同样可两侧超限，多路切
-     才能根治。
-3. **insert() 根**：新增 sub.splice 消费（buildBranchLevels 重建打包层 + errdefer，镜像
-   insertBatch 根 splice）；根 split `sk` 补 errdefer（防御性）。
-4. **insertBatch 根 split sk**（T-42 残留，任务范围 3）：补 `errdefer allocator.free(sk)`。
+增量路径修复后与一次性批量路径**完全同形**（depth=9=⌈log2 130⌉+1），T-37-B 不变式保持。
 
-**sk 可达性说明（诚实记录）**：批量路径的 `sub.split_key` 产端在 T-37-B/T-42 演进后实际
-不存在（insertBatchIntoLeaf/Branch 只返回 splice），`insert()` 的 split_key 产端在本次
-insertIntoLeafSplit/insertIntoBranch 改为 splice 后同样不再产生——两处根 split 分支现为
-防御性死代码，errdefer 无法被 sweep 直接触发（任务预料的"sweep 不可达"即此）。sweep 实际
-覆盖的是活路径：叶/枝 splice 产端 errdefer、insert 根 splice 消费 errdefer、
-Branch.fromPayload 失败释放、entry 应用字段级 errdefer——store 与 btree 共用一个
-FailingAllocator（MemPageStore 经分配器分配页面，故同时覆盖 PageStore 写失败与 btree 侧
-分配失败），全量 fail_index 扫描。
-
-同族修复（均在任务两函数内，由新 sweep 暴露）：见上表 3 项。
-
-## 5. 测试覆盖（insert_split_budget_test.zig）
+## 4. 测试覆盖（near_max_depth_regression_test.zig）
 
 | # | 测试 | 覆盖 |
 |---|---|---|
-| 1 | 单条 insert 进字节重的叶 | mid-split panic（RED）→ chunk+splice 正确性 + 12 条数据完整可读（GREEN） |
-| 2 | 枝重编码字节预算 | ≤64 重编码 panic（RED）→ 字节预算 + 枝 splice（GREEN）+ 21 条完整 |
-| 3 | leaf 场景全量故障 sweep（store+btree 同一 FailingAllocator） | 产端/消费端 errdefer、无 UAF/双释放/泄漏；场景含 found=true overwrite（覆盖 overwrite 所有权） |
-| 4 | branch 场景全量故障 sweep | 同上（含集成块、fromPayload catch、chunk 尾部） |
+| 1 | 单条 insert 近-MAX key（n=130>64） | depth ≤ 2⌈log2 n⌉+4 + select 全量精确读回（内容+顺序+值） |
+| 2 | 逐条 batch（putBatch 形态，n=130） | 同上（batch 路径同构修复） |
+| 3 | 小 key 控制组（N=5000） | depth ≤ 4（实测 3，T-37-B 守卫） |
+| 4 | Db 级 put + deleteRange + select（n=80>64） | deleteRange 后 70 条全量有序读回 + 删/留键 spot-check |
 
-## 6. 已知边界
+## 5. 结论
 
-- 单条路径 chunk 循环中已写入的页面在后续 store 失败时成为孤儿页（store 页级，非内存
-  泄漏，testing.allocator 不可见）——与既有所有产端（批量路径同形）一致，COW 页由
-  dirty/freelist 语义兜底，非本次范围。
-- `insertBatchFallback` / `insertBatchIntoLeafFallback` 仍为无调用者死代码（前次评审已
-  记录），未动。
+先红后绿完整闭环：RED 实测深度 130（线性）→ GREEN 深度 9（O(log n)，与批量同形）；
+test-btree 55/55 全绿零泄漏，全量 436/437+1skip 无回归（T-37/T-40/T-41/T-42/T-43
+已合入路径全部保持）。硬约束核对：未改 MAX_DEPTH（真修重建形状）；逐次写入深度
+O(log n)；正常键 T-37-B 不变式不变；≥2-children 不变量仅在字节下限尾块处松弛为
+≥1（T-36 借位路径保留，正常键树永不产生 1-child 页）。

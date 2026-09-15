@@ -187,7 +187,10 @@ pub fn classify(allocator: std.mem.Allocator, store: ps.PageStore, meta: f2.Meta
         switch (payload[0]) {
             kind_branch => {
                 const count = std.mem.readInt(u16, payload[1..3], .little);
-                if (count < 2 or count > 4096) {
+                // T-44: count == 1 is a LEGAL byte-floor tail page (near-MAX
+                // separators; keeps splice children height-homogeneous — see
+                // encodeBranchPayload). Only count == 0 is structurally bad.
+                if (count < 1 or count > 4096) {
                     rep.walk_errors += 1;
                     continue;
                 }
