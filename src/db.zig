@@ -242,25 +242,40 @@ pub const Db = struct {
         // Micro-batch: the select iterator reads the committed root only, so pending
         // staged puts/deletes must be flushed first to be visible (and deletable).
         try self.flush();
-        // Collect keys in [min, max) — iterator entries are borrowed and next()
-        // invalidates the previous entry, so dupe keys for the tombstone batch.
-        var keys: std.ArrayList([]const u8) = .empty;
+        // T-38-B: stream the range in fixed-size chunks instead of collecting
+        // every key first — net memory is O(CHUNK) (constant), not O(range).
+        //
+        // The iterator pins the root snapshot it was opened with (MVCC reader
+        // slot, released at its deinit): chunk commits swap in new roots, but
+        // the snapshot keeps reading the open-time tree, so every key in the
+        // range is visited exactly once and each gets exactly one tombstone —
+        // entry_count deltas add up exactly as the old single-batch path.
+        //
+        // Borrowed-iterator contract: next() invalidates the previous entry, so
+        // each key is duped before the chunk commit; the dupes are freed after
+        // putBatch returns (insertBatch copies into the leaf pages). CHUNK is a
+        // count: keys are <= MAX_KEY_SIZE, so CHUNK * MAX_KEY_SIZE is a
+        // constant byte bound — no separate byte budget needed.
+        const CHUNK = 256;
+        var keys: [CHUNK][]const u8 = undefined;
+        var entries: [CHUNK]Entry = undefined;
+        var n: usize = 0;
         defer {
-            for (keys.items) |k| self.allocator.free(k);
-            keys.deinit(self.allocator);
+            for (keys[0..n]) |k| self.allocator.free(k);
         }
         var it = try self.select(min, max);
         defer it.deinit();
         while (try it.next()) |e| {
-            try keys.append(self.allocator, try self.allocator.dupe(u8, e.key));
+            keys[n] = try self.allocator.dupe(u8, e.key);
+            entries[n] = .{ .key = keys[n], .value = "", .tombstone = true };
+            n += 1;
+            if (n == CHUNK) {
+                try self.putBatch(entries[0..n]);
+                for (keys[0..n]) |k| self.allocator.free(k);
+                n = 0;
+            }
         }
-        if (keys.items.len == 0) return;
-        const entries = try self.allocator.alloc(Entry, keys.items.len);
-        defer self.allocator.free(entries);
-        for (keys.items, 0..) |k, i| {
-            entries[i] = .{ .key = k, .value = "", .tombstone = true };
-        }
-        try self.putBatch(entries);
+        if (n > 0) try self.putBatch(entries[0..n]);
     }
 
     // ---- Read path (default snapshot = current root) ----
