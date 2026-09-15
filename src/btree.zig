@@ -1142,8 +1142,9 @@ fn insertIntoLeaf(
     };
 }
 
-/// Split path: decode leaf, split into two pages, return split result.
-/// Used when the leaf is full and needs to split.
+/// Split path: decode leaf, re-encode into payload-budgeted pages, return a
+/// splice (or a single page if an overwrite shrank the leaf). Used when the
+/// leaf is full by count or bytes (T-26 precheck) and needs to split.
 fn insertIntoLeafSplit(
     store: PageStore,
     allocator: std.mem.Allocator,
@@ -1161,51 +1162,106 @@ fn insertIntoLeafSplit(
     var leaf = try Leaf.fromPayload(allocator, store, old_payload, dirty);
     defer leaf.deinit();
 
-    // Apply the insert/overwrite to the in-memory leaf
+    // Apply the insert/overwrite to the in-memory leaf.
+    // T-43 (T-42 family): field-level ownership — a failed value dupe must
+    // not orphan the key dupe; the overwrite path must not free the old
+    // entry before the new dupes exist (the old order left a dangling
+    // entry for leaf.deinit to double-free). errdefers are scoped to these
+    // blocks: exiting normally hands ownership to `leaf` (freed by the
+    // leaf.deinit defer).
     const pos = leaf.findPos(key);
     if (found) {
         // Overwrite existing entry
+        const key_d = try allocator.dupe(u8, key);
+        errdefer allocator.free(key_d);
+        const val_d = try allocator.dupe(u8, if (tombstone) "" else value);
+        errdefer allocator.free(val_d);
         const old_entry = leaf.entries[pos];
         allocator.free(old_entry.key);
         allocator.free(old_entry.value);
         leaf.entries[pos] = .{
             .tombstone = tombstone,
-            .key = try allocator.dupe(u8, key),
-            .value = if (tombstone) try allocator.dupe(u8, "") else try allocator.dupe(u8, value),
+            .key = key_d,
+            .value = val_d,
         };
     } else {
         // Insert new entry
+        const key_d = try allocator.dupe(u8, key);
+        errdefer allocator.free(key_d);
+        const val_d = try allocator.dupe(u8, if (tombstone) "" else value);
+        errdefer allocator.free(val_d);
         const new_entries = try allocator.alloc(LeafEntry, leaf.entries.len + 1);
+        errdefer allocator.free(new_entries);
         @memcpy(new_entries[0..pos], leaf.entries[0..pos]);
         new_entries[pos] = .{
             .tombstone = tombstone,
-            .key = try allocator.dupe(u8, key),
-            .value = if (tombstone) try allocator.dupe(u8, "") else try allocator.dupe(u8, value),
+            .key = key_d,
+            .value = val_d,
         };
         @memcpy(new_entries[pos + 1 ..], leaf.entries[pos..]);
         allocator.free(leaf.entries);
         leaf.entries = new_entries;
     }
 
-    // Split
-    const mid = leaf.entries.len / 2;
-    const right_entries = leaf.entries[mid..];
-    const left_entries = leaf.entries[0..mid];
-    const left_page = try store.allocPage();
-    const left_pl = leafPayloadSize(left_entries);
-    var left_buf: [f2.PAGE_SIZE]u8 = undefined;
-    _ = try encodeLeafPayload(left_buf[0..left_pl], left_entries, store, dirty);
-    try writeNodePage(store, left_page, f2.PAGE_TYPE_LEAF, @intCast(left_entries.len), left_buf[0..left_pl]);
-    const right_page = try store.allocPage();
-    const right_pl = leafPayloadSize(right_entries);
-    var right_buf: [f2.PAGE_SIZE]u8 = undefined;
-    _ = try encodeLeafPayload(right_buf[0..right_pl], right_entries, store, dirty);
-    try writeNodePage(store, right_page, f2.PAGE_TYPE_LEAF, @intCast(right_entries.len), right_buf[0..right_pl]);
-    const split_key = try allocator.dupe(u8, right_entries[0].key);
+    // T-43: chunk by cumulative payload bytes (leafChunkLen), not a count
+    // mid-split. The old `mid = len / 2` half could still exceed
+    // NODE_PAYLOAD_CAP when entries carry near-MAX_KEY_SIZE keys — the
+    // right half overflowed the stack encode buffer (out-of-bounds panic).
+    // Two or more chunks come back as a SPLICE (T-37-B shape): the consumer
+    // (insertIntoBranch integration / insert root buildBranchLevels)
+    // integrates the pages at its own level, so height only grows at the
+    // root. Ownership follows T-42: pure errdefer on the producer, handoff
+    // via toOwnedSlice on success.
+    var leaf_pages = std.ArrayList(u32).empty;
+    defer leaf_pages.deinit(allocator);
+    var split_keys = std.ArrayList([]u8).empty;
+    // T-42: pure errdefer — NO `defer deinit` alongside. On success, buffer
+    // AND separator dupes hand off to the splice via toOwnedSlice; the
+    // consumer (insert root splice / insertIntoBranch integration) frees
+    // them.
+    errdefer {
+        for (split_keys.items) |k| allocator.free(k);
+        split_keys.deinit(allocator);
+    }
+    var cpos: usize = 0;
+    while (cpos < leaf.entries.len) {
+        const chunk_len = leafChunkLen(leaf.entries[cpos..], LEAF_MAX_ENTRIES);
+        const chunk = leaf.entries[cpos .. cpos + chunk_len];
+        const page = try store.allocPage();
+        const pl = leafPayloadSize(chunk);
+        var buf: [f2.PAGE_SIZE]u8 = undefined;
+        _ = try encodeLeafPayload(buf[0..pl], chunk, store, dirty);
+        try writeNodePage(store, page, f2.PAGE_TYPE_LEAF, @intCast(chunk_len), buf[0..pl]);
+        try leaf_pages.append(allocator, page);
+        if (cpos + chunk_len < leaf.entries.len) {
+            // separator = first key of the next leaf; duped because the
+            // in-memory entries die at function exit.
+            // T-42: dupe first, errdefer, THEN append — an inline
+            // `append(allocator, try dupe(...))` would orphan the dupe when
+            // the append's own allocation fails.
+            const sep = try allocator.dupe(u8, leaf.entries[cpos + chunk_len].key);
+            errdefer allocator.free(sep);
+            try split_keys.append(allocator, sep);
+        }
+        cpos += chunk_len;
+    }
+    if (leaf_pages.items.len == 1) {
+        // Overwrite shrank the leaf enough to fit one page again — no split.
+        return .{
+            .new_child = leaf_pages.items[0],
+            .live_delta = live_delta,
+            .count_delta = count_delta,
+        };
+    }
+    // T-42: errdefer (not defer) — on success the splice owns `children`
+    // (consumer frees); freed here only if the return expression below
+    // fails after this alloc (e.g. toOwnedSlice OOM).
+    const children = try allocator.alloc(u32, leaf_pages.items.len);
+    errdefer allocator.free(children);
+    @memcpy(children, leaf_pages.items);
     return .{
-        .new_child = left_page,
-        .split_key = split_key,
-        .split_right = right_page,
+        .new_child = children[0],
+        .splice = .{ .keys = try split_keys.toOwnedSlice(allocator), .children = children },
         .live_delta = live_delta,
         .count_delta = count_delta,
     };
@@ -1242,7 +1298,7 @@ fn insertIntoBranch(
     // Mark old page as dirty
     dirty.append(allocator, page_no) catch {};
 
-    if (sub.split_key == null) {
+    if (sub.split_key == null and sub.splice == null) {
         // Fast path: child didn't split — copy page + patch child pointer
         const new_page = try cowBranchNoSplit(store, page_no, loc.idx, loc.children_offset, sub.new_child);
         return .{
@@ -1256,7 +1312,21 @@ fn insertIntoBranch(
     // allocated pages, invalidating the earlier borrowed slice), decode branch,
     // insert new key + child, encode
     const fresh_payload = try readNodePayload(store, page_no);
-    var branch = try Branch.fromPayload(allocator, fresh_payload);
+    // T-43: Branch.fromPayload is the only allocation between the child's
+    // return and the integration blocks below — on its failure the child's
+    // owned splice/split_key are still ours to free (after the integration
+    // the pointer ownership lives in branch.keys -> branch.deinit). Pure
+    // errdefer shape, expressed as an explicit catch because the ownership
+    // handoff happens inside the blocks below.
+    var branch = Branch.fromPayload(allocator, fresh_payload) catch |e| {
+        if (sub.splice) |sp| {
+            for (sp.keys) |k| allocator.free(k);
+            allocator.free(sp.keys);
+            allocator.free(sp.children);
+        }
+        if (sub.split_key) |sk| allocator.free(sk);
+        return e;
+    };
     defer branch.deinit();
 
     const ci = loc.idx;
@@ -1264,31 +1334,71 @@ fn insertIntoBranch(
     // Replace child pointer
     branch.children[ci] = sub.new_child;
 
-    // Insert new key + right child at position ci
-    const sk = sub.split_key.?;
-    const new_keys = try allocator.alloc([]u8, branch.keys.len + 1);
-    const new_children = try allocator.alloc(u32, branch.children.len + 1);
-    @memcpy(new_keys[0..ci], branch.keys[0..ci]);
-    new_keys[ci] = sk;
-    @memcpy(new_keys[ci + 1 ..], branch.keys[ci..]);
-    @memcpy(new_children[0 .. ci + 1], branch.children[0 .. ci + 1]);
-    new_children[ci + 1] = sub.split_right;
-    @memcpy(new_children[ci + 2 ..], branch.children[ci + 1 ..]);
-    // Old keys/children arrays: key pointers transferred to new_keys, only free arrays
-    allocator.free(branch.keys);
-    allocator.free(branch.children);
-    branch.keys = new_keys;
-    branch.children = new_children;
+    // T-43: splice integration (T-37-B multi-way splice — the single-insert
+    // leaf split now splices, mirroring insertBatchIntoBranch). Key pointers
+    // move into branch.keys (freed by deinit); only the arrays are freed
+    // here.
+    // T-42 ownership: we take ownership of the child splice here — the pure
+    // errdefer releases its owned separators + arrays if the allocs below
+    // fail (after the integration the pointer ownership lives in
+    // branch.keys -> branch.deinit).
+    if (sub.splice) |sp| {
+        const add = sp.keys.len; // == sp.children.len - 1
+        errdefer {
+            for (sp.keys) |k| allocator.free(k);
+            allocator.free(sp.keys);
+            allocator.free(sp.children);
+        }
+        const new_keys = try allocator.alloc([]u8, branch.keys.len + add);
+        errdefer allocator.free(new_keys);
+        const new_children = try allocator.alloc(u32, branch.children.len + add);
+        errdefer allocator.free(new_children);
+        @memcpy(new_keys[0..ci], branch.keys[0..ci]);
+        @memcpy(new_keys[ci..][0..add], sp.keys);
+        @memcpy(new_keys[ci + add ..], branch.keys[ci..]);
+        @memcpy(new_children[0..ci], branch.children[0..ci]);
+        for (sp.children, 0..) |c, j| new_children[ci + j] = c;
+        @memcpy(new_children[ci + sp.children.len ..], branch.children[ci + 1 ..]);
+        allocator.free(branch.keys);
+        allocator.free(branch.children);
+        allocator.free(sp.keys);
+        allocator.free(sp.children);
+        branch.keys = new_keys;
+        branch.children = new_children;
+    }
+    // Insert new key + right child at position ci.
+    // T-42: `sk` is an owned dupe from the child split — on a failed alloc
+    // below it must be freed, not leaked (on success its pointer migrates
+    // into branch.keys). Pure errdefer; release points are mutually
+    // exclusive.
+    if (sub.split_key) |sk| {
+        errdefer allocator.free(sk);
+        const new_keys = try allocator.alloc([]u8, branch.keys.len + 1);
+        errdefer allocator.free(new_keys);
+        const new_children = try allocator.alloc(u32, branch.children.len + 1);
+        errdefer allocator.free(new_children);
+        @memcpy(new_keys[0..ci], branch.keys[0..ci]);
+        new_keys[ci] = sk;
+        @memcpy(new_keys[ci + 1 ..], branch.keys[ci..]);
+        @memcpy(new_children[0 .. ci + 1], branch.children[0 .. ci + 1]);
+        new_children[ci + 1] = sub.split_right;
+        @memcpy(new_children[ci + 2 ..], branch.children[ci + 1 ..]);
+        // Old keys/children arrays: key pointers transferred to new_keys, only free arrays
+        allocator.free(branch.keys);
+        allocator.free(branch.children);
+        branch.keys = new_keys;
+        branch.children = new_children;
+    }
 
-    // Split check
-    if (branch.children.len <= BRANCH_MAX_CHILDREN) {
+    // Split check (T-43: byte budget as well as count — big separators
+    // overflow the payload area even under 64 children; the old count-only
+    // check re-encoded an oversized branch straight into an out-of-bounds
+    // stack slice).
+    if (branch.children.len <= BRANCH_MAX_CHILDREN and branchPayloadSize(branch.keys, branch.children) <= NODE_PAYLOAD_CAP) {
         const new_page = try store.allocPage();
-        const keys_slice = try allocator.alloc([]const u8, branch.keys.len);
-        defer allocator.free(keys_slice);
-        for (branch.keys, 0..) |k, i| keys_slice[i] = k;
-        const pl = branchPayloadSize(keys_slice, branch.children);
+        const pl = branchPayloadSize(branch.keys, branch.children);
         var buf: [f2.PAGE_SIZE]u8 = undefined;
-        _ = encodeBranchPayload(buf[0..pl], keys_slice, branch.children);
+        _ = encodeBranchPayload(buf[0..pl], branch.keys, branch.children);
         try writeNodePage(store, new_page, f2.PAGE_TYPE_BRANCH, @intCast(branch.children.len), buf[0..pl]);
         return .{
             .new_child = new_page,
@@ -1296,35 +1406,72 @@ fn insertIntoBranch(
             .count_delta = count_delta,
         };
     }
-    // Split branch
-    const mid = branch.keys.len / 2;
-    const up_key = try allocator.dupe(u8, branch.keys[mid]);
-    // Right half
-    const right_keys = branch.keys[mid + 1 ..];
-    const right_children = branch.children[mid + 1 ..];
-    const right_page = try store.allocPage();
-    const rkeys_slice = try allocator.alloc([]const u8, right_keys.len);
-    defer allocator.free(rkeys_slice);
-    for (right_keys, 0..) |k, i| rkeys_slice[i] = k;
-    var rbuf: [f2.PAGE_SIZE]u8 = undefined;
-    const rpl = branchPayloadSize(rkeys_slice, right_children);
-    _ = encodeBranchPayload(rbuf[0..rpl], rkeys_slice, right_children);
-    try writeNodePage(store, right_page, f2.PAGE_TYPE_BRANCH, @intCast(right_children.len), rbuf[0..rpl]);
-    // Left half
-    const left_keys = branch.keys[0..mid];
-    const left_children = branch.children[0 .. mid + 1];
-    const left_page = try store.allocPage();
-    const lkeys_slice = try allocator.alloc([]const u8, left_keys.len);
-    defer allocator.free(lkeys_slice);
-    for (left_keys, 0..) |k, i| lkeys_slice[i] = k;
-    var lbuf: [f2.PAGE_SIZE]u8 = undefined;
-    const lpl = branchPayloadSize(lkeys_slice, left_children);
-    _ = encodeBranchPayload(lbuf[0..lpl], lkeys_slice, left_children);
-    try writeNodePage(store, left_page, f2.PAGE_TYPE_BRANCH, @intCast(left_children.len), lbuf[0..lpl]);
+    // Overflow (T-43): rebuild this level into PACKED branch pages and
+    // splice them up (same shape as the T-40/T-42 insertBatchIntoBranch
+    // tail): height only grows when the root overflows. Ownership follows
+    // T-42 — pure errdefer on the producer, handoff via toOwnedSlice.
+    var chunk_pages = std.ArrayList(u32).empty;
+    defer chunk_pages.deinit(allocator);
+    var chunk_keys = std.ArrayList([]u8).empty;
+    // T-42: pure errdefer — NO `defer deinit` alongside (an errdefer+defer
+    // pair double-releases on error -> UAF). On success, buffer AND
+    // separator dupes hand off to the splice via toOwnedSlice; consumer
+    // frees.
+    errdefer {
+        for (chunk_keys.items) |k| allocator.free(k);
+        chunk_keys.deinit(allocator);
+    }
+    {
+        var i: usize = 0;
+        while (i < branch.children.len) {
+            // T-40: chunk by cumulative payload bytes, not just child count.
+            var clen = branchChunkLen(branch.keys[i..], branch.children.len - i, BRANCH_MAX_CHILDREN);
+            // T-36: no 1-child tail chunk (encodeBranchPayload asserts >= 2).
+            // Lend one child so the tail keeps >= 2; if the chunk is already
+            // at the byte-floor of 2, promote the tail child page itself
+            // into the outgoing splice instead (last in key order -> the
+            // splice stays ordered; the parent integrates it at its own
+            // level, one level shallower along that path).
+            var promote_orphan = false;
+            if (branch.children.len - i - clen == 1) {
+                if (clen > 2) clen -= 1 else promote_orphan = true;
+            }
+            const children = branch.children[i .. i + clen];
+            const keys = branch.keys[i .. i + clen - 1];
+            const page = try store.allocPage();
+            const pl = branchPayloadSize(keys, children);
+            var buf: [f2.PAGE_SIZE]u8 = undefined;
+            _ = encodeBranchPayload(buf[0..pl], keys, children);
+            try writeNodePage(store, page, f2.PAGE_TYPE_BRANCH, @intCast(children.len), buf[0..pl]);
+            try chunk_pages.append(allocator, page);
+            if (i + clen < branch.children.len) {
+                // separator between chunk j and j+1 = the old branch key at
+                // the boundary; duped — branch.keys dies at deinit.
+                // T-42: dupe first, errdefer, THEN append (an inline
+                // append+dupe orphans the dupe when the append fails).
+                const sep = try allocator.dupe(u8, branch.keys[i + clen - 1]);
+                errdefer allocator.free(sep);
+                try chunk_keys.append(allocator, sep);
+            }
+            if (promote_orphan) {
+                // the separator above is the orphan's; append the child page
+                // itself (clen == 2 always fits)
+                try chunk_pages.append(allocator, branch.children[i + clen]);
+                i += clen + 1;
+            } else {
+                i += clen;
+            }
+        }
+    }
+    // T-42: errdefer (not defer) — on success the splice owns `children`
+    // (consumer frees); freed here only if the return expression below
+    // fails after this alloc (e.g. toOwnedSlice OOM).
+    const children = try allocator.alloc(u32, chunk_pages.items.len);
+    errdefer allocator.free(children);
+    @memcpy(children, chunk_pages.items);
     return .{
-        .new_child = left_page,
-        .split_key = up_key,
-        .split_right = right_page,
+        .new_child = children[0],
+        .splice = .{ .keys = try chunk_keys.toOwnedSlice(allocator), .children = children },
         .live_delta = live_delta,
         .count_delta = count_delta,
     };
@@ -1368,8 +1515,33 @@ pub fn insert(
     else
         try insertIntoBranch(store, allocator, root, key, value, tombstone, dirty);
 
+    // T-43: root splice (single-insert overflow is now a multi-way splice,
+    // mirroring insertBatch): rebuild packed levels up to a new root. Height
+    // grows HERE and only here (minimum possible height for the new child
+    // count). sp.keys are owned by this splice — freed after encoding
+    // (success) and via errdefer on error (T-42 pattern).
+    if (sub.splice) |sp| {
+        errdefer {
+            for (sp.keys) |k| allocator.free(k);
+            allocator.free(sp.keys);
+            allocator.free(sp.children);
+        }
+        const new_root = try buildBranchLevels(allocator, store, sp.children, sp.keys);
+        for (sp.keys) |k| allocator.free(k);
+        allocator.free(sp.keys);
+        allocator.free(sp.children);
+        return .{
+            .new_root = new_root,
+            .live_delta = sub.live_delta,
+            .count_delta = sub.count_delta,
+        };
+    }
     if (sub.split_key) |sk| {
         // Root split: build a new root branch
+        // T-42 residual (defensive): on a failed allocPage/writeNodePage
+        // below, the owned `sk` dupe must be freed, not leaked. Pure
+        // errdefer; on success the free at the end of this block runs.
+        errdefer allocator.free(sk);
         var keys: [1][]const u8 = .{sk};
         var children: [2]u32 = .{ sub.new_child, sub.split_right };
         const new_page = try store.allocPage();
@@ -1451,7 +1623,11 @@ pub fn insertBatch(
         };
     }
     if (sub.split_key) |sk| {
-        // Root split: create new root branch
+        // Root split: create new root branch.
+        // T-42 residual: on a failed allocPage/writeNodePage below, the
+        // owned `sk` dupe must be freed, not leaked (pure errdefer; release
+        // points are mutually exclusive — nothing else frees sk).
+        errdefer allocator.free(sk);
         var keys: [1][]const u8 = .{sk};
         var children: [2]u32 = .{ sub.new_child, sub.split_right };
         const new_page = try store.allocPage();

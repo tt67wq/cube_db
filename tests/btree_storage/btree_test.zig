@@ -347,4 +347,5 @@ comptime {
     _ = @import("btree_leaf_budget_test.zig");
     _ = @import("splice_leak_test.zig");
     _ = @import("insertbatch_owned_test.zig");
+    _ = @import("insert_split_budget_test.zig");
 }

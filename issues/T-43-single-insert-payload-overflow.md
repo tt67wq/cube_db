@@ -34,5 +34,9 @@ T-40 把批量路径全部「按 count 切」的决策点改成 payload-size-awa
 
 ## 状态跟踪
 
-- [ ] conductor 立项决策
-- [ ] 修复 + 回归
+- [x] conductor 立项决策（T-43 立项，impl=cube_db-pi-2）
+- [x] 修复 + 回归（insertIntoLeafSplit chunk+splice / insertIntoBranch 字节预算+splice / insert 根 splice；
+      同族修复：单条路径错误路径泄漏/UAF（entry 应用字段级 errdefer、Branch.fromPayload 失败时释放子代 splice/split_key、
+      overwrite 先 free 后 dupe 的悬垂条目）——均由新故障 sweep 首次覆盖单条路径后暴露；
+      T-42 残留 sk errdefer 已补（防御性，见 test-report 可达性说明）；
+      RED：2 panic（leaf mid-split 4155B / branch 重编码 4297B）+ sweep 30 leaks + overwrite Double free → GREEN：47→51/51，0 泄漏，全量 432/433+skip 无回归）
