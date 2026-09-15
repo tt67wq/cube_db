@@ -30,7 +30,7 @@
     <li class="sub"><a href="#s42">4.2 get 与 findInLeaf：溢出与 tombstone</a></li>
     <li class="sub"><a href="#s43">4.3 findInBranchPayload：原页二分</a></li>
     <li class="part"><a href="#part5">第五部分 · 插入（COW）：快路径与分裂</a></li>
-    <li class="sub"><a href="#s51">5.1 insert 入口与 root 分裂</a></li>
+    <li class="sub"><a href="#s51">5.1 insert 入口与 root 溢出重建</a></li>
     <li class="sub"><a href="#s52">5.2 insertIntoLeaf：栈缓冲 patch</a></li>
     <li class="sub"><a href="#s53">5.3 cowBranchNoSplit：4 字节 patch</a></li>
     <li class="sub"><a href="#s54">5.4 insertIntoBranch：递归 + 快/慢路径</a></li>
@@ -140,9 +140,9 @@
 <li><code>insert</code> 读 root payload 判 leaf/branch。</li>
 <li>递归 <code>insertIntoLeaf</code> / <code>insertIntoBranch</code>：沿途把旧页加入 <code>dirty</code>。</li>
 <li>到达目标叶：拷旧页到栈缓冲 → patch 新 entry → <code>allocPage</code> 新页 → <code>writeNodePage</code> 写入。</li>
-<li>若叶条数超 <code>LEAF_MAX_ENTRIES</code>：分裂成左右两叶，返 <code>split_key</code> + <code>split_right</code>。</li>
-<li>父 branch：若子未分裂，<code>cowBranchNoSplit</code> 仅拷页 + patch 4 字节子指针；若分裂，decode/encode 重排。</li>
-<li>root 分裂：建新 branch root，指向左右子树。</li>
+<li>若叶装不下（条数或字节超限）：按字节预算切成多叶，以 <code>splice</code>（<code>{keys, children}</code>）形态上抛给父层。</li>
+<li>父 branch：若子未分裂，<code>cowBranchNoSplit</code> 仅拷页 + patch 4 字节子指针；若 splice 上抛，decode 后在原 child 位置接上 splice 的 keys/children 再 encode。</li>
+<li>root 溢出：<code>buildBranchLevels</code> 打包重建层级、换新 root——树长高只发生在这里。</li>
 <li>返回 <code>WriteResult{ new_root, live_delta, count_delta }</code>，caller 据此更新 meta。</li>
 </ol>
 </div>
@@ -629,11 +629,11 @@ COW 保证旧页不被改写（写者分配新页），因此切片在调用方�
 慢路径分裂），branch 层 <code>insertIntoBranch</code>（递归 + <code>cowBranchNoSplit</code> 快路径 / decode-encode 慢路径）。
 本部分逐个拆解。</p>
 
-<h3 id="s51">5.1 insert 入口与 root 分裂</h3>
+<h3 id="s51">5.1 insert 入口与 root 溢出重建</h3>
 
-<p><code>insert</code>（btree.zig:1035-1096）是单条写入的对外入口，返回
+<p><code>insert</code>（btree.zig:1461-1521）是单条写入的对外入口，返回
 <code>WriteResult{ new_root, live_delta, count_delta }</code>。它自己不碰 entry 的字节布局，只做三件事：
-空树建档、判定 root 类型后递归、处理只有 root 才会冒泡上来的分裂。子层的活见 §5.2-§5.4，
+空树建档、判定 root 类型后递归、处理只有 root 才会冒泡上来的溢出重建（splice）。子层的活见 §5.2-§5.4，
 本节拆入口本身的三条路。</p>
 
 <pre><code><span class="kw">pub fn</span> <span class="fn">insert</span>(allocator, store, root, key, value, tombstone, dirty) !<span class="ty">WriteResult</span> {
@@ -650,12 +650,11 @@ COW 保证旧页不被改写（写者分配新页），因此切片在调用方�
     <span class="kw">else</span>
         <span class="kw">try</span> <span class="fn">insertIntoBranch</span>(...);
 
-    <span class="kw">if</span> (sub.split_key) |sk| {
-        <span class="cm">// root 分裂：建新 branch root，指向 sub.new_child 与 sub.split_right</span>
-        <span class="kw">var</span> keys = .{sk};
-        <span class="kw">var</span> children = .{ sub.new_child, sub.split_right };
-        <span class="cm">// allocPage + encodeBranchPayload + writeNodePage(BRANCH)</span>
-        <span class="kw">return</span> .{ .new_root = new_page, ... };
+    <span class="kw">if</span> (sub.splice) |sp| {
+        <span class="cm">// root 溢出：buildBranchLevels 把 sp.children 打包建成新 root（④）</span>
+        <span class="cm">// 编码完成后释放 splice 的 keys 与数组（所有权见 ③）</span>
+        <span class="kw">const</span> new_root = <span class="kw">try</span> <span class="fn">buildBranchLevels</span>(allocator, store, sp.children, sp.keys);
+        <span class="kw">return</span> .{ .new_root = new_root, ... };
     }
     <span class="kw">return</span> .{ .new_root = sub.new_child, ... };
 }</code></pre>
@@ -667,15 +666,15 @@ flowchart TD
     C0 -- "否" --> R["② 读 root payload<br/>payload[0] 判类型"]
     R -- "叶" --> LF["insertIntoLeaf<br/>§5.2"]
     R -- "branch" --> BR["insertIntoBranch 递归<br/>§5.4"]
-    LF --> C2{"④ sub.split_key != null ?"}
+    LF --> C2{"④ sub.splice != null ?"}
     BR --> C2
     C2 -- "否" --> F["快路径<br/>new_root = sub.new_child"]
-    C2 -- "是" --> RS["root 分裂<br/>建新 branch root（见 ④）"]
+    C2 -- "是" --> RS["root 溢出 splice 重建<br/>buildBranchLevels 打包建新 root（见 ④）"]
 </div>
 
 <h4>① 空树路径：root == NULL_ROOT，从零建第一个 leaf</h4>
 
-<p><code>NULL_ROOT = 0</code>（btree.zig:10）是 root 的空哨兵——页号 0 永不被分配
+<p><code>NULL_ROOT = 0</code>（btree.zig:11）是 root 的空哨兵——页号 0 永不被分配
 （meta 页占 1/2，数据页从 <code>FIRST_DATA_PAGE=3</code> 起），所以 0 可以放心当“树不存在”用。</p>
 
 <p>此路没有任何旧页可 patch——patch 快路径的前提是“有一页旧数据可拷贝后局部改写”（§5.2/§5.3），
@@ -707,11 +706,11 @@ tombstone 的 value 落盘时按空串处理（dupe 时直接换成 <code>""</co
 <p>细节两则：key/value 先 <code>allocator.dupe</code> 进 entry 数组、encode 完成后由 <code>defer</code>
 立即释放（编码过程只读，caller 切片在此期间并无失效风险，属防御性拷贝）；
 <code>dirty</code> 全程未动——没有旧页要回收，且 <code>encodeLeafPayload</code> 的 dirty 形参
-在实现里本来就是空操作（<code>_ = dirty;</code>，btree.zig:175）。</p>
+在实现里本来就是空操作（<code>_ = dirty;</code>，btree.zig:247）。</p>
 
 <h4>② root 类型判定：payload[0] 一个字节定路由</h4>
 
-<p>非空树先 <code>readNodePayload(store, root)</code>（§1.4，btree.zig:39-44）：CRC 校验后返回
+<p>非空树先 <code>readNodePayload(store, root)</code>（§1.4，btree.zig:52-58）：CRC 校验后返回
 <code>[24 .. 4092)</code> 的 payload 切片。要紧的是：它返回的是<strong>借用</strong>而非拷贝——
 栈上只多一个切片头（ptr+len），数据本体仍在 Store 的页存储里（生产 FilePageStore 是 1TB mmap
 区的裸指针；测试用 MemPageStore 是 <code>AutoHashMap</code> 的 value）。PageStore 接口不保证借用长存：
@@ -720,7 +719,7 @@ tombstone 的 value 落盘时按空串处理（dupe 时直接换成 <code>""</co
 
 <p>那 <code>insert</code> 为何不拷？因为它对这份借用的<strong>全部使用发生在任何分配之前</strong>：
 <code>payload[0] == LEAF_KIND</code> 读一个字节（LEAF_KIND=2 / BRANCH_KIND=1，§1.4 提示框），
-拿到 is_leaf 后就把 payload 抛在脑后——递归返回后无论走 root 分裂还是快路径，用的都是
+拿到 is_leaf 后就把 payload 抛在脑后——递归返回后无论走 root 溢出重建还是快路径，用的都是
 <code>sub</code> 里的页号与指针，不再触碰这份借用。</p>
 
 <p>同一个悬垂问题，三种应对：</p>
@@ -737,63 +736,73 @@ tombstone 的 value 落盘时按空串处理（dupe 时直接换成 <code>""</co
 
 <pre><code><span class="kw">const</span> <span class="ty">InsertSub</span> = <span class="kw">struct</span> {
     new_child: <span class="ty">u32</span>,
-    split_key: ?[]<span class="ty">u8</span> = <span class="kw">null</span>,
-    split_right: <span class="ty">u32</span> = <span class="nu">0</span>,
     live_delta: <span class="ty">i64</span> = <span class="nu">0</span>,
     count_delta: <span class="ty">i64</span> = <span class="nu">0</span>,
+    splice: ?<span class="ty">Splice</span> = <span class="kw">null</span>,
+};
+
+<span class="cm">/// 多路 splice（T-37-B）：非 null 表示子层装不下、被重建成多个打包页。</span>
+<span class="kw">const</span> <span class="ty">Splice</span> = <span class="kw">struct</span> {
+    keys: [][]<span class="ty">u8</span>,      <span class="cm">// keys[i] 是 children[i+1] 子树的首 key</span>
+    children: []<span class="ty">u32</span>,   <span class="cm">// 替换旧 child 的页列表，[0] 也是 new_child</span>
 };</code></pre>
 
 <ul>
 <li><code>new_child</code>——子层完成后的新页号。COW 语义是“改一个节点 = 造一个新页”，
-所以哪怕没分裂，caller 也要把父指针从旧页改指到 new_child。</li>
-<li><code>split_key</code>——非 null 表示子层分裂了；值是 heap 分配的分隔键
-（叶分裂 = <code>right_entries[0].key</code> 的 dupe，btree.zig:906；branch 再分裂 = 上提键的
-dupe，btree.zig:1003）。</li>
-<li><code>split_right</code>——分裂时右半部分的页号。</li>
+所以哪怕没分裂，caller 也要把父指针从旧页改指到 new_child。splice 时它就是
+<code>splice.children[0]</code>。</li>
+<li><code>splice</code>——非 null 表示子层溢出、被重建成多个打包页：旧 child 被
+<code>children</code> 整体替换，<code>keys[i]</code> 是 <code>children[i+1]</code> 子树的首 key——
+所有分隔键都落在原子树的 key 范围内（这是消费方能在自己这层接入的前提）。</li>
 <li><code>live_delta / count_delta</code>——统计增量，只在叶层计算、中间层原样透传（见 ⑤）。</li>
 </ul>
 
-<p><strong>快路径约定</strong>：<code>split_key == null</code> 等价于“子层未分裂”，caller 不需要插入任何
+<p><strong>快路径约定</strong>：<code>splice == null</code> 等价于“子层未分裂”，caller 不需要插入任何
 新键，把 new_child 挂回父指针即可——branch 层这就是 <code>cowBranchNoSplit</code> 的 4 字节
 patch（§5.3），insert 入口则直接 <code>new_root = sub.new_child</code>。一个 optional 同时承载
-“是否分裂”与“分隔键内容”，连额外的 bool 字段都省了。</p>
+“是否溢出”与“重建结果”，连额外的 bool 字段都省了。</p>
 
-<div class="note danger" role="alert">🔴 危险 <b>split_key 的所有权：</b>它是分裂方 <code>allocator.dupe</code>
-出来的 heap 分配，随 InsertSub 移交给 caller，<strong>每条路径必须恰好释放一次</strong>：
-root 分裂时 insert 在 encode 完成后 <code>allocator.free(sk)</code>（btree.zig:1079）；
-非 root 时 insertIntoBranch 慢路径把 sk 转移进 <code>branch.keys</code>（<code>new_keys[ci] = sk</code>，
-btree.zig:974，源码注释“key pointers transferred to new_keys”），由 <code>defer branch.deinit()</code>
-统一释放；branch 若再次分裂，返回的 <code>up_key</code> 是对 <code>keys[mid]</code> 的<strong>全新 dupe</strong>，
-原 sk 仍由 deinit 释放。改任何一端都要守住这个不变量——漏 free 泄漏，双 free 崩溃。</div>
+<div class="note danger" role="alert">🔴 危险 <b>splice 的所有权：</b><code>splice.keys</code> 是产端
+<code>allocator.dupe</code> 出来的 heap 分配（每个分隔键一份、两个数组一份），随 InsertSub 移交
+caller，<strong>每条路径必须恰好释放一次</strong>：branch 消费方（§5.4 慢路径）把 key 指针转移进
+<code>branch.keys</code>（由 <code>defer branch.deinit()</code> 统一释放）后只释放两个数组；root 消费方
+（insert / insertBatch）在 <code>buildBranchLevels</code> 编码完成后释放 keys + 数组。
+改任何一端都要守住这个不变量——漏 free 泄漏，双 free 崩溃。</div>
 
-<h4>④ root 分裂：树长高的唯一时机</h4>
+<div class="note" role="note">📜 历史 <b>split_key / split_right（已废弃）：</b>T-43 之前 InsertSub 用
+<code>split_key</code>（分隔键）+ <code>split_right</code>（右半页号）两字段描述“对半分裂”，
+branch 溢出用“取中点、上提键”分裂。T-43 起分叉统一为 splice 形态（叶层按字节预算切块、
+branch 溢出改为整层重建打包），旧字段于 T-46 删除。保留这段是为了解释“为什么废弃”：
+对半分裂在 near-MAX_KEY_SIZE 下右半仍可能超页容量（T-43）；“嵌套子树”式溢出让深度一轮搅动涨 ~2 层（T-37 depth ratchet）。</div>
 
-<p><strong>触发条件</strong>：insert 的递归返回 <code>sub.split_key != null</code>。
-只有两种来源：root 是叶 → insertIntoLeafSplit 分裂了它（§5.2）；root 是 branch →
-insertIntoBranch 自身再分裂（§5.4）。此时 insert 在入口处造一个新 branch root
-（btree.zig:1077-1092）：</p>
+<h4>④ root 溢出：树长高的唯一时机</h4>
+
+<p><strong>触发条件</strong>：insert 的递归返回 <code>sub.splice != null</code>。
+只有两种来源：root 是叶 → insertIntoLeafSplit 重建了它（§5.2）；root 是 branch →
+insertIntoBranch 自身溢出重建（§5.4）。此时 insert 调 <code>buildBranchLevels(sp.children, sp.keys)</code>
+把重建出的页打包成新 root（btree.zig:1508-1521 的 splice 分支）：</p>
 
 <div class="mermaid">
 flowchart LR
-    subgraph B4["分裂前：root 是满叶（33 条 &gt; 32）"]
+    subgraph B4["溢出前：root 是满叶（33 条 &gt; 32）"]
         OLD["root (leaf)<br/>33 entries"]
     end
-    subgraph AF["分裂后：树高 +1"]
-        NR["new root (branch)<br/>keys = {sk}，nkeys = 2"] --> LC["children[0] = new_child (leaf)<br/>原 root COW 后的新顶<br/>key 均 &lt; sk"]
-        NR --> RC["children[1] = split_right (leaf)<br/>key ≥ sk（sk 本身存这里）"]
+    subgraph AF["溢出后：重建 + 树可能长高"]
+        NR["new root (branch)<br/>buildBranchLevels 打包"] --> LC["children[0] (leaf)<br/>原 root 路径的新顶"]
+        NR --> RC["children[1..] (leaf/branch)<br/>按页容量切块的其余部分"]
     end
-    OLD -. "insertIntoLeafSplit 对半分裂" .-> AF
+    OLD -. "insertIntoLeafSplit 字节预算切块 → splice" .-> AF
 </div>
 
 <ul>
-<li><code>keys = { sk }</code>，<code>children = { sub.new_child, sub.split_right }</code>——
-新 root 恰好是最小合法 branch：1 key + 2 children。<code>encodeBranchPayload</code> 的
-debug assert 正是“children 至少 2 个，且 keys 数 = children 数减一”。</li>
-<li><strong>顺序不变量</strong>：children[0] = new_child 是左子树（原 root 路径 COW 后的新顶，
-key 均 &lt; sk）；children[1] = split_right 是右子树（key ≥ sk——叶分裂时 sk 本身就存在右叶里）。
-§4.3 的路由规则依赖这个顺序，永不颠倒。</li>
-<li><code>writeNodePage(..., PAGE_TYPE_BRANCH, 2, ...)</code>——nkeys=2 记的是
-<strong>children 数</strong>，不是 key 数。</li>
+<li><code>buildBranchLevels</code>（btree.zig:1671，T-37-B 从 insertBatchSplitLeaves 提取）是
+“重建层级”的唯一实现：每层按 <code>BRANCH_MAX_CHILDREN</code>=64 <strong>且字节预算</strong>（T-40）
+切块，尾块保持 ≥ 2 children（T-36/T-44），逐层向上压缩到一个 root 页——新高度是
+children 数的<strong>最小可能值</strong>。</li>
+<li><strong>顺序不变量</strong>：children 有序，<code>keys[i]</code> 是 <code>children[i+1]</code> 子树的首 key
+（叶层切块时 = 下一块首 key，branch 层 = 边界键）。§4.3 的路由规则依赖这个顺序，永不颠倒。</li>
+<li>children 只有 2 个时新 root 恰好是最小合法 branch：1 key + 2 children——
+<code>encodeBranchPayload</code> 的 debug assert 正是“children 至少 2 个，且 keys 数 = children 数减一”。</li>
 </ul>
 
 <p><strong>旧 root 的回收分两层：</strong></p>
@@ -801,8 +810,8 @@ key 均 &lt; sk）；children[1] = split_right 是右子树（key ≥ sk——�
 <ul>
 <li><strong>btree 层——把废弃页“点名”进 dirty</strong>。insert 入口自己没有对旧 root 做
 <code>dirty.append</code>，但并不遗漏：旧 root 正是递归调用的 page_no，已经在子函数里标记过
-（root 是叶 → §5.2 第④步，btree.zig:775；root 是 branch → §5.4 递归返回后立即标记，
-btree.zig:952）。</li>
+（root 是叶 → §5.2 第④步，btree.zig:1043；root 是 branch → §5.4 递归返回后立即标记，
+btree.zig:1304）。</li>
 <li><strong>事务层——物理回收</strong>。writer.zig 的 applyBatch 在事务末尾把 batch_dirty
 加锁搬进 <code>pending_free</code>，最终 <code>store.freePage</code> 归还
 （有活跃读者时延迟到末位读者 flush）。</li>
@@ -837,7 +846,7 @@ insertIntoLeafSplit 也是把算好的 delta 作为参数带入、原样填进�
 <li><strong>branch 层透传</strong>：insertIntoBranch 不做任何加工——
 <code>const live_delta = sub.live_delta;</code> 抄一遍，快慢两条路径的返回值填的都是这两个局部变量；</li>
 <li><strong>入口打包</strong>：insert 把它们包进 <code>WriteResult{ new_root, live_delta, count_delta }</code>——
-root 分裂路径本身不产生统计变化（分隔键、新建 branch 页都不计入 live 口径），纯透传。</li>
+root 重建路径本身不产生统计变化（分隔键、新建 branch 页都不计入 live 口径），纯透传。</li>
 </ul>
 
 <p>真正的消费方在 Db 层：writer.zig 的 applyBatch 对每个 <code>WriteResult</code> 做
@@ -882,9 +891,9 @@ flowchart TD
     B --> D{"new_count &gt; LEAF_MAX_ENTRIES (32) ?"}
     D -- "否：快路径" --> E["⑤ 栈缓冲三段拼接<br/>header + 前段 + 新 entry + 后段"]
     E --> G["⑥ allocPage + writeNodePage(LEAF)"]
-    D -- "是：慢路径" --> H["insertIntoLeafSplit<br/>decode → 应用 → 对半分裂 → 各写一页"]
-    G --> R["返回 InsertSub{ new_child, delta }<br/>split_key = null"]
-    H --> R2["返回 split_key = 右叶首 key"]
+    D -- "是：慢路径" --> H["insertIntoLeafSplit<br/>decode → 应用 → 字节预算切块 → 各写一页"]
+    G --> R["返回 InsertSub{ new_child, delta }<br/>splice = null"]
+    H --> R2["单块：splice = null<br/>多块：返回 splice{keys, children}"]
 </div>
 
 <h4>① 为什么先拷整页到栈缓冲</h4>
@@ -978,13 +987,15 @@ old_payload[尾部区间 .. entries_end]</code>。尾部区间的起点取决于
 
 <p><code>allocPage</code> 取新页号，<code>writeNodePage(store, new_page, PAGE_TYPE_LEAF, new_count,
 new_payload[0..wpos])</code> 一次完成：编码页头（含 nkeys）、拷 payload、剩余区域补零、重算 CRC
-（§1.4）。返回 <code>InsertSub{ new_child, live_delta, count_delta }</code>——<code>split_key</code>
+（§1.4）。返回 <code>InsertSub{ new_child, live_delta, count_delta }</code>——<code>splice</code>
 留空表示未分裂，caller（<code>insertIntoBranch</code>）据此走 <code>cowBranchNoSplit</code> 的
 4 字节 patch 快路径（§5.3）。</p>
 
 <p>慢路径 <code>insertIntoLeafSplit</code>：decode 旧叶为内存 <code>Leaf</code> → 应用 insert/overwrite →
-对半分裂成左右两叶 → <code>encodeLeafPayload</code> + <code>writeNodePage</code> 各写一页 → 返
-<code>split_key = right_entries[0].key</code>。</p>
+按 <code>leafChunkLen</code> 字节预算切块（T-43：不再对半分——near-MAX_KEY_SIZE 的键会让半页仍超页容量）→
+<code>encodeLeafPayload</code> + <code>writeNodePage</code> 每块写一页。单块 = 覆盖后缩小回一页，
+无需分裂直接返回；多块则以 <code>splice{keys, children}</code> 上抛（分隔键 = 下一块首 key 的 dupe，
+产端局部 <code>split_keys</code> ArrayList 收集，<code>toOwnedSlice</code> 移交）。</p>
 
 <h3 id="s53">5.3 cowBranchNoSplit：4 字节 patch</h3>
 
@@ -1025,7 +1036,7 @@ new_payload[0..wpos])</code> 一次完成：编码页头（含 nkeys）、拷 pa
 
     dirty.<span class="fn">append</span>(allocator, page_no) <span class="kw">catch</span> {};
 
-    <span class="kw">if</span> (sub.split_key == <span class="kw">null</span>) {
+    <span class="kw">if</span> (sub.splice == <span class="kw">null</span>) {
         <span class="cm">// ① 快路径：子未分裂 → cowBranchNoSplit</span>
         <span class="kw">const</span> new_page = <span class="kw">try</span> <span class="fn">cowBranchNoSplit</span>(store, page_no, loc.idx, loc.children_offset, sub.new_child);
         <span class="kw">return</span> .{ .new_child = new_page, ... };
@@ -1035,8 +1046,8 @@ new_payload[0..wpos])</code> 一次完成：编码页头（含 nkeys）、拷 pa
     <span class="kw">const</span> fresh_payload = <span class="kw">try</span> <span class="fn">readNodePayload</span>(store, page_no);
     <span class="kw">var</span> branch = <span class="kw">try</span> <span class="ty">Branch</span>.<span class="fn">fromPayload</span>(allocator, fresh_payload);
     <span class="kw">defer</span> branch.<span class="fn">deinit</span>();
-    <span class="cm">// 替换 child[ci] = new_child，插入 split_key + split_right at ci</span>
-    <span class="cm">// 若超 BRANCH_MAX_CHILDREN → 分裂 branch，返 up_key + right_page</span>
+    <span class="cm">// 在 ci 处接上 splice：children[ci] 换成 sp.children，sp.keys 插到 ci</span>
+    <span class="cm">// 若装不下（条数或字节超限）→ 重建成打包 branch 页，再以 splice 上抛</span>
 }</code></pre>
 
 <div class="mermaid">
@@ -1044,12 +1055,12 @@ flowchart TD
     A["insertIntoBranch(page_no)<br/>findChildIdxAndOffset 找子"] --> B{"子是 leaf ?"}
     B -- "是" --> C["insertIntoLeaf（§5.2）"]
     B -- "否" --> D["insertIntoBranch（递归）"]
-    C --> E{"sub.split_key == null ?"}
+    C --> E{"sub.splice == null ?"}
     D --> E
     E -- "是：快路径" --> F["cowBranchNoSplit<br/>整页拷 + patch 4B 子指针（§5.3）"]
-    E -- "否：慢路径" --> G["重读 fresh payload → Branch.fromPayload<br/>child[ci] = new_child<br/>插入 split_key + split_right"]
+    E -- "否：慢路径" --> G["重读 fresh payload → Branch.fromPayload<br/>集成 splice：children[ci] ← sp.children<br/>sp.keys 插到 ci"]
     G --> H{"超 BRANCH_MAX_CHILDREN ?"}
-    H -- "是" --> I["分裂 branch<br/>up_key = keys[mid] 上提 → 冒泡给父层"]
+    H -- "是" --> I["重建成打包 branch 页<br/>→ splice{keys, children} 上抛给父层"]
     H -- "否" --> J["encode 写新页返回"]
     F --> R["返回 InsertSub"]
     I --> R
@@ -1061,8 +1072,11 @@ invalidating the earlier borrowed slice"。慢路径不复用开头读的 <code>
 重读一份再 decode。这与快路径 <code>cowBranchNoSplit</code> 的栈拷贝是同一问题的两种应对：
 快路径在 allocPage 前就拷走整页，慢路径在 allocPage 后重读。</div>
 
-<p>branch 分裂：取 <code>mid = keys.len/2</code>，<code>up_key = keys[mid]</code> 上提，左右两半各成一页。
-<code>up_key</code> 是右子最小 key，上提到父节点作分隔键。</p>
+<p>branch 溢出（T-43）：不再取中点分裂、上提键——把整层重建成打包的 branch 页
+（按 <code>BRANCH_MAX_CHILDREN</code> 与字节预算切块，尾块 ≥ 2 children），以
+<code>splice{keys, children}</code> 上抛，父层在 ci 处整合——与叶层溢出同一形态。
+分隔键取边界键（原 branch 里两个 chunk 之间的 key），上抛后由消费方释放或转移进
+<code>branch.keys</code>。</p>
 
 <p class="muted">第五部分到此。下一部分讲批量插入与整体设计取舍。</p>
 </section>
@@ -1087,12 +1101,12 @@ invalidating the earlier borrowed slice"。慢路径不复用开头读的 <code>
     <span class="kw">else</span>
         <span class="kw">try</span> <span class="fn">insertBatchIntoBranch</span>(...);
 
-    <span class="kw">if</span> (sub.split_key) |sk| { <span class="cm">/* 建 new root branch */</span> }
+    <span class="kw">if</span> (sub.splice) |sp| { <span class="cm">/* buildBranchLevels 重建新 root（同 §5.1④） */</span> }
     <span class="kw">return</span> .{ .new_root = sub.new_child, ... };
 }</code></pre>
 
 <p>三条路径：<code>insertBatchFresh</code>（空树）、<code>insertBatchIntoLeaf</code>（root 是叶）、
-<code>insertBatchIntoBranch</code>（root 是 branch）。root 分裂逻辑与单条 <code>insert</code> 相同。</p>
+<code>insertBatchIntoBranch</code>（root 是 branch）。root 溢出处理与单条 <code>insert</code> 相同（splice → <code>buildBranchLevels</code>，§5.1④）。</p>
 
 <div class="mermaid">
 flowchart TD
@@ -1103,9 +1117,9 @@ flowchart TD
     C1 -- "否" --> C2{"root 是叶 ?"}
     C2 -- "是" --> LF["insertBatchIntoLeaf<br/>O(n+m) 归并（§6.2）"]
     C2 -- "否" --> BR["insertBatchIntoBranch"]
-    LF --> C3{"sub.split_key != null ?"}
+    LF --> C3{"sub.splice != null ?"}
     BR --> C3
-    C3 -- "是" --> NR["建新 root branch（同 §5.1④）"]
+    C3 -- "是" --> NR["buildBranchLevels 重建新 root<br/>（splice → 打包层级，同 §5.1④）"]
     C3 -- "否" --> RC["new_root = sub.new_child"]
 </div>
 
@@ -1133,7 +1147,7 @@ flowchart TD
     <span class="kw">if</span> (merged_entries.len <= LEAF_MAX_ENTRIES) {
         <span class="cm">// 单叶容纳：encodeLeafPayload + writeNodePage</span>
     } <span class="kw">else</span> {
-        <span class="cm">// 多叶：chunk 成 LEAF_MAX_ENTRIES 一组，建叶页 + branch 树</span>
+        <span class="cm">// 多叶：按字节预算切块（leafChunkLen），建叶页 + splice 上抛</span>
     }
 }</code></pre>
 
@@ -1162,26 +1176,26 @@ flowchart TD
 <h3 id="s63">6.3 bulk-load 与多级 branch 构建</h3>
 
 <p>批量条目超单叶容量时，走 <code>insertBatchSplitLeaves</code> / <code>insertBatchFresh</code> 的 bulk-load：
-按 <code>LEAF_MAX_ENTRIES</code> 切块建叶页，再用 <code>BRANCH_MAX_CHILDREN</code> 切块逐层建 branch。</p>
+按字节预算（<code>leafChunkLen</code>，T-40）切块建叶页，再用 <code>BRANCH_MAX_CHILDREN</code> + 字节预算逐层建 branch——两级构建共用 <code>buildBranchLevels</code>（T-37-B 从 insertBatchSplitLeaves 提取，单条 insert 的 root splice 也调它，见 §5.1④）。</p>
 
 <pre><code><span class="cm">// insertBatchSplitLeaves / insertBatchIntoLeaf 多叶路径</span>
 <span class="kw">var</span> pos: <span class="ty">usize</span> = <span class="nu">0</span>;
 <span class="kw">while</span> (pos < entries.len) {
-    <span class="kw">const</span> chunk_len = @min(LEAF_MAX_ENTRIES, entries.len - pos);
+    <span class="kw">const</span> chunk_len = leafChunkLen(entries[pos..], LEAF_MAX_ENTRIES);  <span class="cm">// 字节预算切块（T-40）</span>
     <span class="cm">// encodeLeafPayload(chunk) + writeNodePage(LEAF) → leaf_pages.append</span>
-    <span class="cm">// split_keys.append(entries[pos+chunk_len].key)  // 下一段首 key 作分隔</span>
+    <span class="cm">// split_keys.append(entries[pos+chunk_len].key)  // 局部 ArrayList；下一段首 key 作分隔</span>
     pos += chunk_len;
 }
 <span class="cm">// 多级 branch：current_pages/current_keys 逐层压缩</span>
 <span class="kw">while</span> (current_pages.len > BRANCH_MAX_CHILDREN) {
     <span class="cm">// 按 BRANCH_MAX_CHILDREN 切块建 branch，level_pages_a/b 交替复用</span>
-    <span class="cm">// split_key = current_keys[i + chunk_len - 1]</span>
+    <span class="cm">// 分隔键 = current_keys[i + chunk_len - 1]（局部变量，非 InsertSub 字段）</span>
 }
 <span class="cm">// 最终 root branch</span></code></pre>
 
 <div class="mermaid">
 flowchart TD
-    E["已排序 entries"] --> L["按 LEAF_MAX_ENTRIES (32) 切块建叶页<br/>下一段首 key 作分隔"]
+    E["已排序 entries"] --> L["按字节预算切块建叶页（leafChunkLen）<br/>下一段首 key 作分隔"]
     L --> B{"current_pages.len &gt; BRANCH_MAX_CHILDREN ?"}
     B -- "是" --> C["按 BRANCH_MAX_CHILDREN 切块建 branch<br/>level_pages_a/b 交替复用"]
     C --> B
@@ -1227,7 +1241,7 @@ flowchart TD
 
 <p class="muted">第六部分到此。本讲义覆盖 <code>src/btree.zig</code> 全部公开函数与关键内部函数：
 常量与类型、页 I/O 三件套、leaf/branch 编解码、溢出页链、get 读路径（含已移除 getBorrowed 的设计复盘）、
-insert 单条 COW（快/慢路径 + root 分裂）、insertBatch 批量（归并 + bulk-load）、设计取舍与风险清单。</p>
+insert 单条 COW（快/慢路径 + root 溢出 splice 重建）、insertBatch 批量（归并 + bulk-load）、设计取舍与风险清单。</p>
 </section>
 
 
