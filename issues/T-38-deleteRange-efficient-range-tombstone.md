@@ -1,6 +1,6 @@
 # Issue T-38 — deleteRange 高效化：全量物化 + 每 key tombstone 的 O(range) 内存与写放大
 
-- **状态**: proposed（演进点提案，待立项 TDD）
+- **状态**: fixing（路线 C 先探路已定；探路完成，方案 B 实现中，方案 A 待返工闭环）
 - **优先级**: **high**（可用性缺口 + 内存安全边界；4/4 worker 全部独立提出，共识度最高）
 - **梯队**: 可用性/性能（兼正确性观感——文档承诺与实际行为差距）
 - **来源**: 演进点征集（roadmap-evo）wf-pi-1-E1、wf-pi-2-E2、wf-pi-3-E3、wf-pi-4-E2
@@ -64,7 +64,43 @@ select 迭代器 + tombstone 批量提交实现"），但**没有披露 O(range)
 ## 状态跟踪
 
 - [x] 现状核验（4 worker 独立确认 U-1 在当前 HEAD 成立）
+- [x] 路线决策：**C 先探路**（用户选定），探路结论 = 方案 A 有条件可行 + 推荐 A+B 分期
 - [ ] 确定性 RED 测试（大范围删除内存/性能断言）
 - [ ] 根因定位与修复（GREEN：range tombstone + 墓碑 GC）
 - [ ] 回归测试 + 评审
 - [ ] 验收门稳定后关闭
+
+---
+
+## 执行记录（conductor，2026-09-15）
+
+### 路线 C — 探路（已完成）
+
+- **T-38-P**（cube_db-pi-1，commit `5764fbb`）：设计文档
+  `docs/design/T-38-range-tombstone-probe.md` + 自包含探针
+  `spike/rangetomb_probe.zig`（5 tests）+ 报告
+  `docs/design/T-38-probe-report.md`。零 `src/` 改动，5/5 绿，全量 436/437+1skip。
+- **探路结论**：方案 A（区间墓碑，`PAGE_TYPE_RANGE_TOMBSTONE=5` + meta v2→v3
+  双锚点）**有条件可行**；报告推荐 **A+B 分期**（B 立即止血、A 根治）。
+- **独立评审**（cube_db-pi-2）：**REQUEST_CHANGES**，发现两处 blocking 设计缺口
+  （打洞右段数据复活、近-MAX 边界不可表示），**不否定方案 A 可行性**。
+  → 已立 **T-48**（`issues/T-48-range-tombstone-punch-hole-and-boundary-gaps.md`），
+  返工任务 **T-38-P-R** 已派给 pi-2。
+
+### 分期拆解（探路报告 §4，评审 N3 调整后）
+
+| 阶段 | 内容 | 任务 | 依赖 |
+|---|---|---|---|
+| 0 | **方案 B**：流式分块 deleteRange（消 OOM，零格式风险） | **T-38-B** | 无（已派 pi-3） |
+| 1 | 格式层：墓碑页 codec + meta v3（含 F2 边界编码） | 未派 | T-38-P-R 闭环 |
+| 2 | 读路径：遮蔽判定（tomb_head=0 时休眠） | 未派 | 阶段 1 |
+| 3 | 写路径：新 deleteRange 流 + 打洞语义（含 F1 修正）+ entryCount 流式修正 | 未派 | 阶段 2 |
+
+### 验收 (a) 的判据已落地
+
+`tests/txn_writer_db/deleterange_mem_budget_test.zig`（commit `169aa78`，挂 `test-db`）：
+锁死「deleteRange 内部净分配不随 range 线性增长」——同一场景 N vs 4N 的净字节
+峰值比值 `< 2.0`。**基线实测比值 3.81 → RED**，由 T-38-B 实现到绿。
+
+判据口径钉在「deleteRange 自身申请了什么」，而非全库聚合内存/RSS——后者会在
+方案 B 落地后误红（内存确实降了，聚合口径却看不到）。

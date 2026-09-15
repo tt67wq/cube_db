@@ -1,6 +1,6 @@
 # Issue T-46 — `InsertSub.split_key` 机制已全程 vestigial（死代码清理）
 
-- **状态**: proposed（T-43 评审 F4 转立项）
+- **状态**: closed（2026-09-15，验收通过并合入 main `bcf5368`）
 - **优先级**: low（死代码清理：无正确性影响，但增加阅读与维护负担）
 - **来源**: T-43 独立评审（pi-1，`review.md` Finding F4；T-43 实现者 pi-2 test-report §6 亦记录）
 - **关联**: `src/btree.zig` `InsertSub.split_key` / `split_right` 字段与全部消费分支、
@@ -34,5 +34,22 @@ T-43 为此两处根 split 补的 errdefer 属**无害防御**（实现者已诚
 
 ## 状态跟踪
 
-- [ ] conductor 立项决策
-- [ ] 清理 + 全量回归 + 独立评审
+- [x] conductor 立项决策
+- [x] 清理 + 全量回归 + 独立评审
+- [x] 合入 main（`bcf5368`，conductor ff-merge + 全量 437/437）
+
+## 验收记录（2026-09-15）
+
+- **实现**: cube_db-pi-3，commit `bcf5368`（`src/btree.zig` −153/+4，纯删除）。
+  删除 `InsertSub.split_key`/`split_right` 字段、5 处消费分支、死函数
+  `insertBatchFallback` / `insertBatchIntoLeafFallback`。
+- **独立评审**: cube_db-pi-1（评审者 ≠ 实现者），结论 **APPROVE**
+  （`.agents/tasks/T-46/review.md`）。评审独立在**父提交** `4e69f8a` 上 grep 举证
+  「唯一产端在无调用点函数内 → 全部消费分支恒走 null 侧」，并实测删除前后通过数
+  逐一相同（`zig build test` 436/437+1skip → 436/437+1skip；`test-btree` 55/55）。
+- **整合**: conductor ff-merge 进 main，全量 `zig build test` = **34/34 steps，
+  437/437 passed**（基线 436 通过 + 本次新增 1 条）。
+- **评审残留跟进（非阻塞）**: `docs/lecture_btree.html` 仍以 `split_key`/
+  `split_right` 为主线讲 insert 分裂机制（:653/:740-793/:1028-1106），T-43 splice
+  统一后即已失真、本次删除后加剧。教学文档正确性与代码正确性分离，已另立
+  **T-47** 跟进（见 `issues/T-47-lecture-btree-stale-split-key.md`）。
