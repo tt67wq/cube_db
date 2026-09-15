@@ -3,7 +3,10 @@
 - **任务**: T-38-P（探路/设计，方法 C；不改生产代码）
 - **作者**: cube_db-pi-1（worktree cube-db-pi-1-rebuilt，基线 4e69f8a）
 - **对象 issue**: `issues/T-38-deleteRange-efficient-range-tombstone.md`
-- **状态**: 设计 + 探针验证完成；结论见 `.agents/tasks/T-38-P/probe-report.md`
+- **状态**: 设计 + 探针验证完成；结论见 `docs/design/T-38-probe-report.md`。
+  **T-38-P-R 返工**（评审 F1/F2 + conductor 复算确认）：修正打洞右段复活论证
+  （§4.3）、补边界可表示性分析并修订条目布局（§1.2/§1.4，16B 条头 + append_zero
+  紧凑边界编码）。探针同步返工（6/6 绿）。
 
 本文档回答契约「须回答」的全部条目。所有格式事实基于基线源码实际行号；
 标注【实测】的内容由 `spike/rangetomb_probe.zig` 真实运行背书，
@@ -52,21 +55,22 @@
 `leafPayloadSize` 预算（T-40 家族全部假设 entry=单 key）。改动面反而是最大。
 
 **选定**：新页 kind `PAGE_TYPE_RANGE_TOMBSTONE = 5`（`format.zig:23` 现有
-kind 已用到 4=OVERFLOW），页布局：
+kind 已用到 4=OVERFLOW）。页布局（**T-38-P-R 修订版**：payload 计数移除
+——页头 nkeys 为准；条头 16B；边界加 append_zero 紧凑标志）：
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │ PageHeader (24B): page_no / page_type=5 / gen=commit_seq /  │
 │                   nkeys=墓碑条数 / free_next=下一链页(0=尾)  │
 ├─────────────────────────────────────────────────────────────┤
-│ payload[0..2]  = 墓碑条数 count (u16 LE, ≤TOMB_PER_PAGE)     │
-│ payload[2..]   = 连续定长头数组 × count:                     │
+│ payload[0..]   = 连续定长头数组 × nkeys（无 payload 计数）： │
 │   每条 16B:                                               │
-│     min_len  u32   # min 键长（0 = unbounded/null min）       │
-│     max_len  u32   # max 键长（0 = unbounded/null max）       │
-│     min_off  u32   # min 键字节在 varint 区的偏移             │
-│     max_off  u32   # max 键字节在 varint 区的偏移             │
-│ varint 区（剩余 payload）: 各墓碑的 min/max 原始字节          │
+│     min_len  u32   # min 存储键长；bit31 = append_zero 标志  │
+│     max_len  u32   # max 存储键长；bit31 = append_zero 标志  │
+│     min_off  u32   # min 键字节在变长区的偏移（payload 起）   │
+│     max_off  u32   # max 键字节在变长区的偏移（payload 起）   │
+│ 变长区（剩余 payload）: 各墓碑 min/max 的存储字节             │
+│   （len=0 且无标志 = unbounded/null；append_zero 见下）      │
 │ 尾部 4B CRC32（现有 verifyPageChecksum 全页校验）             │
 └─────────────────────────────────────────────────────────────┘
 每页容量 ≥ 4068/(16+avg_key) 条；链式（free_next 串多页，同 freelist 链式）。
@@ -77,10 +81,35 @@ kind 已用到 4=OVERFLOW），页布局：
 - **gen 戳用 commit sequence**：与 T-33 的 chain 页做法一致
   （`hdr.gen = meta.sequence`，file_page_store.zig:440/:521 的 H1 恢复校验
   同款语义）——torn-sync 后旧代墓碑页会被 H1 式校验拒绝（见 §5）。
-- **页数上限**：单条墓碑最小 16+2×1B ≈ 18B → 每页 ≥ 225 条；
+- **页数上限**：单条墓碑最小 16+2×1B = 18B → 每页 ≥ 226 条（4068/18）；
   链式无总数上限。
-- **nkeys 字段复用**：写墓碑条数，walk 类校验器（page_partition.zig 风格）
-  可以按 `count < 1` 拒绝空页（0 条墓碑没有存在意义，写路径保证不产生）。
+- **nkeys 字段复用**：写墓碑条数（payload 内不再重复计数——双处计数是
+  冗余校验面，CRC 已保完整性）；walk 类校验器（page_partition.zig 风格）
+  可以按 `nkeys < 1` 拒绝空页（0 条墓碑没有存在意义，写路径保证不产生）。
+- **迁移注记（N1）**：探针的 `decodeTombPage` 对 offset 越界用 `@panic`——
+  spike 可接受，**迁移进 `src/` 时必须改为 `error.Truncated/CorruptCrc`**，
+  不得照抄 panic。
+
+#### 边界可表示性分析（T-38-P-R，F2 返工）
+
+算术（conductor 独立复算确认）：`TOMB_PAYLOAD = 4096−24−4 = 4068`。
+基线布局（2B 计数 + 24B 条头含 seq）的变长预算 = 4068−2−24 = **4042B <
+`MAX_KEY_SIZE`(4051)**——单条墓碑一个 4050B 边界就装不下（基线实测
+`TombPageOverflow`），而 `deleteRange` 接受最长 4051B 的用户 key、
+`punchHole` 的 `succ(k)` 需要 4052B。这是设计层可行性缺口，返工修订：
+
+1. **条头 24B → 16B**（逐条 seq 从页 gen 继承，见 §1.4——预算 +8B）；
+2. **payload 计数移除**（页头 nkeys 为准——预算 +2B）；
+   → 单条墓碑 envelope = `16 + min_stored + max_stored ≤ 4068`，
+   即**单边界最长 4052B ≥ MAX_KEY_SIZE=4051**：任意单侧 deleteRange、
+   任意 `succ(k)`（紧凑编码后存储 = 原键长 ≤ 4051）都可表示【实测：探针 6】。
+3. **双长边界**（`min_stored + max_stored > 4052`，如 `['a'×3000, 'z'×3000]`）
+   仍装不下：编码器返回 **typed `error.TombBoundTooLarge`** 明确拒绝
+   【实测：探针 6(c)】，而不是基线的笼统 `TombPageOverflow`。
+   **生产方向（阶段 1 决策）**：边界字节 spill 到 overflow 链页
+   （复用 `PAGE_TYPE_OVERFLOW` 基础设施；单边界 ≤ 4052B 恒可容纳一页
+   4068B → spill 方案数学上完备）或对该类 deleteRange 明确报错并文档化。
+   在阶段 1 定案前，探针按「typed 拒绝」交付。
 
 ### 1.3 树上锚点：root 页头新增「tomb 链头」字段
 
@@ -102,16 +131,25 @@ kind 已用到 4=OVERFLOW），页布局：
 每条 = `[min, max)` 半开区间 + 时间戳（用写入时的 commit sequence）：
 
 ```
-RTombstone = { min: ?[]const u8, max: ?[]const u8, seq: u64 }
+RTombstone = { min: ?Bound, max: ?Bound, seq: u64 }
+Bound      = { bytes: []const u8, append_zero: bool = false }
+# Bound 的 effective 字节串 = bytes ++ (0x00 if append_zero)
 ```
 
-- `min = null`（min_len=0）：负无穷；`max = null`：正无穷——与
+- `min = null`（存储 len=0 且无标志）：负无穷；`max = null`：正无穷——与
   `deleteRange(null, null)` 全区间删除对齐。
-- `seq` 不落盘也可以（页 gen 已带 commit sequence，恢复时从页头读），
-  但**逐条携带 seq 有独立价值**：与逐 key tombstone 的优先级判定、
-  以及未来 GC 的「低于水位即可物化清除」判定需要它。**落盘每条 +8B
-  （条头 16B → 24B）**，或者从页 gen 继承（同页同 seq，条头保持 16B）。
-  探针按「条头 24B 含 seq」实现（最保守容量），页容量 ≥ 4068/(24+2) ≈ 155 条。
+- **seq 从页 gen 继承（T-38-P-R 选定）**：逐条 seq 不落盘（条头保持 16B，
+  §1.2 可表示性分析要求）。安全性论证：读路径是纯空间判定（INV-RT1，
+  不用 seq）；GC 水位判定用页 gen（链重写时间 ≥ 墓碑真实建立时间）——
+  只会把「可物化清除」判得更保守（推迟、不提前），方向安全。打洞分裂段
+  继承原墓碑建立时间的场景同理：写进新页后表现为页 gen（较新），
+  GC 推迟回收，保守安全。
+- **append_zero 是 `succ(k)`（k 的字典序后继上界 = k ++ 0x00）的紧凑表示**
+  （T-38-P-R，F1 修复核心）：存原键长、语义等价于 k ++ 0x00。
+  这使 put 打洞的右段下界**恒可表示**（存储回到原键长，见 §4.3），
+  且 punchHole 零堆分配。比较语义【实测：探针 2 append 边界组】：
+  `succ("b")` 作为 min：`"b"` 不被遮蔽、`"b\x00"`（== effective）被遮蔽
+  （min 含）；作为 max：`"m"` 仍被遮蔽（< "m\x00"）、`"m\x00"` 不被。
 
 ## 2. `f2.MetaPage.version` 平滑升级 / 兼容
 
@@ -126,6 +164,14 @@ RTombstone = { min: ?[]const u8, max: ?[]const u8, seq: u64 }
 | **旧代码读新库（v3）** | `isValidMeta` 判 `version==2` 失败 → `readMetaPage` 返回 null → **打开失败**（干净拒绝，不会误读） | 现状即如此，无需改 |
 
 这是「**单向可升级**」：升级后不能再用旧二进制打开（v3 库对旧代码是关闭的）。
+
+**生产读路径的三值判定（T-38-P-R，N2）**：探针的 `decodeMetaAny` 把
+「非 v2」一律返回 null（探针内部由调用方再探测 v3）；生产 `readMetaPage`
+必须是**三值判定**——v2（tomb_head=0 打开）/ v3（读 tomb_head）/
+**其它（magic 不符或 version ≥ 4：打开失败，报明确错误）**。尤其
+「v4+ 或垃圾」不得与「v2」混同（探针 4 的双 decode 组合即此语义的
+最小演示，迁移时须展开为显式三值）。
+
 理由（怀疑默认）：
 
 - 允许旧代码打开 v3 库要求旧代码理解 tomb_head 遮蔽语义——否则
@@ -236,26 +282,46 @@ deleteRange [a,b); put k         → get(k) 非null（seq 序：put 在后）
 同 commit sequence 原子发布）。staging 并发交错（验收 (c)）语义不变：
 墓碑是 commit 序中的普通一环。
 
-### 4.3 墓碑分裂（put 打洞 / 新墓碑交叠）
+### 4.3 墓碑分裂（put 打洞 / 新墓碑交叠）【T-38-P-R 修订：F1】
 
 后续 put/deleteRange 落在既有墓碑覆盖内时，写路径必须维护 INV-RT1：
 
-- **put(k) 且 k 被墓碑 t=[a,b) 覆盖**：把 t 分裂为 [a,k)+[k',b)（k' 是 k 的
-  后继上界——实现上用 [a,k) 与 (k,b) 两段，注意半开语义：右段改为
-  [k+ε, b) 无法表达，改为 **[k 的严格后继, b)** 不精确——**正解**：
-  墓碑区间集合改用「墓碑存 [min,max)，put k 时把包含 k 的墓碑分裂为
-  [min,k) 与 (k,max) 无法半开表达」→ **改用闭开对**：存 `[min, max)` 且
-  允许 min 端用「k 前缀+0x00」上界技巧不可靠（键空间无哨兵）。
-  **工程正解**：分裂右段直接用 `[max(k, min), max)` 去掉 k 单点无法表达，
-  因此采用 **墓碑重叠语义**：不分裂，而是 put(k) 的 commit 同时追加一条
-  「负墓碑（anti-tombstone）[k, k+] 」？——复杂化。
-  **选定（简洁）**：put(k) 时把覆盖 k 的墓碑删除并物化为其覆盖区间减 k
-  的两个墓碑（[min,k) 与 [k_ceil, max)，其中 k_ceil = k 的**字典序后继**
-  仅在 k 不是任意字节串上界时存在；k = 全 0xFF 尾时右段为空舍弃）。
-  字典序后继 = k 追加 0x00（k+0x00 是 > k 的最短键）。【实测：探针 3 覆盖
-  「put 打洞后原墓碑对新 key 仍遮蔽、对 k 不遮蔽」】
+- **put(k) 且 k 被墓碑 t=[min,max) 覆盖**：把 t 分裂为 **[t.min, k)** 与
+  **[succ(k), t.max)** 两段，其中 `succ(k) = k ++ 0x00`（> k 的最短字节串），
+  用 §1.4 的 append_zero 紧凑边界表示（存原键长）。语义要求：
+  k 不再被遮蔽（put 回来的 key 活），区间内其余 key（含建碑前已被删除的
+  活 entry）必须仍被遮蔽。【实测：探针 3——打洞后对 k 不遮蔽、对区间内
+  其它 key 仍遮蔽；含 F1 复活反例（见下）】
+  - **左段为空**当且仅当 `t.min == k`（covers 已保证 t.min ≤ k）→ 跳过。
+  - **右段为空**当且仅当 `t.max == succ(k)`——k 与 succ(k) 之间不存在任何
+    字节串，故这是唯一情形（如 `deleteRange("b","b\x00")` 建的墓碑再
+    put "b" 会被完全消费）【实测：探针 3 右段真空 edge】。
+
+  **F1 返工记录（错误论证 → 修正）**：基线版本在 `succ(k)` 超长（k 近
+  `MAX_KEY_SIZE`，succ 需 4052B）时**丢弃右段**，并论证「只会漏遮蔽后来又
+  写回又被删的键，由后续 deleteRange 重新建碑覆盖」——**该论证错误**：
+  右段 [succ(k), t.max) 覆盖的是**建碑前就存在、已被那次 deleteRange 删掉
+  的活 entry**，丢弃 = 这些 key **复活**。反例（基线实测红，T-38-P 评审
+  X2 / 返工 RED 用例）：
+
+  ```
+  put "r"(seq1) → deleteRange ["a","z")(seq2) → put big='q'×4051(seq3)
+  基线：右段被丢弃 → "r" 不再被遮蔽 → 复活（错）
+  返工：右段 [succ(big), "z") 以紧凑边界保留 → "r" 仍被遮蔽（对）
+  ```
+
+  正确表述：右段丢弃**仅当右段真空**（t.max == succ(k)）；「右段装不下」
+  不是丢弃理由。append_zero 紧凑编码使 succ 的存储回到原键长（≤4051 ≤
+  envelope 单边界上界 4052），**右段在 envelope 内恒可表示**。
+  - **剩余缺口（诚实声明）**：当 `k.len + t.max_stored > 4052`（k 与 t.max
+    双长）时右段**条目**超出单条 envelope（§1.2 分析）——编码器返回
+    `TombBoundTooLarge`。生产方向（阶段 1/3 决策）：边界 spill 到 overflow
+    页（恒足够）或该 put 走物化 per-key tombstone 兜底（O(range)，仅此
+    边角触发）；**禁止**再回到「丢弃右段」。【未实测：spill/物化兜底——
+    属 T-38 主体阶段 1/3，探针以 typed 错误明确暴露】
 - **新 deleteRange 与旧墓碑交叠**：合并/吸收（新区间并集），链重写时
-  O(T) 归并去重，保持链按 min 有序。
+  O(T) 归并去重，保持链按 min 有序（append_zero 边界参与统一排序，
+  比较 = effective 字节串序）。
 
 ### 4.4 deleteRange 幂等性
 
@@ -306,6 +372,9 @@ rotation→meta 落盘（:698-757）；INV-F1（重复 free 幂等）/ INV-F2
 **结论**：墓碑方案与 T-33 模型**同构兼容**——它只是「另一种从 root/meta
 可达、带 CRC、随 commit 换代的数据页」。最大新增风险是 1 中的「链页损坏
 = 必须报错不静默」，属实现纪律而非模型缺陷。
+（前瞻：若阶段 1 采用 §1.2 的边界 spill，spill 页 = 现有 overflow 型普通
+数据页——从墓碑条目的 min_off/max_out 链可达、带 CRC、不进 freelist chain，
+与上述分析同构，不引入新的崩溃面。）
 
 ## 6. GC / 收敛出口
 
@@ -347,10 +416,13 @@ T ≤ deleteRange 的不同区间数（合并不增长），不会失控，但�
 
 | 项 | 状态 |
 |---|---|
-| 墓碑编码/解码 round-trip、遮蔽边界、共存优先级、v2/v3 meta 兼容 | 【实测】探针 1-4 |
-| put 打洞（字典序后继 k+0x00）语义 | 【实测】探针 3 |
+| 墓碑编码/解码 round-trip（含 append_zero 边界）、遮蔽边界、共存优先级、v2/v3 meta 兼容 | 【实测】探针 1/2/3/4（T-38-P-R 返工后） |
+| put 打洞（字典序后继 k+0x00 紧凑表示）语义，含 F1 复活反例（近-MAX key） | 【实测】探针 3——基线红、返工后绿 |
 | CRC 损坏墓碑页可检测 | 【实测】探针 1 |
+| F2 边界可表示性 envelope（4051B 单边界 / succ 紧凑 / 双长边界 typed 拒绝 / 恰好装满） | 【实测】探针 6——基线 4050B 即 TombPageOverflow（红） |
 | Db 级端到端（deleteRange → 重启 → 遮蔽保持） | 【未实测】需改 db.zig，属 T-38 主体 |
 | 并发 staging/flush 交错下墓碑 commit 序 | 【未实测】需改 writer.zig，属 T-38 主体 |
 | FilePageStore 上 meta 扩字段的 torn 行为 | 【未实测】需改 format/file_page_store，属 T-38 主体；模型论证见 §5 |
 | 墓碑链页数上界的实际增长曲线 | 【未实测】理论界见 §6 |
+| 双长边界（min_stored+max_stored > 4052）的 spill / 物化兜底 | 【未实测】方向已定（§1.2/§4.3），阶段 1 决策；探针以 `TombBoundTooLarge` typed 拒绝 |
+| 生产写路径 punchHole 集成（含右段超 envelope 兜底） | 【未实测】属 T-38 主体阶段 3；探针 3 为墓碑集层面 |

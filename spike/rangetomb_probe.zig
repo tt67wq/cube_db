@@ -1,25 +1,38 @@
 //! rangetomb_probe.zig — T-38-P 探针：区间墓碑方案（设计文档
 //! docs/design/T-38-range-tombstone-probe.md）的最小可运行验证。
+//! T-38-P-R 返工：修复 F1（打洞右段丢弃 = 数据复活）与 F2（近-MAX
+//! 边界可表示性）；FR-1（punchHole 计数释放）随新设计消除。
 //!
 //! 自包含 spike：**不改 src/**。生产常量（PAGE_SIZE/PageHeader/CRC/cmpKey）
 //! 从 cube_db 导入复用；墓碑编解码器、v3 meta 编解码器在本文件实现，
 //! 与设计文档 §1.2/§1.4/§2 的字节布局逐字段对齐：
 //!
-//! 墓碑页（PAGE_TYPE_RANGE_TOMBSTONE = 5，设计 §1.2）：
+//! 墓碑页（PAGE_TYPE_RANGE_TOMBSTONE = 5，设计 §1.2 修订版）：
 //!   PageHeader: page_no / type=5 / gen=commit_seq / nkeys=条数 / free_next=链
-//!   payload[0..2]  count u16
-//!   定长条头 24B × count: min_len u32 / max_len u32 / min_off u32 / max_off u32 / seq u64
-//!   变长区: 各墓碑 min/max 原始字节（len=0 表示 unbounded）
+//!   payload = 连续定长条头 16B × nkeys（无 payload 计数——头为准，CRC 保完整性）:
+//!     min_len u32（bit31 = append_zero 标志）/ max_len u32（bit31 = 同）
+//!     min_off u32 / max_off u32（变长区偏移，相对 payload 起点）
+//!   变长区: 各墓碑 min/max 的存储字节（len=0 且无标志 = unbounded/null）
 //!   尾部 4B 全页 CRC32（复用 f2.verifyPageChecksum）
+//!   逐条 seq 不落盘——从页 gen（commit sequence）继承（设计 §1.4 选定项）。
+//!
+//! 边界紧凑编码（T-38-P-R F1/F2 核心）：Bound = bytes ++ (0x00 if append_zero)。
+//!   - succ(k) = k ++ 0x00（> k 的最短字节串）存为 {bytes=k, append_zero=true}
+//!     —— 存储回到原键长：近-MAX key 的打洞右段恒可表示，punchHole 零堆分配；
+//!   - 单条墓碑 envelope：16 + min_stored + max_stored ≤ 4068
+//!     （单边界最长 4052B ≥ MAX_KEY_SIZE=4051，用户单侧 deleteRange 全覆盖）；
+//!   - 双长边界（min_stored + max_stored > 4052）→ error.TombBoundTooLarge
+//!     （typed 明确拒绝；生产方向 = 边界 spill 到 overflow 页，见设计 §1.2）。
 //!
 //! v3 meta（设计 §2）：58B v2 payload 尾部追加 tomb_head u32 → 62B。
 //!
 //! 验证项（对应设计文档 §9 的【实测】行）：
-//!   1. 墓碑链页 encode → decode round-trip + CRC 翻转可检测（§5.1）
-//!   2. 遮蔽判定边界：min 含 / max 不含 / 空区间 / 全区间 / 倒置（§3.3）
-//!   3. 与逐 key tombstone 共存 + put 打洞（字典序后继 k+0x00）优先级（§3.2/§4.3）
-//!   4. v2↔v3 meta 最小升级/降级：v3 round-trip、v2 视角 tomb_head=0、
-//!      旧 isValidMeta 拒绝 v3、双槽 sequence 取高无混合态（§2）
+//!   1. 墓碑链页 encode → decode round-trip（含 append 边界）+ CRC 翻转可检测（§5.1）
+//!   2. 遮蔽判定边界：min 含 / max 不含 / 空区间 / 全区间 / 倒置 / append 边界（§3.3）
+//!   3. 与逐 key tombstone 共存 + put 打洞（含 F1 复活反例：基线红、返工后绿）（§3.2/§4.3）
+//!   4. v2↔v3 meta 最小升级/降级（§2）
+//!   5. 多墓碑链页 round-trip + 容量上界（设计 §1.2 容量声明核对）
+//!   6. F2 边界可表示性：4051B 单边界 / succ 紧凑 / 双长边界明确拒绝 / 恰好装满
 //!
 //! 运行：zig build test-rangetomb-probe   （exit 0 = 全部断言通过）
 
@@ -33,45 +46,116 @@ const alloc = std.testing.allocator;
 // ===== 设计 §1.2：新页 kind 与条目容量 =====
 
 const PAGE_TYPE_RANGE_TOMBSTONE: u8 = 5;
-const TOMB_HDR: usize = 24; // min_len u32 + max_len u32 + min_off u32 + max_off u32 + seq u64
+/// T-38-P-R：条头 24B → 16B（seq 从页 gen 继承，见设计 §1.4），
+/// bit31 of min_len/max_len = append_zero 边界标志。
+const TOMB_HDR: usize = 16; // min_len|flag u32 + max_len|flag u32 + min_off u32 + max_off u32
 const TOMB_PAYLOAD: usize = f2.PAGE_SIZE - f2.PAGE_HEADER_SIZE - 4;
 
-// ===== 设计 §1.4：墓碑条目 =====
+// ===== 设计 §1.4：墓碑条目与边界 =====
+
+/// 边界 = bytes ++ (0x00 if append_zero)。
+/// append_zero 是 succ(k)（k 的字典序后继上界）的紧凑表示：
+/// 存原键长、语义等价于 k ++ 0x00 —— F1 修复核心（右段恒可建）。
+const Bound = struct {
+    bytes: []const u8,
+    append_zero: bool = false,
+};
 
 const RTombstone = struct {
-    min: ?[]const u8, // null = 负无穷
-    max: ?[]const u8, // null = 正无穷
-    seq: u64, // 写入 commit sequence
+    min: ?Bound, // null = 负无穷
+    max: ?Bound, // null = 正无穷
+    seq: u64, // 写入 commit sequence（盘上从页 gen 继承；内存态保留原值）
 };
+
+fn plain(bytes: []const u8) ?Bound {
+    return .{ .bytes = bytes };
+}
+
+/// 字典序后继上界：effective = bytes ++ 0x00（> bytes 的最短字节串）。
+fn succ(bytes: []const u8) ?Bound {
+    return .{ .bytes = bytes, .append_zero = true };
+}
+
+fn boundEffLen(b: Bound) usize {
+    return b.bytes.len + @intFromBool(b.append_zero);
+}
+
+fn effByte(b: Bound, i: usize) ?u8 {
+    if (i < b.bytes.len) return b.bytes[i];
+    if (b.append_zero and i == b.bytes.len) return 0;
+    return null;
+}
+
+/// 键 k 与（effective）边界 b 的比较。
+fn boundCmpKey(k: []const u8, b: Bound) std.math.Order {
+    const n = @min(k.len, b.bytes.len);
+    for (0..n) |i| {
+        if (k[i] != b.bytes[i]) return if (k[i] < b.bytes[i]) .lt else .gt;
+    }
+    if (k.len < b.bytes.len) return .lt; // k 是 bytes 的真前缀 → k < bytes ≤ eff
+    if (k.len > b.bytes.len) {
+        if (!b.append_zero) return .gt; // k 延伸 bytes → k > bytes
+        // eff = bytes ++ 0x00：比较 k[bytes.len] 与 0x00
+        if (k[b.bytes.len] != 0) return .gt;
+        return if (k.len == b.bytes.len + 1) .eq else .gt;
+    }
+    // k.len == bytes.len
+    return if (b.append_zero) .lt else .eq; // k == bytes < bytes ++ 0x00
+}
+
+/// 两个（effective）边界之间的比较（不打材料化）。
+fn boundCmpBound(a: Bound, b: Bound) std.math.Order {
+    const n = @max(boundEffLen(a), boundEffLen(b));
+    for (0..n) |i| {
+        const x = effByte(a, i);
+        const y = effByte(b, i);
+        if (x == null and y == null) return .eq;
+        if (x == null) return .lt;
+        if (y == null) return .gt;
+        if (x.? != y.?) return if (x.? < y.?) .lt else .gt;
+    }
+    return .eq;
+}
 
 fn covers(t: RTombstone, k: []const u8) bool {
     // [min, max) 半开：min 含、max 不含（设计 §3.3，与 select 同语义）
     if (t.min) |m| {
-        if (btree.cmpKey(k, m) == .lt) return false; // k < min
+        if (boundCmpKey(k, m) == .lt) return false; // k < min
     }
     if (t.max) |m| {
-        if (btree.cmpKey(k, m) != .lt) return false; // k >= max
+        if (boundCmpKey(k, m) != .lt) return false; // k >= max
     }
     return true;
 }
 
-fn rangeEmpty(min: ?[]const u8, max: ?[]const u8) bool {
+fn rangeEmpty(min: ?Bound, max: ?Bound) bool {
     if (min != null and max != null) {
-        return btree.cmpKey(min.?, max.?) != .lt; // min >= max → 空/倒置
+        return boundCmpBound(min.?, max.?) != .lt; // min >= max → 空/倒置
     }
     return false; // 有 null 端 → 非空（全区间或单侧）
 }
 
 // ===== 设计 §1.2：墓碑链页编码（单页版；链 = free_next 串接） =====
 
+fn boundStoredLen(b: ?Bound) usize {
+    return if (b) |m| m.bytes.len else 0;
+}
+
 fn encodeTombPage(page: *[f2.PAGE_SIZE]u8, page_no: u32, tobs: []const RTombstone, commit_seq: u64, next_page: u32) !void {
-    // 定长头区 2 + 24*count，变长区紧随
+    // T-38-P-R (F2)：可表示性分两级——
+    //   1) 单条墓碑：16B 条头 + 边界存储字节 ≤ 页预算，否则 TombBoundTooLarge
+    //      （调用方须拒绝该 deleteRange 或走边界 spill，见设计 §1.2；不是装箱问题）；
+    //   2) 多条装箱：超出则 TombPageOverflow（调用方分页串链——正常路径）。
+    for (tobs) |t| {
+        if (TOMB_HDR + boundStoredLen(t.min) + boundStoredLen(t.max) > TOMB_PAYLOAD) {
+            return error.TombBoundTooLarge;
+        }
+    }
     var vlen: usize = 0;
     for (tobs) |t| {
-        vlen += (if (t.min) |m| m.len else 0) + (if (t.max) |m| m.len else 0);
+        vlen += boundStoredLen(t.min) + boundStoredLen(t.max);
     }
-    const need = 2 + TOMB_HDR * tobs.len + vlen;
-    if (need > TOMB_PAYLOAD) return error.TombPageOverflow; // 调用方分页（链）
+    if (TOMB_HDR * tobs.len + vlen > TOMB_PAYLOAD) return error.TombPageOverflow; // 调用方分页（链）
 
     const hdr = f2.PageHeader{
         .page_no = page_no,
@@ -84,30 +168,33 @@ fn encodeTombPage(page: *[f2.PAGE_SIZE]u8, page_no: u32, tobs: []const RTombston
     const payload = page[f2.PAGE_HEADER_SIZE .. f2.PAGE_SIZE - 4];
     @memset(payload, 0);
 
-    std.mem.writeInt(u16, payload[0..2], @intCast(tobs.len), .little);
-    var hpos: usize = 2;
-    var vpos: usize = 2 + TOMB_HDR * tobs.len;
+    var hpos: usize = 0;
+    var vpos: usize = TOMB_HDR * tobs.len;
     for (tobs) |t| {
-        const min_len: u32 = if (t.min) |m| @intCast(m.len) else 0;
-        const max_len: u32 = if (t.max) |m| @intCast(m.len) else 0;
-        std.mem.writeInt(u32, payload[hpos..][0..4], min_len, .little);
+        var min_raw: u32 = if (t.min) |m| @intCast(m.bytes.len) else 0;
+        var max_raw: u32 = if (t.max) |m| @intCast(m.bytes.len) else 0;
+        if (t.min) |m| {
+            if (m.append_zero) min_raw |= 0x8000_0000; // F1：succ 紧凑标志
+        }
+        if (t.max) |m| {
+            if (m.append_zero) max_raw |= 0x8000_0000;
+        }
+        std.mem.writeInt(u32, payload[hpos..][0..4], min_raw, .little);
         hpos += 4;
-        std.mem.writeInt(u32, payload[hpos..][0..4], max_len, .little);
+        std.mem.writeInt(u32, payload[hpos..][0..4], max_raw, .little);
         hpos += 4;
         std.mem.writeInt(u32, payload[hpos..][0..4], @intCast(vpos), .little);
         hpos += 4;
         if (t.min) |m| {
-            @memcpy(payload[vpos..][0..m.len], m);
-            vpos += m.len;
+            @memcpy(payload[vpos..][0..m.bytes.len], m.bytes);
+            vpos += m.bytes.len;
         }
         std.mem.writeInt(u32, payload[hpos..][0..4], @intCast(vpos), .little);
         hpos += 4;
         if (t.max) |m| {
-            @memcpy(payload[vpos..][0..m.len], m);
-            vpos += m.len;
+            @memcpy(payload[vpos..][0..m.bytes.len], m.bytes);
+            vpos += m.bytes.len;
         }
-        std.mem.writeInt(u64, payload[hpos..][0..8], t.seq, .little);
-        hpos += 8;
     }
     f2.setPageChecksum(page, f2.computePageChecksum(page));
 }
@@ -124,28 +211,38 @@ fn decodeTombPage(page: *const [f2.PAGE_SIZE]u8) !DecodedTombPage {
     const hdr = f2.decodePageHeader(page[0..f2.PAGE_HEADER_SIZE]);
     if (hdr.page_type != PAGE_TYPE_RANGE_TOMBSTONE) return error.CorruptCrc;
     const payload = page[f2.PAGE_HEADER_SIZE .. f2.PAGE_SIZE - 4];
-    const count = std.mem.readInt(u16, payload[0..2], .little);
-    if (count != hdr.nkeys) return error.CorruptCrc; // 头与 payload 一致性
+    // T-38-P-R：payload 双处计数已移除——nkeys 以页头为准（CRC 保完整性）。
+    const count: usize = hdr.nkeys;
     const tobs = try alloc.alloc(RTombstone, count);
-    var hpos: usize = 2;
+    var hpos: usize = 0;
     for (0..count) |i| {
-        const min_len = std.mem.readInt(u32, payload[hpos..][0..4], .little);
+        const min_raw = std.mem.readInt(u32, payload[hpos..][0..4], .little);
         hpos += 4;
-        const max_len = std.mem.readInt(u32, payload[hpos..][0..4], .little);
+        const max_raw = std.mem.readInt(u32, payload[hpos..][0..4], .little);
         hpos += 4;
         const min_off = std.mem.readInt(u32, payload[hpos..][0..4], .little);
         hpos += 4;
         const max_off = std.mem.readInt(u32, payload[hpos..][0..4], .little);
         hpos += 4;
-        const seq = std.mem.readInt(u64, payload[hpos..][0..8], .little);
-        hpos += 8;
+        const min_len: usize = min_raw & 0x7FFF_FFFF;
+        const max_len: usize = max_raw & 0x7FFF_FFFF;
+        const min_app = (min_raw >> 31) & 1 == 1;
+        const max_app = (max_raw >> 31) & 1 == 1;
         if (min_off + min_len > payload.len or max_off + max_len > payload.len) {
+            // N1：spike 用 panic；迁移进 src/ 时必须改为 error.Truncated/CorruptCrc
+            // （设计 §1.2 迁移注记），不得照抄。
             @panic("tomb offset out of bounds");
         }
         tobs[i] = .{
-            .min = if (min_len == 0) null else payload[min_off..][0..min_len],
-            .max = if (max_len == 0) null else payload[max_off..][0..max_len],
-            .seq = seq,
+            .min = if (min_len == 0 and !min_app) null else .{
+                .bytes = payload[min_off..][0..min_len],
+                .append_zero = min_app,
+            },
+            .max = if (max_len == 0 and !max_app) null else .{
+                .bytes = payload[max_off..][0..max_len],
+                .append_zero = max_app,
+            },
+            .seq = hdr.gen, // 设计 §1.4：逐条 seq 从页 gen（commit sequence）继承
         };
     }
     return .{ .hdr = hdr, .tobs = tobs, .next = hdr.free_next };
@@ -159,49 +256,36 @@ fn shadowed(tobs: []const RTombstone, k: []const u8) bool {
     return false;
 }
 
-/// 设计 §4.3：put(k) 打洞——k 的字典序后继 = k ++ 0x00。
-/// 返回分裂后的墓碑集（覆盖 k 的墓碑 t → [t.min,k) 与 [succ(k),t.max)）。
+/// 设计 §4.3（T-38-P-R 修订）：put(k) 打洞——覆盖 k 的墓碑 t 分裂为
+/// [t.min, k) 与 [succ(k), t.max)。
+///
+/// F1 教训（返工记录）：旧版在 succ(k) 超长（k 近 MAX_KEY_SIZE）时**丢弃右段**，
+/// 并论证「只会漏遮蔽后来写回的键」——错误：右段 [succ(k), t.max) 覆盖的是
+/// **建碑前就被那次 deleteRange 删掉的活 entry**，丢弃 = 数据复活。反例
+/// （基线实测红）：put "r" → deleteRange ["a","z") → put 'q'×MAX_KEY_SIZE
+/// 之后 "r" 复活。正确语义：右段必须保留。
+///
+/// 修复：succ(k) 用紧凑 append_zero 边界表示（存原键长），右段恒可表示；
+/// 右段为空的唯一情形是 t.max == succ(k)（k 与 succ(k) 之间不存在任何
+/// 字节串）——此时跳过（探针 3 有专测）。
+///
+/// 所有权：右段 min 借用 k（append_zero 边界不复制字节）——punchHole 零堆
+/// 分配（FR-1 的计数释放接口随之删除）；调用方保证 k 在 out 的使用期内存活。
 fn punchHole(tobs: []const RTombstone, k: []const u8, out: *std.ArrayList(RTombstone)) !void {
     for (tobs) |t| {
         if (!covers(t, k)) {
             try out.append(alloc, t);
             continue;
         }
-        // 左段 [t.min, k)
-        if (t.min == null or btree.cmpKey(t.min.?, k) == .lt) {
-            try out.append(alloc, .{ .min = t.min, .max = k, .seq = t.seq });
+        // 左段 [t.min, k)：为空当且仅当 t.min == k（covers 已保证 t.min ≤ k）
+        if (t.min == null or boundCmpBound(t.min.?, .{ .bytes = k }) == .lt) {
+            try out.append(alloc, .{ .min = t.min, .max = .{ .bytes = k }, .seq = t.seq });
         }
-        // 右段 [succ(k), t.max)；k 追加 0x00 是 > k 的最短键。
-        // k 已是「任意可表示键」时（无法排除 k+len 扩展…实际键长受
-        // MAX_KEY_SIZE 约束，succ 可能超长——此时右段保守放弃（宽界：
-        // 右侧新写入键可能被漏遮蔽？不会：右段放弃意味着该区间无墓碑，
-        // put 的新键本来就不该被旧墓碑遮蔽——INV-RT1 语义即「墓碑不遮蔽
-        // 后续写入」。放弃右段只会漏遮蔽「后来又写回又被删」的键，
-        // 由后续 deleteRange 重新建碑覆盖）。见设计 §4.3。
-        if (k.len + 1 <= btree.MAX_KEY_SIZE) {
-            if (t.max == null or btree.cmpKey(k, t.max.?) == .lt) {
-                const succ = try alloc.alloc(u8, k.len + 1);
-                @memcpy(succ[0..k.len], k);
-                succ[k.len] = 0x00;
-                // succ 所有权移交 out（调用方用 freeAllocatedMins 释放）
-                try out.append(alloc, .{ .min = succ, .max = t.max, .seq = t.seq });
-            }
-        }
-    }
-}
-
-
-/// punchHole 移交的 succ(k) 分配由调用方释放（t.min/t.max 借用原墓碑或
-/// 字面量，不释放；只有右段的 succ 是 punchHole 新分配的）。
-/// 探针简化约定：右段 min 的形状恒为 k ++ 0x00（len = k.len+1 且尾字节
-/// 0x00），据此识别新分配。生产实现应让 punchHole 返回显式分配列表——
-/// spike 不为此做接口。
-fn freePunchedMins(items: []const RTombstone, hole_key_len: usize) void {
-    for (items) |t| {
-        if (t.min) |m| {
-            if (m.len == hole_key_len + 1 and m[m.len - 1] == 0x00) {
-                alloc.free(m);
-            }
+        // 右段 [succ(k), t.max)：succ(k) = k ++ 0x00 是 > k 的最短字节串，
+        // 故右段为空当且仅当 t.max == succ(k)。
+        const right_min = Bound{ .bytes = k, .append_zero = true };
+        if (t.max == null or boundCmpBound(right_min, t.max.?) == .lt) {
+            try out.append(alloc, .{ .min = right_min, .max = t.max, .seq = t.seq });
         }
     }
 }
@@ -244,11 +328,14 @@ fn decodeMetaV3(buf: []const u8) ?MetaV3 {
 
 test "T-38-P probe 1: tombstone page round-trip + CRC corruption detection" {
     const tobs = [_]RTombstone{
-        .{ .min = "apple", .max = "banana", .seq = 42 },
-        .{ .min = null, .max = "a", .seq = 43 }, // 负无穷 .. "a"
-        .{ .min = "z", .max = null, .seq = 44 }, // "z" .. 正无穷
+        .{ .min = plain("apple"), .max = plain("banana"), .seq = 42 },
+        .{ .min = null, .max = plain("a"), .seq = 43 }, // 负无穷 .. "a"
+        .{ .min = plain("z"), .max = null, .seq = 44 }, // "z" .. 正无穷
         .{ .min = null, .max = null, .seq = 45 }, // 全区间
-        .{ .min = "\xff\x00\x11 very long key padded to stress varlen region 0123456789", .max = "\xff\xff\xff", .seq = 46 },
+        .{ .min = plain("\xff\x00\x11 very long key padded to stress varlen region 0123456789"), .max = plain("\xff\xff\xff"), .seq = 46 },
+        // T-38-P-R：append_zero 边界（succ 紧凑表示）round-trip
+        .{ .min = succ("apple"), .max = plain("banana"), .seq = 47 },
+        .{ .min = plain("a"), .max = succ("m"), .seq = 48 },
     };
     var page: [f2.PAGE_SIZE]u8 = undefined;
     try encodeTombPage(&page, 77, &tobs, 4242, 99);
@@ -263,9 +350,16 @@ test "T-38-P probe 1: tombstone page round-trip + CRC corruption detection" {
     try std.testing.expectEqual(tobs.len, d.tobs.len);
     try std.testing.expectEqual(@as(u16, @intCast(tobs.len)), d.hdr.nkeys);
     for (tobs, d.tobs) |want, got| {
-        if (want.min) |m| try std.testing.expectEqualSlices(u8, m, got.min.?) else try std.testing.expect(got.min == null);
-        if (want.max) |m| try std.testing.expectEqualSlices(u8, m, got.max.?) else try std.testing.expect(got.max == null);
-        try std.testing.expectEqual(want.seq, got.seq);
+        if (want.min) |m| {
+            try std.testing.expectEqualSlices(u8, m.bytes, got.min.?.bytes);
+            try std.testing.expectEqual(m.append_zero, got.min.?.append_zero);
+        } else try std.testing.expect(got.min == null);
+        if (want.max) |m| {
+            try std.testing.expectEqualSlices(u8, m.bytes, got.max.?.bytes);
+            try std.testing.expectEqual(m.append_zero, got.max.?.append_zero);
+        } else try std.testing.expect(got.max == null);
+        // T-38-P-R：逐条 seq 不落盘，从页 gen 继承（设计 §1.4 选定项）
+        try std.testing.expectEqual(@as(u64, 4242), got.seq);
     }
 
     // CRC 翻转任意一字节 → CorruptCrc（设计 §5.1：必须报错不静默）
@@ -280,11 +374,11 @@ test "T-38-P probe 1: tombstone page round-trip + CRC corruption detection" {
 }
 
 // =====================================================================
-// 探针 2：遮蔽判定边界（min 含 / max 不含 / 空 / 全区间 / 倒置）
+// 探针 2：遮蔽判定边界（min 含 / max 不含 / 空 / 全区间 / 倒置 / append）
 // =====================================================================
 
 test "T-38-P probe 2: shadowing boundaries [min,max)" {
-    const t = RTombstone{ .min = "b", .max = "e", .seq = 1 };
+    const t = RTombstone{ .min = plain("b"), .max = plain("e"), .seq = 1 };
     // min 含
     try std.testing.expect(covers(t, "b"));
     // max 不含
@@ -301,35 +395,51 @@ test "T-38-P probe 2: shadowing boundaries [min,max)" {
     try std.testing.expect(covers(t, "b\xff\xff\xff\xff\xff")); // b < e，仍在区间内
 
     // 空区间（min == max）
-    try std.testing.expect(rangeEmpty("c", "c"));
+    try std.testing.expect(rangeEmpty(plain("c"), plain("c")));
     // 倒置（min > max）
-    try std.testing.expect(rangeEmpty("d", "c"));
+    try std.testing.expect(rangeEmpty(plain("d"), plain("c")));
     // 空区间墓碑不遮蔽任何 key
-    const empty_t = RTombstone{ .min = "c", .max = "c", .seq = 1 };
+    const empty_t = RTombstone{ .min = plain("c"), .max = plain("c"), .seq = 1 };
     try std.testing.expect(!covers(empty_t, "c"));
     // 全区间墓碑（null, null）遮蔽一切
     const full_t = RTombstone{ .min = null, .max = null, .seq = 1 };
     try std.testing.expect(covers(full_t, ""));
     try std.testing.expect(covers(full_t, "\xff\xff"));
     // 单侧
-    const low_t = RTombstone{ .min = null, .max = "m", .seq = 1 };
+    const low_t = RTombstone{ .min = null, .max = plain("m"), .seq = 1 };
     try std.testing.expect(covers(low_t, "aaa"));
     try std.testing.expect(!covers(low_t, "m"));
-    const high_t = RTombstone{ .min = "m", .max = null, .seq = 1 };
+    const high_t = RTombstone{ .min = plain("m"), .max = null, .seq = 1 };
     try std.testing.expect(covers(high_t, "m"));
     try std.testing.expect(covers(high_t, "\xff\xff"));
     try std.testing.expect(!covers(high_t, "l"));
 
     // shadowed：多墓碑任一覆盖即遮蔽
-    const set = [_]RTombstone{ t, RTombstone{ .min = "x", .max = "y", .seq = 2 } };
+    const set = [_]RTombstone{ t, RTombstone{ .min = plain("x"), .max = plain("y"), .seq = 2 } };
     try std.testing.expect(shadowed(&set, "c"));
     try std.testing.expect(shadowed(&set, "x"));
     try std.testing.expect(!shadowed(&set, "w"));
     try std.testing.expect(!shadowed(&set, "e")); // 边界 max 不含
+
+    // T-38-P-R：append_zero 边界（succ 紧凑表示）的比较语义。
+    // succ("b") effective = "b\x00"：是 > "b" 的最短字节串。
+    const at = RTombstone{ .min = succ("b"), .max = plain("c"), .seq = 1 };
+    try std.testing.expect(!covers(at, "b")); // "b" < "b\x00"（succ 下界不含被打洞的 k）
+    try std.testing.expect(covers(at, "b\x00")); // "b\x00" == succ("b")（min 含）
+    try std.testing.expect(covers(at, "b\x00\x00")); // 更长延伸
+    try std.testing.expect(covers(at, "b\x01"));
+    try std.testing.expect(!covers(at, "a"));
+    try std.testing.expect(!covers(at, "c")); // max 不含
+    // append 上界侧：max = succ("m") effective "m\x00" → "m" 仍被遮蔽、"m\x00" 及以上不被
+    const ut = RTombstone{ .min = plain("a"), .max = succ("m"), .seq = 1 };
+    try std.testing.expect(covers(ut, "m"));
+    try std.testing.expect(!covers(ut, "m\x00"));
+    try std.testing.expect(!covers(ut, "m\x01"));
+    try std.testing.expect(!covers(ut, "m\xff"));
 }
 
 // =====================================================================
-// 探针 3：与逐 key tombstone 共存 + put 打洞（字典序后继）
+// 探针 3：与逐 key tombstone 共存 + put 打洞（含 F1 复活反例）
 // =====================================================================
 
 test "T-38-P probe 3: coexistence with per-key tombstones + put punch-hole" {
@@ -341,7 +451,7 @@ test "T-38-P probe 3: coexistence with per-key tombstones + put punch-hole" {
     defer tobs.deinit(alloc);
 
     // 初始：deleteRange ["b","f")
-    try tobs.append(alloc, .{ .min = "b", .max = "f", .seq = 10 });
+    try tobs.append(alloc, .{ .min = plain("b"), .max = plain("f"), .seq = 10 });
 
     // put "c"（被墓碑覆盖）→ 打洞：[b,c) + [c\0,f)
     var punched: std.ArrayList(RTombstone) = .empty;
@@ -358,7 +468,6 @@ test "T-38-P probe 3: coexistence with per-key tombstones + put punch-hole" {
     try std.testing.expect(!shadowed(punched.items, "a"));
     try std.testing.expect(!shadowed(punched.items, "f"));
     try std.testing.expect(shadowed(punched.items, "b\xff\xff\xff\xff")); // b < f，仍在区间内
-    freePunchedMins(punched.items, 1); // 释放 succ(k) 分配（k="c" len 1）
 
     // put "b"（区间左端点，min 含 → 覆盖）→ 左段为空，只剩右段 [b\0, f)
     var punched2: std.ArrayList(RTombstone) = .empty;
@@ -368,25 +477,46 @@ test "T-38-P probe 3: coexistence with per-key tombstones + put punch-hole" {
     try std.testing.expect(!shadowed(punched2.items, "b"));
     try std.testing.expect(shadowed(punched2.items, "b\x00"));
     try std.testing.expect(shadowed(punched2.items, "e"));
-    freePunchedMins(punched2.items, 1); // k="b" len 1
 
-    // put "e\xff…键后继超 MAX_KEY_SIZE" 的边界：succ(k) 超 MAX_KEY_SIZE 时右段放弃
+    // ===== T-38-P-R (F1) 复活反例：近-MAX key 打洞后右段必须保留 =====
+    // 基线行为（错误）：succ('q'×MAX_KEY_SIZE) 超长 → 右段被丢弃 → 建碑前
+    // 被 deleteRange 删除且从未写回的 "r" 复活（基线实测红，见 T-38-P-R）。
+    // 修复：succ 用紧凑 append_zero 边界，右段恒可建。
     const big = [_]u8{'q'} ** btree.MAX_KEY_SIZE;
-    var punched3: std.ArrayList(RTombstone) = .empty;
-    defer punched3.deinit(alloc);
-    // 先扩碑到 [a, z) 覆盖 big
     var wide: std.ArrayList(RTombstone) = .empty;
     defer wide.deinit(alloc);
-    try wide.append(alloc, .{ .min = "a", .max = "z", .seq = 1 });
+    try wide.append(alloc, .{ .min = plain("a"), .max = plain("z"), .seq = 2 });
+    // 打洞前："r"（建碑前的活 entry，已被范围删除）被遮蔽
+    try std.testing.expect(shadowed(wide.items, "r"));
+    var punched3: std.ArrayList(RTombstone) = .empty;
+    defer punched3.deinit(alloc);
     try punchHole(wide.items, &big, &punched3);
-    try std.testing.expectEqual(@as(usize, 1), punched3.items.len); // 只有左段 [a, q...)
+    // 左段 [a, big) + 右段 [succ(big), z) —— 两段都必须在
+    try std.testing.expectEqual(@as(usize, 2), punched3.items.len);
+    // big 不再被遮蔽（put 回来的 key 活）
     try std.testing.expect(!shadowed(punched3.items, &big));
+    // F1 核心断言："r" ∈ (big, "z") 的建碑前活 entry 必须仍被遮蔽（不复活）
+    try std.testing.expect(shadowed(punched3.items, "r"));
+    // 区间左半仍遮蔽（含左端点 "a"——min 含语义）
     try std.testing.expect(shadowed(punched3.items, "b"));
-    // k=big 长度 = MAX_KEY_SIZE，右段放弃 → 无 succ 分配
+    try std.testing.expect(shadowed(punched3.items, "a"));
+    // 区间外不遮蔽（"z" 是 max 端点，不含）
+    try std.testing.expect(!shadowed(punched3.items, "z"));
+
+    // 右段真空 edge：墓碑 [b, "b\0")（deleteRange("b","b\0") 的产物，恰好只删 "b"）
+    // 再 put "b" → 左段空（min==k）、右段空（max == succ(k)）→ 墓碑被完全消费。
+    var tiny: std.ArrayList(RTombstone) = .empty;
+    defer tiny.deinit(alloc);
+    try tiny.append(alloc, .{ .min = plain("b"), .max = plain("b\x00"), .seq = 3 });
+    var punched4: std.ArrayList(RTombstone) = .empty;
+    defer punched4.deinit(alloc);
+    try punchHole(tiny.items, "b", &punched4);
+    try std.testing.expectEqual(@as(usize, 0), punched4.items.len);
+    try std.testing.expect(!shadowed(punched4.items, "b"));
 
     // 共存：逐 key tombstone（叶内 entry 形态）+ 区间墓碑 —— 两者都是删除，
     // get 判定 = null（无优先级冲突：tombstone entry 本身就是「无值」）
-    const coexist = [_]RTombstone{.{ .min = "b", .max = "f", .seq = 10 }};
+    const coexist = [_]RTombstone{.{ .min = plain("b"), .max = plain("f"), .seq = 10 }};
     // 逐 key tombstone "d"（叶内）与区间墓碑都覆盖 "d"：
     // 读路径结果一致（都是 deleted），shadowed 只对「活 entry」起作用。
     try std.testing.expect(shadowed(&coexist, "d"));
@@ -396,7 +526,6 @@ test "T-38-P probe 3: coexistence with per-key tombstones + put punch-hole" {
     try punchHole(&coexist, "d", &coexist2);
     try std.testing.expect(!shadowed(coexist2.items, "d"));
     try std.testing.expect(shadowed(coexist2.items, "c"));
-    freePunchedMins(coexist2.items, 1); // k="d" len 1
 }
 
 // =====================================================================
@@ -479,27 +608,28 @@ test "T-38-P probe 4: v2/v3 meta upgrade-downgrade demo" {
 // =====================================================================
 
 test "T-38-P probe 5: multi-page chain + capacity bound" {
-    // 每条最小 24B 头 + 2×1B 键 → ≥ 155 条/页（设计 §1.4 声明核对）
+    // 每条最小 16B 头 + 2×1B 键 → ≥ 226 条/页（设计 §1.4 声明核对；
+    // T-38-P-R：条头 24B→16B，容量 155 → 226，与设计 §1.2 的 16B 口径一致）
     const per_page_min = TOMB_PAYLOAD / (TOMB_HDR + 2);
-    try std.testing.expect(per_page_min >= 155);
+    try std.testing.expect(per_page_min >= 226);
 
-    // 构造 300 条墓碑（超过单页容量），分两页链式编码再解码
+    // 构造 300 条墓碑（超过单页容量），分页链式编码再解码
     const many = try alloc.alloc(RTombstone, 300);
     defer alloc.free(many);
     for (0..many.len) |i| {
         var kb: [8]u8 = undefined;
         _ = std.fmt.bufPrint(&kb, "{d:0>8}", .{i * 3}) catch unreachable;
-        many[i] = .{ .min = try alloc.dupe(u8, &kb), .max = try alloc.dupe(u8, kb[0..7] ++ "z"), .seq = @intCast(i) };
+        many[i] = .{ .min = plain(try alloc.dupe(u8, &kb)), .max = plain(try alloc.dupe(u8, kb[0..7] ++ "z")), .seq = @intCast(i) };
     }
     defer for (many) |t| {
-        alloc.free(t.min.?);
-        alloc.free(t.max.?);
+        alloc.free(t.min.?.bytes);
+        alloc.free(t.max.?.bytes);
     };
 
     // 分页：按本组键长（8B min + 8B max）计算每页容量并切分
     //（探针只验证链式 round-trip，装箱策略属主体实现）
-    const per_tomb = TOMB_HDR + 8 + 8; // 40B/条
-    const per_page = (TOMB_PAYLOAD - 2) / per_tomb; // ~101 条/页
+    const per_tomb = TOMB_HDR + 8 + 8; // 32B/条
+    const per_page = TOMB_PAYLOAD / per_tomb; // ~127 条/页
     try std.testing.expect(per_page >= 100);
     const n1 = per_page; // 页 1 装满
     const n2 = per_page; // 页 2 装满
@@ -524,9 +654,67 @@ test "T-38-P probe 5: multi-page chain + capacity bound" {
     try std.testing.expectEqual(n2, d2.tobs.len);
     try std.testing.expectEqual(n3, d3.tobs.len);
     // 抽查内容（首/尾/跨界处）
-    try std.testing.expectEqualSlices(u8, many[0].min.?, d1.tobs[0].min.?);
-    try std.testing.expectEqualSlices(u8, many[n1 - 1].min.?, d1.tobs[n1 - 1].min.?);
-    try std.testing.expectEqualSlices(u8, many[n1].min.?, d2.tobs[0].min.?);
-    try std.testing.expectEqualSlices(u8, many[many.len - 1].max.?, d3.tobs[n3 - 1].max.?);
-    try std.testing.expectEqual(many[n1 + 50].seq, d2.tobs[50].seq);
+    try std.testing.expectEqualSlices(u8, many[0].min.?.bytes, d1.tobs[0].min.?.bytes);
+    try std.testing.expectEqualSlices(u8, many[n1 - 1].min.?.bytes, d1.tobs[n1 - 1].min.?.bytes);
+    try std.testing.expectEqualSlices(u8, many[n1].min.?.bytes, d2.tobs[0].min.?.bytes);
+    try std.testing.expectEqualSlices(u8, many[many.len - 1].max.?.bytes, d3.tobs[n3 - 1].max.?.bytes);
+    // T-38-P-R：逐条 seq 从页 gen（commit_seq=500）继承，不再逐条落盘
+    try std.testing.expectEqual(@as(u64, 500), d2.tobs[50].seq);
+}
+
+// =====================================================================
+// 探针 6（T-38-P-R）：F2 边界可表示性 —— envelope 实测
+// 基线 RED：4050B 边界 → TombPageOverflow（见 T-38-P-R 返工记录）。
+// =====================================================================
+
+test "T-38-P probe 6: F2 boundary representability envelope" {
+    // (a) 单侧 4051B（= MAX_KEY_SIZE）用户边界：16 + 4051 + 0 = 4067 ≤ 4068 → 可表示
+    const kmax = [_]u8{'m'} ** btree.MAX_KEY_SIZE;
+    const single = [_]RTombstone{
+        .{ .min = plain(&kmax), .max = null, .seq = 1 },
+    };
+    var page: [f2.PAGE_SIZE]u8 = undefined;
+    try encodeTombPage(&page, 5, &single, 9, 0);
+    const da = try decodeTombPage(&page);
+    defer alloc.free(da.tobs);
+    try std.testing.expectEqualSlices(u8, &kmax, da.tobs[0].min.?.bytes);
+    try std.testing.expect(da.tobs[0].max == null);
+    try std.testing.expectEqual(@as(u64, 9), da.tobs[0].seq); // 页 gen 继承
+
+    // (b) 打洞右段形状 [succ('q'×4051), "z")：紧凑 append 编码，
+    //     存储量 = 4051 + 1 = 4052 → 16 + 4052 = 4068 恰好装满 → 可表示
+    const big = [_]u8{'q'} ** btree.MAX_KEY_SIZE;
+    const right = [_]RTombstone{
+        .{ .min = succ(&big), .max = plain("z"), .seq = 1 },
+    };
+    try encodeTombPage(&page, 6, &right, 9, 0);
+    const db = try decodeTombPage(&page);
+    defer alloc.free(db.tobs);
+    try std.testing.expectEqualSlices(u8, &big, db.tobs[0].min.?.bytes);
+    try std.testing.expect(db.tobs[0].min.?.append_zero);
+    // 语义核对：右段不遮蔽被打洞的 big，遮蔽 (big, "z") 内的 key
+    try std.testing.expect(!covers(db.tobs[0], &big));
+    try std.testing.expect(covers(db.tobs[0], "r"));
+    try std.testing.expect(!covers(db.tobs[0], "z"));
+
+    // (c) 双长边界 ['a'×3000, 'z'×3000]：16 + 6000 > 4068 → TombBoundTooLarge
+    //     （typed 明确拒绝；生产方向 = 边界 spill 到 overflow 页，见设计 §1.2）
+    const lo = [_]u8{'a'} ** 3000;
+    const hi = [_]u8{'z'} ** 3000;
+    const both_long = [_]RTombstone{
+        .{ .min = plain(&lo), .max = plain(&hi), .seq = 1 },
+    };
+    try std.testing.expectError(error.TombBoundTooLarge, encodeTombPage(&page, 7, &both_long, 9, 0));
+
+    // (d) 边界恰好装满：16 + 2026 + 2026 = 4068 ≤ 4068 → 可表示
+    const lo2 = [_]u8{'a'} ** 2026;
+    const hi2 = [_]u8{'z'} ** 2026;
+    const exact = [_]RTombstone{
+        .{ .min = plain(&lo2), .max = plain(&hi2), .seq = 1 },
+    };
+    try encodeTombPage(&page, 8, &exact, 9, 0);
+    const dd = try decodeTombPage(&page);
+    defer alloc.free(dd.tobs);
+    try std.testing.expectEqualSlices(u8, &lo2, dd.tobs[0].min.?.bytes);
+    try std.testing.expectEqualSlices(u8, &hi2, dd.tobs[0].max.?.bytes);
 }
