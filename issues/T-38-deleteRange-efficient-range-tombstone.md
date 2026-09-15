@@ -66,6 +66,7 @@ select 迭代器 + tombstone 批量提交实现"），但**没有披露 O(range)
 - [x] 现状核验（4 worker 独立确认 U-1 在当前 HEAD 成立）
 - [x] 路线决策：**C 先探路**（用户选定），探路结论 = 方案 A 有条件可行 + 推荐 A+B 分期
 - [ ] 确定性 RED 测试（大范围删除内存/性能断言）
+- [x] 探路（路线 C）+ 独立评审 + 返工闭环（T-38-P / T-38-P-R）
 - [ ] 根因定位与修复（GREEN：range tombstone + 墓碑 GC）
 - [ ] 回归测试 + 评审
 - [ ] 验收门稳定后关闭
@@ -76,7 +77,7 @@ select 迭代器 + tombstone 批量提交实现"），但**没有披露 O(range)
 
 ### 路线 C — 探路（已完成）
 
-- **T-38-P**（cube_db-pi-1，commit `5764fbb`）：设计文档
+- **T-38-P**（cube_db-pi-1，commit `5764fbb`，返工后 rebase 为 `07b4467`）：设计文档
   `docs/design/T-38-range-tombstone-probe.md` + 自包含探针
   `spike/rangetomb_probe.zig`（5 tests）+ 报告
   `docs/design/T-38-probe-report.md`。零 `src/` 改动，5/5 绿，全量 436/437+1skip。
@@ -85,16 +86,22 @@ select 迭代器 + tombstone 批量提交实现"），但**没有披露 O(range)
 - **独立评审**（cube_db-pi-2）：**REQUEST_CHANGES**，发现两处 blocking 设计缺口
   （打洞右段数据复活、近-MAX 边界不可表示），**不否定方案 A 可行性**。
   → 已立 **T-48**（`issues/T-48-range-tombstone-punch-hole-and-boundary-gaps.md`），
-  返工任务 **T-38-P-R** 已派给 pi-2。
+  返工任务 **T-38-P-R** 已派给 pi-2 → 交付 `c4af657`（rebase 后 `21d6c8b`），
+  复审 **APPROVE**，已合入 main；T-48 关闭。
 
 ### 分期拆解（探路报告 §4，评审 N3 调整后）
 
 | 阶段 | 内容 | 任务 | 依赖 |
 |---|---|---|---|
 | 0 | **方案 B**：流式分块 deleteRange（消 OOM，零格式风险） | **T-38-B** | 无（已派 pi-3） |
-| 1 | 格式层：墓碑页 codec + meta v3（含 F2 边界编码） | 未派 | T-38-P-R 闭环 |
+| 1 | 格式层：墓碑页 codec + meta v3（含 F2 边界编码 + **N-R1 typed 拒绝**） | 未派 | T-38-P-R 闭环 ✓ |
 | 2 | 读路径：遮蔽判定（tomb_head=0 时休眠） | 未派 | 阶段 1 |
 | 3 | 写路径：新 deleteRange 流 + 打洞语义（含 F1 修正）+ entryCount 流式修正 | 未派 | 阶段 2 |
+
+**阶段 1 落地前必须补的两项（T-38-P-R 评审 N-R1，详见 T-48）**：
+① 设计文档增补写路径不变量「空区间/空 plain 边界墓碑不得进入编码器」；
+② 编码器对 empty-plain `max` 做 typed 拒绝，把静默折叠（→ 全区间墓碑，数据丢失方向）
+变成显式错误。
 
 ### 验收 (a) 的判据已落地
 
