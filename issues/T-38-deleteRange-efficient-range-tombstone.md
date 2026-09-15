@@ -93,7 +93,7 @@ select 迭代器 + tombstone 批量提交实现"），但**没有披露 O(range)
 
 | 阶段 | 内容 | 任务 | 依赖 |
 |---|---|---|---|
-| 0 | **方案 B**：流式分块 deleteRange（消 OOM，零格式风险） | **T-38-B** | 无（已派 pi-3） |
+| 0 | **方案 B**：流式分块 deleteRange（消 OOM，零格式风险） | **T-38-B** ✅ 已合入 | 无 |
 | 1 | 格式层：墓碑页 codec + meta v3（含 F2 边界编码 + **N-R1 typed 拒绝**） | 未派 | T-38-P-R 闭环 ✓ |
 | 2 | 读路径：遮蔽判定（tomb_head=0 时休眠） | 未派 | 阶段 1 |
 | 3 | 写路径：新 deleteRange 流 + 打洞语义（含 F1 修正）+ entryCount 流式修正 | 未派 | 阶段 2 |
@@ -111,3 +111,33 @@ select 迭代器 + tombstone 批量提交实现"），但**没有披露 O(range)
 
 判据口径钉在「deleteRange 自身申请了什么」，而非全库聚合内存/RSS——后者会在
 方案 B 落地后误红（内存确实降了，聚合口径却看不到）。
+
+### 阶段 0（T-38-B）验收记录 — 2026-09-15
+
+- **实现**：cube_db-pi-3，commit `fb2d18d`（rebase 后 `8f9c8fb`），
+  `src/db.zig` 单文件 +28/−13。`deleteRange` 改为 **CHUNK=256 条流式分块**：
+  栈上定长 `keys`/`entries` 数组，边迭代边 `putBatch` 并释放本块 dupes。
+- **判据两态（conductor 独立复跑）**：
+  - 基线 `169aa78`：比值 **3.81**（N=2000→879234B, 4N=8000→3353196B）→ **RED** ✓
+  - `8f9c8fb`：比值 **1.05**（N=2000→115640B, 4N=8000→121720B）→ **GREEN** ✓
+  - 幂等重删峰值 0B。
+- **独立评审**（cube_db-pi-2，评审者 ≠ 实现者）：**APPROVE**
+  （`.agents/tasks/T-38-B/review.md`）。评审自写 6 组探针独立设计：
+  - **跨块边界**（RED 测试盲区）7 个形状：N = 255/256/257/511/512/513/1152，
+    `entryCount` 减少量**恰等于** N，无双重 tombstone / count_delta 重复递减；
+  - 语义矩阵：倒置/空区间 no-op **且不 flush**、staged in-range put 被删、
+    半开边界、幂等、区间外哨兵、近-MAX key（1 entry/leaf 跨块）、8 波交错；
+  - 内存判据**未被规避**：栈上定长块 + 窗口内 dupe→putBatch→free 循环，
+    无全局缓冲、无延迟释放；
+  - **所有权声称核实**：`putBatch → applyBatch → btree.insertBatch` 确实把 key
+    memcpy 进叶页 payload，故分块内 free 安全（非 UAF）。依据既有约定
+    「slices only need to be valid for the duration of the putBatch call」。
+  - 迭代器 pin 快照论证经读码 + 实测核实（`select` register-then-capture，
+    `defer it.deinit()` 覆盖整个分块循环）。
+  - 越界：`git diff 169aa78 fb2d18d -- tests/` **空**（RED 测试未被改）。
+- **整合**：conductor rebase 到 main（`src/` 经 diff 校验与评审对象**字节一致**）
+  → ff-merge `8f9c8fb`；`test-db` 38/38，全量 **437/437**。
+- **评审附带发现**：**N-1**（`put` 组合条目溢出 panic，pre-existing，T-43 家族
+  残留）→ 已立 `issues/N-1-put-composite-entry-overflow-panic.md`，
+  conductor 已独立复现确认；**N-2**（CHUNK=256 近-MAX key 时 ≈1MB 瞬时内存）
+  为观察项，不阻塞。
