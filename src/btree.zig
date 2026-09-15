@@ -102,6 +102,13 @@ pub fn readNodePayloadFast(store: PageStore, page_no: u32) ![]const u8 {
 
 /// Write a node page (page header + payload + CRC)
 pub fn writeNodePage(store: PageStore, page_no: u32, page_type: u8, nkeys: u16, payload: []const u8) !void {
+    // N-1 defense-in-depth: payload must fit the page body. Unreachable via
+    // public paths once the composite-aware inlineValueBudget holds (all
+    // chunkers guarantee per-page fits); this guards direct btree callers
+    // and future regressions from the old UB (usize underflow in `remaining`
+    // / OOB @memcpy — silent corruption in Release). Graceful error, never
+    // assert (T-33 style).
+    if (payload.len > NODE_PAYLOAD_CAP) return error.PayloadTooLarge;
     const page = try store.writePage(page_no);
     const arr: *[f2.PAGE_SIZE]u8 = @ptrCast(page.ptr);
     const hdr = f2.PageHeader{
@@ -120,8 +127,29 @@ pub fn writeNodePage(store: PageStore, page_no: u32, page_type: u8, nkeys: u16, 
 
 // ===== Leaf node encoding =====
 
-/// Max inline value size (leaves headroom for the page header and multiple entries)
+/// Max inline value size (leaves headroom for the page header and multiple
+/// entries). NOT the only threshold (N-1): it is one of the two bounds in
+/// `inlineValueBudget` — the composite cap (key+value must fit one page) can
+/// push far smaller values onto the overflow chain.
 pub const MAX_INLINE_VALUE: usize = 3800;
+
+/// Inline value budget for a single entry with a `key_len`-byte key (N-1,
+/// composite-aware overflow). A value stays inline iff its length is ≤ this
+/// budget; otherwise it escapes to an overflow chain (4B page_no in-leaf),
+/// no matter how small it is. Both bounds:
+///   - MAX_INLINE_VALUE (leaves headroom for other entries), and
+///   - the composite cap: leaf header 3 + per-entry fixed 10 (tombstone 1 +
+///     klen 4 + vlen 4 + flags 1) + key + value ≤ NODE_PAYLOAD_CAP.
+/// For key_len ≤ MAX_KEY_SIZE (= NODE_PAYLOAD_CAP-3-14) the composite term
+/// is ≥ 4, so it never underflows; direct callers with an oversized key are
+/// saturated to 0 defensively (the only caller contract is key ≤
+/// MAX_KEY_SIZE, enforced at Db/WriteTxn entries and re-checked in
+/// insert/insertBatch, but this function must not underflow for any input).
+pub fn inlineValueBudget(key_len: usize) usize {
+    const combined = NODE_PAYLOAD_CAP - 3 - 10;
+    if (key_len >= combined) return 0; // saturate: everything overflows
+    return @min(MAX_INLINE_VALUE, combined - key_len);
+}
 
 /// Max key size (T-33 / U-6). Derivation — a leaf must hold at least ONE
 /// entry with the smallest possible encoding of its value:
@@ -132,6 +160,11 @@ pub const MAX_INLINE_VALUE: usize = 3800;
 ///                         to an overflow chain (4 bytes in-leaf); a key has
 ///                         no such escape, so key is the hard bound:
 ///   MAX_KEY_SIZE = usable - 3 - (1 + 4 + 4 + 1 + 4)
+/// NOTE (N-1): the "value can always escape" assumption holds only because
+/// `inlineValueBudget` is composite-aware — the escape triggers when the
+/// key+value combination busts the page budget, not merely when
+/// value.len > MAX_INLINE_VALUE. Do not revert that judgment to a pure
+/// value-length test, or this derivation's premise breaks again.
 /// Enforced at the Db/WriteTxn entry points (graceful error.KeyTooLarge,
 /// see db.zig) and re-checked at insert/insertBatch entry as defense in
 /// depth for direct btree callers (error, never assert).
@@ -229,7 +262,7 @@ fn freeOverflowPages(store: PageStore, first_page: u32, dirty: *std.ArrayList(u3
 
 /// Determine whether an entry needs an overflow page
 fn needsOverflow(entry: LeafEntry) bool {
-    return entry.value.len > MAX_INLINE_VALUE;
+    return entry.value.len > inlineValueBudget(entry.key.len); // N-1: composite-aware
 }
 
 pub fn leafPayloadSize(entries: []const LeafEntry) usize {
@@ -237,7 +270,7 @@ pub fn leafPayloadSize(entries: []const LeafEntry) usize {
     for (entries) |e| {
         // tombstone(1) + klen(4) + key + vlen(4) + flags(1) + value
         // For overflow, value takes 4 bytes (page_no) instead of inline
-        const value_sz = if (e.value.len > MAX_INLINE_VALUE) @as(usize, 4) else e.value.len;
+        const value_sz = if (e.value.len > inlineValueBudget(e.key.len)) @as(usize, 4) else e.value.len; // N-1
         n += 1 + 4 + e.key.len + 4 + 1 + value_sz;
     }
     return n;
@@ -253,7 +286,7 @@ pub fn encodeLeafPayload(buf: []u8, entries: []const LeafEntry, store: PageStore
     std.mem.writeInt(u16, buf[pos..][0..2], @intCast(entries.len), .little);
     pos += 2;
     for (entries) |e| {
-        const is_ov = e.value.len > MAX_INLINE_VALUE;
+        const is_ov = e.value.len > inlineValueBudget(e.key.len); // N-1
         buf[pos] = if (e.tombstone) @as(u8, 1) else 0;
         pos += 1;
         std.mem.writeInt(u32, buf[pos..][0..4], @intCast(e.key.len), .little);
@@ -341,13 +374,16 @@ pub const NODE_PAYLOAD_CAP: usize = f2.PAGE_SIZE - f2.PAGE_HEADER_SIZE - 4;
 /// leafPayloadSize: header 3 + per-entry 10 + klen + value_sz (overflow
 /// values count as a 4B page pointer). A single entry always fits
 /// (MAX_KEY_SIZE is derived from this bound), so the result is >= 1
-/// whenever there is at least one entry left.
+/// whenever there is at least one entry left. Premise (N-1): this relies on
+/// the composite-aware `inlineValueBudget` — when key+value busts the page
+/// budget the value escapes to an overflow chain (4B in-leaf), so the
+/// single-entry minimum 3+10+klen+4 ≤ NODE_PAYLOAD_CAP holds unconditionally.
 pub fn leafChunkLen(entries: []const LeafEntry, max: usize) usize {
     var n: usize = 3;
     var len: usize = 0;
     while (len < @min(max, entries.len)) {
         const e = entries[len];
-        const value_sz = if (e.value.len > MAX_INLINE_VALUE) @as(usize, 4) else e.value.len;
+        const value_sz = if (e.value.len > inlineValueBudget(e.key.len)) @as(usize, 4) else e.value.len; // N-1
         const need = 10 + e.key.len + value_sz;
         if (len > 0 and n + need > NODE_PAYLOAD_CAP) break;
         n += need;
@@ -1058,7 +1094,7 @@ fn insertIntoLeaf(
     // a 4B page pointer.
     {
         const payload_cap = f2.PAGE_SIZE - f2.PAGE_HEADER_SIZE - 4;
-        const val_sz: usize = if (tombstone) 0 else (if (value.len > MAX_INLINE_VALUE) 4 else value.len);
+        const val_sz: usize = if (tombstone) 0 else (if (value.len > inlineValueBudget(key.len)) 4 else value.len); // N-1
         const new_entry_sz = 10 + key.len + val_sz;
         const tail_sz = entries_end - (if (found) entry_end else entry_start);
         if (entry_start + new_entry_sz + tail_sz > payload_cap) {
@@ -1103,7 +1139,7 @@ fn insertIntoLeaf(
     const val_len: u32 = if (tombstone) 0 else @intCast(value.len);
     std.mem.writeInt(u32, new_payload[wpos..][0..4], val_len, .little);
     wpos += 4;
-    if (!tombstone and value.len > MAX_INLINE_VALUE) {
+    if (!tombstone and value.len > inlineValueBudget(key.len)) { // N-1: composite-aware
         // Overflow
         new_payload[wpos] = LEAF_FLAG_OVERFLOW;
         wpos += 1;

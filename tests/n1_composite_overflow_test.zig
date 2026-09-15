@@ -311,6 +311,19 @@ test "N-1 #1/#2/#3 control: empty and MAX-key entries still store" {
     try std.testing.expectEqualStrings("x", v2.?);
 }
 
+test "N-1 defense: writeNodePage rejects payload > NODE_PAYLOAD_CAP (typed error)" {
+    var ms = ps.MemPageStore.init(std.testing.allocator, 10);
+    defer ms.deinit();
+    // writeNodePage 是 pub 的 btree 编码原语：直接按契约调用（非伪造内部状态）。
+    // 修后公开写入路径不再产生超限 payload，此处只能直调验证防御分支本身。
+    var over: [btree.NODE_PAYLOAD_CAP + 1]u8 = undefined;
+    @memset(&over, 0);
+    try std.testing.expectError(error.PayloadTooLarge, btree.writeNodePage(ms.store(), 3, 2, 0, &over));
+    // 恰好在上限：正常写入，不报错
+    var at_cap: [btree.NODE_PAYLOAD_CAP]u8 = undefined;
+    @memset(&at_cap, 0);
+    try btree.writeNodePage(ms.store(), 3, 2, 0, &at_cap);
+}
 test "N-1 #15 control: delete with near-MAX key is a safe no-op tombstone" {
     var ms = ps.MemPageStore.init(std.testing.allocator, 1000);
     defer ms.deinit();
