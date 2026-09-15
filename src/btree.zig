@@ -778,10 +778,10 @@ fn findInBranchPayload(payload: []const u8, key: []const u8) !u32 {
 
 // ===== insert（COW） =====
 
+// T-46: the old split_key/split_right fields are gone — child splits are
+// unified under `splice` since T-43 (split_key had no live producer left).
 const InsertSub = struct {
     new_child: u32,
-    split_key: ?[]u8 = null,
-    split_right: u32 = 0,
     live_delta: i64 = 0,
     count_delta: i64 = 0,
     splice: ?Splice = null,
@@ -1303,7 +1303,7 @@ fn insertIntoBranch(
     // Mark old page as dirty
     dirty.append(allocator, page_no) catch {};
 
-    if (sub.split_key == null and sub.splice == null) {
+    if (sub.splice == null) {
         // Fast path: child didn't split — copy page + patch child pointer
         const new_page = try cowBranchNoSplit(store, page_no, loc.idx, loc.children_offset, sub.new_child);
         return .{
@@ -1319,7 +1319,7 @@ fn insertIntoBranch(
     const fresh_payload = try readNodePayload(store, page_no);
     // T-43: Branch.fromPayload is the only allocation between the child's
     // return and the integration blocks below — on its failure the child's
-    // owned splice/split_key are still ours to free (after the integration
+    // owned splice is still ours to free (after the integration
     // the pointer ownership lives in branch.keys -> branch.deinit). Pure
     // errdefer shape, expressed as an explicit catch because the ownership
     // handoff happens inside the blocks below.
@@ -1329,7 +1329,6 @@ fn insertIntoBranch(
             allocator.free(sp.keys);
             allocator.free(sp.children);
         }
-        if (sub.split_key) |sk| allocator.free(sk);
         return e;
     };
     defer branch.deinit();
@@ -1371,30 +1370,6 @@ fn insertIntoBranch(
         branch.keys = new_keys;
         branch.children = new_children;
     }
-    // Insert new key + right child at position ci.
-    // T-42: `sk` is an owned dupe from the child split — on a failed alloc
-    // below it must be freed, not leaked (on success its pointer migrates
-    // into branch.keys). Pure errdefer; release points are mutually
-    // exclusive.
-    if (sub.split_key) |sk| {
-        errdefer allocator.free(sk);
-        const new_keys = try allocator.alloc([]u8, branch.keys.len + 1);
-        errdefer allocator.free(new_keys);
-        const new_children = try allocator.alloc(u32, branch.children.len + 1);
-        errdefer allocator.free(new_children);
-        @memcpy(new_keys[0..ci], branch.keys[0..ci]);
-        new_keys[ci] = sk;
-        @memcpy(new_keys[ci + 1 ..], branch.keys[ci..]);
-        @memcpy(new_children[0 .. ci + 1], branch.children[0 .. ci + 1]);
-        new_children[ci + 1] = sub.split_right;
-        @memcpy(new_children[ci + 2 ..], branch.children[ci + 1 ..]);
-        // Old keys/children arrays: key pointers transferred to new_keys, only free arrays
-        allocator.free(branch.keys);
-        allocator.free(branch.children);
-        branch.keys = new_keys;
-        branch.children = new_children;
-    }
-
     // Split check (T-43: byte budget as well as count — big separators
     // overflow the payload area even under 64 children; the old count-only
     // check re-encoded an oversized branch straight into an out-of-bounds
@@ -1542,26 +1517,6 @@ pub fn insert(
             .count_delta = sub.count_delta,
         };
     }
-    if (sub.split_key) |sk| {
-        // Root split: build a new root branch
-        // T-42 residual (defensive): on a failed allocPage/writeNodePage
-        // below, the owned `sk` dupe must be freed, not leaked. Pure
-        // errdefer; on success the free at the end of this block runs.
-        errdefer allocator.free(sk);
-        var keys: [1][]const u8 = .{sk};
-        var children: [2]u32 = .{ sub.new_child, sub.split_right };
-        const new_page = try store.allocPage();
-        const pl = branchPayloadSize(&keys, &children);
-        var buf: [f2.PAGE_SIZE]u8 = undefined;
-        _ = encodeBranchPayload(buf[0..pl], &keys, &children);
-        try writeNodePage(store, new_page, f2.PAGE_TYPE_BRANCH, 2, buf[0..pl]);
-        allocator.free(sk);
-        return .{
-            .new_root = new_page,
-            .live_delta = sub.live_delta,
-            .count_delta = sub.count_delta,
-        };
-    }
     return .{
         .new_root = sub.new_child,
         .live_delta = sub.live_delta,
@@ -1624,25 +1579,6 @@ pub fn insertBatch(
         allocator.free(sp.children);
         return .{
             .new_root = new_root,
-            .live_delta = sub.live_delta,
-            .count_delta = sub.count_delta,
-        };
-    }
-    if (sub.split_key) |sk| {
-        // Root split: create new root branch.
-        // T-42 residual: on a failed allocPage/writeNodePage below, the
-        // owned `sk` dupe must be freed, not leaked (pure errdefer; release
-        // points are mutually exclusive — nothing else frees sk).
-        errdefer allocator.free(sk);
-        var keys: [1][]const u8 = .{sk};
-        var children: [2]u32 = .{ sub.new_child, sub.split_right };
-        const new_page = try store.allocPage();
-        const pl = branchPayloadSize(&keys, &children);
-        var buf: [f2.PAGE_SIZE]u8 = undefined;
-        _ = encodeBranchPayload(buf[0..pl], &keys, &children);
-        try writeNodePage(store, new_page, f2.PAGE_TYPE_BRANCH, 2, buf[0..pl]);
-        return .{
-            .new_root = new_page,
             .live_delta = sub.live_delta,
             .count_delta = sub.count_delta,
         };
@@ -2021,69 +1957,6 @@ fn insertBatchIntoLeaf(
     };
 }
 
-/// Fallback: when batch is too large for shared COW path, use per-entry insert.
-/// Correct but slower — the shared COW optimization only applies to small batches.
-fn insertBatchFallback(
-    allocator: std.mem.Allocator,
-    store: PageStore,
-    root: u32,
-    entries: []const LeafEntry,
-    dirty: *std.ArrayList(u32),
-) !WriteResult {
-    var new_root = root;
-    var live_delta: i64 = 0;
-    var count_delta: i64 = 0;
-
-    for (entries) |e| {
-        const wr = try insert(allocator, store, new_root, e.key, e.value, e.tombstone, dirty);
-        new_root = wr.new_root;
-        live_delta += wr.live_delta;
-        count_delta += wr.count_delta;
-    }
-
-    return .{ .new_root = new_root, .live_delta = live_delta, .count_delta = count_delta };
-}
-
-/// Fallback: when entries exceed leaf capacity, use per-entry insertIntoLeaf.
-fn insertBatchIntoLeafFallback(
-    store: PageStore,
-    allocator: std.mem.Allocator,
-    page_no: u32,
-    entries: []const LeafEntry,
-    dirty: *std.ArrayList(u32),
-) !InsertSub {
-    // Fallback: use per-entry insertIntoLeaf (not insert, which expects root).
-    // This keeps the same COW semantics as the branch caller expects.
-    var new_child = page_no;
-    var live_delta: i64 = 0;
-    var count_delta: i64 = 0;
-    var pending_split_key: ?[]u8 = null;
-    var pending_split_right: u32 = 0;
-
-    for (entries) |e| {
-        const sub = try insertIntoLeaf(store, allocator, new_child, e.key, e.value, e.tombstone, dirty);
-        new_child = sub.new_child;
-        live_delta += sub.live_delta;
-        count_delta += sub.count_delta;
-        // If this entry caused a split, we need to propagate it.
-        // But insertIntoLeaf only splits within the leaf — the branch caller
-        // will see the split_key/split_right from the last InsertSub.
-        if (sub.split_key) |sk| {
-            if (pending_split_key) |old| allocator.free(old);
-            pending_split_key = sk;
-            pending_split_right = sub.split_right;
-        }
-    }
-
-    return .{
-        .new_child = new_child,
-        .split_key = pending_split_key,
-        .split_right = pending_split_right,
-        .live_delta = live_delta,
-        .count_delta = count_delta,
-    };
-}
-
 /// Batch insert into branch node
 fn insertBatchIntoBranch(
     store: PageStore,
@@ -2183,28 +2056,6 @@ fn insertBatchIntoBranch(
                 allocator.free(branch.children);
                 allocator.free(sp.keys);
                 allocator.free(sp.children);
-                branch.keys = new_keys;
-                branch.children = new_children;
-            }
-            if (sub.split_key) |sk| {
-                // Child split: insert new key + child.
-                // T-42: `sk` is an owned dupe from the child split — on a
-                // failed alloc below it must be freed, not leaked (on
-                // success its pointer migrates into branch.keys). Pure
-                // errdefer; release points are mutually exclusive.
-                errdefer allocator.free(sk);
-                const new_keys = try allocator.alloc([]u8, branch.keys.len + 1);
-                errdefer allocator.free(new_keys);
-                const new_children = try allocator.alloc(u32, branch.children.len + 1);
-                errdefer allocator.free(new_children);
-                @memcpy(new_keys[0..ci], branch.keys[0..ci]);
-                new_keys[ci] = sk;
-                @memcpy(new_keys[ci + 1 ..], branch.keys[ci..]);
-                @memcpy(new_children[0 .. ci + 1], branch.children[0 .. ci + 1]);
-                new_children[ci + 1] = sub.split_right;
-                @memcpy(new_children[ci + 2 ..], branch.children[ci + 1 ..]);
-                allocator.free(branch.keys);
-                allocator.free(branch.children);
                 branch.keys = new_keys;
                 branch.children = new_children;
             }
