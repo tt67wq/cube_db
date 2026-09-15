@@ -593,6 +593,22 @@ pub fn build(b: *std.Build) void {
     const run_delete_range_concurrent_test = b.addRunArtifact(delete_range_concurrent_test);
     db_test_step.dependOn(&run_delete_range_concurrent_test.step);
 
+    // deleterange_mem_budget_test — T-38-B RED: deleteRange internal
+    // allocation peak must not grow linearly with the range (O(1) chunking).
+    const deleterange_mem_budget_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/txn_writer_db/deleterange_mem_budget_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    const run_deleterange_mem_budget_test = b.addRunArtifact(deleterange_mem_budget_test);
+    db_test_step.dependOn(&run_deleterange_mem_budget_test.step);
+
     // applybatch_single_vs_multi_test — applyBatch single vs multi entry consistency tests (T-21)
 
     const applybatch_single_vs_multi_test = b.addTest(.{
