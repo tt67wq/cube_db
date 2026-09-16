@@ -1,6 +1,6 @@
 # Issue N-1 — `put` 组合条目溢出 panic：key 近-MAX + 较大 value
 
-- **状态**: fixing（探路 N-1-P 已完成：判定**方向 B**；实现任务待派）
+- **状态**: **CLOSED** ✅（修复已合入 main：`ba85d2c` RED + `6d1d318` 修复，评审 APPROVE）
 - **优先级**: medium（**可被正常 API 触发**的 panic，非静默损坏；属 T-43 家族残留）
 - **来源**: T-38-B 独立评审（cube_db-pi-2，`.agents/tasks/T-38-B/review.md` N-1）
   + conductor 独立复现确认
@@ -70,7 +70,52 @@ T-43 修的是 `insertIntoLeafSplit` 的 mid-split 边界，T-44 修的是分裂
 - [x] conductor 独立复现确认（scratch 工程，已删）
 - [x] 立项 + 派探路任务 **N-1-P**（pi-2，读码判定修复方向）
 - [x] 探路交付 `656d0df`（rebase 后 `f5356b1`）→ 判定**方向 B**
-- [ ] 派发实现任务（方向 B + RED 测试）
+- [x] 派发实现任务（方向 B + RED 测试，pi-3）
+- [x] 交付：RED `ba85d2c` + 修复 `6d1d318`（`src/btree.zig` +44/−8，新测试 374 行）
+- [x] conductor 独立复核 RED→GREEN 两态（基线 panic / 修复全绿）
+- [x] 交叉评审 APPROVE（pi-2，`.agents/tasks/N-1/review.md`，228 行）
+- [x] 合入 main（`6d1d318`）+ 全量 `zig build test` = **36/36 steps, 452/452 passed**
+
+## 验收记录（2026-09-16）
+
+**结论：方向 B 修复已合入并关闭。**
+
+- 交付物：`ba85d2c`（RED 测试 374 行，边界表 15 例）→ `6d1d318`
+  （修复：`src/btree.zig` +44/−8）。
+- **两态证据（conductor 与评审各自独立复跑，结论一致）**：
+  - 基线 `f987d46`：10 例 RED，两种 panic 形态 ——
+    `integer overflow`（组合 4069–4072）与
+    `index out of bounds: index 4101, len 4096`（组合 > 4072），
+    与探路报告 §4 完全一致；控制组 5 例基线即绿。
+  - 修复 `6d1d318`：15/15 全绿；全量 **36/36 steps, 452/452 passed**。
+- **修复形态**：`inlineValueBudget(key_len) =
+  min(MAX_INLINE_VALUE, NODE_PAYLOAD_CAP − 3 − 10 − key_len)`，
+  `key_len ≥ 4055` 时饱和为 0（合法 key ≤ 4051 时恒 ≥ 4，无 usize 下溢）；
+  6 处判定点统一调用该函数（`:265/:273/:289/:386/:1097/:1142`），
+  **无第 7 处**（评审独立 grep 含 writer/db/读侧解码全扫描确认）；
+  `writeNodePage` 增 `error.PayloadTooLarge` 防御（替代 Release 下
+  usize 下溢 UB / 静默覆盖，`!void` 签名免改调用方）。
+- **最大风险点（小 value 走溢出链）经独立攻击验证**：评审自写 6 组探针，
+  含 **300 轮小 value 溢出链覆盖压力（页池仅 1000 页 —— 不回收必耗尽）**、
+  迭代器逐字节读链、混合批、边界翻转（2050 内联 ↔ 2051 走链）、
+  批量分裂、范围墓碑共存，全绿零泄漏。
+- **错误面**：所有原本 panic 的输入变为可存；`error.KeyTooLarge`
+  （key > 4051）行为不变；Db API 错误面不变。
+- **硬约束**：方向未改（非入口拒绝）、磁盘格式零改动、读路径零改动、
+  无无关重构。
+
+### 遗留观察（非阻塞，另立跟踪）
+
+- **N-o1**：`needsOverflow`（`src/btree.zig:264`）现**无调用者**。
+  注意此为**既有死代码**（基线 `f987d46` 时即已无调用者，非本次引入）；
+  修后各判定点直接内联 `inlineValueBudget` 比较，该函数仍为孤儿。
+  建议后续删除或让 6 处判定点统一改走它（契约 1.2 的更彻底形态）。
+- **N-o2**：任务契约 Acceptance 写「基线 437/437」为笔误，实测基线
+  436/437 + 1 skipped（不影响验收）。
+- **N-o3**：RED 测试的 15 个用例名仍带 `RED` 字样（现已是 GREEN 回归用例），
+  纯命名问题。
+- **N-o4**：探路报告 §3 表 #4/#5/#10 未逐一复刻，由既有 overflow 链测试
+  与评审 A5 探针部分覆盖，属测试矩阵完整性小缺口。
 
 ## 探路结论（N-1-P，2026-09-15）—— 判定：方向 B
 
