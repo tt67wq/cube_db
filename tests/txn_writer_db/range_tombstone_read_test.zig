@@ -480,3 +480,147 @@ test "T-38-2 s10: corrupted tomb page CRC propagates as error.CorruptCrc" {
         try std.testing.expectEqual(error.CorruptCrc, e);
     }
 }
+
+// =====================================================================
+// 缺口用例 G-6（spec-precheck HIGH）：链环防护 —— free_next 成环的墓碑链
+// 必须返回 typed error，不得无限循环 / OOM / panic（盘上数据不可信，
+// trust boundary）。测试若真 hang 会被超时判死——这正是要抓的形态。
+// =====================================================================
+
+test "T-38-2 g6: tomb chain cycle (free_next ring) must error, not hang" {
+    var ms = newStore();
+    defer ms.deinit();
+    {
+        var db = try dbi.Db.open(alloc, ms.store(), .{});
+        defer db.close();
+        try putAll(db);
+    }
+    // 手工构造环：p1 → p2 → p1（两页 CRC 均合法，只是链成环）
+    const s = ms.store();
+    var meta = (try s.readMeta()).?;
+    const p1: u32 = ms.next_free;
+    ms.next_free += 1;
+    const p2: u32 = ms.next_free;
+    ms.next_free += 1;
+    {
+        const buf = try s.writePage(p1);
+        try f2.encodeTombPage(buf[0..f2.PAGE_SIZE], p1, &.{tomb("c", "d")}, meta.sequence + 1, p2);
+    }
+    {
+        const buf = try s.writePage(p2);
+        try f2.encodeTombPage(buf[0..f2.PAGE_SIZE], p2, &.{tomb("a", "b")}, meta.sequence + 1, p1); // 指回 p1 = 环
+    }
+    meta.version = 3;
+    meta.tomb_head = p1;
+    meta.sequence += 1;
+    try s.writeMeta(&meta);
+
+    var db = try dbi.Db.open(alloc, ms.store(), .{});
+    defer db.close();
+
+    // 点查被墓碑覆盖的 key：必须以 error 返回（任意 typed error 均可），
+    // 不得返回原值、不得挂起（挂起 = 测试超时死亡，同样是失败）
+    if (db.get("c")) |maybe_v| {
+        defer if (maybe_v) |s2| alloc.free(s2);
+        try std.testing.expect(false); // RED：当前返回原值——应返回 typed error
+    } else |_| {} // 任意 error 可接受（Truncated / CorruptCrc / 专用错误名均可）
+
+    // select 全区间同样不得挂起：必须以 error 返回
+    if (db.select(null, null)) |it_res| {
+        var it = it_res;
+        defer it.deinit();
+        var got = try collectKeys(&it);
+        defer freeKeys(&got);
+        try std.testing.expect(false); // RED：当前静默吐出——应返回 typed error
+    } else |_| {}
+}
+
+// =====================================================================
+// 缺口用例 G-9（spec-precheck LOW）：乱序链 —— 墓碑链不按 min 排序
+// （排序是阶段 3 写入者的义务，格式层不强制；手工注入可以无序）。
+// 读路径必须按线性扫描语义判定，不得假设链/条目有序。
+// =====================================================================
+
+test "T-38-2 g9: out-of-order tomb chain — linear scan semantics" {
+    var ms = newStore();
+    defer ms.deinit();
+    // 页 1 内部乱序（min 降序：[d,e) 在 [a,b) 前）；
+    // 页 2 的 min ("ba") 又小于页 1 两条 —— 跨页也乱序。
+    const page1 = [_]f2.RangeTombstone{ tomb("d", "e"), tomb("a", "b") };
+    const page2 = [_]f2.RangeTombstone{tomb("ba", "c")};
+    var db = try openWithTombs(&ms, .{}, &page1, &page2);
+    defer db.close();
+
+    // [a,b)：a 遮蔽、b 可见
+    try expectShadowed(db, "a");
+    try expectVisible(db, "b");
+    // [ba,c)：b\0 可见（< ba）、ba 遮蔽、c 遮蔽、c\0 可见
+    try expectVisible(db, "b\x00");
+    try expectShadowed(db, "ba");
+    try expectShadowed(db, "c");
+    try expectVisible(db, "c\x00");
+    // [d,e)：d 遮蔽、e 可见
+    try expectShadowed(db, "d");
+    try expectVisible(db, "e");
+
+    // select 与逐 get 一致：可见集 = {b, b\0, c\0, e}
+    var it = try db.select(null, null);
+    defer it.deinit();
+    var got = try collectKeys(&it);
+    defer freeKeys(&got);
+    const want = [_][]const u8{ "b", "b\x00", "c\x00", "e" };
+    try std.testing.expectEqual(want.len, got.items.len);
+    for (want, got.items) |w, g| try std.testing.expectEqualStrings(w, g);
+}
+
+// =====================================================================
+// 缺口用例 G-10（spec-precheck LOW）：空键边界 —— effective "\x00"
+// （= succ("")，紧凑表示 Bound{bytes="", append_zero=true}）作 min/max
+// 对空键 "" 的含/不含语义（设计 §1.4：len=0 且有标志 ≠ null）。
+// =====================================================================
+
+test "T-38-2 g10: empty-key boundary — effective NUL (0x00) min/max vs empty key" {
+    // (a) min = succ("") = "\x00"（effective）：["\x00", null) —— "" 不含、"\x00" 含
+    {
+        var ms = newStore();
+        defer ms.deinit();
+        {
+            var db = try dbi.Db.open(alloc, ms.store(), .{});
+            defer db.close();
+            try db.putDirect("", "v"); // 空键合法（checkKeySize 只限上界）
+            try db.putDirect("\x00", "v");
+            try db.putDirect("a", "v");
+        }
+        const tobs = [_]f2.RangeTombstone{
+            .{ .min = .{ .bytes = "", .append_zero = true }, .max = null },
+        };
+        var db = try openWithTombs(&ms, .{}, &tobs, &.{});
+        defer db.close();
+
+        try expectVisible(db, ""); // "" < "\x00" → 不含（min 含但 ""≠"\x00"）
+        try expectShadowed(db, "\x00"); // 恰等于 effective min → 含
+        try expectShadowed(db, "a"); // > "\x00" → 含
+    }
+
+    // (b) max = succ("") = "\x00"（effective）：[null, "\x00") —— "" 含、"\x00" 不含
+    {
+        var ms = newStore();
+        defer ms.deinit();
+        {
+            var db = try dbi.Db.open(alloc, ms.store(), .{});
+            defer db.close();
+            try db.putDirect("", "v-empty");
+            try db.putDirect("\x00", "v");
+            try db.putDirect("a", "v");
+        }
+        const tobs = [_]f2.RangeTombstone{
+            .{ .min = null, .max = .{ .bytes = "", .append_zero = true } },
+        };
+        var db = try openWithTombs(&ms, .{}, &tobs, &.{});
+        defer db.close();
+
+        try expectShadowed(db, ""); // "" < "\x00"（max 不含端点本身）→ 含
+        try expectVisible(db, "\x00"); // 恰等于 effective max → 不含
+        try expectVisible(db, "a"); // > "\x00" → 不含
+    }
+}
