@@ -1,6 +1,9 @@
 # Issue T-38 — deleteRange 高效化：全量物化 + 每 key tombstone 的 O(range) 内存与写放大
 
-- **状态**: fixing（路线 C 先探路已定；探路完成，方案 B 实现中，方案 A 待返工闭环）
+- **状态**: fixing（**阶段 1 格式层 / 阶段 2 读路径已合入 main 并通过验收**
+  —— 阶段 1 `baa44bd`、阶段 2 `88124bc`（验收① 452/452 + 验收② 15/15 + review APPROVE）；
+  **当前进行阶段 3 写路径 / 阶段 4 GC**。阶段 3 前置：`issues/T-49-…`（high，数据破坏面）、
+  `issues/T-50-…` 待决）
 - **优先级**: **high**（可用性缺口 + 内存安全边界；4/4 worker 全部独立提出，共识度最高）
 - **梯队**: 可用性/性能（兼正确性观感——文档承诺与实际行为差距）
 - **来源**: 演进点征集（roadmap-evo）wf-pi-1-E1、wf-pi-2-E2、wf-pi-3-E3、wf-pi-4-E2
@@ -88,7 +91,7 @@ select 迭代器 + tombstone 批量提交实现"），但**没有披露 O(range)
   双锚点）**有条件可行**；报告推荐 **A+B 分期**（B 立即止血、A 根治）。
 - **独立评审**（cube_db-pi-2）：**REQUEST_CHANGES**，发现两处 blocking 设计缺口
   （打洞右段数据复活、近-MAX 边界不可表示），**不否定方案 A 可行性**。
-  → 已立 **T-48**（`issues/T-48-range-tombstone-punch-hole-and-boundary-gaps.md`），
+  → 已立 **T-48**（`issues/archived/T-48-range-tombstone-punch-hole-and-boundary-gaps.md`，已关闭归档），
   返工任务 **T-38-P-R** 已派给 pi-2 → 交付 `c4af657`（rebase 后 `21d6c8b`），
   复审 **APPROVE**，已合入 main；T-48 关闭。
 
@@ -108,7 +111,7 @@ select 迭代器 + tombstone 批量提交实现"），但**没有披露 O(range)
    凡新增磁盘版本号前必须先修此缺口，否则重演 T-49 式静默空库 + 数据覆盖；
 ② **version 切换策略**落地（「是否曾写墓碑」决定 v2/v3），并同步更正
    T-49 记录的部署纪律（升级后不得回滚二进制 = 否则静默数据破坏）。
-③ **T-52（NB-1）环防护加固**（`issues/T-52-…`）：`walkTombChain` 上界改用已访问页号
+③ **T-52（NB-1）环防护加固**（`issues/archived/T-52-…`，**已修复归档**）：`walkTombChain` 上界改用已访问页号
    set（环重访即 `error.Truncated`，O(链) 内存）或收紧到 `min(mapsize, last_page+1)`，
    消除 FilePageStore 上的准 hang / ~12 GiB 资源炸弹。阶段 3 引入真实写路径后会自然
    产生环链的可触发面，故列为前置。
@@ -220,12 +223,12 @@ select 迭代器 + tombstone 批量提交实现"），但**没有披露 O(range)
   - **T-51（medium）**：RED 3 处 fixture 缺陷（s2 单墓碑期望集矛盾 s4、s7 断言未存储
     key、g9 把 max 不含端点误当含端点），使验收②一度 12/15。**非实现缺陷**；由测试
     作者 pi-3 修 fixture（断言语义不变），修后 15/15 → 已立并关闭
-    `issues/T-51-t38-2-red-fixture-defects.md`。
+    `issues/archived/T-51-t38-2-red-fixture-defects.md`（已关闭归档）。
   - **NB-1（medium，新）**：`walkTombChain` 环防护上界 = `store.mapsize()`，在
     `FilePageStore` 上 = 2^28 页 → CRC 合法环链要 ~2.68 亿次 decode + ~12 GiB 峰值
     内存才触发 `error.Truncated`，实为准 hang/资源炸弹（MemPageStore 上防护有效）。
     仅损坏库触发（trust boundary），阶段 2 测试全走 MemPageStore 故不阻塞 →
-    已立 `issues/T-52-tomb-chain-ring-guard-fps-ineffective.md`，列为阶段 3 前置。
+    已立 `issues/archived/T-52-tomb-chain-ring-guard-fps-ineffective.md`（已修复归档），列为阶段 3 前置。
 - **本阶段已知限制（不修，如实报告）**：任何 commit 会把 meta 重写回 v2/`tomb_head=0`
   → reopen 丢墓碑。这是 H-2 声明的语义分叉，根治在**阶段 3**（写路径 + T-50）。
 - **遗留（阶段 3/4）**：写路径（新 deleteRange 流 + 打洞 + version 切换 + entryCount
