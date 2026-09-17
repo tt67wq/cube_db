@@ -653,17 +653,21 @@ fn tombListCovers(pages: []const f2.TombPage, key: []const u8) bool {
 /// Walk a tombstone chain following free_next (0 = tail), decoding every
 /// page into `pages` (tobs arrays allocated with `a`).
 /// H-1 trust boundary: decodeTombPage does NOT validate free_next — a
-/// CRC-valid cycle would loop forever. Guard: at most `store.mapsize()`
-/// page steps (generous in either store impl's unit — Mem: page count,
-/// File: bytes; both upper-bound any legal chain), exceeded →
-/// error.Truncated (typed, no hang, no unbounded growth).
+/// CRC-valid cycle would loop forever. Guard: visited-page set (dedup by
+/// page number) — the instant free_next revisits an already-walked page,
+/// return error.Truncated (typed, no hang; memory O(chain length)).
+/// T-52: NOT a mapsize() step bound — that "limit" is backend-inconsistent
+/// (MemPageStore: page count, FilePageStore: 2^28) and on FilePageStore a
+/// CRC-valid ring would run ~2.68e8 steps / ~12 GiB before tripping —
+/// a quasi-hang. The visited set catches a ring on its first revisit,
+/// regardless of store backend.
 fn walkTombChain(store: PageStore, head: u32, pages: *std.ArrayList(f2.TombPage), a: std.mem.Allocator) !void {
-    const limit = store.mapsize();
+    var visited = std.AutoHashMapUnmanaged(u32, void){};
+    defer visited.deinit(a);
     var pn: u32 = head;
-    var steps: u64 = 0;
     while (pn != 0) {
-        steps += 1;
-        if (steps > limit) return error.Truncated; // cycle / corrupt chain
+        const gop = try visited.getOrPut(a, pn);
+        if (gop.found_existing) return error.Truncated; // cycle: page revisited
         const raw = try store.readPage(pn);
         const tp = try f2.decodeTombPage(a, raw[0..f2.PAGE_SIZE]);
         try pages.append(a, tp);
