@@ -65,10 +65,12 @@ select 迭代器 + tombstone 批量提交实现"），但**没有披露 O(range)
 
 - [x] 现状核验（4 worker 独立确认 U-1 在当前 HEAD 成立）
 - [x] 路线决策：**C 先探路**（用户选定），探路结论 = 方案 A 有条件可行 + 推荐 A+B 分期
-- [ ] 确定性 RED 测试（大范围删除内存/性能断言）
+- [x] 确定性 RED 测试（大范围删除内存断言：T-38-B 的 `deleterange_mem_budget_test.zig`）
 - [x] 探路（路线 C）+ 独立评审 + 返工闭环（T-38-P / T-38-P-R）
-- [ ] 根因定位与修复（GREEN：range tombstone + 墓碑 GC）
-- [ ] 回归测试 + 评审
+- [x] 阶段 0（方案 B 流式分块）：T-38-B 合入 `8f9c8fb`，验收 (a) 内存项达成
+- [x] 阶段 1（格式层）：T-38-1 合入 `baa44bd`（三方多签：acceptance 绿 + review APPROVE + test PASS）
+- [ ] 阶段 2/3/4 根因落地（读路径 / 写路径 / GC）
+- [ ] 回归测试 + 评审（阶段 2 起需并发 staging 交错测试）
 - [ ] 验收门稳定后关闭
 
 ---
@@ -94,9 +96,17 @@ select 迭代器 + tombstone 批量提交实现"），但**没有披露 O(range)
 | 阶段 | 内容 | 任务 | 依赖 |
 |---|---|---|---|
 | 0 | **方案 B**：流式分块 deleteRange（消 OOM，零格式风险） | **T-38-B** ✅ 已合入 | 无 |
-| 1 | 格式层：墓碑页 codec + meta v3（含 F2 边界编码 + **N-R1 typed 拒绝**） | 未派 | T-38-P-R 闭环 ✓ |
-| 2 | 读路径：遮蔽判定（tomb_head=0 时休眠） | 未派 | 阶段 1 |
+| 1 | 格式层：墓碑页 codec + meta v3（含 F2 边界编码 + **N-R1 typed 拒绝** + bit30 spill 预留位） | **T-38-1** ✅ 已合入 `baa44bd` | T-38-P-R 闭环 ✓ |
+| 2 | 读路径：遮蔽判定（tomb_head=0 时休眠） | 未派 | 阶段 1 ✓ |
 | 3 | 写路径：新 deleteRange 流 + 打洞语义（含 F1 修正）+ entryCount 流式修正 | 未派 | 阶段 2 |
+| 4 | GC：水位收割（空区间丢弃）+ crash 矩阵扩展；物化清除挂 U-5 | 未派 | 阶段 3 |
+
+**阶段 3 前置条件（新增，来自阶段 1 评审 T-49/T-50）**：
+① **开库路径必须区分「invalid meta」与「fresh DB」**（`issues/T-50-…`）——
+   当前 `readMetaPageSingle` 对 magic 坏 / v4 统一返回 `null`，与空库同形；
+   凡新增磁盘版本号前必须先修此缺口，否则重演 T-49 式静默空库 + 数据覆盖；
+② **version 切换策略**落地（「是否曾写墓碑」决定 v2/v3），并同步更正
+   T-49 记录的部署纪律（升级后不得回滚二进制 = 否则静默数据破坏）。
 
 **阶段 1 落地前必须补的两项（T-38-P-R 评审 N-R1，详见 T-48）**：
 ① 设计文档增补写路径不变量「空区间/空 plain 边界墓碑不得进入编码器」；
@@ -141,3 +151,33 @@ select 迭代器 + tombstone 批量提交实现"），但**没有披露 O(range)
   残留）→ 已立 `issues/N-1-put-composite-entry-overflow-panic.md`，
   conductor 已独立复现确认；**N-2**（CHUNK=256 近-MAX key 时 ≈1MB 瞬时内存）
   为观察项，不阻塞。
+
+### 阶段 1（T-38-1 格式层）验收记录 — 2026-09-17
+
+- **交付**：RED `4d5c95f`（cube_db-pi-3）→ GREEN `baa44bd`（cube_db-pi-1），
+  已 ff-merge 入 main。变更：`src/format.zig` +230（`PAGE_TYPE_RANGE_TOMBSTONE=5`
+  页 codec + `MetaPage.tomb_head` + `META_PAGE_PAYLOAD_SIZE` 58→62 + 三值判定
+  + bit30 spill 预留位）、设计文档 ±17、`build.zig` +15、单测 +541（10 tests）。
+- **TDD 证据**：RED = 编译失败 11 errors（`PAGE_TYPE_RANGE_TOMBSTONE`/`tomb_head`
+  未实现）；GREEN 后 `test-format` 62/62。判定者 pi-3 复核实测：
+  `git diff 4d5c95f baa44bd -- tests/` **空**（测试零改动）；
+  临时 revert `src/format.zig` 回基线 → 测试**回到 11 errors 失败态**（约束力实证，
+  非恒真）。
+- **独立评审**（cube_db-pi-2，评审者 ≠ 实现者）：**APPROVE**，
+  Blocking 0 / Non-blocking 6。评审自写 scratch R1–R8（8/8）独立实证，含
+  **RED 未覆盖的真 u32 回绕路径**（`min_off=0xFFFF_FFFF` → typed `error.Truncated`
+  无 panic）、nkeys=65535 上界、bit30 decode 拒绝、v2 手工规范页**整页逐字节相等**、
+  脏缓冲三模式 encode 确定性（F-3 实锤）。
+- **conductor 独立验收**：main 上 `zig build test` = **452/452**（0 skip，exit 0）；
+  `test-format` 62/62；`test-rangetomb-probe` 6/6（探针"侥幸自洽"预判实证为真绿）。
+  （worktree 内跑显示 451/452+1skip 系 `zig-out/bin/cube_check` 不存在导致
+  `cube_check_test.zig` 条件跳过，环境差异非回归。）
+- **预审发现的规格缺陷**（pi-2 `spec-precheck.md`）：
+  - **F-1（high）**：设计 §2 称「旧代码读 v3 库 = 干净拒绝」，实测为 **Db.open 静默
+    按空库打开 + 后续写入覆盖 v3 数据页**（数据破坏面）→ 已立
+    `issues/T-49-v3-db-silent-empty-open-doc-error.md`，设计文档已更正。
+  - **F-4**：spill 预留位落点设计未指定 → pi-1 定案 bit30（`min_len`/`max_len`）
+    + 回写设计 §1.2。
+  - 评审另发现 **N-1**：三值判定的「第三值」在 API 层是 `null`（与 fresh DB 不可
+    区分）→ 已立 `issues/T-50-meta-third-value-null-vs-fresh-db.md`，列为阶段 3 前置。
+- **遗留（阶段 2/3/4）**：读/写路径接入、version 切换策略、spill 实装、GC。
