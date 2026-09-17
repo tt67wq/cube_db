@@ -321,6 +321,22 @@ pub fn build(b: *std.Build) void {
     const run_format_test = b.addRunArtifact(format_test);
     const format_test_step = b.step("test-format", "Run format tests only");
     format_test_step.dependOn(&run_format_test.step);
+    format_test_step.dependOn(&run_format_test.step);
+
+    // T-38-1: range-tombstone format tests (RED first) ride the test-format step
+    const tomb_format_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/core_format/range_tombstone_format_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    const run_tomb_format_test = b.addRunArtifact(tomb_format_test);
+    format_test_step.dependOn(&run_tomb_format_test.step);
 
     // ponytail: zig build test-ps runs only page_store tests
     const ps_test = b.addTest(.{
