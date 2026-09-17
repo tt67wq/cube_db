@@ -418,6 +418,23 @@ pub fn build(b: *std.Build) void {
     const rangetomb_read_test_step = b.step("test-rangetomb-read", "Run T-38-2 range-tombstone read-path tests");
     rangetomb_read_test_step.dependOn(&run_rangetomb_read_test.step);
 
+    // T-52: tomb-chain ring guard on FilePageStore (RED first, conductor-authored)
+    const tomb_guard_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/txn_writer_db/tomb_chain_guard_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    const run_tomb_guard_test = b.addRunArtifact(tomb_guard_test);
+    const tomb_guard_test_step = b.step("test-tombguard", "Run T-52 tomb-chain ring-guard tests");
+    tomb_guard_test_step.dependOn(&run_tomb_guard_test.step);
+    test_step.dependOn(&run_tomb_guard_test.step);
+
     // ponytail: zig build test-writer runs only writer tests
     const writer_test = b.addTest(.{
         .root_module = b.createModule(.{
