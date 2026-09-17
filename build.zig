@@ -321,7 +321,6 @@ pub fn build(b: *std.Build) void {
     const run_format_test = b.addRunArtifact(format_test);
     const format_test_step = b.step("test-format", "Run format tests only");
     format_test_step.dependOn(&run_format_test.step);
-    format_test_step.dependOn(&run_format_test.step);
 
     // T-38-1: range-tombstone format tests (RED first) ride the test-format step
     const tomb_format_test = b.addTest(.{

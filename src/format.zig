@@ -1,4 +1,4 @@
-//! format.zig — v2 page format constants and encode/decode (page header, meta, freelist, CRC)
+//! format.zig — v2 page format constants and encode/decode (page header, meta, freelist, range-tombstone, CRC)
 //! Pure-function module, no IO. PAGE_SIZE=4096, fixed 24B page header, 4B trailing CRC.
 const std = @import("std");
 
@@ -11,6 +11,10 @@ pub const PAGE_TYPE_META: u8 = 1;
 pub const PAGE_TYPE_BRANCH: u8 = 2;
 pub const PAGE_TYPE_LEAF: u8 = 3;
 pub const PAGE_TYPE_OVERFLOW: u8 = 4;
+/// T-38-1: range-tombstone chain page (design §1.2). Payload = 16B entry
+/// headers × nkeys followed by the varlen bound bytes; no payload counter
+/// (header nkeys is the source of truth, CRC guards integrity).
+pub const PAGE_TYPE_RANGE_TOMBSTONE: u8 = 5;
 
 /// Special page numbers
 pub const NULL_PAGE: u32 = 0;
@@ -18,7 +22,11 @@ pub const META_PAGE_0: u32 = 1;
 pub const META_PAGE_1: u32 = 2;
 
 pub const MAGIC_V2: u32 = 0x4355_4232; // "CUB2"
-pub const META_PAGE_PAYLOAD_SIZE: usize = 58;
+/// Meta payload (design §2, T-38-1): 58B v2 base layout + 4B tomb_head.
+/// v2 encoding writes only the base 58B (byte-identical to the old format);
+/// version==3 appends tomb_head at [58..62).
+pub const META_PAGE_PAYLOAD_SIZE: usize = 62;
+pub const META_PAGE_PAYLOAD_SIZE_V2: usize = 58;
 
 /// Max free-page entries per FREE page: payload = PAGE_SIZE - PAGE_HEADER_SIZE(24) - CRC(4);
 /// first 4 bytes hold the count, the rest holds u32 entries. T-33: single source of truth
@@ -49,6 +57,10 @@ pub const MetaPage = struct {
     free_head: u32,
     free_count: u64,
     last_page: u32,
+    /// T-38-1 (design §2): head of the range-tombstone page chain (0 = none).
+    /// Decoded from payload [58..62) only when version==3 (v2 → 0).
+    /// Defaulted so existing full-field struct literals keep compiling.
+    tomb_head: u32 = 0,
 };
 
 const Crc32 = std.hash.crc.Crc32;
@@ -153,6 +165,12 @@ pub fn encodeMetaPayload(buf: []u8, meta: *const MetaPage) void {
     std.mem.writeInt(u64, buf[pos..][0..8], meta.free_count, .little);
     pos += 8;
     std.mem.writeInt(u32, buf[pos..][0..4], meta.last_page, .little);
+    // T-38-1 (design §2): v3 appends tomb_head; v2 leaves the tail untouched
+    // (callers zero-fill it — writeMetaPage memsets the payload first, so v2
+    // pages stay byte-identical to the old format).
+    if (meta.version == 3) {
+        std.mem.writeInt(u32, buf[META_PAGE_PAYLOAD_SIZE_V2..][0..4], meta.tomb_head, .little);
+    }
 }
 
 pub fn decodeMetaPayload(buf: []const u8) MetaPage {
@@ -177,6 +195,13 @@ pub fn decodeMetaPayload(buf: []const u8) MetaPage {
     const free_count = std.mem.readInt(u64, buf[pos..][0..8], .little);
     pos += 8;
     const last_page = std.mem.readInt(u32, buf[pos..][0..4], .little);
+    // T-38-1 (design §2): tomb_head only exists on disk for v3; v2 pages
+    // never define [58..62) (kept zero), and v2 decode must not read a
+    // possibly-undefined tail.
+    var tomb_head: u32 = 0;
+    if (version == 3) {
+        tomb_head = std.mem.readInt(u32, buf[META_PAGE_PAYLOAD_SIZE_V2..][0..4], .little);
+    }
     return .{
         .magic = magic,
         .version = version,
@@ -188,11 +213,19 @@ pub fn decodeMetaPayload(buf: []const u8) MetaPage {
         .free_head = free_head,
         .free_count = free_count,
         .last_page = last_page,
+        .tomb_head = tomb_head,
     };
 }
 
 pub fn isValidMeta(meta: MetaPage) bool {
     return meta.magic == MAGIC_V2 and meta.version == 2;
+}
+
+/// T-38-1 (design §2 N2) three-way validity: v2 and v3 are both openable
+/// (v2 decodes with tomb_head=0); anything else (bad magic, version >= 4)
+/// is rejected — never conflated with v2.
+pub fn isValidMetaAny(meta: MetaPage) bool {
+    return meta.magic == MAGIC_V2 and (meta.version == 2 or meta.version == 3);
 }
 
 /// Write meta into a page buffer (page index 0 or 1 -> page number 1 or 2)
@@ -222,7 +255,7 @@ pub fn readMetaPageSingle(page: *const [PAGE_SIZE]u8) ?MetaPage {
     const hdr = decodePageHeader(page[0..PAGE_HEADER_SIZE]);
     if (hdr.page_type != PAGE_TYPE_META) return null;
     const meta = decodeMetaPayload(page[PAGE_HEADER_SIZE .. PAGE_SIZE - 4]);
-    if (!isValidMeta(meta)) return null;
+    if (!isValidMetaAny(meta)) return null;
     return meta;
 }
 
@@ -277,6 +310,197 @@ pub fn readFreelistEntries(page: *const [PAGE_SIZE]u8) []align(1) const u32 {
 }
 
 // ===== Tests =====
+
+// ===== Range-tombstone chain pages (T-38-1, design §1.2/§1.4) =====
+
+/// Fixed 16B entry header: min_len u32 + max_len u32 + min_off u32 + max_off u32.
+pub const TOMB_ENTRY_SIZE: usize = 16;
+
+/// Tomb page payload budget: PAGE_SIZE - header(24) - CRC(4). Single-entry
+/// envelope: TOMB_ENTRY_SIZE + min_stored + max_stored <= 4068, so a single
+/// bound can be up to 4052B >= MAX_KEY_SIZE (design §1.2 F2 rework).
+pub const TOMB_PAYLOAD_SIZE: usize = PAGE_SIZE - PAGE_HEADER_SIZE - 4;
+comptime {
+    std.debug.assert(TOMB_PAYLOAD_SIZE == 4068);
+}
+
+/// A range endpoint. Effective byte string = bytes ++ (0x00 if append_zero);
+/// append_zero is the compact encoding of succ(k) = k ++ 0x00 (> k, shortest):
+/// it stores the ORIGINAL key length, so punch-hole right segments stay
+/// representable for near-MAX_KEY_SIZE keys (design §1.4, F1 fix).
+pub const TombBound = struct {
+    bytes: []const u8,
+    append_zero: bool = false,
+};
+
+/// One [min, max) half-open tombstone. Per-entry seq is NOT stored on disk —
+/// it is inherited from the page header gen (= commit sequence at write time,
+/// design §1.4), which is what keeps the entry header at 16B.
+pub const RangeTombstone = struct {
+    min: ?TombBound, // null = negative infinity (stored len 0, no flag)
+    max: ?TombBound, // null = positive infinity
+};
+
+/// Decoded tomb page. `tobs` is allocated with the allocator passed to
+/// decodeTombPage (caller frees); each bound's bytes BORROW the page buffer,
+/// so the page must outlive every use of the decoded bounds.
+pub const TombPage = struct {
+    hdr: PageHeader, // hdr.gen = commit sequence (seq inheritance, §1.4)
+    tobs: []RangeTombstone,
+    next: u32, // = hdr.free_next: next chain page (0 = tail)
+};
+
+fn boundStoredLen(b: ?TombBound) usize {
+    return if (b) |m| m.bytes.len else 0;
+}
+
+/// Encode a range-tombstone page (design §1.2 revised layout):
+/// PageHeader(24B) with page_type=5, gen=commit_seq, nkeys=entry count,
+/// free_next=next_page; payload = 16B entry headers × nkeys (no payload
+/// counter) followed by the varlen bound bytes; trailing 4B whole-page CRC.
+///
+/// Entry len word layout: bit31 = append_zero flag; bit30 = spill reserved
+/// (F-4: always 0 here, kept for future bound-spill-to-overflow pages);
+/// low 30 bits = stored key length.
+///
+/// Errors — two distinct levels, must not be conflated (design §1.2):
+///   error.TombBoundTooLarge — single entry 16 + min_stored + max_stored
+///     > 4068 (double-long bound; production direction = spill, stage 3)
+///   error.TombPageOverflow  — multi-entry packing over the page budget
+///     (normal path: the caller splits into a free_next chain)
+///
+/// ORDERING (E6/E7): both envelope checks run BEFORE any @intCast / bit
+/// packing. They are what makes the u16 nkeys cast safe (packing bounds
+/// entries to 254) and keeps stored lengths <= 4052 < 2^30 clear of the
+/// bit31/bit30 flags. Do not reorder.
+pub fn encodeTombPage(
+    page: *[PAGE_SIZE]u8,
+    page_no: u32,
+    tobs: []const RangeTombstone,
+    commit_seq: u64,
+    next_page: u32,
+) !void {
+    for (tobs) |t| {
+        if (TOMB_ENTRY_SIZE + boundStoredLen(t.min) + boundStoredLen(t.max) > TOMB_PAYLOAD_SIZE) {
+            return error.TombBoundTooLarge;
+        }
+    }
+    var vlen: usize = 0;
+    for (tobs) |t| {
+        vlen += boundStoredLen(t.min) + boundStoredLen(t.max);
+    }
+    if (TOMB_ENTRY_SIZE * tobs.len + vlen > TOMB_PAYLOAD_SIZE) return error.TombPageOverflow;
+
+    // F-3: initialize the whole page (including the 5 PageHeader padding
+    // bytes) BEFORE computing the CRC — undefined bytes must not enter the
+    // checksum.
+    @memset(page[0 .. PAGE_SIZE - 4], 0);
+    const hdr = PageHeader{
+        .page_no = page_no,
+        .page_type = PAGE_TYPE_RANGE_TOMBSTONE,
+        // Design §5.3: informational gen = commit sequence (tomb pages are
+        // not freelist chain pages, so there is no H1-style hard check).
+        .gen = commit_seq,
+        .nkeys = @intCast(tobs.len), // safe: packing check above bounds len <= 254 (E6)
+        .free_next = next_page,
+    };
+    encodePageHeader(page[0..PAGE_HEADER_SIZE], &hdr);
+    const payload = page[PAGE_HEADER_SIZE .. PAGE_SIZE - 4];
+    var hpos: usize = 0;
+    var vpos: usize = TOMB_ENTRY_SIZE * tobs.len; // varlen starts right after the entry array
+    for (tobs) |t| {
+        // @intCast safe: the envelope check ran first (E7) — stored len <= 4052
+        var min_raw: u32 = @intCast(boundStoredLen(t.min));
+        var max_raw: u32 = @intCast(boundStoredLen(t.max));
+        if (t.min) |m| {
+            if (m.append_zero) min_raw |= 0x8000_0000; // bit31 = append_zero (spill bit30 stays 0, F-4)
+        }
+        if (t.max) |m| {
+            if (m.append_zero) max_raw |= 0x8000_0000;
+        }
+        std.mem.writeInt(u32, payload[hpos..][0..4], min_raw, .little);
+        hpos += 4;
+        std.mem.writeInt(u32, payload[hpos..][0..4], max_raw, .little);
+        hpos += 4;
+        // @intCast safe: vpos <= TOMB_PAYLOAD_SIZE after the checks (E8)
+        std.mem.writeInt(u32, payload[hpos..][0..4], @intCast(vpos), .little);
+        hpos += 4;
+        if (t.min) |m| {
+            @memcpy(payload[vpos..][0..m.bytes.len], m.bytes);
+            vpos += m.bytes.len;
+        }
+        std.mem.writeInt(u32, payload[hpos..][0..4], @intCast(vpos), .little);
+        hpos += 4;
+        if (t.max) |m| {
+            @memcpy(payload[vpos..][0..m.bytes.len], m.bytes);
+            vpos += m.bytes.len;
+        }
+    }
+    setPageChecksum(page, computePageChecksum(page));
+}
+
+/// Decode a range-tombstone page. Design §5.1: a CRC failure is library
+/// corruption (same severity class as tree pages) — report, never silent.
+///
+/// Errors (design §1.2 N1 — no @panic in src/, that was spike privilege):
+///   error.CorruptCrc      — whole-page CRC mismatch
+///   error.InvalidTombPage — page_type != 5, or a reserved bit30 set in a
+///                           len word (future spill encoding: clean rejection
+///                           by this decoder, not a misread)
+///   error.Truncated       — entry-header array or offset/len out of bounds
+///   error.OutOfMemory     — allocation of the tobs array
+pub fn decodeTombPage(a: std.mem.Allocator, page: *const [PAGE_SIZE]u8) !TombPage {
+    if (!verifyPageChecksum(page)) return error.CorruptCrc;
+    const hdr = decodePageHeader(page[0..PAGE_HEADER_SIZE]);
+    if (hdr.page_type != PAGE_TYPE_RANGE_TOMBSTONE) return error.InvalidTombPage;
+    const payload = page[PAGE_HEADER_SIZE .. PAGE_SIZE - 4];
+    const count: usize = hdr.nkeys;
+    // E2: nkeys comes from disk (u16, up to 65535 -> a 1MB header array) — a
+    // CRC-valid page can be crafted to blow past the 4068B payload, so bound
+    // the array before slicing.
+    if (count > payload.len / TOMB_ENTRY_SIZE) return error.Truncated;
+    const tobs = try a.alloc(RangeTombstone, count);
+    errdefer a.free(tobs);
+    var hpos: usize = 0;
+    for (0..count) |i| {
+        const min_raw = std.mem.readInt(u32, payload[hpos..][0..4], .little);
+        hpos += 4;
+        const max_raw = std.mem.readInt(u32, payload[hpos..][0..4], .little);
+        hpos += 4;
+        const min_off = std.mem.readInt(u32, payload[hpos..][0..4], .little);
+        hpos += 4;
+        const max_off = std.mem.readInt(u32, payload[hpos..][0..4], .little);
+        hpos += 4;
+        // F-4: bit30 spill reserved — must be 0 in this format version.
+        if ((min_raw & 0x4000_0000) != 0 or (max_raw & 0x4000_0000) != 0) {
+            return error.InvalidTombPage;
+        }
+        const min_len: usize = min_raw & 0x3FFF_FFFF;
+        const max_len: usize = max_raw & 0x3FFF_FFFF;
+        const min_app = (min_raw >> 31) & 1 == 1;
+        const max_app = (max_raw >> 31) & 1 == 1;
+        // E11: widen before adding — u32 + u32 wraps on 32-bit targets
+        // (pi-2 F-2: 0xFFFFFFFF + 0x7FFF_FFFF panics in safe builds).
+        if (@as(u64, min_off) + @as(u64, min_len) > payload.len or
+            @as(u64, max_off) + @as(u64, max_len) > payload.len)
+        {
+            return error.Truncated;
+        }
+        // len=0 with no flag = null bound (±infinity); len=0 WITH the flag is
+        // the valid bound "" ++ 0x00 (effective "\x00").
+        tobs[i] = .{
+            .min = if (min_len == 0 and !min_app) null else .{
+                .bytes = payload[min_off..][0..min_len],
+                .append_zero = min_app,
+            },
+            .max = if (max_len == 0 and !max_app) null else .{
+                .bytes = payload[max_off..][0..max_len],
+                .append_zero = max_app,
+            },
+        };
+    }
+    return .{ .hdr = hdr, .tobs = tobs, .next = hdr.free_next };
+}
 
 
 test "format: page header roundtrip" {

@@ -65,8 +65,8 @@ kind 已用到 4=OVERFLOW）。页布局（**T-38-P-R 修订版**：payload 计�
 ├─────────────────────────────────────────────────────────────┤
 │ payload[0..]   = 连续定长头数组 × nkeys（无 payload 计数）： │
 │   每条 16B:                                               │
-│     min_len  u32   # min 存储键长；bit31 = append_zero 标志  │
-│     max_len  u32   # max 存储键长；bit31 = append_zero 标志  │
+│     min_len  u32   # min 存储键长；bit31=append_zero；bit30=spill 预留（恒0）│
+│     max_len  u32   # max 存储键长；bit31=append_zero；bit30=spill 预留（恒0）│
 │     min_off  u32   # min 键字节在变长区的偏移（payload 起）   │
 │     max_off  u32   # max 键字节在变长区的偏移（payload 起）   │
 │ 变长区（剩余 payload）: 各墓碑 min/max 的存储字节             │
@@ -87,6 +87,11 @@ kind 已用到 4=OVERFLOW）。页布局（**T-38-P-R 修订版**：payload 计�
   冗余校验面，CRC 已保完整性）；walk 类校验器（page_partition.zig 风格）
   可以按 `nkeys < 1` 拒绝空页（0 条墓碑没有存在意义，写路径保证不产生）。
 - **迁移注记（N1）**：探针的 `decodeTombPage` 对 offset 越界用 `@panic`——
+- **bit30 spill 预留位（T-38-1 落地补充，F-4）**：条头 `min_len`/`max_len` 的
+  **bit30 恒为 0**，保留给「边界 spill 到 overflow 链页」（本节上文的双长边界生产
+  方向）；bit31 仍为 append_zero。编码恒写 0；解码遇到置位按损坏拒绝
+  （`error.InvalidTombPage`）——预留本身是格式的一部分，未来启用时随
+  解码器协同升级，当前版本解码器对其干净拒绝而非误读。
   spike 可接受，**迁移进 `src/` 时必须改为 `error.Truncated/CorruptCrc`**，
   不得照抄 panic。
 
@@ -161,9 +166,9 @@ Bound      = { bytes: []const u8, append_zero: bool = false }
 | 方向 | 行为 | 实现 |
 |---|---|---|
 | **新代码读旧库（v2）** | `tomb_head` 视为 0（无墓碑）——v2 的 58B payload 没有 tomb_head，按「无墓碑链」处理，全部读路径短路，行为与旧版逐字节一致 | decode v2 → tomb_head=0 |
-| **旧代码读新库（v3）** | `isValidMeta` 判 `version==2` 失败 → `readMetaPage` 返回 null → **打开失败**（干净拒绝，不会误读） | 现状即如此，无需改 |
+| **旧代码读新库（v3）** | `isValidMeta` 判 `version==2` 失败 → `readMetaPage` 返回 null → **Db.open 静默按空库打开**（db.zig:55-77 / file_page_store.zig:199-220 把双槽 null 视为「未曾初始化」，fresh DB 路径）；后续写入从 FIRST_DATA_PAGE 重新分配，**覆盖既有 v3 数据页**（静默数据破坏，T-38-1 F-1 更正，issue T-49）。干净拒绝只在 cube_check 等走 `error.NoMeta` 的工具层成立（cube_check.zig:66） | 现状如此（更正自原「打开失败」的错误描述） |
 
-这是「**单向可升级**」：升级后不能再用旧二进制打开（v3 库对旧代码是关闭的）。
+这是「**单向可升级**」：升级后**不得回滚二进制**——旧二进制不会拒绝打开 v3 库，而是静默按空库打开并覆盖数据（见上表 F-1 更正与 T-49），比「打不开」恶劣得多。
 
 **生产读路径的三值判定（T-38-P-R，N2）**：探针的 `decodeMetaAny` 把
 「非 v2」一律返回 null（探针内部由调用方再探测 v3）；生产 `readMetaPage`
@@ -176,8 +181,8 @@ Bound      = { bytes: []const u8, append_zero: bool = false }
 
 - 允许旧代码打开 v3 库要求旧代码理解 tomb_head 遮蔽语义——否则
   `select` 会把已删 key 全部吐回来（**静默数据复活**，比打开失败恶劣得多）。
-- 现有生态（cube_check、备份工具）都走 `isValidMeta`，v3 库会被它们
-  干净拒绝而不是误判。
+- 现有生态里 cube_check 等工具层走 `readMeta() orelse return error.NoMeta`，对 v3 库
+  干净拒绝；但 **Db/FPS 打开路径不会拒绝**（见上表）——干净拒绝不是全局属性，仅在工具层成立。
 - 若未来需要「降级打开」，可选加 version 位图（如 v=3 且 payload 首字段带
   feature-bits，tomb 子集为 0 时按 v2 行为）——**本期不做**，记录为扩展点。
 
