@@ -166,9 +166,9 @@ Bound      = { bytes: []const u8, append_zero: bool = false }
 | 方向 | 行为 | 实现 |
 |---|---|---|
 | **新代码读旧库（v2）** | `tomb_head` 视为 0（无墓碑）——v2 的 58B payload 没有 tomb_head，按「无墓碑链」处理，全部读路径短路，行为与旧版逐字节一致 | decode v2 → tomb_head=0 |
-| **旧代码读新库（v3）** | `isValidMeta` 判 `version==2` 失败 → `readMetaPage` 返回 null → **Db.open 静默按空库打开**（db.zig:55-77 / file_page_store.zig:199-220 把双槽 null 视为「未曾初始化」，fresh DB 路径）；后续写入从 FIRST_DATA_PAGE 重新分配，**覆盖既有 v3 数据页**（静默数据破坏，T-38-1 F-1 更正，issue T-49）。干净拒绝只在 cube_check 等走 `error.NoMeta` 的工具层成立（cube_check.zig:66） | 现状如此（更正自原「打开失败」的错误描述） |
+| **旧代码读新库（v3）** | 【T-53 之前的旧行为】`isValidMeta` 判 `version==2` 失败 → `readMetaPage` 返回 null → **Db.open 静默按空库打开**（把双槽 null 视为「未曾初始化」，fresh DB 路径）；后续写入从 FIRST_DATA_PAGE 重新分配，**覆盖既有 v3 数据页**（静默数据破坏，T-38-1 F-1 更正，issue T-49）。干净拒绝只在 cube_check 等走 `error.NoMeta` 的工具层成立（cube_check.zig:66） | 【T-53 已修】`readMetaPage` 对「CRC 合法但 magic/version 不认识」（坏 magic / v1 / ≥v4）的槽返回 `error.InvalidMeta`（format.zig `isInvalidMetaPage`）；`Db.open` 拒绝且不写盘（errdefer 零泄漏）；`FPS.init` 以 `invalid_meta` 标记区分 fresh 与 invalid（init 不致命，硬门在 Db.open）。**风险仅剩「回滚到 T-53 之前的旧二进制」** |
 
-这是「**单向可升级**」：升级后**不得回滚二进制**——旧二进制不会拒绝打开 v3 库，而是静默按空库打开并覆盖数据（见上表 F-1 更正与 T-49），比「打不开」恶劣得多。
+这是「**单向可升级**」：升级后**不得回滚二进制**——**T-53 之前**的旧二进制不会拒绝打开 v3 库，而是静默按空库打开并覆盖数据（见上表 F-1 更正与 T-49），比「打不开」恶劣得多：**回滚不是「用不了」，而是「静默毁数据」**。T-53 之后的新二进制对一切认不出的 meta（v1 / v4+ / 坏 magic）一律 typed 拒绝，不再有此风险。
 
 **生产读路径的三值判定（T-38-P-R，N2）**：探针的 `decodeMetaAny` 把
 「非 v2」一律返回 null（探针内部由调用方再探测 v3）；生产 `readMetaPage`

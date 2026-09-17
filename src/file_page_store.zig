@@ -107,6 +107,12 @@ pub const FilePageStore = struct {
     /// True when open-time chain restore rejected the persisted freelist (INV-F2:
     /// leak, never mis-reclaim). Written once in init, read-only afterwards.
     free_list_discarded: bool = false,
+    /// T-53 (T-49/T-50): a meta slot is CRC-valid but has an unrecognized
+    /// magic/version. Such a file is NOT a fresh DB — init stays non-failing
+    /// (low-level layer; the hard gate is Db.open → error.InvalidMeta via
+    /// readMeta, before any write can consume the un-recovered next_free).
+    /// Written once in init, read-only afterwards (diagnostic surface).
+    invalid_meta: bool = false,
 
     /// T-39-B: membership mirror of `freelist` — pushPoolLocked dedup in
     /// O(1) instead of the old O(pool) indexOfScalar scan. Sync contract:
@@ -198,6 +204,14 @@ pub const FilePageStore = struct {
         // to write the OTHER page next (alternating write for crash safety)
         const m0 = f2.readMetaPageSingle(&fps.meta0);
         const m1 = f2.readMetaPageSingle(&fps.meta1);
+        // T-53 (T-49/T-50): distinguish invalid from fresh. A slot that is
+        // CRC-valid but has an unrecognized magic/version means this file was
+        // NOT simply never initialized — it was written by a different/newer
+        // binary. Record it; such slots are skipped by recovery below exactly
+        // like torn ones (their content cannot be trusted). The hard gate is
+        // Db.open (readMeta → error.InvalidMeta) — FilePageStore.init itself
+        // stays non-failing so diagnostic tools can still open the file.
+        fps.invalid_meta = f2.isInvalidMetaPage(&fps.meta0) or f2.isInvalidMetaPage(&fps.meta1);
         if (m0 != null and m1 != null) {
             // Both valid: active page is the one with higher sequence;
             // meta_index should point to the inactive (older) page to overwrite next

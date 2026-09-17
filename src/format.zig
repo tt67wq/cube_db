@@ -259,8 +259,31 @@ pub fn readMetaPageSingle(page: *const [PAGE_SIZE]u8) ?MetaPage {
     return meta;
 }
 
-/// Read from the two meta pages and take the higher sequence (crash safe)
-pub fn readMetaPage(page0: *const [PAGE_SIZE]u8, page1: *const [PAGE_SIZE]u8) ?MetaPage {
+/// T-53 (T-49/T-50): does this slot hold a CRC-valid, well-formed META page
+/// whose magic/version we do NOT recognize (bad magic, version 1, version >= 4)?
+/// This is NOT "no meta": a file with such a slot is NOT a fresh DB — treating
+/// it as fresh is the T-49/T-50 silent-overwrite bug. Distinct from a torn or
+/// zeroed slot, which legitimately decodes to null (crash safety: the other
+/// slot wins). A random corruption cannot land here: it breaks the checksum
+/// first; only a real writer with a different magic/version can.
+pub fn isInvalidMetaPage(page: *const [PAGE_SIZE]u8) bool {
+    if (!verifyPageChecksum(page)) return false; // torn/zeroed — not "invalid"
+    const hdr = decodePageHeader(page[0..PAGE_HEADER_SIZE]);
+    if (hdr.page_type != PAGE_TYPE_META) return false; // not a meta slot at all
+    const meta = decodeMetaPayload(page[PAGE_HEADER_SIZE .. PAGE_SIZE - 4]);
+    return !isValidMetaAny(meta);
+}
+
+/// Read from the two meta pages and take the higher sequence (crash safe).
+/// T-53: a slot that is CRC-valid but unrecognized (isInvalidMetaPage) fails
+/// the WHOLE read with error.InvalidMeta — never conflated with "no meta"
+/// (fresh DB = exactly both slots null). "Any invalid slot errors" (not just
+/// the sequence winner): an unrecognized slot can only come from a different/
+/// newer writer, and continuing on the other slot would silently re-expose an
+/// older state — reject instead (issues T-49 + T-50). Torn/zeroed slots stay
+/// null (crash safety: the other slot wins).
+pub fn readMetaPage(page0: *const [PAGE_SIZE]u8, page1: *const [PAGE_SIZE]u8) !?MetaPage {
+    if (isInvalidMetaPage(page0) or isInvalidMetaPage(page1)) return error.InvalidMeta;
     const m0 = readMetaPageSingle(page0);
     const m1 = readMetaPageSingle(page1);
     if (m0 == null and m1 == null) return null;
@@ -579,7 +602,7 @@ test "format: meta alternation — take larger sequence" {
     @memset(&page1, 0);
     writeMetaPage(&page0, &meta0, 0);
     writeMetaPage(&page1, &meta1, 1);
-    const got = readMetaPage(&page0, &page1);
+    const got = try readMetaPage(&page0, &page1);
     try std.testing.expect(got != null);
     try std.testing.expectEqual(@as(u64, 200), got.?.sequence);
 }
@@ -597,7 +620,7 @@ test "format: meta alternation — one corrupt, take other" {
     writeMetaPage(&page0, &meta0, 0);
     @memset(page1[0..PAGE_HEADER_SIZE], 0xff);
     setPageChecksum(&page1, computePageChecksum(&page1));
-    const got = readMetaPage(&page0, &page1);
+    const got = try readMetaPage(&page0, &page1);
     try std.testing.expect(got != null);
     try std.testing.expectEqual(@as(u64, 500), got.?.sequence);
 }

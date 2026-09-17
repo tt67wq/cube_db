@@ -63,7 +63,18 @@ pub const Db = struct {
     pub fn open(allocator: std.mem.Allocator, store: PageStore, opts: wrt.Options) !*Db {
         const state = try allocator.create(State);
         state.* = State.init(allocator, store, opts);
+        // T-53: invalid meta / read errors propagate from below; errdefer
+        // covers them: State.init allocates nothing, so destroy suffices
+        // (also covers a failed Db allocation further down).
+        errdefer allocator.destroy(state);
 
+        // T-53 (T-49/T-50): store.readMeta() now fails with error.InvalidMeta
+        // when a meta slot is CRC-valid but unrecognized (bad magic / v1 / v4+)
+        // — readMetaPage keeps torn/zeroed slots null (crash-safe fallback to
+        // the other slot), so "null" still means fresh. Invalid is never
+        // treated as fresh — that was the T-49/T-50 silent-empty-open +
+        // data-overwrite bug. FilePageStore's vtReadMeta re-syncs its meta
+        // buffers from the mmap first, so cross-process writers land too.
         var tomb_head: u32 = 0; // T-38-2: captured with root from the SAME meta page
         if (try store.readMeta()) |meta| {
             tomb_head = meta.tomb_head;
