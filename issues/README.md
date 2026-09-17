@@ -3,7 +3,7 @@
 本目录记录开发/评审/整合过程中发现的问题，每个问题一个带编号与状态的 `.md` 文件。
 本文件是**总索引**：想快速知道「还剩哪些没修、卡在哪、下一步是什么」，看这里即可。
 
-> 最后更新：2026-09-18（已 closed 的 issue 迁入 `archived/`）。main = `383dabf`。
+> 最后更新：2026-09-18（关闭 T-49 + T-50，迁入 `archived/`；新立 T-53）。main = `1c6ce1d`。
 
 **布局约定**：`issues/` 根目录**只放仍活跃的 issue**（`open` / `proposed` / `fixing` / `partial`）。
 一旦置为 `closed` 并通过验收，**立即 `git mv` 进 `archived/`**，文件名不变。
@@ -40,28 +40,28 @@
 | `fixing` | T-38 |
 | `partial` | T-39 |
 | `proposed` | T-39-C、T-45、T-47 |
-| `open` | T-49、T-50 |
+| `open` | T-53 |
 
-**活跃 issue 共 7 条**（根目录下除本 README 外的全部 `.md`）。
-已 closed 的 12 条见下文「三、归档」。
+**活跃 issue 共 6 条**（根目录下除本 README 外的全部 `.md`）。
+已 closed 的 14 条见下文「三、归档」。
 
 ### 明细
 
 | 编号 | 标题（简） | 状态 | 还剩什么 / 下一步 | 关联 main |
 |---|---|---|---|---|
-| **T-38** | deleteRange 高效化：全量物化 + 每 key tombstone 的 O(range) 内存与写放大 | `fixing` | **阶段 3 主线**。阶段 1（格式层）/ 阶段 2（读路径）已合入验收；当前在阶段 3（写路径）/ 阶段 4（GC）。前置 T-49/T-50 待决 | `baa44bd`、`88124bc` |
+| **T-38** | deleteRange 高效化：全量物化 + 每 key tombstone 的 O(range) 内存与写放大 | `fixing` | **阶段 3 主线**。阶段 1（格式层）/ 阶段 2（读路径）已合入验收；当前在阶段 3（写路径）/ 阶段 4（GC）。前置 T-49/T-50 已由 T-53 关闭 | `baa44bd`、`88124bc`、`1c6ce1d` |
 | **T-39** | freelist 持久化写放大：每次 commit 整链重写 + O(pool) 去重扫描 | `partial` | 去重收敛 / 静默吞错可观测化 / FreelistStats 观测 API 已验收关闭；**写放大痛点未闭**，已拆出 T-39-C | — |
 | **T-39-C** | append-only freelist 增量持久化在现有崩溃模型下不可闭合（impossibility 记录） | `proposed` | 已论证「不改 T-33 崩溃安全模型则无法安全落地」，等 conductor 决定是否投入新的磁盘格式不变量（freshness proof） | — |
 | **T-45** | T-43 sweep 回归测试 overwrite 步骤使用 stale root（测试瑕疵） | `proposed` | 测试语义瑕疵，sweep 有效性不受影响；待决定是否修 | — |
 | **T-47** | `docs/lecture_btree.html` 与 T-43/T-46 后实现脱节 | `proposed` | **已交付但搁置**：交付物 `4632fcb` 未合入，评审 REQUEST_CHANGES；待返工或弃用 | — |
-| **T-49** | 设计文档 §2「旧代码读 v3 库 = 干净拒绝打开」与源码不符：实际静默清空并覆盖数据 | `open` | **high，数据破坏面**。待立项修复；是 T-38 阶段 1 的部署风险前提 | — |
-| **T-50** | meta 三值判定的「第三值」是 `null`，与 fresh DB 不可区分 | `open` | medium（v4 出现时升级为 high）。与 T-49 同根因家族；与 T-38 阶段 3 的 version 切换策略耦合 | — |
+| **T-53** | 「torn meta」方向仍可被当 fresh DB 打开：双槽 torn 时可能覆盖既有数据页 | `open` | medium，数据破坏面（与 T-49 同族，需双重损坏或单提交库 torn 触发）。T-53 任务只闭合了 invalid-meta 方向；torn 方向留待评估 heuristic 拒绝 | `1c6ce1d`（T-53 主任务已合入） |
 
 ### 值得先看的
 
-- **T-49 / T-50** 是仅有的两条 `open`，且 T-49 标 high（数据破坏面）、是 T-38 阶段 3 的前置。
-  要推进阶段 3，这两条得先有结论。
-- **T-38** 是唯一的 `fixing`，是本仓库当前的主线工作。
+- **T-53** 是唯一的 `open`，数据破坏面（与已关闭的 T-49 同族，但方向是 torn 而非 invalid）。
+  触发需双重损坏或单提交库 torn，当前无实际触发面；待评估 heuristic 拒绝。
+- **T-38** 是唯一的 `fixing`，是本仓库当前的主线工作。其阶段 3 的前置
+  T-49/T-50 已由 T-53 关闭（`1c6ce1d`），**阶段 3 现可推进**。
 - **T-39 + T-39-C** 要连起来读：T-39 剩的那块之所以没做完，是因为 T-39-C 论证了它在现有
   崩溃模型下**做不到**。别把它们当成两个独立的小问题。
 
@@ -69,7 +69,7 @@
 
 ## 三、归档（`archived/`）
 
-已全部 `closed`，保留供追溯，不再维护。共 12 条。
+已全部 `closed`，保留供追溯，不再维护。共 14 条。
 
 | 编号 | 标题（简） | 状态 | 关联 main |
 |---|---|---|---|
@@ -84,10 +84,13 @@
 | T-48 | range tombstone punch-hole 与边界缺口 | `closed` | — （N-R1 转阶段 1 跟进） |
 | T-51 | T-38-2 RED fixture 缺陷 | `closed` | `88124bc` |
 | T-52 | 墓碑链环防护在 FilePageStore 上形同虚设（准 hang / 资源炸弹） | `closed` | `24bb874`（遗留 O-1/O-2 转阶段 4） |
+| T-49 | 设计文档 §2「旧代码读 v3 库 = 干净拒绝打开」与源码不符：实际静默清空并覆盖数据 | `closed` | `1c6ce1d`（T-53 一并关闭；残余 torn 方向转 T-53 issue） |
+| T-50 | meta 三值判定的「第三值」是 `null`，与 fresh DB 不可区分 | `closed` | `1c6ce1d`（T-53 一并关闭） |
 | N-1 | put composite entry 溢出 panic | `closed` | `ba85d2c`、`6d1d318` |
 
 **引用归档文件时注意**：路径已变为 `issues/archived/<原名>.md`。
-T-38 / T-51 / T-52 等文件中出现的 `issues/T-5x-….md` 式引用是**归档前写的**，未回改，读作 `archived/` 下同名文件。
+T-38 / T-49 / T-50 / T-51 / T-52 等文件中出现的 `issues/T-5x-….md` 式引用是**归档前写的**，
+未回改，读作 `archived/` 下同名文件。
 
 ---
 
@@ -122,8 +125,11 @@ T-38 与 T-51 中都出现过 451/452 vs 452/452 的表述，它们并不矛盾�
 
 ### 4.3 编号规则
 
-编号单调递增，扫描本目录取最大值 +1。当前最大值 = **T-52**；另有独立编号 **N-1**（另一来源系列）。
+编号单调递增，扫描本目录取最大值 +1。当前最大值 = **T-53**；另有独立编号 **N-1**（另一来源系列）。
 归档不移除编号，避免历史引用失效。
+
+**注**：任务号与 issue 号可共用（如 T-52、T-53 都是「任务 `T-53` / issue `T-53`」同号），
+这是既有约定（一个任务产出的问题沿用任务号）。
 
 ### 4.4 状态流转
 
@@ -148,5 +154,7 @@ proposed：尚未决定要做（待立项 / 待评估 / 已论证不可闭合）
 ## 五、关联材料
 
 - `docs/reviews/` — 各次独立评审产出
+- `docs/reviews/T-53-review.md` — T-53（关闭 T-49 + T-50）合并评审报告（review + test 三方多签）
 - `issues/archived/T-52-…md` — 墓碑链环防护（visited-set 修法，已归档）
+- `issues/archived/T-49-…md`、`issues/archived/T-50-…md` — 开库路径 invalid-meta 问题（T-53 一并关闭）
 - `docs/lecture_t52_commit_chain.html` — T-52 的五个 commit 讲义（小白向）

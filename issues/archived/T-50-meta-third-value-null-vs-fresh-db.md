@@ -1,6 +1,6 @@
 # Issue T-50 — meta 三值判定的「第三值」是 `null`，与 fresh DB 不可区分（v4 出现时会重演 T-49 静默空库）
 
-- **状态**: open
+- **状态**: closed（2026-09-18，T-53 修复经三方多签合入 main；验收见文末）
 - **发现于**: T-38-1 评审（`review.md` Non-blocking N-1）
 - **发现时间**: 2026-09-17
 - **来源**: 评审发现（T-38-1 评审者 pi-2 独立实证）
@@ -51,10 +51,27 @@ T-38-1 已把「非 v2 非 v3 → 拒绝」在 `isValidMetaAny` 层收紧
 
 ## 处置
 
-- [ ] 挂 T-38 阶段 3 前置条件：`readMetaPage` 开库路径引入 invalid-meta 与 fresh 的
-      显式区分（typed error 或三值枚举），`Db.open` 对 invalid-meta 明确拒绝。
-- [ ] 作为「新增磁盘版本号」类变更的通用前置检查项（写入 T-38 issue 的阶段 3 段落）。
-- [ ] 阶段 3 落地后置为 closed。
+- [x] 挂 T-38 阶段 3 前置条件：`readMetaPage` 开库路径引入 invalid-meta 与 fresh 的
+      显式区分（**typed error `error.InvalidMeta`**），`Db.open` 对 invalid-meta 明确拒绝。
+- [x] 作为「新增磁盘版本号」类变更的通用前置检查项（写入 T-38 issue 的阶段 3 段落）。
+- [x] 落地后置为 closed。
+
+## 关闭验收（2026-09-18）
+
+**由 T-53 一并关闭**（T-49 + T-50 同根因，合并为一个任务）。
+三方多签：impl pi-1 + review pi-2（approve，Blocking 0）+ test pi-3（PASS，11 条对抗用例全绿）。
+产物：RED `fb492ea` + GREEN `1c6ce1d`；评审见 `docs/reviews/T-53-review.md`。
+
+实测（`1c6ce1d`）：
+
+- `format.isInvalidMetaPage` 用 `!isValidMetaAny` 做判据，对 v4 / v1 / 坏 magic /
+  **任何未来 version** 结构性拦截（与具体版本号无关）；
+- `readMetaPage` 签名 `?MetaPage` → `!?MetaPage`，第三值 = `error.InvalidMeta`（typed）；
+- 独立对抗用例 adv3：`version × magic` **30 组合全部拒绝**；
+  adv7：`store().readMeta()` 在 **store 层**即报错（门不止在 Db）；
+- 回归门全绿，老库（v2/v3）行为零变化。
+
+**残余（另立）**：`torn` 方向仍可被当 fresh 打开 → `issues/T-53-torn-meta-still-fresh-db-data-overwrite.md`。
 
 ## 备注
 
