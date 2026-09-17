@@ -401,7 +401,6 @@ pub fn build(b: *std.Build) void {
     const run_rangetomb_probe = b.addRunArtifact(rangetomb_probe);
     const rangetomb_probe_step = b.step("test-rangetomb-probe", "Run T-38-P range-tombstone probe (spike)");
     rangetomb_probe_step.dependOn(&run_rangetomb_probe.step);
-    rangetomb_probe_step.dependOn(&run_rangetomb_probe.step);
 
     // T-38-2: range-tombstone read-path shadowing tests (RED first)
     const rangetomb_read_test = b.addTest(.{

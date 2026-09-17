@@ -2222,6 +2222,16 @@ pub const Iterator = struct {
     /// layer does not depend on wrt.State).
     pin_ctx: ?*anyopaque = null,
     pin_deinit: ?*const fn (*anyopaque) void = null,
+    /// T-38-2: entry shadow-skip hook (optional). Injected by db.zig for
+    /// range-tombstone shadowing: called per surviving entry AFTER the
+    /// min/max range checks, before yielding; `true` = skip the entry.
+    /// Errors propagate through next(). Default null = zero behavior change.
+    skip_ctx: ?*anyopaque = null,
+    skip_fn: ?*const fn (ctx: *anyopaque, key: []const u8) anyerror!bool = null,
+    /// Releases skip_ctx at deinit (called BEFORE pin_deinit so the shadow
+    /// context is fully done with the borrowed pages before the MVCC pin
+    /// that keeps them alive is released).
+    skip_deinit: ?*const fn (*anyopaque) void = null,
     /// Hot-read CRC policy (T-35 Part A): set by selectChecked from the
     /// Db's Options; every page this iterator reads (branch re-reads in
     /// stepToNextLeaf, descents, overflow chains) goes through it.
@@ -2235,6 +2245,10 @@ pub const Iterator = struct {
     const Frame = struct { page_no: u32, child_idx: usize };
 
     pub fn deinit(self: *Iterator) void {
+        if (self.skip_deinit) |f| {
+            if (self.skip_ctx) |c| f(c);
+            self.skip_ctx = null;
+        }
         if (self.pin_deinit) |f| {
             if (self.pin_ctx) |c| f(c);
             self.pin_ctx = null;
@@ -2293,6 +2307,13 @@ pub const Iterator = struct {
                     }
                     if (self.max) |mx| {
                         if (cmpKey(ev.key, mx) != .lt) return null;
+                    }
+                    // T-38-2: tombstone shadow filter (db.zig-injected). After
+                    // the range checks so the hook only sees yield candidates;
+                    // `continue` rides the same advance() semantics as the
+                    // tombstone/min/max skips above.
+                    if (self.skip_fn) |f| {
+                        if (try f(self.skip_ctx.?, ev.key)) continue;
                     }
                     if (ev.flags & LEAF_FLAG_OVERFLOW != 0) {
                         // Overflow value: assemble the chain into the reuse

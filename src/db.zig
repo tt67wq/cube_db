@@ -52,11 +52,21 @@ pub const Db = struct {
     batch_threshold: usize,
     pending: std.ArrayList(Entry),
 
+    /// T-38-2 (design §2): range-tombstone chain head captured at open from
+    /// the SAME meta read that seeds State (same-page consistent pair).
+    /// v2/fresh stores decode to 0. Immutable for this Db's lifetime in
+    /// phase 2 (no write path swaps it) — that is what makes captureSnapshot's
+    /// two independent loads tear-free; phase 3 moves root+tomb_head into one
+    /// packed atomic in wrt.State when deleteRange starts swapping it.
+    tomb_head: std.atomic.Value(u32),
+
     pub fn open(allocator: std.mem.Allocator, store: PageStore, opts: wrt.Options) !*Db {
         const state = try allocator.create(State);
         state.* = State.init(allocator, store, opts);
 
+        var tomb_head: u32 = 0; // T-38-2: captured with root from the SAME meta page
         if (try store.readMeta()) |meta| {
+            tomb_head = meta.tomb_head;
             state.root.store(meta.root_page, .release);
             state.sequence.store(meta.sequence, .release);
             state.entry_count.store(meta.entry_count, .release);
@@ -74,6 +84,7 @@ pub const Db = struct {
             .staging_mutex = .{},
             .batch_threshold = opts.micro_batch.batch_threshold,
             .pending = .empty,
+            .tomb_head = std.atomic.Value(u32).init(tomb_head),
         };
         return db;
     }
@@ -280,6 +291,37 @@ pub const Db = struct {
 
     // ---- Read path (default snapshot = current root) ----
 
+    // ---- T-38-2: range-tombstone shadowing (design §3.1/§1.4) ----
+
+    /// (root, tomb_head) captured as one logical snapshot. Phase 2 tear-free
+    /// proof: tomb_head is immutable after open (only open writes it), so the
+    /// two loads can never interleave into mismatched generations. Phase 3
+    /// MUST replace the body with a single packed-atomic load from wrt.State
+    /// (root<<32|tomb_head) once deleteRange starts swapping tomb_head —
+    /// both tear directions are unsafe (stale tomb hides re-put keys; fresh
+    /// tomb leaks a future delete into an old snapshot). This fn is the only
+    /// capture point for all five read entrypoints.
+    const ReadSnapshot = struct { root: u32, tomb_head: u32 };
+
+    fn captureSnapshot(self: *Db) ReadSnapshot {
+        return .{ .root = self.state.getRoot(), .tomb_head = self.tomb_head.load(.acquire) };
+    }
+
+    /// Is `key` covered by any tombstone on the chain at `head`?
+    /// tomb_head==0 short-circuits (unique: impl-plan §7-4) — zero I/O, zero
+    /// allocation, byte-identical behavior on tomb-less stores.
+    /// Corrupt-chain errors (CorruptCrc/InvalidTombPage/Truncated, incl. the
+    /// H-1 cycle guard) propagate — NEVER swallowed into "no tombs"
+    /// (design §5.1: tomb corruption is library corruption).
+    fn isShadowed(self: *Db, head: u32, key: []const u8) !bool {
+        if (head == 0) return false;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        var pages: std.ArrayList(f2.TombPage) = .empty;
+        try walkTombChain(self.store, head, &pages, arena.allocator());
+        return tombListCovers(pages.items, key);
+    }
+
     pub fn get(self: *Db, key: []const u8) !?[]u8 {
         // Register-then-capture (same pattern as select / ReadTxn, T-29
         // review finding 1): the reader must be registered BEFORE the root
@@ -289,10 +331,15 @@ pub const Db = struct {
         // snapshot still references, and the next alloc would overwrite them
         // mid-descent (silent misread). Whichever root is read, its COW old
         // pages stay in pending_free until endRead releases the pin.
+        // T-38-2: the same pin keeps the tomb chain pages alive for the
+        // shadow walk below.
         const reader = self.state.beginRead();
         defer self.state.endRead(reader);
-        const root = self.state.getRoot();
-        return try btree.getChecked(self.allocator, self.store, root, key, self.state.opts.crc_check);
+        const snap = captureSnapshot(self);
+        // T-38-2 (design §3.1): pure spatial pre-descent check — a covered key
+        // is "missing" (INV-RT1: no timestamp needed on the read path).
+        if (try self.isShadowed(snap.tomb_head, key)) return null;
+        return try btree.getChecked(self.allocator, self.store, snap.root, key, self.state.opts.crc_check);
     }
 
     /// Zero-copy point read (T-29 Phase A): value is copied into the caller's
@@ -305,8 +352,11 @@ pub const Db = struct {
         // pages the in-flight descent still references.
         const reader = self.state.beginRead();
         defer self.state.endRead(reader);
-        const root = self.state.getRoot();
-        return try btree.getIntoChecked(self.store, root, key, buffer, self.state.opts.crc_check);
+        const snap = captureSnapshot(self);
+        // T-38-2: covered key → null without touching the caller's buffer
+        // (check runs before descent, so BufferTooSmall can't fire either).
+        if (try self.isShadowed(snap.tomb_head, key)) return null;
+        return try btree.getIntoChecked(self.store, snap.root, key, buffer, self.state.opts.crc_check);
     }
 
     /// Range query (T-29 Phase B borrowed iterator): next() returns borrowed
@@ -325,8 +375,18 @@ pub const Db = struct {
         // in pending_free until the iterator's deinit (last reader out).
         const reader = self.state.beginRead(); // MVCC pin: snapshot protection for the iterator's borrowed pages
         errdefer self.state.endRead(reader);
-        const root = self.state.getRoot();
-        var it = try btree.selectChecked(self.allocator, self.store, root, min, max, self.state.opts.crc_check);
+        const snap = captureSnapshot(self);
+        var it = try btree.selectChecked(self.allocator, self.store, snap.root, min, max, self.state.opts.crc_check);
+        // T-38-2 (M-1): shadow filter — decode the whole chain ONCE here
+        // (eager: corrupt-chain errors surface at select() itself), then
+        // per-entry checks are pure compares. it.deinit() releases BOTH the
+        // shadow ctx (skip_deinit) and the reader pin (pin_deinit).
+        if (snap.tomb_head != 0) {
+            const ctx = try loadShadowCtx(self.allocator, self.store, snap.tomb_head);
+            it.skip_ctx = ctx;
+            it.skip_fn = shadowSkip;
+            it.skip_deinit = shadowSkipDeinit;
+        }
         it.pin_ctx = @ptrCast(reader);
         it.pin_deinit = endReadPin;
         return it;
@@ -369,7 +429,11 @@ pub const Db = struct {
     /// writers (MVCC). Must be ended via endReadTxn/ReadTxn.end.
     pub fn beginReadTxn(self: *Db) !ReadTxn {
         const reader = self.state.beginRead();
-        return .{ .db = self, .snapshot_root = self.state.getRoot(), .reader = reader };
+        // T-38-2: tomb_head captured atomically-with-root (captureSnapshot seam);
+        // the txn must keep using THIS value — never db.tomb_head's current
+        // value, which a later commit could swap mid-txn (phase 3).
+        const snap = captureSnapshot(self);
+        return .{ .db = self, .snapshot_root = snap.root, .snapshot_tomb_head = snap.tomb_head, .reader = reader };
     }
 
     pub fn beginRead(self: *Db) *wrt.Reader {
@@ -474,10 +538,17 @@ pub const WriteTxn = struct {
 pub const ReadTxn = struct {
     db: *Db,
     snapshot_root: u32,
+    /// T-38-2: tombstone chain head at the txn's BEGIN moment (captured
+    /// atomically-with-root in beginReadTxn). Fixed for the txn's lifetime —
+    /// later tomb swaps by concurrent writers never leak into this snapshot.
+    snapshot_tomb_head: u32,
     reader: *wrt.Reader,
     ended: bool = false,
 
     pub fn get(self: *ReadTxn, key: []const u8) !?[]u8 {
+        // T-38-2: shadow check with the BEGIN-time snapshot tomb_head; the
+        // txn's own reader pin keeps the chain pages alive for the walk.
+        if (try self.db.isShadowed(self.snapshot_tomb_head, key)) return null;
         return try btree.getChecked(self.db.allocator, self.db.store, self.snapshot_root, key, self.db.state.opts.crc_check);
     }
 
@@ -485,6 +556,8 @@ pub const ReadTxn = struct {
     /// (null = key missing, BufferTooSmall = buffer too small, nothing
     /// written), with the snapshot pinned to this txn's root.
     pub fn getInto(self: *ReadTxn, key: []const u8, buffer: []u8) !?usize {
+        // T-38-2: same pre-descent shadow check (buffer untouched on cover).
+        if (try self.db.isShadowed(self.snapshot_tomb_head, key)) return null;
         return try btree.getIntoChecked(self.db.store, self.snapshot_root, key, buffer, self.db.state.opts.crc_check);
     }
 
@@ -494,10 +567,19 @@ pub const ReadTxn = struct {
     /// additional MVCC reader slot (stacking with the txn's pin, reader counts
     /// are incremental), released at deinit() — the iterator must still be
     /// deinit'd before the txn ends.
+    /// T-38-2: shadow filter uses the txn's BEGIN-time tomb snapshot.
     pub fn select(self: *ReadTxn, min: ?[]const u8, max: ?[]const u8) !btree.Iterator {
         const reader = self.db.state.beginRead(); // iterator's own pin (released at deinit)
         errdefer self.db.state.endRead(reader);
         var it = try btree.selectChecked(self.db.allocator, self.db.store, self.snapshot_root, min, max, self.db.state.opts.crc_check);
+        // T-38-2 (M-1): same shadow-filter shape as Db.select, but pinned to
+        // the txn's BEGIN-time tomb snapshot (snapshot_tomb_head).
+        if (self.snapshot_tomb_head != 0) {
+            const ctx = try loadShadowCtx(self.db.allocator, self.db.store, self.snapshot_tomb_head);
+            it.skip_ctx = ctx;
+            it.skip_fn = shadowSkip;
+            it.skip_deinit = shadowSkipDeinit;
+        }
         it.pin_ctx = @ptrCast(reader);
         it.pin_deinit = endReadPin;
         return it;
@@ -521,6 +603,111 @@ pub const ReadTxn = struct {
 fn endReadPin(ctx: *anyopaque) void {
     const reader: *wrt.Reader = @ptrCast(@alignCast(ctx));
     reader.state.endRead(reader);
+}
+
+// ===== T-38-2: range-tombstone shadowing helpers (design §3.1/§1.4) =====
+
+/// Compare `k` against a bound's EFFECTIVE byte string (bytes ++ 0x00 if
+/// append_zero — design §1.4), without materializing the concatenation.
+/// Semantics ported verbatim from the validated spike probe (探针 2).
+fn boundCmpKey(k: []const u8, b: f2.TombBound) std.math.Order {
+    const n = @min(k.len, b.bytes.len);
+    for (0..n) |i| {
+        if (k[i] != b.bytes[i]) return if (k[i] < b.bytes[i]) .lt else .gt;
+    }
+    if (k.len < b.bytes.len) return .lt; // k is a proper prefix of bytes → k < bytes ≤ eff
+    if (k.len > b.bytes.len) {
+        if (!b.append_zero) return .gt; // k extends bytes → k > bytes
+        // eff = bytes ++ 0x00: compare k[bytes.len] against the 0x00 suffix
+        if (k[b.bytes.len] != 0) return .gt;
+        return if (k.len == b.bytes.len + 1) .eq else .gt;
+    }
+    // k.len == bytes.len
+    return if (b.append_zero) .lt else .eq; // k == bytes < bytes ++ 0x00
+}
+
+/// [min, max) half-open coverage — min inclusive, max exclusive, null =
+/// unbounded (design §3.1 INV-RT1: pure spatial check, no timestamps).
+fn tombCovers(t: f2.RangeTombstone, k: []const u8) bool {
+    if (t.min) |m| {
+        if (boundCmpKey(k, m) == .lt) return false; // k < min
+    }
+    if (t.max) |m| {
+        if (boundCmpKey(k, m) != .lt) return false; // k >= max
+    }
+    return true;
+}
+
+/// Linear scan over decoded pages — deliberately NOT assuming any ordering
+/// (L-1: chain sorting is a phase-3 writer invariant; injected/corrupt chains
+/// are unordered).
+fn tombListCovers(pages: []const f2.TombPage, key: []const u8) bool {
+    for (pages) |p| {
+        for (p.tobs) |t| {
+            if (tombCovers(t, key)) return true;
+        }
+    }
+    return false;
+}
+
+/// Walk a tombstone chain following free_next (0 = tail), decoding every
+/// page into `pages` (tobs arrays allocated with `a`).
+/// H-1 trust boundary: decodeTombPage does NOT validate free_next — a
+/// CRC-valid cycle would loop forever. Guard: at most `store.mapsize()`
+/// page steps (generous in either store impl's unit — Mem: page count,
+/// File: bytes; both upper-bound any legal chain), exceeded →
+/// error.Truncated (typed, no hang, no unbounded growth).
+fn walkTombChain(store: PageStore, head: u32, pages: *std.ArrayList(f2.TombPage), a: std.mem.Allocator) !void {
+    const limit = store.mapsize();
+    var pn: u32 = head;
+    var steps: u64 = 0;
+    while (pn != 0) {
+        steps += 1;
+        if (steps > limit) return error.Truncated; // cycle / corrupt chain
+        const raw = try store.readPage(pn);
+        const tp = try f2.decodeTombPage(a, raw[0..f2.PAGE_SIZE]);
+        try pages.append(a, tp);
+        pn = tp.next;
+    }
+}
+
+/// Decoded tomb chain for select-time shadowing: the chain is walked and
+/// decoded ONCE per select() (corrupt-chain errors surface at the select
+/// call itself), then every per-entry check is a pure compare. The struct is
+/// arena-owned as a whole: `arena` state lives inside the ctx allocation,
+/// and deinit frees everything (ctx included) in one shot.
+const ShadowCtx = struct {
+    arena: std.heap.ArenaAllocator,
+    pages: []f2.TombPage, // tobs arrays arena-owned; bound bytes BORROW the (COW-immutable, pin-protected) page buffers
+
+    fn covers(self: *const ShadowCtx, key: []const u8) bool {
+        return tombListCovers(self.pages, key);
+    }
+};
+
+fn loadShadowCtx(a: std.mem.Allocator, store: PageStore, head: u32) !*ShadowCtx {
+    var arena = std.heap.ArenaAllocator.init(a);
+    errdefer arena.deinit();
+    const aa = arena.allocator();
+    const ctx = try aa.create(ShadowCtx);
+    var pages: std.ArrayList(f2.TombPage) = .empty;
+    try walkTombChain(store, head, &pages, aa);
+    // NOTE: `aa` borrows the stack `arena`; both uses above happen before the
+    // struct-init moves the arena state into ctx (which lives in arena memory).
+    ctx.* = .{ .arena = arena, .pages = try pages.toOwnedSlice(aa) };
+    return ctx;
+}
+
+/// btree.Iterator skip hook (T-38-2, M-1): true = entry shadowed → skip.
+/// Pure compare (decode already happened at select time) — cannot fail.
+fn shadowSkip(ctx: *anyopaque, key: []const u8) anyerror!bool {
+    const s: *ShadowCtx = @ptrCast(@alignCast(ctx));
+    return s.covers(key);
+}
+
+fn shadowSkipDeinit(ctx: *anyopaque) void {
+    const s: *ShadowCtx = @ptrCast(@alignCast(ctx));
+    s.arena.deinit(); // frees the ctx allocation itself
 }
 test "db: open default state" {
     var ms = ps.MemPageStore.init(std.testing.allocator, 1000);
