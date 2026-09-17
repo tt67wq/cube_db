@@ -161,11 +161,13 @@ test "T-38-2 s1: point get shadowed inside [min,max), visible outside" {
 test "T-38-2 s2: half-open boundary — min covered, max not (get and select agree)" {
     var ms = newStore();
     defer ms.deinit();
-    var db = try openWithTombs(&ms, .{}, &.{tomb("b", "d")}, &.{});
+    // fixture（T-51 修复）：[b,"b\0") + [c,"d") 双墓碑——b\0/ba 在 [b,"b\0")
+    // 端点外不被遮蔽（[b,d) 会把它们整个吞掉），b、c 仍被遮蔽
+    var db = try openWithTombs(&ms, .{}, &.{ tomb("b", "b\x00"), tomb("c", "d") }, &.{});
     defer db.close();
 
-    try expectShadowed(db, "b"); // min 侧：含
-    try expectVisible(db, "d"); // max 侧：不含
+    try expectShadowed(db, "b"); // min 侧：含（[b,"b\0") 恰好只遮 b）
+    try expectVisible(db, "d"); // max 侧：不含（[c,"d") 的 max 不含 d）
 
     // select 边界与 get 一致：select("b","d") 吐出 b\0、ba（b、c 被遮蔽）
     var it = try db.select("b", "d");
@@ -325,9 +327,20 @@ test "T-38-2 s7: multi-page tomb chain — shadowing across free_next pages" {
     var ms = newStore();
     defer ms.deinit();
     // 页 1：[a,b)；页 2：[c,d) + [db,dc)（两条，验证链尾页多条目）
+    // fixture（T-51 修复）：s7 需要 db/dba/dc 三个额外 key，openWithTombs 的
+    // 固定 seed 不含它们——手动走「写数据 → 关库 → 注入 → 重开」流程
     const page1 = [_]f2.RangeTombstone{tomb("a", "b")};
     const page2 = [_]f2.RangeTombstone{ tomb("c", "d"), tomb("db", "dc") };
-    var db = try openWithTombs(&ms, .{}, &page1, &page2);
+    {
+        var db = try dbi.Db.open(alloc, ms.store(), .{});
+        defer db.close();
+        try putAll(db);
+        try db.putDirect("db", "v");
+        try db.putDirect("dba", "v");
+        try db.putDirect("dc", "v");
+    }
+    _ = try injectTombs(&ms, &page1, &page2);
+    var db = try dbi.Db.open(alloc, ms.store(), .{});
     defer db.close();
 
     // 页 1 的墓碑
@@ -547,7 +560,11 @@ test "T-38-2 g9: out-of-order tomb chain — linear scan semantics" {
     // 页 1 内部乱序（min 降序：[d,e) 在 [a,b) 前）；
     // 页 2 的 min ("ba") 又小于页 1 两条 —— 跨页也乱序。
     const page1 = [_]f2.RangeTombstone{ tomb("d", "e"), tomb("a", "b") };
-    const page2 = [_]f2.RangeTombstone{tomb("ba", "c")};
+    // fixture（T-51 修复）：max 用 succ("c")（append_zero）——断言语义是
+    // 「c 被遮蔽、c\0 可见」，对应上界 "c\0"（普通 "c" 不含端点，c 会可见）
+    const page2 = [_]f2.RangeTombstone{
+        .{ .min = .{ .bytes = "ba" }, .max = .{ .bytes = "c", .append_zero = true } },
+    };
     var db = try openWithTombs(&ms, .{}, &page1, &page2);
     defer db.close();
 
