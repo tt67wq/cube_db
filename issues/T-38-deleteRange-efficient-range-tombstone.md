@@ -69,7 +69,8 @@ select 迭代器 + tombstone 批量提交实现"），但**没有披露 O(range)
 - [x] 探路（路线 C）+ 独立评审 + 返工闭环（T-38-P / T-38-P-R）
 - [x] 阶段 0（方案 B 流式分块）：T-38-B 合入 `8f9c8fb`，验收 (a) 内存项达成
 - [x] 阶段 1（格式层）：T-38-1 合入 `baa44bd`（三方多签：acceptance 绿 + review APPROVE + test PASS）
-- [ ] 阶段 2/3/4 根因落地（读路径 / 写路径 / GC）
+- [x] 阶段 2（读路径）：T-38-2 合入 `88124bc`（三方多签：验收① 452/452 + 验收② 15/15 + review APPROVE）
+- [ ] 阶段 3/4 根因落地（写路径 / GC）
 - [ ] 回归测试 + 评审（阶段 2 起需并发 staging 交错测试）
 - [ ] 验收门稳定后关闭
 
@@ -97,16 +98,20 @@ select 迭代器 + tombstone 批量提交实现"），但**没有披露 O(range)
 |---|---|---|---|
 | 0 | **方案 B**：流式分块 deleteRange（消 OOM，零格式风险） | **T-38-B** ✅ 已合入 | 无 |
 | 1 | 格式层：墓碑页 codec + meta v3（含 F2 边界编码 + **N-R1 typed 拒绝** + bit30 spill 预留位） | **T-38-1** ✅ 已合入 `baa44bd` | T-38-P-R 闭环 ✓ |
-| 2 | 读路径：遮蔽判定（tomb_head=0 时休眠） | 未派 | 阶段 1 ✓ |
-| 3 | 写路径：新 deleteRange 流 + 打洞语义（含 F1 修正）+ entryCount 流式修正 | 未派 | 阶段 2 |
+| 2 | 读路径：遮蔽判定（tomb_head=0 时休眠） | **T-38-2** ✅ 已合入 `88124bc` | T-51 关闭 ✓ |
+| 3 | 写路径：新 deleteRange 流 + 打洞语义（含 F1 修正）+ entryCount 流式修正 | 未派 | 阶段 2 ✓（前置 T-49/T-50/T-52） |
 | 4 | GC：水位收割（空区间丢弃）+ crash 矩阵扩展；物化清除挂 U-5 | 未派 | 阶段 3 |
 
-**阶段 3 前置条件（新增，来自阶段 1 评审 T-49/T-50）**：
+**阶段 3 前置条件（阶段 1 评审 T-49/T-50 + 阶段 2 评审 NB-1）**：
 ① **开库路径必须区分「invalid meta」与「fresh DB」**（`issues/T-50-…`）——
    当前 `readMetaPageSingle` 对 magic 坏 / v4 统一返回 `null`，与空库同形；
    凡新增磁盘版本号前必须先修此缺口，否则重演 T-49 式静默空库 + 数据覆盖；
 ② **version 切换策略**落地（「是否曾写墓碑」决定 v2/v3），并同步更正
    T-49 记录的部署纪律（升级后不得回滚二进制 = 否则静默数据破坏）。
+③ **T-52（NB-1）环防护加固**（`issues/T-52-…`）：`walkTombChain` 上界改用已访问页号
+   set（环重访即 `error.Truncated`，O(链) 内存）或收紧到 `min(mapsize, last_page+1)`，
+   消除 FilePageStore 上的准 hang / ~12 GiB 资源炸弹。阶段 3 引入真实写路径后会自然
+   产生环链的可触发面，故列为前置。
 
 **阶段 1 落地前必须补的两项（T-38-P-R 评审 N-R1，详见 T-48）**：
 ① 设计文档增补写路径不变量「空区间/空 plain 边界墓碑不得进入编码器」；
@@ -181,3 +186,47 @@ select 迭代器 + tombstone 批量提交实现"），但**没有披露 O(range)
   - 评审另发现 **N-1**：三值判定的「第三值」在 API 层是 `null`（与 fresh DB 不可
     区分）→ 已立 `issues/T-50-meta-third-value-null-vs-fresh-db.md`，列为阶段 3 前置。
 - **遗留（阶段 2/3/4）**：读/写路径接入、version 切换策略、spill 实装、GC。
+
+### 阶段 2（T-38-2 读路径：墓碑遮蔽判定）验收记录 — 2026-09-17
+
+- **交付**：RED `2b05ca8`（cube_db-pi-3，12 测试）→ RED 追加缺口 `f2751bc`
+  （+g6/g9/g10，15 测试）→ GREEN `b60d0fd`（cube_db-pi-1）→ 评审 `593fe11`
+  （cube_db-pi-2）→ fixture 修复 `88124bc`（cube_db-pi-3，T-51），已 ff-merge 入 main。
+- **变更**：`src/db.zig` +201（Db `tomb_head` 字段于 open 一次性捕获；`captureSnapshot`
+  唯一捕获 seam；`isShadowed` 点查 + `tomb_head==0` 唯一短路；`ShadowCtx` 供 select
+  物化；`tombListCovers`/`boundCmpKey` 线性扫 + append_zero 有效字节比较；
+  `walkTombChain` 环防护；五入口 `Db.get/getInto/select` + `ReadTxn.get/getInto/select`
+  全接入，ReadTxn 用 `snapshot_tomb_head`）、`src/btree.zig` +21（**仅 Iterator**：
+  3 个默认 null 钩子 + next() 在 overflow 组装前插钩子 + deinit 顺序
+  `skip_deinit→pin_deinit`）、`build.zig` -1（删 RED 引入的重复 dependOn）。
+  所有权合规：`format.zig`/`writer.zig`/`file_page_store.zig` 零触碰。
+- **TDD 证据**：RED 12 测试 11 红 1 绿（s8 为 `tomb_head==0` 短路的刻意的守门绿）；
+  追加 g6/g9/g10 后 14 红 1 绿。GREEN 后验收①**无墓碑零行为变化**（本阶段核心门）；
+  判定者 pi-2 复核实测 `git diff f2751bc b60d0fd -- tests/` **空**（GREEN 零改测试）。
+- **conductor 独立验收**（合并后 main `88124bc`）：
+  - 验收① 回归门：`zig build test` = **452/452**（0 skip，exit 0）——与基线 `f5b7db6`
+    逐数一致，零回归。
+  - 验收② 手工构造墓碑页遮蔽：`zig build test-rangetomb-read` = **15/15**（exit 0）。
+  - 格式层守卫：`test-format` 62/62。
+  - （worktree 内跑显示 451/452+1skip 系 `cube_check_test.zig` 环境条件跳过，非回归。）
+- **独立评审**（cube_db-pi-2，评审者 ≠ 实现者）：对 `b60d0fd` **APPROVE**，
+  Blocking 0 / Non-blocking 3。评审自写 scratch P1–P6 独立推导期望值全绿：
+  P1 遮蔽真值表（4 墓碑形态 × 16 key 含 `""`/`"\x00"`/`\xff\xff` 邻界）、
+  P2 select⟺get 一致性（3 页乱序链）、P3 环防护（自指环 + 2 页环 → typed
+  `error.Truncated` 无 hang）、P4 pin 不泄漏（含物化失败 errdefer 路径 + ReadTxn
+  存续期 reader_count）、P5 `tomb_head==0` **结构性**短路证明（钩子根本没挂）、
+  P6 FPS mapsize 算术。评审并独立复核确认 T-51 判定（实现正确、fixture 错）。
+- **发现**：
+  - **T-51（medium）**：RED 3 处 fixture 缺陷（s2 单墓碑期望集矛盾 s4、s7 断言未存储
+    key、g9 把 max 不含端点误当含端点），使验收②一度 12/15。**非实现缺陷**；由测试
+    作者 pi-3 修 fixture（断言语义不变），修后 15/15 → 已立并关闭
+    `issues/T-51-t38-2-red-fixture-defects.md`。
+  - **NB-1（medium，新）**：`walkTombChain` 环防护上界 = `store.mapsize()`，在
+    `FilePageStore` 上 = 2^28 页 → CRC 合法环链要 ~2.68 亿次 decode + ~12 GiB 峰值
+    内存才触发 `error.Truncated`，实为准 hang/资源炸弹（MemPageStore 上防护有效）。
+    仅损坏库触发（trust boundary），阶段 2 测试全走 MemPageStore 故不阻塞 →
+    已立 `issues/T-52-tomb-chain-ring-guard-fps-ineffective.md`，列为阶段 3 前置。
+- **本阶段已知限制（不修，如实报告）**：任何 commit 会把 meta 重写回 v2/`tomb_head=0`
+  → reopen 丢墓碑。这是 H-2 声明的语义分叉，根治在**阶段 3**（写路径 + T-50）。
+- **遗留（阶段 3/4）**：写路径（新 deleteRange 流 + 打洞 + version 切换 + entryCount
+  流式修正）、GC（水位收割 + crash 矩阵扩展）。阶段 3 前置：T-49、T-50、**T-52**。
