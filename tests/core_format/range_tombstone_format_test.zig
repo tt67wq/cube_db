@@ -519,7 +519,7 @@ test "T-38-1: meta mixed v2/v3 slots — higher sequence wins, no mixed state" {
     f2.writeMetaPage(&p_v2, &v2m, 0);
     f2.writeMetaPage(&p_v3, &v3m, 1);
     {
-        const got = f2.readMetaPage(&p_v2, &p_v3);
+        const got = try f2.readMetaPage(&p_v2, &p_v3);
         try std.testing.expect(got != null);
         try std.testing.expectEqual(@as(u64, 101), got.?.sequence);
         try std.testing.expectEqual(@as(u32, 777), got.?.tomb_head);
@@ -532,7 +532,7 @@ test "T-38-1: meta mixed v2/v3 slots — higher sequence wins, no mixed state" {
     @memset(&p_v2, 0);
     f2.writeMetaPage(&p_v2, &v2m, 0);
     {
-        const got = f2.readMetaPage(&p_v3, &p_v2);
+        const got = try f2.readMetaPage(&p_v3, &p_v2);
         try std.testing.expect(got != null);
         try std.testing.expectEqual(@as(u64, 102), got.?.sequence);
         try std.testing.expectEqual(@as(u32, 0), got.?.tomb_head);

@@ -435,6 +435,24 @@ pub fn build(b: *std.Build) void {
     tomb_guard_test_step.dependOn(&run_tomb_guard_test.step);
     test_step.dependOn(&run_tomb_guard_test.step);
 
+    // T-53 (T-49 + T-50): open path must distinguish invalid-meta from fresh DB
+    // (RED first, conductor-authored)
+    const open_meta_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/txn_writer_db/open_meta_guard_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    const run_open_meta_test = b.addRunArtifact(open_meta_test);
+    const open_meta_test_step = b.step("test-openmeta", "Run T-53 invalid-meta vs fresh-DB tests");
+    open_meta_test_step.dependOn(&run_open_meta_test.step);
+    test_step.dependOn(&run_open_meta_test.step);
+
     // ponytail: zig build test-writer runs only writer tests
     const writer_test = b.addTest(.{
         .root_module = b.createModule(.{

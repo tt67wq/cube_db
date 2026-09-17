@@ -209,7 +209,7 @@ test "format: meta alternation — take larger sequence" {
     f2.writeMetaPage(&page0, &meta0, 0);
     f2.writeMetaPage(&page1, &meta1, 1);
     // recovery: take the larger sequence
-    const got = f2.readMetaPage(&page0, &page1);
+    const got = try f2.readMetaPage(&page0, &page1);
     try std.testing.expect(got != null);
     try std.testing.expectEqual(@as(u64, 200), got.?.sequence);
     try std.testing.expectEqual(@as(u32, 60), got.?.root_page);
@@ -233,7 +233,7 @@ test "format: meta alternation — meta0 newer" {
     @memset(&page1, 0);
     f2.writeMetaPage(&page0, &meta0, 0);
     f2.writeMetaPage(&page1, &meta1, 1);
-    const got = f2.readMetaPage(&page0, &page1);
+    const got = try f2.readMetaPage(&page0, &page1);
     try std.testing.expect(got != null);
     try std.testing.expectEqual(@as(u64, 300), got.?.sequence);
     try std.testing.expectEqual(@as(u32, 70), got.?.root_page);
@@ -253,7 +253,7 @@ test "format: meta alternation — one corrupt, take other" {
     // page1 is garbage (meta never written, or a half-written crash)
     @memset(page1[0..f2.PAGE_HEADER_SIZE], 0xff);
     f2.setPageChecksum(&page1, f2.computePageChecksum(&page1));
-    const got = f2.readMetaPage(&page0, &page1);
+    const got = try f2.readMetaPage(&page0, &page1);
     try std.testing.expect(got != null);
     try std.testing.expectEqual(@as(u64, 500), got.?.sequence);
     try std.testing.expectEqual(@as(u32, 100), got.?.root_page);
@@ -266,7 +266,7 @@ test "format: meta alternation — both corrupt returns null" {
     @memset(&page1, 0xff);
     f2.setPageChecksum(&page0, f2.computePageChecksum(&page0));
     f2.setPageChecksum(&page1, f2.computePageChecksum(&page1));
-    const got = f2.readMetaPage(&page0, &page1);
+    const got = try f2.readMetaPage(&page0, &page1);
     try std.testing.expect(got == null);
 }
 
@@ -277,7 +277,7 @@ test "format: meta alternation — both empty returns null" {
     @memset(&page1, 0);
     f2.setPageChecksum(&page0, f2.computePageChecksum(&page0));
     f2.setPageChecksum(&page1, f2.computePageChecksum(&page1));
-    const got = f2.readMetaPage(&page0, &page1);
+    const got = try f2.readMetaPage(&page0, &page1);
     try std.testing.expect(got == null);
 }
 
