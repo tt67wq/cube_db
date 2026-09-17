@@ -664,6 +664,7 @@ fn tombListCovers(pages: []const f2.TombPage, key: []const u8) bool {
 fn walkTombChain(store: PageStore, head: u32, pages: *std.ArrayList(f2.TombPage), a: std.mem.Allocator) !void {
     var visited = std.AutoHashMapUnmanaged(u32, void){};
     defer visited.deinit(a);
+    // mapsize() 不可作步数上界：两后端单位不一致（Mem=页数、File=2^28），File 侧宽到准 hang（T-52）。
     var pn: u32 = head;
     while (pn != 0) {
         const gop = try visited.getOrPut(a, pn);
