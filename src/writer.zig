@@ -184,6 +184,20 @@ pub const State = struct {
     closed: std.atomic.Value(bool),
 
     meta_index: u32,
+    /// T-38-3 (R1/R3): SINGLE packed publication of (root<<32|tomb_head).
+    /// Canonical capture source for ALL readers — one load is tear-free now
+    /// that deleteRange swaps tomb_head. Writers (serialized by Db's
+    /// write_mutex) store `root` first, then this packed word LAST (.release):
+    /// any packed load returns a (root, tomb_head) pair that was simultaneously
+    /// true at some publication point. The phase-2 "tomb_head immutable after
+    /// open" argument is dead (deleteRange swaps it); this word replaces it.
+    root_tomb: std.atomic.Value(u64),
+
+    /// T-38-3 (C3): meta version policy — 2 until the first range tombstone
+    /// is ever written, 3 from then on (sticky: never downgrades, a v3 db
+    /// stays v3 even when its chain is fully consumed — punch a7c). Seeded
+    /// from the opened meta; only mutated under write_mutex.
+    meta_version: std.atomic.Value(u16),
 
     /// Active reader count (0 = no readers, dirty pages can be reclaimed
     /// safely; the fast-path predicate)
@@ -217,6 +231,8 @@ pub const State = struct {
             .allocator = allocator,
             .store = store,
             .root = std.atomic.Value(u32).init(btree.NULL_ROOT),
+            .root_tomb = std.atomic.Value(u64).init(@as(u64, btree.NULL_ROOT) << 32),
+            .meta_version = std.atomic.Value(u16).init(2),
             .sequence = std.atomic.Value(u64).init(0),
             .dirt = std.atomic.Value(u64).init(0),
             .entry_count = std.atomic.Value(u64).init(0),
@@ -228,6 +244,114 @@ pub const State = struct {
             .pending_free = .empty,
             .pending_free_mu = .{},
         };
+    }
+
+    /// Publish a consistent (root, tomb_head) pair. Writer-side only (caller
+    /// holds Db's write_mutex). `root` is stored first for legacy
+    /// single-field readers (getRoot/treeDepth); the packed word is the
+    /// reader-visible commit point — readers must load THAT, never the
+    /// separate fields (see root_tomb doc).
+    pub fn publishSnapshot(self: *State, root: u32, tomb_head: u32) void {
+        self.root.store(root, .release);
+        self.root_tomb.store((@as(u64, root) << 32) | tomb_head, .release);
+    }
+
+    /// Current tombstone chain head (from the packed word — consistent with
+    /// the root captured at the same instant).
+    pub fn getTombHead(self: *State) u32 {
+        return @truncate(self.root_tomb.load(.acquire));
+    }
+
+    /// Capture (root, tomb_head) as one tear-free pair (T-38-3 R1).
+    pub fn captureRootTomb(self: *State) struct { root: u32, tomb_head: u32 } {
+        const rt = self.root_tomb.load(.acquire);
+        return .{ .root = @intCast(rt >> 32), .tomb_head = @truncate(rt) };
+    }
+
+    /// T-38-3: write a commit meta page. The ONE place meta is written
+    /// (applyBatch / commitTombSwap / compact all route here) — fixes R2:
+    /// version and tomb_head are always passed through, never hardcoded.
+    /// Preserves the T-27 power_fail ordering: data pages (incl. tomb chain
+    /// pages) sync before meta; meta sync after.
+    fn writeCommitMeta(self: *State, root: u32, tomb_head: u32, version: u16, sequence: u64, entry_count: u64, byte_size: u64) !void {
+        const meta = f2.MetaPage{
+            .magic = f2.MAGIC_V2,
+            .version = version,
+            .mapsize = self.store.mapsize(),
+            .sequence = sequence,
+            .root_page = root,
+            .entry_count = entry_count,
+            .byte_size = byte_size,
+            // free_head/free_count are placeholders: FilePageStore.vtWriteMeta
+            // overrides them with the persisted chain values (same pattern as
+            // last_page). MemPageStore has no persistence and keeps them 0.
+            .free_head = 0,
+            .free_count = 0,
+            .last_page = 0,
+            .tomb_head = tomb_head,
+        };
+        if (self.opts.durability == .power_fail) {
+            try self.store.syncDataPages();
+        }
+        try self.store.writeMeta(&meta);
+        if (self.opts.fsync or self.opts.durability == .power_fail) {
+            try self.store.sync();
+        }
+    }
+
+    /// T-38-3: write a full tombstone chain as fresh pages, linked by
+    /// free_next, gen-stamped with this commit's sequence. Returns the new
+    /// head (0 = empty chain, no pages written). Page numbers come from the
+    /// normal allocator; the pages are ordinary data pages (design §5.3).
+    /// Entries must each fit the single-entry envelope (caller guarantees —
+    /// the punch/merge planner materializes anything that doesn't).
+    fn writeTombChain(self: *State, tobs: []const f2.RangeTombstone, commit_seq: u64, pages_out: *std.ArrayList(u32), a: std.mem.Allocator) !u32 {
+        if (tobs.len == 0) return 0;
+        // Greedy packing, mirroring encodeTombPage's overflow check exactly:
+        // 16*n + sum(stored lens) <= TOMB_PAYLOAD_SIZE per page.
+        var chunks: std.ArrayList([]const f2.RangeTombstone) = .empty;
+        defer chunks.deinit(a);
+        var start: usize = 0;
+        var used: usize = 0;
+        for (tobs, 0..) |t, i| {
+            const min_len = if (t.min) |m| m.bytes.len else 0;
+            const max_len = if (t.max) |m| m.bytes.len else 0;
+            if (used + f2.TOMB_ENTRY_SIZE + min_len + max_len > f2.TOMB_PAYLOAD_SIZE and i > start) {
+                try chunks.append(a, tobs[start..i]);
+                start = i;
+                used = 0;
+            }
+            used += f2.TOMB_ENTRY_SIZE + min_len + max_len;
+        }
+        try chunks.append(a, tobs[start..]);
+
+        // Two passes: allocate all pages first, then encode (each page needs
+        // its successor's number for free_next).
+        for (0..chunks.items.len) |_| {
+            const pn = try self.store.allocPage();
+            try pages_out.append(a, pn);
+        }
+        for (chunks.items, 0..) |chunk, ci| {
+            const pn = pages_out.items[ci];
+            const buf = try self.store.writePage(pn);
+            const next: u32 = if (ci + 1 < pages_out.items.len) pages_out.items[ci + 1] else 0;
+            // Planner guarantees envelope fit; packing mirrors the encoder
+            // budget, so an encode error is a contract violation on our side.
+            try f2.encodeTombPage(buf[0..f2.PAGE_SIZE], pn, chunk, commit_seq, next);
+        }
+        return pages_out.items[0];
+    }
+
+    /// T-38-3: retire old tomb-chain pages through the standard MVCC
+    /// pending_free path (release_seq = the sequence of the commit that made
+    /// them unreachable — readers with older snapshots keep walking them).
+    fn queuePendingFree(self: *State, page_nos: []const u32, release_seq: u64) void {
+        self.pending_free_mu.lockUncancelable();
+        defer self.pending_free_mu.unlock();
+        for (page_nos) |pn| {
+            self.pending_free.append(self.allocator, .{ .page_no = pn, .release_seq = release_seq }) catch {};
+        }
+        self.dirt.store(@intCast(self.pending_free.items.len), .release);
     }
 
     pub fn deinit(self: *State) void {
@@ -342,30 +466,17 @@ pub const State = struct {
         // Reclaim (dispatched internally by reader_count/watermark; dirt set
         // to the remaining pinned count)
         self.reclaimPendingFree();
-        // Write the new meta
-        const cur_root = self.root.load(.acquire);
+        // Write the new meta — T-38-3 (R2): through writeCommitMeta with
+        // version + tomb_head passthrough. The old literal (hardcoded v2,
+        // tomb_head implicitly 0) is exactly what wiped a db's tombstones on
+        // compact. root/tomb captured as one packed pair (consistent commit
+        // view); compact does not swap the chain, only republishes it.
+        const snap = self.captureRootTomb();
         const cur_sequence = self.sequence.load(.acquire);
         const cur_entry_count = self.entry_count.load(.acquire);
         const cur_byte_size = self.byte_size.load(.acquire);
-        const meta = f2.MetaPage{
-            .magic = f2.MAGIC_V2,
-            .version = 2,
-            .mapsize = self.store.mapsize(),
-            .sequence = cur_sequence + 1,
-            .root_page = cur_root,
-            .entry_count = cur_entry_count,
-            .byte_size = cur_byte_size,
-            // free_head/free_count are placeholders: FilePageStore.vtWriteMeta
-            // overrides them with the persisted chain values (same pattern as
-            // last_page). MemPageStore has no persistence and keeps them 0.
-            .free_head = 0,
-            .free_count = 0,
-            .last_page = 0,
-        };
-        try self.store.writeMeta(&meta);
-        if (self.opts.fsync) {
-            try self.store.sync();
-        }
+        try self.writeCommitMeta(snap.root, snap.tomb_head, self.meta_version.load(.acquire), cur_sequence + 1, cur_entry_count, cur_byte_size);
+        self.publishSnapshot(snap.root, snap.tomb_head);
         self.sequence.store(cur_sequence + 1, .release);
         // T-30: dirt is no longer zeroed — reclaimPendingFree already set it
         // to the still-pinned page count
@@ -454,8 +565,39 @@ pub const State = struct {
     }
 
     /// Apply a batch of write requests to the B-tree, commit meta, fsync,
-    /// update atomic state
+    /// update atomic state. No tombstone swap (plain path).
     pub fn applyBatch(self: *State, batch: []const Request) !void {
+        return self.applyBatchSwap(batch, null);
+    }
+
+    /// T-38-3: a planned tombstone-chain swap, applied atomically with a
+    /// batch commit (the punch-hole path). Built by Db.planTombPunch under
+    /// the write mutex; `tobs` is the FULL replacement chain (sorted by
+    /// effective min); `old_pages` are the previous chain's pages (retired
+    /// via pending_free, same release sequence as this commit's tree
+    /// victims); `extra_reqs` are materialized per-key tombstones for the
+    /// O(range) fallback (design §4.3: a split segment that exceeds the
+    /// single-entry envelope must be materialized — NEVER dropped).
+    pub const TombSwap = struct {
+        tobs: []const f2.RangeTombstone,
+        old_pages: []const u32,
+        extra_reqs: []const Request = &.{},
+        /// T-38-3 entryCount/byte_size compensation: every punch key and
+        /// materialized key whose PRE-COMMIT tree entry was physically live
+        /// (btree.get != null) was shadowed — already excluded from the
+        /// counters when its covering tombstone was created. The punch's
+        /// tree-overwrite (live→live) yields count_delta=0 from insert, and a
+        /// materialized tombstone (live→tombstone) yields -1 — both wrong
+        /// (visibility goes shadowed→visible, or stays shadowed). These
+        /// deltas restore the invariant: entry_count == visible-live count.
+        revive_count: i64 = 0,
+        revive_bytes: i64 = 0,
+    };
+
+    /// applyBatch + optional tombstone-chain swap in ONE commit (single
+    /// writeMeta / single sequence bump — INV-RT1 holds on disk at every
+    /// instant). Caller holds Db's write_mutex.
+    pub fn applyBatchSwap(self: *State, batch: []const Request, swap: ?TombSwap) !void {
         if (self.closed.load(.acquire)) {
             for (batch) |r| r.future.set(error.Closed);
             return;
@@ -480,6 +622,20 @@ pub const State = struct {
         const cur_entry_count = self.entry_count.load(.acquire);
         const cur_byte_size = self.byte_size.load(.acquire);
 
+        // T-38-3: materialized fallback tombstones ride in the SAME batch
+        // (the planner only emits them for split segments that exceed the
+        // single-entry envelope — design §4.3 F1: never dropped).
+        var reqs: []const Request = batch;
+        if (swap) |s| {
+            if (s.extra_reqs.len > 0) {
+                var combined = try self.allocator.alloc(Request, batch.len + s.extra_reqs.len);
+                @memcpy(combined[0..batch.len], batch);
+                @memcpy(combined[batch.len..], s.extra_reqs);
+                reqs = combined;
+            }
+        }
+        defer if (reqs.ptr != batch.ptr) self.allocator.free(@constCast(reqs));
+
         // 2. Arena for COW path temporary allocations (key/value dupe, Leaf/Branch decode).
         // Eliminates per-allocation syscall overhead: ~145 alloc/free per btree.insert
         // collapses to arena bump-pointer, freed in one shot at batch end.
@@ -495,9 +651,9 @@ pub const State = struct {
         var new_root = cur_root;
 
         // Fast path for single entry: use insert directly (avoids sort/dupe/insertBatch overhead)
-        if (batch.len == 1) {
-            const wr = btree.insert(arena_alloc, self.store, new_root, batch[0].key, batch[0].value, batch[0].tombstone, &batch_dirty) catch |err| {
-                for (batch) |r| r.future.set(err);
+        if (reqs.len == 1) {
+            const wr = btree.insert(arena_alloc, self.store, new_root, reqs[0].key, reqs[0].value, reqs[0].tombstone, &batch_dirty) catch |err| {
+                for (batch) |r| r.future.set(err); // original futures only (extra_reqs carry none)
                 return;
             };
             new_root = wr.new_root;
@@ -511,10 +667,10 @@ pub const State = struct {
         const t_order0 = if (prof) ProfileStats.now() else 0;
         const Order = enum { strict, non_dec, unordered };
         const order = blk: {
-            if (batch.len <= 1) break :blk Order.strict;
+            if (reqs.len <= 1) break :blk Order.strict;
             var has_dup = false;
-            for (1..batch.len) |i| {
-                switch (btree.cmpKey(batch[i - 1].key, batch[i].key)) {
+            for (1..reqs.len) |i| {
+                switch (btree.cmpKey(reqs[i - 1].key, reqs[i].key)) {
                     .lt => {},
                     .eq => has_dup = true,
                     .gt => break :blk Order.unordered,
@@ -525,10 +681,10 @@ pub const State = struct {
         if (prof) ProfileStats.txn_order_ns += @intCast(ProfileStats.now() - t_order0);
 
         const t_dupe0 = if (prof) ProfileStats.now() else 0;
-        const arena_entries = try arena_alloc.alloc(btree.LeafEntry, batch.len);
+        const arena_entries = try arena_alloc.alloc(btree.LeafEntry, reqs.len);
         if (order != .unordered) {
             // Fast path: ordered input skips dupe + sort, referencing the caller's slices directly
-            for (batch, 0..) |req, i| {
+            for (reqs, 0..) |req, i| {
                 arena_entries[i] = .{ .tombstone = req.tombstone, .key = req.key, .value = req.value };
             }
             if (prof) ProfileStats.txn_dupe_ns += @intCast(ProfileStats.now() - t_dupe0);
@@ -548,7 +704,7 @@ pub const State = struct {
 
             const t_ib0 = if (prof) ProfileStats.now() else 0;
             const wr = btree.insertBatch(arena_alloc, self.store, new_root, entries, &batch_dirty) catch |err| {
-                for (batch) |r| r.future.set(err);
+                for (batch) |r| r.future.set(err); // original futures only (extra_reqs carry none)
                 return;
             };
             if (prof) ProfileStats.txn_insertbatch_ns += @intCast(ProfileStats.now() - t_ib0);
@@ -561,13 +717,13 @@ pub const State = struct {
             // allocation), memcpy into it, and sort reading contiguous
             // memory (cache-hot)
             var key_buf_len: usize = 0;
-            for (batch) |req| {
+            for (reqs) |req| {
                 key_buf_len += req.key.len;
                 if (!req.tombstone) key_buf_len += req.value.len;
             }
             const key_buf = try arena_alloc.alloc(u8, key_buf_len);
             var key_off: usize = 0;
-            for (batch, 0..) |req, i| {
+            for (reqs, 0..) |req, i| {
                 @memcpy(key_buf[key_off..][0..req.key.len], req.key);
                 const k = key_buf[key_off..][0..req.key.len];
                 key_off += req.key.len;
@@ -609,7 +765,7 @@ pub const State = struct {
 
             const t_ib0 = if (prof) ProfileStats.now() else 0;
             const wr = btree.insertBatch(arena_alloc, self.store, new_root, entries, &batch_dirty) catch |err| {
-                for (batch) |r| r.future.set(err);
+                for (batch) |r| r.future.set(err); // original futures only (extra_reqs carry none)
                 return;
             };
             if (prof) ProfileStats.txn_insertbatch_ns += @intCast(ProfileStats.now() - t_ib0);
@@ -617,7 +773,7 @@ pub const State = struct {
             batch_entry_delta += wr.count_delta;
             batch_byte_delta += wr.live_delta;
         } // end unordered path
-        } // end else (batch.len > 1)
+        } // end else (reqs.len > 1)
 
         // 3. This batch's dirty pages go into pending_free (not reclaimed
         //    immediately — MVCC safe). Take pending_free_mu, serializing
@@ -644,59 +800,63 @@ pub const State = struct {
 
         // 4. Compute the new meta values
         const new_sequence = cur_sequence + 1;
-        const new_entry_count_signed: i64 = @as(i64, @intCast(cur_entry_count)) + batch_entry_delta;
+        // T-38-3: fold in the punch/materialization compensation (see
+        // TombSwap.revive_count) — insert's own deltas can't see shadowing.
+        var total_entry_delta = batch_entry_delta;
+        var total_byte_delta = batch_byte_delta;
+        if (swap) |s| {
+            total_entry_delta += s.revive_count;
+            total_byte_delta += s.revive_bytes;
+        }
+        const new_entry_count_signed: i64 = @as(i64, @intCast(cur_entry_count)) + total_entry_delta;
         const new_entry_count: u64 = @intCast(@max(@as(i64, 0), new_entry_count_signed));
-        const new_byte_signed: i64 = @as(i64, @intCast(cur_byte_size)) + batch_byte_delta;
+        const new_byte_signed: i64 = @as(i64, @intCast(cur_byte_size)) + total_byte_delta;
         const new_byte: u64 = @intCast(@max(@as(i64, 0), new_byte_signed));
 
-        // 5. Write meta
-        const t_meta0 = if (prof) ProfileStats.now() else 0;
-        const meta = f2.MetaPage{
-            .magic = f2.MAGIC_V2,
-            .version = 2,
-            .mapsize = self.store.mapsize(),
-            .sequence = new_sequence,
-            .root_page = new_root,
-            .entry_count = new_entry_count,
-            .byte_size = new_byte,
-            // free_head/free_count are placeholders: FilePageStore.vtWriteMeta
-            // overrides them with the persisted chain values (same pattern as
-            // last_page). MemPageStore has no persistence and keeps them 0.
-            .free_head = 0,
-            .free_count = 0,
-            .last_page = 0,
-        };
-        // T-27 commit ordering: under power_fail, flush this batch's data
-        // pages to stable storage (fdatasync semantics) before writing meta,
-        // guaranteeing that at the moment the meta commit becomes durable,
-        // the data pages it points to have already landed (or land at the
-        // latest simultaneously) — power loss can never recover a root
-        // pointing at dangling pages. The process_crash level keeps the old
-        // behavior (no pre-flush needed under the page-cache-intact
-        // process-crash model).
-        if (self.opts.durability == .power_fail) {
-            try self.store.syncDataPages();
+        // T-38-3: tombstone-chain swap — write the new chain (fresh pages,
+        // gen = new_sequence) BEFORE the meta that publishes it, retire the
+        // old chain's pages with the same release sequence as this commit's
+        // tree victims, then route the meta write through writeCommitMeta
+        // with version/tomb_head passthrough (R2: never hardcode v2 here).
+        // Crash between chain write and meta → orphan pages, leak-direction
+        // safe (design §5.1); crash after meta → old readers pinned by MVCC.
+        var new_tomb_head: u32 = self.getTombHead();
+        if (swap) |s| {
+            var tomb_pages: std.ArrayList(u32) = .empty;
+            defer tomb_pages.deinit(arena_alloc);
+            new_tomb_head = try self.writeTombChain(s.tobs, new_sequence, &tomb_pages, arena_alloc);
+            // step 3 block above holds pending_free_mu only per-append; the
+            // old chain pages join the SAME pending_free list with the SAME
+            // release sequence (this commit) — readers with older snapshots
+            // keep walking the old chain until their watermark passes.
+            if (s.old_pages.len > 0) self.queuePendingFree(s.old_pages, new_sequence);
         }
-        try self.store.writeMeta(&meta);
 
-        // 6. fsync (meta to disk). power_fail syncs unconditionally (every
-        // commit is a double sync: data pages first, meta after — see the
-        // Durability notes above); fsync=false only makes sense for
-        // process_crash (async durability, the user calls Db.sync() manually).
-        if (self.opts.fsync or self.opts.durability == .power_fail) {
-            try self.store.sync();
-        }
+        // 5. Write meta (T-38-3: via writeCommitMeta — version/tomb_head
+        // passthrough; power_fail pre-sync covers the new tomb pages too).
+        const t_meta0 = if (prof) ProfileStats.now() else 0;
+        const commit_version: u16 = if (swap != null and new_tomb_head != 0)
+            3
+        else
+            self.meta_version.load(.acquire);
+        try self.writeCommitMeta(new_root, new_tomb_head, commit_version, new_sequence, new_entry_count, new_byte);
+
+        // (step 6's old fsync block moved INTO writeCommitMeta — one meta
+        // write, one sync, same T-27 ordering.)
         if (prof) ProfileStats.txn_meta_ns += @intCast(ProfileStats.now() - t_meta0);
 
         // 7. Atomically update state (dirt was already updated with the
-        // append under the lock in step 3)
-        self.root.store(new_root, .release);
+        // append under the lock in step 3). T-38-3: (root, tomb_head) publish
+        // through the packed word — the tear-free reader capture point (R1).
+        // meta_version goes sticky-3 the moment a chain head exists.
+        self.publishSnapshot(new_root, new_tomb_head);
+        if (new_tomb_head != 0) self.meta_version.store(3, .release);
         self.sequence.store(new_sequence, .release);
         self.entry_count.store(new_entry_count, .release);
         self.byte_size.store(new_byte, .release);
 
         // 8. All requests succeeded
-        for (batch) |req| {
+        for (batch) |req| { // original futures only (extra_reqs carry none)
             req.future.set({});
         }
 
@@ -711,6 +871,50 @@ pub const State = struct {
             ProfileStats.txn_count += 1;
             ProfileStats.txn_entries += batch.len;
         }
+    }
+
+    /// T-38-3 (C1): deleteRange's commit — swap the tombstone chain WITHOUT
+    /// touching the tree (root unchanged; the covered entries stay physical
+    /// and shadowed). One sequence bump, one meta write: {root, tomb_head,
+    /// version, entry_count, byte_size} publish atomically. Old chain pages
+    /// retire via pending_free (release_seq = new sequence — old-snapshot
+    /// readers keep walking them, same as tree COW victims).
+    /// count_delta/byte_delta come from the caller's streaming pass (visible
+    /// in-range keys; byte formula = key.len + value.len + 10, matching
+    /// btree's live_delta accounting for a live→tombstone replacement).
+    /// Caller holds Db's write_mutex.
+    pub fn commitTombSwap(
+        self: *State,
+        tobs: []const f2.RangeTombstone,
+        old_pages: []const u32,
+        count_delta: i64,
+        byte_delta: i64,
+    ) !void {
+        const snap = self.captureRootTomb();
+        const cur_sequence = self.sequence.load(.acquire);
+        const cur_entry_count = self.entry_count.load(.acquire);
+        const cur_byte_size = self.byte_size.load(.acquire);
+        const new_sequence = cur_sequence + 1;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        var tomb_pages: std.ArrayList(u32) = .empty;
+        defer tomb_pages.deinit(arena.allocator());
+        const new_head = try self.writeTombChain(tobs, new_sequence, &tomb_pages, arena.allocator());
+        if (old_pages.len > 0) self.queuePendingFree(old_pages, new_sequence);
+
+        const new_entry_count: u64 = @intCast(@max(@as(i64, 0), @as(i64, @intCast(cur_entry_count)) + count_delta));
+        const new_byte: u64 = @intCast(@max(@as(i64, 0), @as(i64, @intCast(cur_byte_size)) + byte_delta));
+        // Sticky version: 3 once a chain head exists; a fully-consumed chain
+        // (head 0) keeps the db's version — v3 never downgrades (C3).
+        const commit_version: u16 = if (new_head != 0) 3 else self.meta_version.load(.acquire);
+        try self.writeCommitMeta(snap.root, new_head, commit_version, new_sequence, new_entry_count, new_byte);
+
+        self.publishSnapshot(snap.root, new_head);
+        if (new_head != 0) self.meta_version.store(3, .release);
+        self.sequence.store(new_sequence, .release);
+        self.entry_count.store(new_entry_count, .release);
+        self.byte_size.store(new_byte, .release);
     }
 };
 

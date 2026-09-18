@@ -52,14 +52,6 @@ pub const Db = struct {
     batch_threshold: usize,
     pending: std.ArrayList(Entry),
 
-    /// T-38-2 (design §2): range-tombstone chain head captured at open from
-    /// the SAME meta read that seeds State (same-page consistent pair).
-    /// v2/fresh stores decode to 0. Immutable for this Db's lifetime in
-    /// phase 2 (no write path swaps it) — that is what makes captureSnapshot's
-    /// two independent loads tear-free; phase 3 moves root+tomb_head into one
-    /// packed atomic in wrt.State when deleteRange starts swapping it.
-    tomb_head: std.atomic.Value(u32),
-
     pub fn open(allocator: std.mem.Allocator, store: PageStore, opts: wrt.Options) !*Db {
         const state = try allocator.create(State);
         state.* = State.init(allocator, store, opts);
@@ -75,10 +67,13 @@ pub const Db = struct {
         // treated as fresh — that was the T-49/T-50 silent-empty-open +
         // data-overwrite bug. FilePageStore's vtReadMeta re-syncs its meta
         // buffers from the mmap first, so cross-process writers land too.
-        var tomb_head: u32 = 0; // T-38-2: captured with root from the SAME meta page
         if (try store.readMeta()) |meta| {
-            tomb_head = meta.tomb_head;
-            state.root.store(meta.root_page, .release);
+            // T-38-3 (R1): root + tomb_head publish as ONE packed word —
+            // deleteRange swaps tomb_head from now on, so the phase-2
+            // "immutable after open" argument is dead; readers capture the
+            // pair from state.root_tomb (tear-free by construction).
+            state.publishSnapshot(meta.root_page, meta.tomb_head);
+            state.meta_version.store(meta.version, .release);
             state.sequence.store(meta.sequence, .release);
             state.entry_count.store(meta.entry_count, .release);
             state.byte_size.store(meta.byte_size, .release);
@@ -95,7 +90,6 @@ pub const Db = struct {
             .staging_mutex = .{},
             .batch_threshold = opts.micro_batch.batch_threshold,
             .pending = .empty,
-            .tomb_head = std.atomic.Value(u32).init(tomb_head),
         };
         return db;
     }
@@ -247,13 +241,28 @@ pub const Db = struct {
         }
 
         if (prof) wrt.ProfileStats.db_staging_ns += @intCast(wrt.ProfileStats.now() - t0);
-        try self.state.applyBatch(reqs);
+        // T-38-3 (C2, INV-RT1): if any live-entry key falls inside an existing
+        // tombstone, plan the split (same-commit swap — a put can never land
+        // under a tomb that still covers it). No chain → null swap, zero cost.
+        var punch_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer punch_arena.deinit();
+        const swap = try planTombPunch(self, punch_arena.allocator(), reqs);
+        try self.state.applyBatchSwap(reqs, swap);
         for (futures) |*f| try (try f.wait()).value;
     }
 
     /// Delete all keys k in [min, max) — half-open, same boundary semantics as select.
     /// null min/max = unbounded (null, null) deletes every key.
     /// Idempotent on already-missing keys. No-op (success) when range is inverted/empty.
+    ///
+    /// T-38-3 (C1, design §4.1): the range becomes a persisted range-tombstone
+    /// chain (one chain write + one meta swap — root untouched, covered
+    /// entries stay physical and shadowed). Memory is O(#tombstones), never
+    /// O(range). entryCount is fixed by a streaming O(1)-memory pass over the
+    /// visible in-range keys (C4). Envelope-fallback: a range whose two bounds
+    /// together exceed the single-entry tombstone envelope (both near
+    /// MAX_KEY_SIZE) materializes per-key tree tombstones instead (O(range),
+    /// this corner only) — the old chunked path, unchanged semantics.
     pub fn deleteRange(self: *Db, min: ?[]const u8, max: ?[]const u8) !void {
         // Inverted/empty range → no-op success, no side effects (don't even flush).
         if (min) |m| {
@@ -261,23 +270,83 @@ pub const Db = struct {
                 if (btree.cmpKey(m, mx) != .lt) return;
             }
         }
-        // Micro-batch: the select iterator reads the committed root only, so pending
-        // staged puts/deletes must be flushed first to be visible (and deletable).
+        // Micro-batch: the tombstone covers committed state; staged puts must
+        // be flushed first (punch-hole at their later commit handles anything
+        // staged after this point — INV-RT1 is maintained by the put path).
         try self.flush();
-        // T-38-B: stream the range in fixed-size chunks instead of collecting
-        // every key first — net memory is O(CHUNK) (constant), not O(range).
-        //
-        // The iterator pins the root snapshot it was opened with (MVCC reader
-        // slot, released at its deinit): chunk commits swap in new roots, but
-        // the snapshot keeps reading the open-time tree, so every key in the
-        // range is visited exactly once and each gets exactly one tombstone —
-        // entry_count deltas add up exactly as the old single-batch path.
-        //
-        // Borrowed-iterator contract: next() invalidates the previous entry, so
-        // each key is duped before the chunk commit; the dupes are freed after
-        // putBatch returns (insertBatch copies into the leaf pages). CHUNK is a
-        // count: keys are <= MAX_KEY_SIZE, so CHUNK * MAX_KEY_SIZE is a
-        // constant byte bound — no separate byte budget needed.
+
+        const min_stored: usize = if (min) |m| m.len else 0;
+        const max_stored: usize = if (max) |m| m.len else 0;
+        if (f2.TOMB_ENTRY_SIZE + min_stored + max_stored > f2.TOMB_PAYLOAD_SIZE) {
+            // Double-long bounds: not representable as a single entry — the
+            // documented materialization fallback (design §4.3).
+            return self.deleteRangeMaterialized(min, max);
+        }
+
+        // Single-writer: the streaming count, chain merge and the meta swap
+        // must see one consistent committed state (no interleaved commit).
+        self.write_mutex.lock() catch return error.LockFailed;
+        defer self.write_mutex.unlock();
+
+        // Idempotent short-circuit (design §4.4): if [min,max) is already
+        // covered by the existing chain, this deleteRange changes nothing
+        // observable — skip the count pass, chain rewrite AND the commit.
+        // Probe on a STACK FixedBufferAllocator: the heap ArenaAllocator's
+        // minimum block (~1KB) would alone exceed the T-38-B idempotent
+        // re-delete budget (peak2 <= peak). A chain too big for the probe
+        // falls back to the general heap path below.
+        {
+            var sbuf: [1024]u8 = undefined;
+            var fba = std.heap.FixedBufferAllocator.init(&sbuf);
+            var p_tobs: std.ArrayList(f2.RangeTombstone) = .empty;
+            var p_pages: std.ArrayList(u32) = .empty;
+            if (loadTombChainInto(self, fba.allocator(), &p_tobs, &p_pages)) {
+                if (rangeCoveredBy(p_tobs.items, min, max)) return;
+            } else |err| switch (err) {
+                error.OutOfMemory => {}, // probe too small — general path
+                else => return err, // real read/decode error propagates
+            }
+        }
+
+        // General path: load the chain into a heap arena for the merge.
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+        var tobs: std.ArrayList(f2.RangeTombstone) = .empty;
+        var old_pages: std.ArrayList(u32) = .empty;
+        try loadTombChainInto(self, aa, &tobs, &old_pages);
+
+        // C4: stream-count the VISIBLE in-range keys (shadow-aware select) +
+        // their live-byte contribution (key.len + value.len + 10 — matches
+        // btree's live_delta for a live→tombstone replacement). O(1) memory.
+        var count: i64 = 0;
+        var live_bytes: i64 = 0;
+        {
+            var it = try self.select(min, max);
+            defer it.deinit();
+            while (try it.next()) |e| {
+                count += 1;
+                live_bytes += @intCast(e.key.len + e.value.len + 10);
+            }
+        }
+
+        // Merge (union) the new interval into the existing chain, re-sort by
+        // effective min, dedup exact equals (design §4.3 last bullet).
+        try tobs.append(aa, .{
+            .min = if (min) |m| .{ .bytes = m } else null,
+            .max = if (max) |m| .{ .bytes = m } else null,
+        });
+        sortTobs(tobs.items);
+        try dedupTobs(&tobs, aa);
+
+        try self.state.commitTombSwap(tobs.items, old_pages.items, -count, -live_bytes);
+    }
+
+    /// T-38-3 fallback: per-key tree tombstones in fixed chunks (the pre-
+    /// stage-3 deleteRange, kept verbatim for the unrepresentable-envelope
+    /// corner). O(CHUNK) memory. Multi-commit is fine here — no range tomb is
+    /// involved, INV-RT1 does not apply.
+    fn deleteRangeMaterialized(self: *Db, min: ?[]const u8, max: ?[]const u8) !void {
         const CHUNK = 256;
         var keys: [CHUNK][]const u8 = undefined;
         var entries: [CHUNK]Entry = undefined;
@@ -304,18 +373,17 @@ pub const Db = struct {
 
     // ---- T-38-2: range-tombstone shadowing (design §3.1/§1.4) ----
 
-    /// (root, tomb_head) captured as one logical snapshot. Phase 2 tear-free
-    /// proof: tomb_head is immutable after open (only open writes it), so the
-    /// two loads can never interleave into mismatched generations. Phase 3
-    /// MUST replace the body with a single packed-atomic load from wrt.State
-    /// (root<<32|tomb_head) once deleteRange starts swapping tomb_head —
-    /// both tear directions are unsafe (stale tomb hides re-put keys; fresh
+    /// (root, tomb_head) captured as one logical snapshot. T-38-3 (R1/R3):
+    /// ONE packed-atomic load from wrt.State — deleteRange now swaps
+    /// tomb_head, so the phase-2 "immutable after open" argument is dead;
+    /// both tear directions were unsafe (stale tomb hides re-put keys; fresh
     /// tomb leaks a future delete into an old snapshot). This fn is the only
     /// capture point for all five read entrypoints.
     const ReadSnapshot = struct { root: u32, tomb_head: u32 };
 
     fn captureSnapshot(self: *Db) ReadSnapshot {
-        return .{ .root = self.state.getRoot(), .tomb_head = self.tomb_head.load(.acquire) };
+        const rt = self.state.captureRootTomb();
+        return .{ .root = rt.root, .tomb_head = rt.tomb_head };
     }
 
     /// Is `key` covered by any tombstone on the chain at `head`?
@@ -515,7 +583,10 @@ pub const WriteTxn = struct {
             reqs[i] = .{ .key = e.key, .value = e.value, .tombstone = e.tombstone, .future = &futures[i] };
         }
         if (prof) wrt.ProfileStats.db_reqs_ns += @intCast(wrt.ProfileStats.now() - t_reqs0);
-        try self.db.state.applyBatch(reqs);
+        // T-38-3 (C2, INV-RT1): same-commit tomb split for covered puts
+        // (see putBatch — one code path, same invariant).
+        const swap = try planTombPunch(self.db, arena_alloc, reqs);
+        try self.db.state.applyBatchSwap(reqs, swap);
         const t_wait0 = if (prof) wrt.ProfileStats.now() else 0;
         for (futures) |*f| try (try f.wait()).value;
         if (prof) wrt.ProfileStats.db_futures_wait_ns += @intCast(wrt.ProfileStats.now() - t_wait0);
@@ -682,6 +753,12 @@ fn walkTombChain(store: PageStore, head: u32, pages: *std.ArrayList(f2.TombPage)
         if (gop.found_existing) return error.Truncated; // cycle: page revisited
         const raw = try store.readPage(pn);
         const tp = try f2.decodeTombPage(a, raw[0..f2.PAGE_SIZE]);
+        // Exact-capacity growth (T-38-B mem budget): ArrayList's default first
+        // append reserves capacity 8 (384B for TombPage) — noticeable against
+        // the O(1) deleteRange budget on the idempotent re-delete path.
+        // ponytail: O(pages²) copy worst case on very long chains — fine at
+        // real chain sizes; revisit if chains exceed ~100 pages.
+        try pages.ensureTotalCapacity(a, pages.items.len + 1);
         try pages.append(a, tp);
         pn = tp.next;
     }
@@ -724,6 +801,269 @@ fn shadowSkip(ctx: *anyopaque, key: []const u8) anyerror!bool {
 fn shadowSkipDeinit(ctx: *anyopaque) void {
     const s: *ShadowCtx = @ptrCast(@alignCast(ctx));
     s.arena.deinit(); // frees the ctx allocation itself
+}
+
+// ===== T-38-3: write-path tomb planning (design §4.3, INV-RT1) =====
+
+/// Effective-bound comparison without materializing bytes: eff(b) =
+/// b.bytes ++ (0x00 if append_zero). Null is handled by callers (a null
+/// min/max means ±infinity and never reaches here).
+fn boundCmp(a: f2.TombBound, b: f2.TombBound) std.math.Order {
+    const a_len = a.bytes.len + @as(usize, @intFromBool(a.append_zero));
+    const b_len = b.bytes.len + @as(usize, @intFromBool(b.append_zero));
+    const n = @min(a_len, b_len);
+    for (0..n) |i| {
+        const ab: u8 = if (i < a.bytes.len) a.bytes[i] else 0;
+        const bb: u8 = if (i < b.bytes.len) b.bytes[i] else 0;
+        if (ab != bb) return if (ab < bb) .lt else .gt;
+    }
+    if (a_len < b_len) return .lt;
+    if (a_len > b_len) return .gt;
+    return .eq;
+}
+
+/// Sort a tomb list by effective min (null min = -inf sorts first). Stable
+/// enough for determinism; exact-equal duplicates are removed by dedupTobs.
+fn sortTobs(tobs: []f2.RangeTombstone) void {
+    const Ctx = struct {
+        fn lt(_: void, a: f2.RangeTombstone, b: f2.RangeTombstone) bool {
+            const am = a.min orelse return b.min != null; // -inf first
+            const bm = b.min orelse return false;
+            return boundCmp(am, bm) == .lt;
+        }
+    };
+    std.mem.sort(f2.RangeTombstone, tobs, {}, Ctx.lt);
+}
+
+/// Drop adjacent exact-equal entries (post-sort). Rebuilds the arena-backed
+/// list in place: every tomb whose (min,max) effective pair equals the kept
+/// predecessor is removed (design §4.3: union + dedup — a repeated
+/// deleteRange of the same range leaves one tomb).
+fn dedupTobs(list: *std.ArrayList(f2.RangeTombstone), a: std.mem.Allocator) !void {
+    if (list.items.len < 2) return;
+    var keep: usize = 0;
+    for (list.items[1..]) |t| {
+        const prev = list.items[keep];
+        const same = blk: {
+            if ((prev.min == null) != (t.min == null)) break :blk false;
+            if (prev.min) |pm| {
+                if (boundCmp(pm, t.min.?) != .eq) break :blk false;
+            }
+            if ((prev.max == null) != (t.max == null)) break :blk false;
+            if (prev.max) |pmax| {
+                if (boundCmp(pmax, t.max.?) != .eq) break :blk false;
+            }
+            break :blk true;
+        };
+        if (!same) {
+            keep += 1;
+            list.items[keep] = t;
+        }
+    }
+    list.shrinkRetainingCapacity(keep + 1);
+    _ = a; // entries are arena-owned; shrinking needs no allocator
+}
+
+/// Load the current chain into `tobs` (bounds BORROW the page buffers — the
+/// caller holds the write mutex, no swap can race) and record its page
+/// numbers into `old_pages` (retired at commit).
+fn loadTombChainInto(self: *Db, a: std.mem.Allocator, tobs: *std.ArrayList(f2.RangeTombstone), old_pages: *std.ArrayList(u32)) !void {
+    const head = self.state.getTombHead();
+    if (head == 0) return;
+    var pages: std.ArrayList(f2.TombPage) = .empty;
+    defer pages.deinit(a);
+    try walkTombChain(self.store, head, &pages, a);
+    for (pages.items) |tp| {
+        // Exact-capacity growth — see walkTombChain's note (T-38-B).
+        try old_pages.ensureTotalCapacity(a, old_pages.items.len + 1);
+        try old_pages.append(a, tp.hdr.page_no);
+        try tobs.ensureTotalCapacity(a, tobs.items.len + tp.tobs.len);
+        try tobs.appendSlice(a, tp.tobs);
+    }
+}
+
+/// Is [min, max) fully covered by the union of `tobs`? (Idempotent
+/// short-circuit predicate — finite bounds only; null bounds fall back to the
+/// general path.) Order-agnostic greedy interval cover: extend a frontier
+/// with the largest reachable tomb max until it passes max. O(T²) worst case
+/// on a small in-memory list — fine.
+fn rangeCoveredBy(tobs: []const f2.RangeTombstone, min: ?[]const u8, max: ?[]const u8) bool {
+    if (min == null or max == null) return false;
+    const lo: f2.TombBound = .{ .bytes = min.? };
+    const hi: f2.TombBound = .{ .bytes = max.? };
+    var frontier = lo; // covered up to (exclusive) `frontier`
+    var moved = true;
+    while (boundCmp(frontier, hi) == .lt) {
+        if (!moved) return false; // gap: nothing extends the frontier
+        moved = false;
+        for (tobs) |t| {
+            if (t.max == null) return true; // +inf max swallows everything
+            const tmax = t.max.?;
+            // t must start at or before the frontier …
+            if (t.min != null and boundCmp(t.min.?, frontier) == .gt) continue;
+            // … and extend it strictly further
+            if (boundCmp(tmax, frontier) != .gt) continue;
+            if (boundCmp(tmax, hi) != .lt) return true; // reached max
+            frontier = tmax;
+            moved = true;
+        }
+    }
+    return true;
+}
+
+/// Does this split segment fit the single-entry envelope? (design §4.3 F1:
+/// "right segment too large" is NEVER a drop reason — callers materialize.)
+fn segmentFits(min: ?f2.TombBound, max: ?f2.TombBound) bool {
+    const min_len: usize = if (min) |m| m.bytes.len else 0;
+    const max_len: usize = if (max) |m| m.bytes.len else 0;
+    return f2.TOMB_ENTRY_SIZE + min_len + max_len <= f2.TOMB_PAYLOAD_SIZE;
+}
+
+/// T-38-3 (C2, INV-RT1): plan the tomb-split for a batch of puts.
+/// For every live-entry request key covered by a tombstone t=[tmin,tmax):
+/// split t into [tmin,k) and [succ(k),tmax) — succ(k) is stored compactly as
+/// {k, append_zero} (§1.4). Left segment dropped only when tmin == k
+/// (effective); right segment dropped only when tmax == succ(k) (the truly
+/// empty segment — a7c); a too-large segment is MATERIALIZED as per-key
+/// tree tombstones in the same commit (never dropped, F1).
+/// Returns null when nothing is covered (the common no-tomb / no-overlap
+/// case — zero planning cost beyond one packed load + chain walk).
+/// Caller holds the write mutex; everything allocates in `a` (punch arena).
+fn planTombPunch(self: *Db, a: std.mem.Allocator, reqs: []const wrt.Request) !?wrt.State.TombSwap {
+    const head = self.state.getTombHead();
+    if (head == 0) return null;
+    // Any live-entry key that can be covered? Cheapest filter first: only
+    // non-tombstone requests participate (a delete inside a tomb range is
+    // already shadowed — INV-RT1 only constrains LIVE entries).
+    var has_live = false;
+    for (reqs) |r| {
+        if (!r.tombstone) {
+            has_live = true;
+            break;
+        }
+    }
+    if (!has_live) return null;
+
+    var tobs: std.ArrayList(f2.RangeTombstone) = .empty;
+    var old_pages: std.ArrayList(u32) = .empty;
+    try loadTombChainInto(self, a, &tobs, &old_pages);
+    if (tobs.items.len == 0) return null;
+
+    var extra: std.ArrayList(wrt.Request) = .empty;
+    var revive_count: i64 = 0;
+    var revive_bytes: i64 = 0;
+    var changed = false;
+    for (reqs) |r| {
+        if (r.tombstone) continue;
+        const k = r.key;
+        var punched = false;
+        // Split every covering tomb (multiple overlapping toms may cover k —
+        // all must split, else k stays shadowed by the survivor).
+        var i: usize = 0;
+        while (i < tobs.items.len) {
+            const t = tobs.items[i];
+            if (!tombCovers(t, k)) {
+                i += 1;
+                continue;
+            }
+            changed = true;
+            punched = true;
+            // Build the two segments, drop the original.
+            const tmin = t.min;
+            const tmax = t.max;
+            _ = tobs.orderedRemove(i);
+
+            // Left segment [tmin, k): dropped iff tmin == k (effective).
+            const left_empty = tmin != null and boundCmp(tmin.?, .{ .bytes = k }) == .eq;
+            if (!left_empty) {
+                const lmin = tmin;
+                const lmax: ?f2.TombBound = .{ .bytes = k };
+                if (segmentFits(lmin, lmax)) {
+                    try tobs.append(a, .{ .min = lmin, .max = lmax });
+                } else {
+                    try materializeSegment(self, a, &extra, &revive_count, &revive_bytes, lmin, k);
+                }
+            }
+
+            // Right segment [succ(k), tmax): dropped iff tmax == succ(k).
+            const succ: f2.TombBound = .{ .bytes = k, .append_zero = true };
+            const right_empty = tmax != null and boundCmp(tmax.?, succ) == .eq;
+            if (!right_empty) {
+                const rmin: ?f2.TombBound = succ;
+                const rmax = tmax;
+                if (segmentFits(rmin, rmax)) {
+                    try tobs.append(a, .{ .min = rmin, .max = rmax });
+                } else {
+                    // F1: NEVER drop the right segment — it covers entries
+                    // deleted by the tomb being split; dropping resurrects
+                    // them. Materialize per-key tombstones instead.
+                    try materializeSegment(self, a, &extra, &revive_count, &revive_bytes, succ, if (tmax) |tm| try effBoundBytes(a, tm) else null);
+                }
+            }
+        }
+        // entryCount/byte_size compensation (TombSwap.revive_*): k was
+        // covered → shadowed → already excluded from the counters when its
+        // tomb was created. If the PRE-COMMIT tree entry is physically live,
+        // the overwrite below yields insert count_delta=0 while k becomes
+        // visible → +1 (bytes likewise, get-value convention matching the
+        // shadowing deduction). Physically-absent / tree-tombstone entries
+        // get insert's own +1 — no compensation.
+        if (punched) {
+            const root = self.state.getRoot();
+            if (try btree.get(a, self.store, root, k)) |old_v| {
+                revive_count += 1;
+                revive_bytes += @intCast(k.len + old_v.len + 10);
+            }
+        }
+    }
+    if (!changed) return null;
+
+    sortTobs(tobs.items);
+    try dedupTobs(&tobs, a);
+    return .{
+        .tobs = tobs.items,
+        .old_pages = old_pages.items,
+        .extra_reqs = extra.items,
+        .revive_count = revive_count,
+        .revive_bytes = revive_bytes,
+    };
+}
+
+/// Materialize a segment [min, max) as per-key tree tombstone requests for
+/// every key the tree currently holds in that range (visible or shadowed —
+/// the segment's range coverage is being dropped, so both kinds must be
+/// pinned dead; already-dead tombstone entries are skipped by insert).
+/// Raw byte bounds: the caller materializes effective bounds via
+/// effBoundBytes. O(range) — only reachable in the envelope corner.
+fn materializeSegment(self: *Db, a: std.mem.Allocator, extra: *std.ArrayList(wrt.Request), revive_count: *i64, revive_bytes: *i64, min: ?f2.TombBound, max: ?[]const u8) !void {
+    // Raw iteration on the current root: no shadow skip (we must see
+    // physically-present entries regardless of current shadowing), no MVCC
+    // pin needed — the write mutex is held, no commit can interleave.
+    const root = self.state.getRoot();
+    var it = try btree.selectChecked(a, self.store, root, if (min) |m| try effBoundBytes(a, m) else null, max, self.state.opts.crc_check);
+    defer it.deinit();
+    while (try it.next()) |e| {
+        const k = try a.dupe(u8, e.key);
+        try extra.append(a, .{ .key = k, .value = "", .tombstone = true, .future = undefined });
+        // Counter compensation: every materialized key is inside the split
+        // segment ⊆ t → currently shadowed → excluded from the counters; the
+        // tree tombstone insert below reports live→tombstone (count_delta
+        // -1, live_delta -old) — both wrong for a key that was already
+        // invisible. +1 / +old-contribution restores the invariant.
+        revive_count.* += 1;
+        revive_bytes.* += @intCast(e.key.len + e.value.len + 10);
+    }
+}
+
+/// Materialize a bound's effective bytes (bytes ++ 0x00 if append_zero) as a
+/// raw key slice for tree iteration bounds. Caller's arena; the result of a
+/// null bound is handled by the caller (null = unbounded).
+fn effBoundBytes(a: std.mem.Allocator, b: f2.TombBound) ![]const u8 {
+    if (!b.append_zero) return b.bytes;
+    const out = try a.alloc(u8, b.bytes.len + 1);
+    @memcpy(out[0..b.bytes.len], b.bytes);
+    out[b.bytes.len] = 0;
+    return out;
 }
 test "db: open default state" {
     var ms = ps.MemPageStore.init(std.testing.allocator, 1000);

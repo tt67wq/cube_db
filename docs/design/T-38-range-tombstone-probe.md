@@ -334,6 +334,36 @@ deleteRange [a,b); put k         → get(k) 非null（seq 序：put 在后）
 可短路（或照写，等价）。对外语义（现状 db.zig:237-238 注释承诺
 「Idempotent on already-missing keys」）保持。
 
+### 4.5 写路径不变量（T-38-3 落地实记）
+
+**INV-W1（编码器入口净化，阶段 1 评审 N-R1）**：空区间（min ≥ max，倒置或
+空）与**空 plain 边界墓碑**（`min == max` 的 `[x, x)`，或打洞分裂产生的
+空段）**不得进入编码器**。实现口径：deleteRange 入口对倒置/空区间直接
+no-op 返回（零副作用，不 flush）；打洞分裂段只有在「非真空」时才生成
+墓碑条目（左段空 ⟺ `t.min == k`；右段空 ⟺ `t.max == succ(k)`）。
+
+**INV-W2（原子发布）**：打洞（put 进墓碑区间）与 deleteRange 建碑都在
+**单一 commit** 内完成——`applyBatchSwap` / `commitTombSwap`：一次
+`writeMeta`、一次 sequence 递增；树插入（若有）、墓碑链页写入、旧链页
+`pending_free`（`release_seq` = 新 sequence）同批发布。INV-RT1 在盘上
+任意时刻成立。
+
+**INV-W3（计数一致）**：`entryCount` 恒等于「可见活 entry 数」（物理树
+活 ∧ 未被链遮蔽）。打洞/物化触碰「物理活但被遮蔽」的 entry 时（insert
+的 count_delta 看不见遮蔽状态），由 `TombSwap.revive_count/revive_bytes`
+补偿，补偿判据 = 提交前 `btree.get(k) != null`（物理活）∧ 被遮蔽。
+
+**INV-W4（覆盖短路）**：deleteRange 入口先在**栈上**（FixedBufferAllocator
+探针，零堆分配）检查 `[min,max)` 是否已被现有链覆盖——已覆盖则整个
+调用零副作用返回（幂等快路径，T-38-B 预算的 `peak2 ≤ peak` 由此成立）；
+探针装不下的大链自动回落通用路径。
+
+**§2 表格行 2 补充（T-53 后新事实）**：本表「旧代码读新库」行为列描述
+的是 T-53 之前的旧行为（保留作历史）；T-53 之后的新二进制对 v1/v4+/
+坏 magic 一律 `error.InvalidMeta` 拒绝。**T-38-3 之后**，本仓库自己的写
+路径已会产出 v3 meta（首次 deleteRange 起，sticky 3），「v3 库」不再仅
+是构造态。
+
 ## 5. 崩溃安全（与 T-33 模型交互）【重点风险面】
 
 T-33 模型要点（源码核实）：两代 meta 双槽交替 + sequence 取高恢复
