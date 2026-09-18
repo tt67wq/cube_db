@@ -32,6 +32,11 @@ steps:
       #    历史 flaky 的 txn_test.concurrency 竞态已于 2026-08-13 修复 (commit e26931c)
       #    -j2 + --maxrss 4GB: 单次 zig build test 本地实测峰值 3.2GB(37 个测试二进制
       #    并行编译), 受限 CI runner 会 OOM, 压并发 + 限内存 (慢但稳)
+      #    T-54-B: 运行期峰值曾高达 17G(crash 组 1M putBatch + page_allocator 的 mmap
+      #    取整放大, 见 docs/design/T-54-B-crash-mem-and-log-noise.md), 已在测试侧改用
+      #    smp_allocator 修至 <1G; --maxrss 4GB 因此同时覆盖编译与运行峰值。
+      #    测试诊断默认静默(CUBE_TEST_VERBOSE=1 打开) — 成功运行的 stderr 不再出现
+      #    `failed command:` 误导行。
       - zig build test -j2 --maxrss 4GB
 
   # 基准回归检查: 暂不启用。阈值按本机 M1 Pro 校准, Codeberg runner CPU 不同会误报。

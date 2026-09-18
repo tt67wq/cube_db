@@ -2,6 +2,7 @@ const std = @import("std");
 const cube = @import("cube_db");
 const Db = cube.Db;
 const FilePageStore = cube.file_page_store.FilePageStore;
+const tdiag = @import("test_diag.zig");
 
 fn monoNs() i64 {
     var ts: std.c.timespec = undefined;
@@ -22,7 +23,10 @@ fn unlinkPath(path: []const u8) void {
 }
 
 test "FilePageStore ordered 1M putBatch" {
-    const allocator = std.heap.page_allocator;
+    // T-54-B: was std.heap.page_allocator — 每次微分配独立 mmap+4KB 取整，
+    // 1M-entry putBatch 的 ~30 万次微分配被放大成 17GB RSS（vmmap: 10 万个
+    // 112K SM=PRV 区域）。smp_allocator 同样线程安全，实测峰值 16.5GB → ~430MB。
+    const allocator = std.heap.smp_allocator;
     const path = ".test_fps_ordered.db";
     defer unlinkPath(path);
 
@@ -43,11 +47,13 @@ test "FilePageStore ordered 1M putBatch" {
     const start = monoNs();
     try db.putBatch(entries);
     const el = monoNs() - start;
-    std.debug.print("FPS ordered 1M: {d:.2} ns/entry, count={d}\n", .{ @as(f64, @floatFromInt(el)) / @as(f64, @floatFromInt(n)), db.entryCount() });
+    tdiag.print("FPS ordered 1M: {d:.2} ns/entry, count={d}\n", .{ @as(f64, @floatFromInt(el)) / @as(f64, @floatFromInt(n)), db.entryCount() });
 }
 
 test "FilePageStore unordered 100K putBatch" {
-    const allocator = std.heap.page_allocator;
+    // T-54-B: 同上（见 ordered 测试注释），smp_allocator 替换 page_allocator。
+    // 112K SM=PRV 区域）。smp_allocator 同样线程安全，实测峰值 16.5GB → ~430MB。
+    const allocator = std.heap.smp_allocator;
     const path = ".test_fps_unordered.db";
     defer unlinkPath(path);
 
@@ -69,5 +75,5 @@ test "FilePageStore unordered 100K putBatch" {
     const start = monoNs();
     try db.putBatch(entries);
     const el = monoNs() - start;
-    std.debug.print("FPS unordered 100K: {d:.2} ns/entry, count={d}\n", .{ @as(f64, @floatFromInt(el)) / @as(f64, @floatFromInt(n)), db.entryCount() });
+    tdiag.print("FPS unordered 100K: {d:.2} ns/entry, count={d}\n", .{ @as(f64, @floatFromInt(el)) / @as(f64, @floatFromInt(n)), db.entryCount() });
 }
