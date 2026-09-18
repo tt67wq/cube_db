@@ -73,7 +73,8 @@ select 迭代器 + tombstone 批量提交实现"），但**没有披露 O(range)
 - [x] 阶段 0（方案 B 流式分块）：T-38-B 合入 `8f9c8fb`，验收 (a) 内存项达成
 - [x] 阶段 1（格式层）：T-38-1 合入 `baa44bd`（三方多签：acceptance 绿 + review APPROVE + test PASS）
 - [x] 阶段 2（读路径）：T-38-2 合入 `88124bc`（三方多签：验收① 452/452 + 验收② 15/15 + review APPROVE）
-- [ ] 阶段 3/4 根因落地（写路径 / GC）
+- [x] 阶段 3（写路径）：T-38-3 合入 `fe2f575`（三方多签：RED `aba3607` → GREEN 8/8+6/6 + review APPROVE `3a39b85` Blocking 0 + test PASS `b1667bf` 含反证）
+- [ ] 阶段 4 根因落地（GC：水位收割 + crash 矩阵扩展；物化清除挂 U-5）
 - [ ] 回归测试 + 评审（阶段 2 起需并发 staging 交错测试）
 - [ ] 验收门稳定后关闭
 
@@ -102,8 +103,8 @@ select 迭代器 + tombstone 批量提交实现"），但**没有披露 O(range)
 | 0 | **方案 B**：流式分块 deleteRange（消 OOM，零格式风险） | **T-38-B** ✅ 已合入 | 无 |
 | 1 | 格式层：墓碑页 codec + meta v3（含 F2 边界编码 + **N-R1 typed 拒绝** + bit30 spill 预留位） | **T-38-1** ✅ 已合入 `baa44bd` | T-38-P-R 闭环 ✓ |
 | 2 | 读路径：遮蔽判定（tomb_head=0 时休眠） | **T-38-2** ✅ 已合入 `88124bc` | T-51 关闭 ✓ |
-| 3 | 写路径：新 deleteRange 流 + 打洞语义（含 F1 修正）+ entryCount 流式修正 | 未派 | 阶段 2 ✓（前置 T-49/T-50/T-52） |
-| 4 | GC：水位收割（空区间丢弃）+ crash 矩阵扩展；物化清除挂 U-5 | 未派 | 阶段 3 |
+| 3 | 写路径：新 deleteRange 流 + 打洞语义（含 F1 修正）+ entryCount 流式修正 | **T-38-3** ✅ 已合入 `fe2f575` | 阶段 2 ✓（前置 T-49/T-50/T-52 全关闭） |
+| 4 | GC：水位收割（空区间丢弃）+ crash 矩阵扩展；物化清除挂 U-5 | 未派 | 阶段 3 ✓ |
 
 **阶段 3 前置条件（阶段 1 评审 T-49/T-50 + 阶段 2 评审 NB-1）**：
 ① **开库路径必须区分「invalid meta」与「fresh DB」**（`issues/T-50-…`）——
