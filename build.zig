@@ -453,6 +453,41 @@ pub fn build(b: *std.Build) void {
     open_meta_test_step.dependOn(&run_open_meta_test.step);
     test_step.dependOn(&run_open_meta_test.step);
 
+    // T-38-3 (stage 3 write path): deleteRange writes a range-tombstone chain
+    // (RED first, conductor-authored). test-t38-3-write = flow/version/count;
+    // test-t38-3-punch = punch-hole/split (INV-RT1, F1).
+    const t38_3_write_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/txn_writer_db/t38_3_write_path_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    const run_t38_3_write_test = b.addRunArtifact(t38_3_write_test);
+    const t38_3_write_test_step = b.step("test-t38-3-write", "Run T-38-3 stage-3 write-path tests");
+    t38_3_write_test_step.dependOn(&run_t38_3_write_test.step);
+    test_step.dependOn(&run_t38_3_write_test.step);
+
+    const t38_3_punch_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/txn_writer_db/t38_3_punch_hole_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+            },
+        }),
+    });
+    const run_t38_3_punch_test = b.addRunArtifact(t38_3_punch_test);
+    const t38_3_punch_test_step = b.step("test-t38-3-punch", "Run T-38-3 punch-hole/split tests");
+    t38_3_punch_test_step.dependOn(&run_t38_3_punch_test.step);
+    test_step.dependOn(&run_t38_3_punch_test.step);
+
     // ponytail: zig build test-writer runs only writer tests
     const writer_test = b.addTest(.{
         .root_module = b.createModule(.{
