@@ -1,10 +1,9 @@
 # Issue T-38 — deleteRange 高效化：全量物化 + 每 key tombstone 的 O(range) 内存与写放大
 
-- **状态**: fixing（**阶段 1 格式层 / 阶段 2 读路径 / 阶段 3 写路径均已合入 main 并通过验收**
-  —— 阶段 1 `baa44bd`、阶段 2 `88124bc`（验收① 452/452 + 验收② 15/15 + review APPROVE）、
-  阶段 3 `fe2f575`（RED `aba3607` → GREEN 8/8+6/6 + review APPROVE `3a39b85` Blocking 0 +
-  test PASS `b1667bf` 含反证）；**当前只剩阶段 4（GC）**。阶段 3 前置 `issues/T-49-…`/`T-50-…`
-  已由 `1c6ce1d` 关闭，`T-52` 已修复归档）
+- **状态**: fixing（**阶段 1 / 2 / 3 均已合入 main 并通过验收**：`baa44bd`、`88124bc`、`fe2f575`；
+  **阶段 4a（GC：水位收割 + 链规范化）已合入 `50af0d1`** —— 新增显式 `Db.gcTombstones`
+  + `deleteRange` 冗余区间短路 + 链恒为规范最小形式；review approve Blocking 0 / test PASS）。
+  **只剩阶段 4b（crash 矩阵扩展 → T-38-5）**；物化清除挂 U-5 真·compact）
 - **优先级**: **high**（可用性缺口 + 内存安全边界；4/4 worker 全部独立提出，共识度最高）
 - **梯队**: 可用性/性能（兼正确性观感——文档承诺与实际行为差距）
 - **来源**: 演进点征集（roadmap-evo）wf-pi-1-E1、wf-pi-2-E2、wf-pi-3-E3、wf-pi-4-E2
@@ -75,7 +74,9 @@ select 迭代器 + tombstone 批量提交实现"），但**没有披露 O(range)
 - [x] 阶段 1（格式层）：T-38-1 合入 `baa44bd`（三方多签：acceptance 绿 + review APPROVE + test PASS）
 - [x] 阶段 2（读路径）：T-38-2 合入 `88124bc`（三方多签：验收① 452/452 + 验收② 15/15 + review APPROVE）
 - [x] 阶段 3（写路径）：T-38-3 合入 `fe2f575`（三方多签：RED `aba3607` → GREEN 8/8+6/6 + review APPROVE `3a39b85` Blocking 0 + test PASS `b1667bf` 含反证）
-- [ ] 阶段 4 根因落地（GC：水位收割 + crash 矩阵扩展；物化清除挂 U-5）
+- [x] 阶段 4a（GC）：T-38-4 合入 `50af0d1`（三方多签：review approve @`d6c588a` Blocking 0 +
+  test PASS @`d6c588a` + 修 NB-1/2/3 的 `8236305`；门 v2 六项绿）
+- [ ] 阶段 4b（crash 矩阵扩展：墓碑 commit 场景进 T5/T7 家族）→ **T-38-5** 未派
 - [ ] 回归测试 + 评审（阶段 2 起需并发 staging 交错测试）
 - [ ] 验收门稳定后关闭
 
@@ -105,7 +106,8 @@ select 迭代器 + tombstone 批量提交实现"），但**没有披露 O(range)
 | 1 | 格式层：墓碑页 codec + meta v3（含 F2 边界编码 + **N-R1 typed 拒绝** + bit30 spill 预留位） | **T-38-1** ✅ 已合入 `baa44bd` | T-38-P-R 闭环 ✓ |
 | 2 | 读路径：遮蔽判定（tomb_head=0 时休眠） | **T-38-2** ✅ 已合入 `88124bc` | T-51 关闭 ✓ |
 | 3 | 写路径：新 deleteRange 流 + 打洞语义（含 F1 修正）+ entryCount 流式修正 | **T-38-3** ✅ 已合入 `fe2f575` | 阶段 2 ✓（前置 T-49/T-50/T-52 全关闭） |
-| 4 | GC：水位收割（空区间丢弃）+ crash 矩阵扩展；物化清除挂 U-5 | 未派 | 阶段 3 ✓ |
+| 4a | GC：水位收割（空区间丢弃）+ 交叠/相邻归并；**新增显式 `Db.gcTombstones`**（不碰 compact 的 O(1) 公开承诺） | **T-38-4** ✅ 已合入 `50af0d1` | 阶段 3 ✓ |
+| 4b | crash 矩阵扩展：墓碑 commit 场景进 T5/T7 家族（把探路报告 §5「模型不变」从分析变实证） | **T-38-5** 未派 | 阶段 4a ✓ |
 
 **阶段 3 前置条件（阶段 1 评审 T-49/T-50 + 阶段 2 评审 NB-1）**：
 ① **开库路径必须区分「invalid meta」与「fresh DB」**（`issues/T-50-…`）——
@@ -235,3 +237,56 @@ select 迭代器 + tombstone 批量提交实现"），但**没有披露 O(range)
   → reopen 丢墓碑。这是 H-2 声明的语义分叉，根治在**阶段 3**（写路径 + T-50）。
 - **遗留（阶段 3/4）**：写路径（新 deleteRange 流 + 打洞 + version 切换 + entryCount
   流式修正）、GC（水位收割 + crash 矩阵扩展）。阶段 3 前置：T-49、T-50、**T-52**。
+
+---
+
+### 阶段 4a（T-38-4 GC：水位收割 + 链规范化）验收记录 — 2026-09-20
+
+- **交付**：RED `8cf3e29`（conductor 预写，11 用例 g1..g11）→ GREEN `d6c588a`（ws1-pi1）
+  → 修评审非阻塞 `8236305`（纯注释/文档，零逻辑改动），已 `--no-ff` 合入 `50af0d1`。
+- **改动**：`src/db.zig`（`deleteRange` count==0 短路；新增 `pub fn gcTombstones`；raw 探针）、
+  `src/writer.zig`（新增 `canonicalTombs` + `tombBoundCmp`，挂在 **两个**链发布点：
+  `commitTombSwap` 与 `applyBatchSwap` 的 swap 分支）、`docs/usage.md`（§3.6b + deleteRange no-op 条目）。
+  **零格式变更**（`src/format.zig` 未触碰）。
+- **契约要点（C1..C6）**：
+  - **C1** `deleteRange` 在可见计数 `count == 0` 时零副作用返回 —— 可证明冗余
+    （`count` 是 shadow-aware 的**可见** key 数；为 0 ⟹ 区间内每个物理 entry 已被现有链遮蔽
+    ⟹ 新区间改变不了任何读结果）。这是探路报告 §6 所说「最常见」积累源的根治。
+  - **C2** 链恒为**规范最小形式**（排序 + 交叠/相邻归并 = 并集，纯区间算术不扫树）。
+  - **C3** `Db.gcTombstones()`：对每个区间做一次 **raw 扫描**（不跳遮蔽，同 `materializeSegment` 口径），
+    无物理 entry → 收割；**有则必须保留**（丢了 = 被遮蔽 key 复活 = 数据损坏）。
+  - **C5** `Db.compact()` **一行未改**（`docs/usage.md` 三处公开承诺 O(1)），收割不塞进 compact。
+- **独立评审**（ws1-pi3，纯静态，评审者 ≠ 实现者）：**approve，Blocking 0 / Non-blocking 5**。
+  独立论证：raw 口径**不带** `shadowSkip` ⇒ 探针范围 ≡ 遮蔽范围，无「探针比遮蔽窄」的复活窗口；
+  C1 论证成立；C2 区间代数正确（并集覆盖严格相等）；punch 恒等性静态可证。
+  **NB-1（最重要）**：gc 探针的注释/文档声称「tree-tombstone 也算物理 entry」，但
+  `btree.Iterator.next()` 首行 `if (ev.tombstone) continue` 使其**不会被返回** ⇒ 声称失实。
+  评审**独立证明仍安全**（tree-tombstone 的 key 对任何快照的任何读者都是死键、value 不可恢复；
+  且 C1 后不再新建这类区间）故判非阻塞，但**要求修正声称** → 已在 `8236305` 改正
+  （注释 + 文档改成真实口径并写明为何仍安全）。
+- **独立测试**（ws1-pi2，测试者 ≠ 实现者/评审者）：**PASS**。
+  - 门 v2 六项全绿（全量 exit 0 + `failed command:` 0 / `test-one -Dfilter=T-38-4` exit 0 /
+    `gcTombstones` 存在 / 文档 / 不含 `tests/` / 不含 `src/format.zig`）。
+  - **独立 scratch 探针 S1..S11**（`/tmp`，不进仓库；同一探针在基线与本 commit 各跑一遍）：
+    S1 复活陷阱（2 区间 → gc 后 1 区间，被收割的是空区间 `[x,z)`，`[b,d)` 保留、b/c 仍不可见）；
+    S2 全收割后 `tomb_head=0` 且 **version 3 sticky 不回退**；S3 无可收割时零副作用幂等；
+    S4 C1（head/seq/ver 全不变）；S5/S6 三口径 + 持久化；S7 活跃 reader 跨 gc（旧链页按
+    `release_seq` 挂起，reader 视图一致）；S8 compact 不碰链；S11 `[null,null)` 全区间收割。
+  - **punch 路径链形状对比**：打洞步骤（step1–3）在基线与本 commit **逐条一致** ⇒
+    `canonicalTombs` 挂进 `applyBatchSwap` 是**恒等变换**，证实「punch 用 `succ(k)` 做右段下界
+    ⇒ 天然有 gap ⇒ 规范输入 ⟹ 规范输出」。差异只出现在 deleteRange 收口处的**归并非规范堆积**
+    （C2 的预期行为，并集覆盖相同）。
+  - **数字核对**：`a389301` 532 → `8cf3e29` 543（9 红，按设计）→ `d6c588a` 543（全绿）
+    = **532 + 11 逐层吻合**，`t38_4_tomb_gc_test.zig` **确实在默认门内**（三重证据）⇒
+    **无「测试静默不执行」缺陷**。
+- **conductor 私人教训（已记入 README §4.5）**：我一度把默认门总数测成 **539**，据此怀疑
+  「4 个新用例没进默认门」。真相是 `zig build test` 的汇总计数**只统计本次实际执行的 run-test step，
+  缓存命中的计 0** —— 那次是「坏 seed 失败 + 大部分 step 缓存命中」的运行。冷缓存绿跑 = 543/543。
+  **报总数必须用冷缓存 + `--summary all` + 绿跑。**
+- **合并前 conductor 集成验证**（main `50af0d1`）：`zig build`（install）exit 0 且 11 个工具/bench
+  二进制全产出；`zig build test --seed 0x8c40347c` exit 0 / 85s / `failed command:` 0。
+- **附带发现**：默认门（= CI 的测试步）因 `tests/fuzz/api_batch_fuzz_test.zig` 依赖随机 seed 而
+  **~10% 假红**（SIGSEGV use-after-free / `ModelMismatch`），已在**干净基线**上复现定责 →
+  另立 **T-56**（open）。T-38-4 的门固定 seed 以保持确定。
+- **遗留**：阶段 4b（crash 矩阵扩展，T-38-5）；物化清除仍挂 U-5 真·compact；
+  非阻塞 NB-4（`writer.zig` 重缩进稀释 diff）记录不修。
