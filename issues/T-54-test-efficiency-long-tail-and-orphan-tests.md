@@ -1,10 +1,13 @@
 # Issue T-54 — 测试效率：单个 180s step 独占 wall time + 49 个测试从不执行
 
-- **状态**: open
+- **状态**: `partial` — **P0（量准）与 P4.1/P4.2（17GB 内存炸弹 + 日志误导）已合入 main 验收**；
+  **还剩 P1（拆长尾，主收益）、P2（迭代入口）、P3（补漏 + 去重）、P4.3（README 说明）**。
 - **发现于**: main `c09666f` 全量测试实测（conductor 调查，workspace `w1E`）
 - **发现时间**: 2026-09-18
 - **来源**: 项目 owner 提出「迭代后每次跑测试都要很长时间，想整理测试功能」→ conductor 实测定位
-- **关联 worker / 任务**: 待派发（建议 P0 → `ws1-pi1`；P2 与 P0 无依赖，可并行 → `ws1-pi2`）
+- **关联 worker / 任务**: T-54-A（P0，`ws1-pi1`）、T-54-B（P4.1+P4.2，`ws1-pi2`）、
+  T-54-D（P1 前调研，`ws1-pi1`）、T-54-E（附带调研，`ws1-pi2`）**均已合入 main**；
+  **T-54-C（P1 实施）待派发**（建议 `ws1-pi1` 实现 / `ws1-pi3` 评审 / `ws1-pi2` 测试）
 - **严重程度**: **medium-high**，三条独立痛点：
   - **效率面**：182s 里 **180s 由单个 step 独占**，且并行度只有 1.6x。开发者每次迭代都付这个成本
     （日常迭代应可 <5s）。
@@ -13,6 +16,9 @@
 - **关联**: `build.zig`（844 行）、`.woodpecker/ci.yml`、`.github/workflows/ci.yml`；
   P-5 涉及 zig `lib/compiler/build_runner.zig` 的回显行为
 - **基线**: main `c09666f`（工作区干净），Zig 0.16.0 / macOS / warm cache
+- **合入后实测**（main `4a27c22`，**main 检出目录**，warm cache）: `zig build test` **exit 0 /
+  182.6s / 44 steps / 477/477 pass（0 skip）**；crash step 70 pass 25s MaxRSS **1G**（P4.1 前为 17G）；
+  btree_storage step 63 pass **3m** MaxRSS 1G（长尾未拆，P1 待做）；core_format 107 pass 43s MaxRSS 827M
 
 ---
 
@@ -209,7 +215,8 @@ if (filter) |f| t.filters = &.{f};   // Compile.filters（0.16 支持，编译�
 
 | 阶段 | wall time | 说明 |
 |---|---|---|
-| 现状 | 182s | — |
+| 现状（立项时，main `c09666f`） | 182s | — |
+| 合入 P4.1/P4.2 后实测（main `4a27c22`） | **182.6s** | 内存与日志已修，**wall 不变**（长尾未拆，符合预期） |
 | + P1（拆长尾） | **~50–60s** | 最大收益，且是纯结构改动 |
 | + P3（接进 49 个测试） | ~65–75s | 覆盖面 +49 条，时间只涨一点（多数很快） |
 | 日常迭代（P2） | **< 5s** | `test-one -Dfilter=` |
@@ -231,6 +238,10 @@ if (filter) |f| t.filters = &.{f};   // Compile.filters（0.16 支持，编译�
 |---|---|---|
 | 2026-09-18 | 立 issue T-54，**本次只落文档不改代码** | 项目 owner 决定 |
 | 2026-09-18 | 49 个孤儿测试**接进验收命令**（不废弃） | 与 P1 配合，避免 wall time 反弹 |
+| 2026-09-18 | **P0 结论：180s 由单个测试独占**（`tests/btree_storage/insertbatch_owned_test.zig` 的 T4 branch-producer fault sweep ≈170s），**不拆分 btree_storage** | T-54-A，`a150ca1` |
+| 2026-09-18 | **P4.1 + P4.2 完成**：crash 组 17G→1G（改 smp_allocator）、测试诊断默认静默（`CUBE_TEST_VERBOSE=1` 打开）、CI 注释同步 | T-54-B，`89bf0f2`，独立评审 approve |
+| 2026-09-18 | **P1 方案定为「T4 fault sweep 4 路分片并行」**（T-54-D 推荐方案 (a)：语义零损失、`build.zig` 可不动、预估 wall ~50s）。**否决** (c2) 减故障点 82→25、(d) 移出验收门（均触碰覆盖红线）；(c3) 优化模式因实测 RSS ~7–8G 爆 CI `--maxrss 4GB` 预算否决 | 待派发 T-54-C |
+| 2026-09-18 | T-54-A/B/D/E 合入 main（`b43dcd6`、`4a27c22`），台账 `open` → `partial` | conductor 集成验证：477/477 pass、`failed command:` 计数 0 |
 
 ---
 
