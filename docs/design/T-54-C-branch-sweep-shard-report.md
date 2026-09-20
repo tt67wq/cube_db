@@ -42,10 +42,10 @@ build.zig / src/** / btree_test.zig / core_format/** / crash_insertbatch_pb/** *
 ### SWEEP 摘要原文（verbose 运行）
 
 ```
-SWEEP shard=a first=21762 last=21783 points=21
-SWEEP shard=b first=21783 last=21804 points=21
-SWEEP shard=c first=21804 last=21824 points=20
-SWEEP shard=d first=21824 last=21844 points=20
+SWEEP shard=a total=21842 first=21762 last=21783 points=21
+SWEEP shard=b total=21842 first=21783 last=21804 points=21
+SWEEP shard=c total=21842 first=21804 last=21824 points=20
+SWEEP shard=d total=21842 first=21824 last=21844 points=20
 ```
 
 4 片首尾相接、无重叠、无缝隙，合计 **82 个故障点**（21+21+20+20）。
@@ -88,6 +88,27 @@ RUN 2: FailingAllocator.allocations = 21842 (window [21762, 21844))
 
 在门修正前，本任务以"实现完成 + 默认门（运行 1）全绿 + 运行 2 仅因冻结常量
 口径差失败"的状态交付。
+
+### 裁决结果（2026-09-20，conductor）
+
+**选项 2 被采纳。** conductor 已独立核实勘误（直读
+`lib/std/testing/FailingAllocator.zig`：`allocations` 仅在 alloc 成功路径 +1，
+resize/remap 不计），确认 21842 / [21762,21844) 成立、原 T4 一直 sweep 的就是该窗口、
+实时校准语义的保留是正确的。check.sh 已升 **v2**：不再冻结绝对窗口常量，改为从
+分片自报的 `total=` 推导期望窗口 [total-|80, total+2)，并校验 4 片 total 一致 /
+铺满无缝隙无重叠 / 点数合计 = 窗口宽度 / 最宽片-最窄片 ≤ 1。相应地，4 个分片文件的
+SWEEP 摘要行已升级为 v2 格式（含 total）：
+`SWEEP shard=<a|b|c|d> total={d} first={d} last={d} points={d}`。
+
+**check.sh v2 实跑（本 worktree，最终验收，exit 0）：**
+
+```
+check.sh: repo=/Users/admin/.herdr/worktrees/cube_db/worktree-silver-harbor-9567
+check.sh: [1/2] default run  exit=0 wall=54s  log=/tmp/t54c-check-default-82449.log
+check.sh: [2/2] verbose run  exit=0 wall=54s  log=/tmp/t54c-check-verbose-82449.log
+  分片自报 total=21842 -> 期望窗口 [21762,21844) 宽度 82
+PASS: 4 片铺满 [21762,21844) 共 82 点（分片 [20, 20, 21, 21]）；默认运行 exit 0 且 failed command: 计数 0；wall=54s < 70s
+```
 
 ## 4. check.sh 输出原文
 

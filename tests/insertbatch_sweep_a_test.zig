@@ -5,8 +5,10 @@
 //! Each shard is its own top-level test binary (picked up by build.zig's
 //! tests/*.zig auto-discovery), sweeps its own sub-range of the original
 //! window [total-|80, total+2), and prints a machine-readable summary line
-//! (verbose-gated, via tests/core_format/test_diag.zig — unconditional
-//! prints would regress T-54-B's "failed command: = 0" gate).
+//! (includes the shard's calibrated total; verbose-gated via
+//! tests/core_format/test_diag.zig — unconditional
+//! prints would regress T-54-B's "failed command: = 0" gate; format is
+//! check.sh v2 contract: SWEEP shard=<a-d> total=<T> first=<F> last=<L> points=<K>).
 //!
 //! Shards a..d are gap-free and non-overlapping; their union is exactly the
 //! original sweep window (guarded by tests/insertbatch_sweep_partition_test.zig).
@@ -19,5 +21,5 @@ test "T-42: branch-producer error path — no UAF, no leaks (calibrated fault sw
     const total = try h.countAllocs(h.branchOverflowScenario);
     const r = h.shardRange(total, 0);
     try h.sweepFailIndexes("branch-a", h.branchOverflowScenario, r.first, r.last_exclusive);
-    diag.print("SWEEP shard=a first={d} last={d} points={d}\n", .{ r.first, r.last_exclusive, r.last_exclusive - r.first });
+    diag.print("SWEEP shard=a total={d} first={d} last={d} points={d}\n", .{ total, r.first, r.last_exclusive, r.last_exclusive - r.first });
 }
