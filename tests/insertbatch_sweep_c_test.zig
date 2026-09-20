@@ -1,4 +1,4 @@
-//! insertbatch_sweep_a_test.zig — T-54-C shard c (of a..d) of the T-42
+//! insertbatch_sweep_c_test.zig — T-54-C shard c (of a..d) of the T-42
 //! branch-producer calibrated fault sweep, split out of
 //! tests/btree_storage/insertbatch_owned_test.zig for parallel execution.
 //!

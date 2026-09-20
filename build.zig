@@ -272,6 +272,10 @@ pub fn build(b: *std.Build) void {
     while (tests_iter.next(io) catch null) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".zig")) continue;
+        // T-54-F: test-one's root closure runs ONLY under its own step (with
+        // -Dfilter); auto-discovering it here would double-execute every test
+        // it aggregates.
+        if (std.mem.eql(u8, entry.name, "test_one_aggregator.zig")) continue;
         const t = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path(b.fmt("tests/{s}", .{entry.name})),
@@ -842,4 +846,80 @@ pub fn build(b: *std.Build) void {
     fuzz_step.dependOn(&run_fuzz_range_delete.step);
     fuzz_step.dependOn(&run_fuzz_format.step);
     fuzz_step.dependOn(&run_fuzz_meta.step);
+
+    // ===== T-54-F (P3a): wire orphan tests into the default gate =====
+    // Append-only: reuse the run artifacts that already power the named steps
+    // (test-db / test-format / test-rangetomb-read / test-fuzz) — the build graph
+    // runs a step once no matter how many steps depend on it, so this adds zero
+    // duplicate compilation and zero duplicate execution (freelist_amp_red
+    // gets a new artifact but NOT test_step — see its comment below).
+    // long_run_2min stays OUT of the default gate by adjudication
+    // (2-min soak; keeps its own long-run step).
+    // freelist_amp_red_test.zig is NOT wired into test_step: its RED #1
+    // ("small commit must not rewrite the whole FREE chain") is RED **by
+    // design on main** — T-39-C proved incremental freelist persistence
+    // cannot close safely under the current crash model and was downgraded
+    // (issues/T-39-C-followup-append-only-freelist.md; RED #2/#3 are green
+    // via T-39-B). Wiring it in would make `zig build test` permanently
+    // exit 1. It gets a named step instead (on-demand, like long-run).
+    // → adjudication request in docs/design/T-54-F-*.md §3.
+    const freelist_amp_red_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/core_format/freelist_amp_red_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+            },
+        }),
+    });
+    const run_freelist_amp_red_test = b.addRunArtifact(freelist_amp_red_test);
+    const freelist_amp_red_step = b.step("test-t39-red", "T-39 RED tests (RED #1 red by design — T-39-C downgraded; NOT in the default gate)");
+    freelist_amp_red_step.dependOn(&run_freelist_amp_red_test.step);
+
+    // txn_writer_db orphans (artifacts exist; they rode db_test_step only)
+    test_step.dependOn(&run_rangetomb_read_test.step);
+    test_step.dependOn(&run_applybatch_single_vs_multi_test.step);
+    test_step.dependOn(&run_delete_range_concurrent_test.step);
+    test_step.dependOn(&run_deleterange_mem_budget_test.step);
+    test_step.dependOn(&run_mvcc_concurrent_flush_test.step);
+    // core_format orphans (range_tombstone_format rode test-format only)
+    test_step.dependOn(&run_tomb_format_test.step);
+    // fuzz orphans (artifacts exist; they rode test-fuzz only)
+    test_step.dependOn(&run_fuzz_probe.step);
+    test_step.dependOn(&run_fuzz_api.step);
+    test_step.dependOn(&run_fuzz_api_batch.step);
+    test_step.dependOn(&run_fuzz_range_delete.step);
+    test_step.dependOn(&run_fuzz_format.step);
+    test_step.dependOn(&run_fuzz_meta.step);
+
+    // ===== T-54-F (P2): test-one — fast iteration entry with compile-time filter =====
+    // Zig 0.16 has no runtime --test-filter; Compile.filters prunes at compile
+    // time (cached per filter value). Root closure = tests/test_one_aggregator.zig
+    // (everything the default gate covers on the tests/ side EXCEPT the 4
+    // insertbatch sweep shards — each is a ~46s fault sweep that would serialize
+    // in a single binary). src/ unit tests (mod_tests/exe_tests) are separate.
+    // Usage: zig build test-one -Dfilter=T-42   (always pass -Dfilter; without
+    // it this runs the whole aggregated suite in ONE serial binary — slow.)
+    const test_one_filter = b.option([]const u8, "filter", "test-one: 只跑名字含该子串的测试");
+    const test_one = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/test_one_aggregator.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cube_db", .module = mod },
+                .{ .name = "zio", .module = zio_mod },
+                .{ .name = "cube_check", .module = cube_check_mod },
+            },
+        }),
+    });
+    // NOTE: not `&.{f}` — that takes the address of a stack temporary whose
+    // lifetime ends with this statement; Compile.reads it later during make()
+    // and zig's build runner segfaults (getZigArgs arg iteration). Dupe onto
+    // the build-runner arena so it lives for the whole build.
+    if (test_one_filter) |f| test_one.filters = b.allocator.dupe([]const u8, &.{f}) catch @panic("oom");
+    const run_test_one = b.addRunArtifact(test_one);
+    const test_one_step = b.step("test-one", "Run filtered tests in one binary (use -Dfilter=<substr>)");
+    test_one_step.dependOn(&run_test_one.step);
 }
