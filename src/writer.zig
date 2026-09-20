@@ -884,6 +884,8 @@ pub const State = struct {
     /// T-38-4 (C2): effective-bound compare — eff(b) = b.bytes ++ (0x00 if
     /// b.append_zero), null never reaches here (a null min is -inf, a null max
     /// is +inf; both handled by the merge driver below).
+    /// Mirror of db.zig's boundCmp — the two layers cannot share code
+    /// (writer must not import db); change either one, you MUST sync the other.
     fn tombBoundCmp(a: f2.TombBound, b: f2.TombBound) std.math.Order {
         const a_len = a.bytes.len + @as(usize, @intFromBool(a.append_zero));
         const b_len = b.bytes.len + @as(usize, @intFromBool(b.append_zero));

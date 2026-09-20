@@ -506,8 +506,14 @@ pub const Db = struct {
         if (tobs.items.len == 0) return; // tomb_head == 0: zero-side-effect no-op
 
         // Raw probe per interval: one bounded raw iteration each; the first
-        // entry (alive OR tree-tombstone — anything physical counts, keep is
-        // the conservative direction) marks the interval as load-bearing.
+        // returned entry marks the interval as load-bearing. NOTE the iterator
+        // SKIPS tree-tombstone entries (btree.zig next(): `if (ev.tombstone) continue`),
+        // so an interval whose physical entries are ALL tree-tombstones reads as
+        // empty and gets harvested. That is still safe — such a key is a dead key
+        // for every snapshot and reader (btree.get returns null on tombstone; select
+        // skips it), so the interval is observationally irrelevant; and C1 means
+        // deleteRange no longer creates such intervals. The conservative direction
+        // for LIVE entries is preserved: they ARE returned, so the interval is kept.
         // Write mutex held: no commit can interleave, no MVCC pin needed
         // (same reasoning as materializeSegment).
         const root = self.state.getRoot();
@@ -863,6 +869,8 @@ fn shadowSkipDeinit(ctx: *anyopaque) void {
 /// Effective-bound comparison without materializing bytes: eff(b) =
 /// b.bytes ++ (0x00 if append_zero). Null is handled by callers (a null
 /// min/max means ±infinity and never reaches here).
+/// Mirror of writer.zig's tombBoundCmp — the two layers cannot share code
+/// (writer must not import db); change either one, you MUST sync the other.
 fn boundCmp(a: f2.TombBound, b: f2.TombBound) std.math.Order {
     const a_len = a.bytes.len + @as(usize, @intFromBool(a.append_zero));
     const b_len = b.bytes.len + @as(usize, @intFromBool(b.append_zero));
