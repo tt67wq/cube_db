@@ -29,7 +29,7 @@ fn checkTotal(total: usize) !void {
     for (0..h.SHARD_COUNT) |i| {
         const r = h.shardRange(total, i);
         try testing.expect(r.first <= r.last_exclusive);
-        try testing.expectEqual(r.last_exclusive - r.first, r.last_exclusive - r.first);
+        try testing.expect(r.last_exclusive - r.first <= width); // no shard wider than the window
         firsts[i] = r.first;
         lasts[i] = r.last_exclusive;
         sum += r.last_exclusive - r.first;
