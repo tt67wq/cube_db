@@ -1,9 +1,10 @@
 # Issue T-38 — deleteRange 高效化：全量物化 + 每 key tombstone 的 O(range) 内存与写放大
 
-- **状态**: fixing（**阶段 1 格式层 / 阶段 2 读路径已合入 main 并通过验收**
-  —— 阶段 1 `baa44bd`、阶段 2 `88124bc`（验收① 452/452 + 验收② 15/15 + review APPROVE）；
-  **当前进行阶段 3 写路径 / 阶段 4 GC**。阶段 3 前置：`issues/T-49-…`（high，数据破坏面）、
-  `issues/T-50-…` 待决）
+- **状态**: fixing（**阶段 1 格式层 / 阶段 2 读路径 / 阶段 3 写路径均已合入 main 并通过验收**
+  —— 阶段 1 `baa44bd`、阶段 2 `88124bc`（验收① 452/452 + 验收② 15/15 + review APPROVE）、
+  阶段 3 `fe2f575`（RED `aba3607` → GREEN 8/8+6/6 + review APPROVE `3a39b85` Blocking 0 +
+  test PASS `b1667bf` 含反证）；**当前只剩阶段 4（GC）**。阶段 3 前置 `issues/T-49-…`/`T-50-…`
+  已由 `1c6ce1d` 关闭，`T-52` 已修复归档）
 - **优先级**: **high**（可用性缺口 + 内存安全边界；4/4 worker 全部独立提出，共识度最高）
 - **梯队**: 可用性/性能（兼正确性观感——文档承诺与实际行为差距）
 - **来源**: 演进点征集（roadmap-evo）wf-pi-1-E1、wf-pi-2-E2、wf-pi-3-E3、wf-pi-4-E2

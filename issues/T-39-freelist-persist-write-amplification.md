@@ -1,6 +1,6 @@
 # Issue T-39 — freelist 持久化写放大：每次 commit 整链重写 + O(pool) 去重扫描
 
-- **状态**: 部分交付（去重/观测痛点已闭合并验收；写放大痛点不可在现有崩溃模型下安全闭合，
+- **状态**: `partial`（去重/观测痛点已闭合并验收；写放大痛点不可在现有崩溃模型下安全闭合，
   拆分至 `issues/T-39-C-followup-append-only-freelist.md` 后续立项）
 - **交付注记**: 本次 TDD 完成"去重收敛 + 静默吞错可观测化 + FreelistStats 观测 API"
   （T-39-B），并独立评审通过（review.md verdict=approve）+ T-27 崩溃注入矩阵稳定全绿
