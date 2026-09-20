@@ -1036,8 +1036,13 @@ fn planTombPunch(self: *Db, a: std.mem.Allocator, reqs: []const wrt.Request) !?w
             const tmax = t.max;
             _ = tobs.orderedRemove(i);
 
-            // Left segment [tmin, k): dropped iff tmin == k (effective).
-            const left_empty = tmin != null and boundCmp(tmin.?, .{ .bytes = k }) == .eq;
+            // Left segment [tmin, k): dropped iff tmin == k (effective), or
+            // k is the EMPTY key — [tmin, "") covers nothing (no key is < ""),
+            // and its max bound {bytes:"", append_zero:false} would encode
+            // exactly like null (= +inf) on disk, turning the segment into
+            // [tmin, +inf) and shadowing the whole library (T-57). The
+            // tmin==k check alone misses the tmin==null case.
+            const left_empty = k.len == 0 or (tmin != null and boundCmp(tmin.?, .{ .bytes = k }) == .eq);
             if (!left_empty) {
                 const lmin = tmin;
                 const lmax: ?f2.TombBound = .{ .bytes = k };
