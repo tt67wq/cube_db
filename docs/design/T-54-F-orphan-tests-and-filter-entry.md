@@ -79,6 +79,18 @@ error: 'freelist_amp_red_test.test.T-39 RED #1: small commit against a large poo
    expected-fail」——实现复杂且语义糊，不推荐；
 3. 或改判「T-39 RED #1 废弃/改写」（动测试文件，超出本任务红线）。
 
+### 裁决结果（2026-09-20，conductor）
+
+**选项 1 被采纳。** conductor 独立核实了全部证据链（issues/T-39-C-followup
+:3/:26/:106、issues/T-39-freelist-persist-write-amplification:78、测试代码 :97
+起的 MissingFreelistStatsApi 守卫），确认 RED #1 在 main 上本来就红，并明确
+**契约自相矛盾归因于 conductor**（初版 total=538 是闭包分析数出来的，没跑过）。
+裁决：freelist_amp_red 留在默认门外（`test-t39-red` 命名 step，按需跑），
+**期望总数 538 → 532**（484 + 48），check.sh 已升 v2（另新增 `failed command:` = 0
+门）。理由（conductor 原则）：默认验收门必须全绿；把已知红塞进去会让红灯常态化，
+真回归会被淹没。它的价值是「红着提醒 T-39-C 未闭合」，test-one 闭包包含它
+（`-Dfilter=T-39` 可迭代）是正确设计。—— 即本提交前已实现的形态，无需改动。
+
 ## 4. test-one 迭代入口（P2）
 
 - 用法：`zig build test-one -Dfilter=<子串>`（Zig 0.16 无运行期 filter，
@@ -130,29 +142,36 @@ FAIL: 测试总数 484 != 期望 538
 CHECK_EXIT=1
 ```
 
-### check.sh 现状（改动后，待 §3 裁决后应转绿）
+### check.sh v2 终验（裁决后，本 worktree，exit 0）
+
+裁决采纳选项 1（EXPECT_TOTAL=532）后，check.sh v2（含新增 `failed command:` = 0 门）
+实跑全绿：
 
 ```
 check.sh: repo=/Users/admin/.herdr/worktrees/cube_db/worktree-silver-harbor-9567
-check.sh: [1/3] default run  exit=0 wall=68s  log=/tmp/t54f-default-84491.log
+check.sh: [1/3] default run  exit=0 wall=91s  log=/tmp/t54f-default-135.log
+PASS(1b): failed command: 计数 = 0
   steps=78/78  tests=531/532
-FAIL: 测试总数 532 != 期望 538
-CHECK_EXIT=1
+PASS(2): 测试总数 532 == 532（484 基线 + 48 接进；freelist_amp_red 6 条 KNOWN-RED 例外）
+  test-one: 预热 6.4s，计时 4.2s，命中测试 3 条
+PASS(3): test-one -Dfilter=T-42 命中 3 条，4.2s < 5.0s
+  nit 1: 3 个分片文件头注释已指向自身
+  nit 2: partition 测试无 expectEqual(X, X) 形态的恒真断言
+PASS: 全部通过（默认运行 wall=91s，仅记录不作硬门）
+CHECK_EXIT=0
 ```
 
-门其余两步已单独实测通过（等价命令逐条复现）：
-- 步骤 3（test-one）：`exit=0 dt=4.22s hits=3` → PASS 条件全满足；
-- 步骤 4（nit）：b/c/d 文件头指向自身 ✓；partition 无恒真断言 ✓。
-若 conductor 裁定 EXPECT_TOTAL=532（§3 选项 1），check.sh 即 exit 0。
+（wall 91s 为共享受载时段实测，契约明示 wall 非硬门、仅记录。）
 
 ## 6. 顺带记录 / 建议（不在本任务范围，写进报告供 conductor 排期）
 
-1. **stderr 噪音回归（1 处）**：`deleterange_mem_budget_test.zig` 有 2 条裸
-   `std.debug.print`（`[T-38-B] ...` 诊断），接进后绿色运行的 stderr 重新出现
-   1 行 `failed command:`（T-54-B 卫生约定的回归）。未修原因：红线禁止删改现有
-   test 内容；且模块路径限制（根在 `tests/txn_writer_db/` 不能 `../` import
-   core_format/test_diag.zig）。**建议**：T-54-G 重构时把 test_diag 做成 build.zig
-   模块（`test_diag_mod`）统一注入，顺带删掉现存 2 份拷贝，一次性解决。
+1. **stderr 噪音回归（1 处）—— 本轮已修**（conductor 裁决授权）：`deleterange_mem_budget_test.zig`
+   的 2 条信息性 `std.debug.print`（原 :218 与 :257，`[T-38-B]` 峰值诊断）改为
+   **verbose 门控默认静默**（内联最小 `CUBE_TEST_VERBOSE` 判定，与
+   tests/core_format/test_diag.zig 同约定；模块路径限制不能 `../` import，
+   统一模块化留给 T-54-G）。断言/语义/其它行零改动；
+   `CUBE_TEST_VERBOSE=1 zig build test-db` 实测诊断仍可打印。check.sh v2 的
+   新门 `failed command:` 计数 = 0 已验证通过。
 2. **test-one 5s 门余量薄**（4.2s vs 5s）：预算大头是 T-42 leaf sweep 的 3.9s。
    若未来机器更慢可在门上放宽到 <8s，或把 `FILTER_SUBSTR` 换成不命中 leaf sweep
    的子串（如 `shard`）。

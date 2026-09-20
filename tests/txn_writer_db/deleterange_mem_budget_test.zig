@@ -41,6 +41,22 @@ const Db = cube.Db;
 
 const alloc = std.testing.allocator;
 
+/// T-54-F: 信息性诊断默认静默（与 tests/core_format/test_diag.zig 同约定），
+/// `CUBE_TEST_VERBOSE=1` 打开。此文件是独立测试二进制（模块根在
+/// tests/txn_writer_db/，不能 ../ import test_diag.zig），故内联最小判定；
+/// 统一模块化留给 T-54-G。
+var diag_verbose: ?bool = null;
+fn diagPrint(comptime fmt: []const u8, args: anytype) void {
+    if (diag_verbose == null) {
+        diag_verbose = if (std.c.getenv("CUBE_TEST_VERBOSE")) |s|
+            std.mem.span(s).len > 0 and !std.mem.eql(u8, std.mem.span(s), "0")
+        else
+            false;
+    }
+    if (!diag_verbose.?) return;
+    std.debug.print(fmt, args);
+}
+
 /// 关键字节数阈值：现状下每 key 至少一份 dupe 副本（key 长 KEY_LEN）
 /// + 一个 Entry 结构。4N 场景与 N 场景的峰值比 >= 3.0 即判 O(range)。
 const GROWTH_RATIO_MAX: f64 = 2.0;
@@ -215,7 +231,7 @@ test "T-38-B: deleteRange 内部净分配不随 range 线性增长（O(1) 分块
     try std.testing.expect(tracker_a.ignored > 0);
     try std.testing.expect(tracker_b.ignored > 0);
 
-    std.debug.print(
+    diagPrint(
         "\n[T-38-B] deleteRange 内部净峰值: N={d} -> {d}B | 4N={d} -> {d}B | 比值={d:.2}\n",
         .{ N, a.peak, N * 4, b.peak, @as(f64, @floatFromInt(b.peak)) / @as(f64, @floatFromInt(@max(a.peak, 1))) },
     );
@@ -254,6 +270,6 @@ test "T-38-B: deleteRange 后净分配归零（无泄漏）" {
     tracker.open();
     try db.deleteRange("k000000", "kzzzzzz");
     const peak2 = tracker.close();
-    std.debug.print("\n[T-38-B] 首次峰值={d}B 幂等重删峰值={d}B\n", .{ peak, peak2 });
+    diagPrint("\n[T-38-B] 首次峰值={d}B 幂等重删峰值={d}B\n", .{ peak, peak2 });
     try std.testing.expect(peak2 <= peak);
 }
