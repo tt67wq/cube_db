@@ -14,6 +14,7 @@ const FilePageStore = cube.file_page_store.FilePageStore;
 const Db = cube.Db;
 
 const alloc = std.testing.allocator;
+const tdiag = @import("test_diag.zig");
 
 const c = @cImport({
     @cInclude("unistd.h");
@@ -115,7 +116,7 @@ fn verifyConsistent(path: []const u8, n: usize) !void {
         std.debug.print("INCONSISTENT: {d}/{d} keys present after crash!\n", .{ present, n });
         return error.InconsistentState;
     }
-    std.debug.print("  consistent: {d}/{d} keys present (0=old state, {d}=new state)\n", .{ present, n, n });
+    tdiag.print("  consistent: {d}/{d} keys present (0=old state, {d}=new state)\n", .{ present, n, n });
 }
 
 // ===== Test 1: normal putBatch + fsync, reopen should see all data =====

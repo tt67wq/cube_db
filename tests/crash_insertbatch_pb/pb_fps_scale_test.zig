@@ -2,6 +2,7 @@ const std = @import("std");
 const cube = @import("cube_db");
 const Db = cube.Db;
 const FilePageStore = cube.file_page_store.FilePageStore;
+const tdiag = @import("test_diag.zig");
 
 fn monoNs() i64 {
     var ts: std.c.timespec = undefined;
@@ -22,7 +23,8 @@ fn unlinkPath(path: []const u8) void {
 }
 
 test "FPS ordered scaling" {
-    const allocator = std.heap.page_allocator;
+    // T-54-B: smp_allocator 替换 page_allocator（微分配 mmap 取整放大 RSS，见 pb_fps_ordered_test 注释）
+    const allocator = std.heap.smp_allocator;
     const v100: [100]u8 = [_]u8{'x'} ** 100;
 
     for ([_]usize{ 10000, 100000, 500000, 1000000 }) |n| {
@@ -39,6 +41,6 @@ test "FPS ordered scaling" {
         const start = monoNs();
         try db.putBatch(entries);
         const el = monoNs() - start;
-        std.debug.print("FPS ordered N={d:>7}: {d:.2} ns/entry\n", .{ n, @as(f64, @floatFromInt(el)) / @as(f64, @floatFromInt(n)) });
+        tdiag.print("FPS ordered N={d:>7}: {d:.2} ns/entry\n", .{ n, @as(f64, @floatFromInt(el)) / @as(f64, @floatFromInt(n)) });
     }
 }

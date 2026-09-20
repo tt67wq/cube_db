@@ -5,6 +5,7 @@ const cube = @import("cube_db");
 const Db = cube.Db;
 const MemPageStore = cube.page_store.MemPageStore;
 const testing = std.testing;
+const tdiag = @import("test_diag.zig");
 
 // large batch insert then delete all; verify memory usage falls back (slab pages returned)
 test "slab: large batch then delete all, memory returns" {
@@ -29,7 +30,7 @@ test "slab: large batch then delete all, memory returns" {
 
     const pages_after_insert = ms.pages.items.len;
     const free_after_insert = ms.freelist.items.len;
-    std.debug.print("pages after insert: {d} (freelist={d}, active={d})\n", .{ pages_after_insert, free_after_insert, pages_after_insert - free_after_insert });
+    tdiag.print("pages after insert: {d} (freelist={d}, active={d})\n", .{ pages_after_insert, free_after_insert, pages_after_insert - free_after_insert });
 
     // delete all
     {
@@ -45,7 +46,7 @@ test "slab: large batch then delete all, memory returns" {
 
     const pages_after_delete = ms.pages.items.len;
     const free_after_delete = ms.freelist.items.len;
-    std.debug.print("pages after delete: {d} (freelist={d}, active={d})\n", .{ pages_after_delete, free_after_delete, pages_after_delete - free_after_delete });
+    tdiag.print("pages after delete: {d} (freelist={d}, active={d})\n", .{ pages_after_delete, free_after_delete, pages_after_delete - free_after_delete });
 
     // slab free path: after delete, the active page count (items.len - freelist.len) should fall back
     // under COW, delete writes new pages (tombstones) and old pages go to the freelist, so items.len may grow
@@ -53,7 +54,7 @@ test "slab: large batch then delete all, memory returns" {
     const active_after_insert = pages_after_insert - free_after_insert;
     const active_after_delete = pages_after_delete - free_after_delete;
     try testing.expect(active_after_delete <= active_after_insert);
-    std.debug.print("active pages: {d} -> {d} ({s})\n", .{ active_after_insert, active_after_delete, if (active_after_delete <= active_after_insert) "OK" else "FAIL" });
+    tdiag.print("active pages: {d} -> {d} ({s})\n", .{ active_after_insert, active_after_delete, if (active_after_delete <= active_after_insert) "OK" else "FAIL" });
 }
 
 // alternating insert/delete cycles, verifying slab pool reuse (no leak growth)
@@ -93,7 +94,7 @@ test "slab: repeated insert/delete cycles, no leak" {
 
     try testing.expectEqual(@as(u64, 0), db.entryCount());
     const final_pages = ms.pages.items.len - ms.freelist.items.len;
-    std.debug.print("peak active: {d}, final active: {d}\n", .{ peak_pages, final_pages });
+    tdiag.print("peak active: {d}, final active: {d}\n", .{ peak_pages, final_pages });
     // with slab pool reuse, the final active page count must not exceed the peak (no leak growth)
     try testing.expect(final_pages <= peak_pages);
 }

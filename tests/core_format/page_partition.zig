@@ -33,6 +33,7 @@ const cube = @import("cube_db");
 const f2 = cube.format;
 const ps = cube.page_store;
 const btree = cube.btree;
+const tdiag = @import("test_diag.zig");
 
 // btree.zig keeps these private; mirrored here (btree.zig: LEAF_KIND / BRANCH_KIND /
 // LEAF_FLAG_OVERFLOW). If they ever change, the tree walk below reports walk_errors rather than
@@ -283,7 +284,9 @@ pub fn classify(allocator: std.mem.Allocator, store: ps.PageStore, meta: f2.Meta
 }
 
 pub fn dump(self: *const Report, label: []const u8) void {
-    std.debug.print(
+    // T-54-B: 成功路径也调用 dump（每个 checkpoint 一行），故默认静默；失败时
+    // 紧随其后的重叠明细行仍无条件输出（错误上下文不丢）。
+    tdiag.print(
         "[T7 {s}] last_page={d} meta={d} tree={d} chain={d} free={d} orphan={d} walk_errors={d} out_of_range={d} overlaps={d}\n",
         .{ label, self.last_page, self.n_meta, self.n_tree, self.n_chain, self.n_free, self.n_orphan, self.walk_errors, self.out_of_range, self.overlaps.items.len },
     );

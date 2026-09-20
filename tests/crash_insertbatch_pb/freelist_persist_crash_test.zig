@@ -43,6 +43,7 @@ const f2 = cube.format;
 const Db = cube.Db;
 const FilePageStore = cube.file_page_store.FilePageStore;
 const part = @import("../core_format/page_partition.zig");
+const tdiag = @import("test_diag.zig");
 
 const c = @cImport({
     @cInclude("unistd.h");
@@ -251,7 +252,7 @@ fn checkAfterCrash(path: []const u8, label: []const u8) !Landed {
     try part.expectDisjoint(&rep);
     try std.testing.expectEqual(false, discardedOf(&fps));
 
-    std.debug.print("{s}: c3={s} c4={s} free_count={d} pool={d}\n", .{
+    tdiag.print("{s}: c3={s} c4={s} free_count={d} pool={d}\n", .{
         label,
         if (c3) "landed" else "lost",
         if (c4) "landed" else "lost",
@@ -286,7 +287,7 @@ fn writeRoundAndRecheck(path: []const u8, landed: Landed, label: []const u8) !vo
         var rep = try part.classify(alloc, fps.store(), meta);
         defer rep.deinit();
         try part.expectDisjoint(&rep); // no page in two classes => no double allocation
-        std.debug.print("{s}: post-write recheck OK (last_page={d})\n", .{ label, meta.last_page });
+        tdiag.print("{s}: post-write recheck OK (last_page={d})\n", .{ label, meta.last_page });
     }
 }
 

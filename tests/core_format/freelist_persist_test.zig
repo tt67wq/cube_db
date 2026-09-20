@@ -29,6 +29,7 @@ const ps = cube.page_store;
 const Db = cube.Db;
 const FilePageStore = cube.file_page_store.FilePageStore;
 const part = @import("page_partition.zig");
+const tdiag = @import("test_diag.zig");
 
 const c = @cImport({
     @cInclude("unistd.h");
@@ -423,9 +424,11 @@ test "T4: churn x6 close/reopen — last_page growth bounded (headline criterion
         last_pages[r] = meta.last_page;
     }
 
-    std.debug.print("T4 last_page per round: ", .{});
-    for (last_pages) |lp| std.debug.print("{d} ", .{lp});
-    std.debug.print("\n", .{});
+    if (tdiag.verbose()) {
+        std.debug.print("T4 last_page per round: ", .{});
+        for (last_pages) |lp| std.debug.print("{d} ", .{lp});
+        std.debug.print("\n", .{});
+    }
 
     // Rounds 1-2 are warm-up: round 1 ends with only the delete batch's victims in the pool, which
     // is less than one round's peak demand, so round 2 must still bump. From round 3 on the regime
