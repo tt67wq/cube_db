@@ -330,15 +330,21 @@ pub const Db = struct {
             }
         }
 
-        // Merge (union) the new interval into the existing chain, re-sort by
-        // effective min, dedup exact equals (design §4.3 last bullet).
+        // T-38-4 (C1, P1): count == 0 ⟹ every physical entry in [min,max) is
+        // already shadowed by the existing chain ⟹ one more covering layer
+        // changes no read result — the new interval is provably redundant.
+        // commitTombSwap's deltas would both be 0 anyway, so returning here
+        // is semantically identical AND zero-side-effect: no chain page, no
+        // meta write, no sequence bump, no counter change.
+        if (count == 0) return;
+
         try tobs.append(aa, .{
             .min = if (min) |m| .{ .bytes = m } else null,
             .max = if (max) |m| .{ .bytes = m } else null,
         });
-        sortTobs(tobs.items);
-        try dedupTobs(&tobs, aa);
-
+        // T-38-4 (C2): the chain is canonicalized at its single publish point
+        // (commitTombSwap) — sort/merge/dedup happens there for ALL paths, so
+        // nothing to do locally.
         try self.state.commitTombSwap(tobs.items, old_pages.items, -count, -live_bytes);
     }
 
@@ -469,6 +475,62 @@ pub const Db = struct {
         it.pin_ctx = @ptrCast(reader);
         it.pin_deinit = endReadPin;
         return it;
+    }
+
+    /// T-38-4 (C3): harvest tombstone intervals that can no longer shadow
+    /// anything. For every interval on the chain, a RAW tree scan decides
+    /// (no shadow skip — same 口径 as materializeSegment): any physically
+    /// present entry in the range → KEEP the interval (dropping it would
+    /// resurrect the entries it shadows — F1 direction, data loss); none →
+    /// drop it (observationally neutral for EVERY snapshot, P3 — no reader
+    /// watermark needed; old chain pages retire via the standard
+    /// pending_free/release_seq discipline).
+    /// Zero-side-effect short-circuits: tomb_head == 0, or nothing harvestable
+    /// → no meta write, no sequence bump. Publishing goes through
+    /// commitTombSwap (canonical chain per C2) with BOTH deltas 0 — dropping
+    /// an entry-less interval cannot change visible counts.
+    /// Deliberately NOT called from compact(): compact is O(1) by public
+    /// contract (docs/usage.md) — gc is the separate convergence exit.
+    pub fn gcTombstones(self: *Db) !void {
+        // Same serialization as every other write path (single-writer commit
+        // view for the raw scans and the chain swap).
+        self.write_mutex.lock() catch return error.LockFailed;
+        defer self.write_mutex.unlock();
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+        var tobs: std.ArrayList(f2.RangeTombstone) = .empty;
+        var old_pages: std.ArrayList(u32) = .empty;
+        try loadTombChainInto(self, aa, &tobs, &old_pages);
+        if (tobs.items.len == 0) return; // tomb_head == 0: zero-side-effect no-op
+
+        // Raw probe per interval: one bounded raw iteration each; the first
+        // returned entry marks the interval as load-bearing. NOTE the iterator
+        // SKIPS tree-tombstone entries (btree.zig next(): `if (ev.tombstone) continue`),
+        // so an interval whose physical entries are ALL tree-tombstones reads as
+        // empty and gets harvested. That is still safe — such a key is a dead key
+        // for every snapshot and reader (btree.get returns null on tombstone; select
+        // skips it), so the interval is observationally irrelevant; and C1 means
+        // deleteRange no longer creates such intervals. The conservative direction
+        // for LIVE entries is preserved: they ARE returned, so the interval is kept.
+        // Write mutex held: no commit can interleave, no MVCC pin needed
+        // (same reasoning as materializeSegment).
+        const root = self.state.getRoot();
+        var kept: std.ArrayList(f2.RangeTombstone) = .empty;
+        for (tobs.items) |t| {
+            const has_entry = blk: {
+                var it = try btree.selectChecked(aa, self.store, root, if (t.min) |m| try effBoundBytes(aa, m) else null, if (t.max) |m| try effBoundBytes(aa, m) else null, self.state.opts.crc_check);
+                defer it.deinit();
+                break :blk (try it.next()) != null;
+            };
+            if (has_entry) try kept.append(aa, t);
+        }
+        if (kept.items.len == tobs.items.len) return; // nothing harvestable → no side effects
+
+        // Deltas 0: an entry-less interval shadows nothing, so visibility and
+        // both counters are unchanged by dropping it (P3).
+        try self.state.commitTombSwap(kept.items, old_pages.items, 0, 0);
     }
 
     pub fn compact(self: *Db) !void {
@@ -681,7 +743,6 @@ pub const ReadTxn = struct {
 /// MVCC pin callback for btree.Iterator (T-29 Phase B): releases the reader
 /// slot at deinit. The btree layer does not depend on wrt.State; decoupled
 /// via an opaque callback.
-
 fn endReadPin(ctx: *anyopaque) void {
     const reader: *wrt.Reader = @ptrCast(@alignCast(ctx));
     reader.state.endRead(reader);
@@ -808,6 +869,8 @@ fn shadowSkipDeinit(ctx: *anyopaque) void {
 /// Effective-bound comparison without materializing bytes: eff(b) =
 /// b.bytes ++ (0x00 if append_zero). Null is handled by callers (a null
 /// min/max means ±infinity and never reaches here).
+/// Mirror of writer.zig's tombBoundCmp — the two layers cannot share code
+/// (writer must not import db); change either one, you MUST sync the other.
 fn boundCmp(a: f2.TombBound, b: f2.TombBound) std.math.Order {
     const a_len = a.bytes.len + @as(usize, @intFromBool(a.append_zero));
     const b_len = b.bytes.len + @as(usize, @intFromBool(b.append_zero));

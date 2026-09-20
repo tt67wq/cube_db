@@ -662,117 +662,117 @@ pub const State = struct {
         } else {
             // Copy keys/values into arena first (caller slices may not survive — e.g. stack buffer reuse)
 
-        // O(n) order detection: strict (strictly increasing, no dups) /
-        // non_dec (non-decreasing, with dups) / unordered
-        const t_order0 = if (prof) ProfileStats.now() else 0;
-        const Order = enum { strict, non_dec, unordered };
-        const order = blk: {
-            if (reqs.len <= 1) break :blk Order.strict;
-            var has_dup = false;
-            for (1..reqs.len) |i| {
-                switch (btree.cmpKey(reqs[i - 1].key, reqs[i].key)) {
-                    .lt => {},
-                    .eq => has_dup = true,
-                    .gt => break :blk Order.unordered,
-                }
-            }
-            break :blk if (has_dup) Order.non_dec else Order.strict;
-        };
-        if (prof) ProfileStats.txn_order_ns += @intCast(ProfileStats.now() - t_order0);
-
-        const t_dupe0 = if (prof) ProfileStats.now() else 0;
-        const arena_entries = try arena_alloc.alloc(btree.LeafEntry, reqs.len);
-        if (order != .unordered) {
-            // Fast path: ordered input skips dupe + sort, referencing the caller's slices directly
-            for (reqs, 0..) |req, i| {
-                arena_entries[i] = .{ .tombstone = req.tombstone, .key = req.key, .value = req.value };
-            }
-            if (prof) ProfileStats.txn_dupe_ns += @intCast(ProfileStats.now() - t_dupe0);
-
-            // O(n) dedup (with non-decreasing duplicates, collapse adjacent
-            // duplicates; last write wins)
-            var n: usize = 0;
-            for (arena_entries) |e| {
-                if (n > 0 and btree.cmpKey(arena_entries[n - 1].key, e.key) == .eq) {
-                    arena_entries[n - 1] = e;
-                } else {
-                    arena_entries[n] = e;
-                    n += 1;
-                }
-            }
-            const entries = arena_entries[0..n];
-
-            const t_ib0 = if (prof) ProfileStats.now() else 0;
-            const wr = btree.insertBatch(arena_alloc, self.store, new_root, entries, &batch_dirty) catch |err| {
-                for (batch) |r| r.future.set(err); // original futures only (extra_reqs carry none)
-                return;
-            };
-            if (prof) ProfileStats.txn_insertbatch_ns += @intCast(ProfileStats.now() - t_ib0);
-            new_root = wr.new_root;
-            batch_entry_delta += wr.count_delta;
-            batch_byte_delta += wr.live_delta;
-        } else {
-            // Unordered: current path (dupe + sort + dedup)
-            // Pre-allocate one contiguous key/value buffer (single
-            // allocation), memcpy into it, and sort reading contiguous
-            // memory (cache-hot)
-            var key_buf_len: usize = 0;
-            for (reqs) |req| {
-                key_buf_len += req.key.len;
-                if (!req.tombstone) key_buf_len += req.value.len;
-            }
-            const key_buf = try arena_alloc.alloc(u8, key_buf_len);
-            var key_off: usize = 0;
-            for (reqs, 0..) |req, i| {
-                @memcpy(key_buf[key_off..][0..req.key.len], req.key);
-                const k = key_buf[key_off..][0..req.key.len];
-                key_off += req.key.len;
-                var v: []const u8 = "";
-                if (!req.tombstone) {
-                    @memcpy(key_buf[key_off..][0..req.value.len], req.value);
-                    v = key_buf[key_off..][0..req.value.len];
-                    key_off += req.value.len;
-                }
-                arena_entries[i] = .{ .tombstone = req.tombstone, .key = k, .value = v };
-            }
-            if (prof) ProfileStats.txn_dupe_ns += @intCast(ProfileStats.now() - t_dupe0);
-
-            // Sort by key
-            const t_sort0 = if (prof) ProfileStats.now() else 0;
-            if (arena_entries.len > 1) {
-                const SortCtx = struct {
-                    fn lt(_: void, a: btree.LeafEntry, b: btree.LeafEntry) bool {
-                        return btree.cmpKey(a.key, b.key) == .lt;
+            // O(n) order detection: strict (strictly increasing, no dups) /
+            // non_dec (non-decreasing, with dups) / unordered
+            const t_order0 = if (prof) ProfileStats.now() else 0;
+            const Order = enum { strict, non_dec, unordered };
+            const order = blk: {
+                if (reqs.len <= 1) break :blk Order.strict;
+                var has_dup = false;
+                for (1..reqs.len) |i| {
+                    switch (btree.cmpKey(reqs[i - 1].key, reqs[i].key)) {
+                        .lt => {},
+                        .eq => has_dup = true,
+                        .gt => break :blk Order.unordered,
                     }
-                };
-                std.mem.sort(btree.LeafEntry, arena_entries, {}, SortCtx.lt);
-            }
-            if (prof) ProfileStats.txn_sort_ns += @intCast(ProfileStats.now() - t_sort0);
-
-            // Dedup (last write wins)
-            const t_dedup0 = if (prof) ProfileStats.now() else 0;
-            var n: usize = 0;
-            for (arena_entries) |e| {
-                if (n > 0 and btree.cmpKey(arena_entries[n - 1].key, e.key) == .eq) {
-                    arena_entries[n - 1] = e;
-                } else {
-                    arena_entries[n] = e;
-                    n += 1;
                 }
-            }
-            const entries = arena_entries[0..n];
-            if (prof) ProfileStats.txn_dedup_ns += @intCast(ProfileStats.now() - t_dedup0);
-
-            const t_ib0 = if (prof) ProfileStats.now() else 0;
-            const wr = btree.insertBatch(arena_alloc, self.store, new_root, entries, &batch_dirty) catch |err| {
-                for (batch) |r| r.future.set(err); // original futures only (extra_reqs carry none)
-                return;
+                break :blk if (has_dup) Order.non_dec else Order.strict;
             };
-            if (prof) ProfileStats.txn_insertbatch_ns += @intCast(ProfileStats.now() - t_ib0);
-            new_root = wr.new_root;
-            batch_entry_delta += wr.count_delta;
-            batch_byte_delta += wr.live_delta;
-        } // end unordered path
+            if (prof) ProfileStats.txn_order_ns += @intCast(ProfileStats.now() - t_order0);
+
+            const t_dupe0 = if (prof) ProfileStats.now() else 0;
+            const arena_entries = try arena_alloc.alloc(btree.LeafEntry, reqs.len);
+            if (order != .unordered) {
+                // Fast path: ordered input skips dupe + sort, referencing the caller's slices directly
+                for (reqs, 0..) |req, i| {
+                    arena_entries[i] = .{ .tombstone = req.tombstone, .key = req.key, .value = req.value };
+                }
+                if (prof) ProfileStats.txn_dupe_ns += @intCast(ProfileStats.now() - t_dupe0);
+
+                // O(n) dedup (with non-decreasing duplicates, collapse adjacent
+                // duplicates; last write wins)
+                var n: usize = 0;
+                for (arena_entries) |e| {
+                    if (n > 0 and btree.cmpKey(arena_entries[n - 1].key, e.key) == .eq) {
+                        arena_entries[n - 1] = e;
+                    } else {
+                        arena_entries[n] = e;
+                        n += 1;
+                    }
+                }
+                const entries = arena_entries[0..n];
+
+                const t_ib0 = if (prof) ProfileStats.now() else 0;
+                const wr = btree.insertBatch(arena_alloc, self.store, new_root, entries, &batch_dirty) catch |err| {
+                    for (batch) |r| r.future.set(err); // original futures only (extra_reqs carry none)
+                    return;
+                };
+                if (prof) ProfileStats.txn_insertbatch_ns += @intCast(ProfileStats.now() - t_ib0);
+                new_root = wr.new_root;
+                batch_entry_delta += wr.count_delta;
+                batch_byte_delta += wr.live_delta;
+            } else {
+                // Unordered: current path (dupe + sort + dedup)
+                // Pre-allocate one contiguous key/value buffer (single
+                // allocation), memcpy into it, and sort reading contiguous
+                // memory (cache-hot)
+                var key_buf_len: usize = 0;
+                for (reqs) |req| {
+                    key_buf_len += req.key.len;
+                    if (!req.tombstone) key_buf_len += req.value.len;
+                }
+                const key_buf = try arena_alloc.alloc(u8, key_buf_len);
+                var key_off: usize = 0;
+                for (reqs, 0..) |req, i| {
+                    @memcpy(key_buf[key_off..][0..req.key.len], req.key);
+                    const k = key_buf[key_off..][0..req.key.len];
+                    key_off += req.key.len;
+                    var v: []const u8 = "";
+                    if (!req.tombstone) {
+                        @memcpy(key_buf[key_off..][0..req.value.len], req.value);
+                        v = key_buf[key_off..][0..req.value.len];
+                        key_off += req.value.len;
+                    }
+                    arena_entries[i] = .{ .tombstone = req.tombstone, .key = k, .value = v };
+                }
+                if (prof) ProfileStats.txn_dupe_ns += @intCast(ProfileStats.now() - t_dupe0);
+
+                // Sort by key
+                const t_sort0 = if (prof) ProfileStats.now() else 0;
+                if (arena_entries.len > 1) {
+                    const SortCtx = struct {
+                        fn lt(_: void, a: btree.LeafEntry, b: btree.LeafEntry) bool {
+                            return btree.cmpKey(a.key, b.key) == .lt;
+                        }
+                    };
+                    std.mem.sort(btree.LeafEntry, arena_entries, {}, SortCtx.lt);
+                }
+                if (prof) ProfileStats.txn_sort_ns += @intCast(ProfileStats.now() - t_sort0);
+
+                // Dedup (last write wins)
+                const t_dedup0 = if (prof) ProfileStats.now() else 0;
+                var n: usize = 0;
+                for (arena_entries) |e| {
+                    if (n > 0 and btree.cmpKey(arena_entries[n - 1].key, e.key) == .eq) {
+                        arena_entries[n - 1] = e;
+                    } else {
+                        arena_entries[n] = e;
+                        n += 1;
+                    }
+                }
+                const entries = arena_entries[0..n];
+                if (prof) ProfileStats.txn_dedup_ns += @intCast(ProfileStats.now() - t_dedup0);
+
+                const t_ib0 = if (prof) ProfileStats.now() else 0;
+                const wr = btree.insertBatch(arena_alloc, self.store, new_root, entries, &batch_dirty) catch |err| {
+                    for (batch) |r| r.future.set(err); // original futures only (extra_reqs carry none)
+                    return;
+                };
+                if (prof) ProfileStats.txn_insertbatch_ns += @intCast(ProfileStats.now() - t_ib0);
+                new_root = wr.new_root;
+                batch_entry_delta += wr.count_delta;
+                batch_byte_delta += wr.live_delta;
+            } // end unordered path
         } // end else (reqs.len > 1)
 
         // 3. This batch's dirty pages go into pending_free (not reclaimed
@@ -824,7 +824,15 @@ pub const State = struct {
         if (swap) |s| {
             var tomb_pages: std.ArrayList(u32) = .empty;
             defer tomb_pages.deinit(arena_alloc);
-            new_tomb_head = try self.writeTombChain(s.tobs, new_sequence, &tomb_pages, arena_alloc);
+            // T-38-4 (C2): same canonicalization as commitTombSwap — punch
+            // publishes via applyBatchSwap, so the invariant lives HERE too.
+            // The punch planner splits with succ(k)=k++0x00 as the right
+            // segment's lower bound, leaving a gap at k itself — canonical
+            // input ⟹ canonical output, so this should be an identity
+            // transform; if a chain shape ever changes here, punch produced a
+            // non-canonical chain (real finding — investigate).
+            const canon = try canonicalTombs(arena_alloc, s.tobs);
+            new_tomb_head = try self.writeTombChain(canon, new_sequence, &tomb_pages, arena_alloc);
             // step 3 block above holds pending_free_mu only per-append; the
             // old chain pages join the SAME pending_free list with the SAME
             // release sequence (this commit) — readers with older snapshots
@@ -873,6 +881,72 @@ pub const State = struct {
         }
     }
 
+    /// T-38-4 (C2): effective-bound compare — eff(b) = b.bytes ++ (0x00 if
+    /// b.append_zero), null never reaches here (a null min is -inf, a null max
+    /// is +inf; both handled by the merge driver below).
+    /// Mirror of db.zig's boundCmp — the two layers cannot share code
+    /// (writer must not import db); change either one, you MUST sync the other.
+    fn tombBoundCmp(a: f2.TombBound, b: f2.TombBound) std.math.Order {
+        const a_len = a.bytes.len + @as(usize, @intFromBool(a.append_zero));
+        const b_len = b.bytes.len + @as(usize, @intFromBool(b.append_zero));
+        const n = @min(a_len, b_len);
+        for (0..n) |i| {
+            const ab: u8 = if (i < a.bytes.len) a.bytes[i] else 0;
+            const bb: u8 = if (i < b.bytes.len) b.bytes[i] else 0;
+            if (ab != bb) return if (ab < bb) .lt else .gt;
+        }
+        if (a_len < b_len) return .lt;
+        if (a_len > b_len) return .gt;
+        return .eq;
+    }
+
+    /// T-38-4 (C2): canonical minimal form of a tomb list — copy, sort by
+    /// effective min (null = -inf, first), then one linear merge pass absorbing
+    /// every interval whose effective min is <= the current interval's effective
+    /// max (`<=` covers overlapping, adjacent AND contained/equal intervals).
+    /// Pure interval arithmetic: the result's coverage EQUALS the input's union
+    /// — no tree scan, no visibility change. A (min=null, max=null) input
+    /// collapses to that single full interval. Returns a slice of `a`'s memory.
+    fn canonicalTombs(a: std.mem.Allocator, tobs: []const f2.RangeTombstone) ![]const f2.RangeTombstone {
+        if (tobs.len == 0) return &.{};
+        const sorted = try a.alloc(f2.RangeTombstone, tobs.len);
+        @memcpy(sorted, tobs);
+        const Ctx = struct {
+            fn lt(_: void, x: f2.RangeTombstone, y: f2.RangeTombstone) bool {
+                const xm = x.min orelse return y.min != null; // null min = -inf → first
+                const ym = y.min orelse return false;
+                return tombBoundCmp(xm, ym) == .lt;
+            }
+        };
+        std.mem.sort(f2.RangeTombstone, sorted, {}, Ctx.lt);
+
+        const out = try a.alloc(f2.RangeTombstone, sorted.len); // disjoint output never exceeds input length
+        var n: usize = 0;
+        var cur = sorted[0];
+        for (sorted[1..]) |t| {
+            // Merge iff t.min <= cur.max (effective). cur.max == null is +inf →
+            // absorbs everything; t.min == null (sort-tie at the front) also
+            // overlaps cur by construction.
+            const merge = cur.max == null or blk: {
+                const nm = t.min orelse break :blk true;
+                break :blk tombBoundCmp(nm, cur.max.?) != .gt;
+            };
+            if (merge) {
+                if (t.max == null) {
+                    cur.max = null; // +inf absorbs the finite max
+                } else if (cur.max) |cm| {
+                    if (tombBoundCmp(t.max.?, cm) == .gt) cur.max = t.max;
+                }
+            } else {
+                out[n] = cur;
+                n += 1;
+                cur = t;
+            }
+        }
+        out[n] = cur;
+        n += 1;
+        return out[0..n];
+    }
     /// T-38-3 (C1): deleteRange's commit — swap the tombstone chain WITHOUT
     /// touching the tree (root unchanged; the covered entries stay physical
     /// and shadowed). One sequence bump, one meta write: {root, tomb_head,
@@ -900,7 +974,13 @@ pub const State = struct {
         defer arena.deinit();
         var tomb_pages: std.ArrayList(u32) = .empty;
         defer tomb_pages.deinit(arena.allocator());
-        const new_head = try self.writeTombChain(tobs, new_sequence, &tomb_pages, arena.allocator());
+        // T-38-4 (C2): the chain is published ONLY in canonical minimal form —
+        // sorted by effective min, overlapping AND adjacent intervals merged
+        // into their union. Pure interval arithmetic (coverage = input's
+        // union), no tree scan; all three publish paths (deleteRange /
+        // punch-planner consumers / gcTombstones) inherit it here.
+        const canon = try canonicalTombs(arena.allocator(), tobs);
+        const new_head = try self.writeTombChain(canon, new_sequence, &tomb_pages, arena.allocator());
         if (old_pages.len > 0) self.queuePendingFree(old_pages, new_sequence);
 
         const new_entry_count: u64 = @intCast(@max(@as(i64, 0), @as(i64, @intCast(cur_entry_count)) + count_delta));
