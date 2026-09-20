@@ -3,7 +3,7 @@
 本目录记录开发/评审/整合过程中发现的问题，每个问题一个带编号与状态的 `.md` 文件。
 本文件是**总索引**：想快速知道「还剩哪些没修、卡在哪、下一步是什么」，看这里即可。
 
-> 最后更新：2026-09-20（**T-38 阶段 4a（GC：水位收割 + 链规范化）已合入 `50af0d1`**，只剩 4b crash 矩阵；新立 **T-56**（fuzz seed flaky，CI 假红面））。main = `50af0d1`。
+> 最后更新：2026-09-20（**T-56 深挖出新数据面缺陷 → 新立 T-57（高优先级）**；T-56/T-57 已派发 impl）。main = `77a7b32`。
 
 **布局约定**：`issues/` 根目录**只放仍活跃的 issue**（`open` / `proposed` / `fixing` / `partial`）。
 一旦置为 `closed` 并通过验收，**立即 `git mv` 进 `archived/`**，文件名不变。
@@ -37,12 +37,12 @@
 
 | 状态 | 编号 |
 |---|---|
-| `fixing` | T-38 |
+| `fixing` | T-38、T-56 |
 | `partial` | T-39 |
 | `proposed` | T-39-C、T-45、T-47 |
-| `open` | T-53、T-55、T-56 |
+| `open` | T-53、T-55、T-57 |
 
-**活跃 issue 共 8 条**（根目录下除本 README 外的全部 `.md`）。
+**活跃 issue 共 9 条**（根目录下除本 README 外的全部 `.md`）。
 已 closed 的 15 条见下文「三、归档」。
 
 ### 明细
@@ -56,6 +56,8 @@
 | **T-47** | `docs/lecture_btree.html` 与 T-43/T-46 后实现脱节 | `proposed` | **已交付但搁置**：交付物 `4632fcb` 未合入，评审 REQUEST_CHANGES；待返工或弃用 | — |
 | **T-53** | 「torn meta」方向仍可被当 fresh DB 打开：双槽 torn 时可能覆盖既有数据页 | `open` | medium，数据破坏面（与 T-49 同族，需双重损坏或单提交库 torn 触发）。T-53 任务只闭合了 invalid-meta 方向；torn 方向留待评估 heuristic 拒绝 | `1c6ce1d`（T-53 主任务已合入） |
 | **T-55** | T-54-G 遗留 nit：`is_shard` 前缀匹配把 `insertbatch_sweep_partition_test.zig`（毫秒级纯算术守卫）也排除出 `test-one` | `open` | 低（无正确性影响：它仍在默认门；`-Dfilter` 命中 0 时是**响亮 addFail** 而非静默通过）。修法：`is_shard` 改精确匹配 4 个分片文件名，或加 `!endsWith("_partition_test.zig")` | — |
+| **T-56** | `api_batch_fuzz_test.zig` 依赖随机 seed，使默认门（及 CI）非确定性 flaky | `fixing` | **根因已实证为两个独立缺陷**：① 脚手架 `delete_batch` 下标/计数错配（洞）→ SIGSEGV @0xaaaa（本 issue 修）；② **DB 真缺陷**（空 key 端点与 `null` 编码混淆）→ 已另立 **T-57**。分支 `t56-fuzz-harness`，RED `bcabfa1` | — |
+| **T-57** | **`put("")`（空 key）在区间墓碑库上使全部已存在 key 不可见**（`entryCount` 与 `select`/`get` 不一致） | `open` | **高优先级，数据面**。根因：`src/format.zig` 的 `TombBound` 用「存 len 0、无 flag」表示 `null`，而空 key 端点 `{bytes:"",append_zero:false}` 编码与之相同 ⇒ 给空 key 打洞留下的 `[min, "")` 段解码成 `[min, null)` = 全库。修法：产出端规范化（不改磁盘格式）。分支 `t57-empty-key`，RED `9119cc7` | — |
 
 ### 值得先看的
 
@@ -63,9 +65,11 @@
   触发需双重损坏或单提交库 torn，当前无实际触发面；待评估 heuristic 拒绝。
 - **T-38** 是唯一的 `fixing`，是本仓库当前的主线工作。阶段 4a（GC 水位收割 + 链规范化）已合入
   `50af0d1` → **只剩阶段 4b（crash 矩阵扩展，T-38-5）**。
-- **T-56** 是**唯一影响 CI 可靠性的 issue**：`api_batch_fuzz_test.zig` 依赖随机 seed，默认门
-  约 10% 假红（含一处 SIGSEGV use-after-free）。其中 `ModelMismatch` 一种模式**不排除是真 DB
-  缺陷**（写进去读不回来），值得优先查清 —— 详见该 issue 的「处置建议」。
+- **T-57** 是**当前最高优先级**：数据面缺陷 —— 只要库上有区间墓碑，`put("")` 就让**整个库**
+  对 `select`/`get` 不可见（`entryCount()` 仍报真实条数，上层无从察觉）。已定位到格式层
+  `TombBound` 的 `null`/空 key 编码歧义，修法是产出端规范化（不改磁盘格式）。
+- **T-56** 已实证为**两个独立根因**（脚手架洞 + 上述 DB 缺陷），因此拆成 T-56（脚手架）
+  与 T-57（数据面）两条线并行推进；详见 `issues/T-56-*.md` 的「根因定位」一节。
 - **T-39 + T-39-C** 要连起来读：T-39 剩的那块之所以没做完，是因为 T-39-C 论证了它在现有
   崩溃模型下**做不到**。别把它们当成两个独立的小问题。
 - **T-54（测试效率）已 `closed` 并归档**（`8f3671d`）：wall 182.6s → **55s**、`build.zig` 924→149 行、
@@ -132,7 +136,7 @@ T-38 与 T-51 中都出现过 451/452 vs 452/452 的表述，它们并不矛盾�
 
 ### 4.3 编号规则
 
-编号单调递增，扫描本目录取最大值 +1。当前最大值 = **T-56**；另有独立编号 **N-1**（另一来源系列）。
+编号单调递增，扫描本目录取最大值 +1。当前最大值 = **T-57**；另有独立编号 **N-1**（另一来源系列）。
 归档不移除编号，避免历史引用失效。
 
 **注**：任务号与 issue 号可共用（如 T-52、T-53 都是「任务 `T-53` / issue `T-53`」同号），
