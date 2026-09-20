@@ -234,3 +234,51 @@ test "fuzz putBatch API — corpus replay" {
     };
     _ = try fuzz.replayCorpus(FuzzCtx, &ctx, batchFuzzTestOne, "tests/fuzz/corpus/api");
 }
+
+// =====================================================================
+// T-56 RED（conductor 预写，TDD：先红后绿）
+//
+// 根因：delete_batch 分支「写在下标 i、却用 actual_dn 切片」——一旦 `if (actual_key_len == 0) continue`
+// 发生，del_entries/del_keys 就留洞，`del_entries[0..actual_dn]` 会把 **undefined 条目**
+// 喂给 putBatch，并把 undefined 指针交给 free → SIGSEGV（0xaa 填充）。
+// 实现者必须修根因；不得删除本测试、不得弱化 get_all 的模型比对。
+// =====================================================================
+
+test "T-56 r1: delete_batch must not feed undefined entries (zero-length key hole)" {
+    var ms = ps.MemPageStore.init(std.testing.allocator, 10000);
+    defer ms.deinit();
+    var db = try dbi.Db.open(std.testing.allocator, ms.store(), .{});
+    defer db.close();
+
+    var model = std.StringHashMap([]const u8).init(std.testing.allocator);
+    defer cleanupModel(&model, std.testing.allocator);
+
+    var ctx = FuzzCtx{ .db = db, .model = &model, .allocator = std.testing.allocator };
+
+    try db.put("a", "1");
+    try model.put(try std.testing.allocator.dupe(u8, "a"), try std.testing.allocator.dupe(u8, "1"));
+
+    // op = delete_batch(2)，count = 2；第 1 个 key 长度为 0（触发空洞），第 2 个 key = "a"
+    const input = [_]u8{ 2, 2, 0, 0, 1, 0, 'a' };
+    _ = try execOneOp(&input, &ctx);
+
+    // 不得崩溃；且 "a" 必须从 DB 与 model 中一致地删除
+    const g = try db.get("a");
+    defer if (g) |v| std.testing.allocator.free(v);
+    try std.testing.expect(g == null);
+    try std.testing.expect(model.get("a") == null);
+}
+
+test "T-56 r2: known-bad seed 0x37c6c92f (SIGSEGV via delete_batch hole) must pass" {
+    var ms = ps.MemPageStore.init(std.testing.allocator, 10000);
+    defer ms.deinit();
+    var db = try dbi.Db.open(std.testing.allocator, ms.store(), .{});
+    defer db.close();
+
+    var model = std.StringHashMap([]const u8).init(std.testing.allocator);
+    defer cleanupModel(&model, std.testing.allocator);
+
+    var ctx = FuzzCtx{ .db = db, .model = &model, .allocator = std.testing.allocator };
+    // 该 seed 在 main 上确定性 SIGSEGV（free 0xaaaaaaaaaaaaaaaa @ :146）
+    _ = try fuzz.fuzzLoop(FuzzCtx, &ctx, batchFuzzTestOne, 100, 0x37c6c92f);
+}
