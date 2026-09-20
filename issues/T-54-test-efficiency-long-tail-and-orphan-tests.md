@@ -1,7 +1,7 @@
 # Issue T-54 — 测试效率：单个 180s step 独占 wall time + 49 个测试从不执行
 
-- **状态**: `partial` — **P0（量准）、P1（拆长尾，主收益）、P4.1/P4.2（17GB 内存炸弹 + 日志误导）已合入 main 验收**；
-  **还剩 P2（迭代入口）、P3（补漏 + 去重）、P4.3（README 说明）**。
+- **状态**: `partial` — **P0（量准）、P1（拆长尾，主收益）、P3a（漏测面闭合）、P4.1/P4.2（17GB 内存炸弹 + 日志误导）已合入 main 验收**；
+  **还剩 P3b（递归自动发现 + 删重复编译 + 修 test-one 闭包缺口）、P4.3（README 说明）**。
 - **发现于**: main `c09666f` 全量测试实测（conductor 调查，workspace `w1E`）
 - **发现时间**: 2026-09-18
 - **来源**: 项目 owner 提出「迭代后每次跑测试都要很长时间，想整理测试功能」→ conductor 实测定位
@@ -21,6 +21,11 @@
   55s / 54 steps / 484 tests（483 pass + 1 skip = worktree 缺 `zig-out/bin/cube_check`）/ `failed command:` 计数 0**；
   btree_storage step **180s → 14s**；4 个分片 step 各 ~46–48s **并行**（实测并行度 ~5.1；串行则需 ~190s）；
   82 个故障点铺满 `[21762,21844)`（分片 20/20/21/21）。⚠️ 共享受载机器上第 3 次运行 wall 90s（环境噪声，见 §六）
+- **P3a 合入后实测**（main `79e92bb`，worker worktree @ `b49b27e`，tester `ws1-pi2`）: `zig build test` **exit 0 /
+  78 steps / 532 tests（531 pass + 1 skip = worktree 缺 `zig-out/bin/cube_check`）/ `failed command:` 计数 0**；
+  12 个孤儿文件 / 48 条接进默认门（总数构成独立核算 **437 + 47 + 48 = 532** 精确吻合）；
+  `zig build test-one -Dfilter=T-42` 命中 3 条、**4.3s < 5s** 迭代入口可用。
+  ⚠️ 已知缺口（非阻塞）：`test-one` 闭包缺 6 文件 / 31 条 → 见 §六，记入 T-54-G
 
 ---
 
@@ -220,7 +225,8 @@ if (filter) |f| t.filters = &.{f};   // Compile.filters（0.16 支持，编译�
 | 现状（立项时，main `c09666f`） | 182s | — |
 | 合入 P4.1/P4.2 后实测（main `4a27c22`） | **182.6s** | 内存与日志已修，**wall 不变**（长尾未拆，符合预期） |
 | + P1（拆长尾）**已达成**（main `d56d49d`） | **55s（实测）** | T-54-C：4 路分片并行；空机 54–55s，共享受载机 90s |
-| + P3（接进 49 个测试） | ~65–75s | 覆盖面 +49 条，时间只涨一点（多数很快） |
+| + P3a（接进 48 条孤儿）**已达成**（main `79e92bb`） | **58–111s** | 实接 **48** 条（非 49：`freelist_amp_red` 6 条是 KNOWN-RED，见 §六）；wall 受负载波动 |
+| + P3b（重构 + 删重复编译 + `build.zig` <150 行） | 待做 | 未派；含修 `test-one` 闭包缺口 6 文件 / 31 条 |
 | 日常迭代（P2） | **< 5s** | `test-one -Dfilter=` |
 
 ---
@@ -248,6 +254,11 @@ if (filter) |f| t.filters = &.{f};   // Compile.filters（0.16 支持，编译�
 | 2026-09-20 | **勘误**：T-54-D 报告的 `total=21852` / 窗口 `[21772,21854)` 系其 probe 计数口径（把 grow 型 resize/remap 也计为分配）；真实 `FailingAllocator.allocations` 口径 = **21842** → 窗口 **`[21762,21844)`**（宽度同为 82） | 已核源码 `lib/std/testing/FailingAllocator.zig`（`allocations` 仅在 `alloc` 成功路径 +1）。T-54-C 保留实时校准语义；门 v2 改为从分片自报 total 推导窗口 —— 硬编码冻结常量会丢 10 个真实故障点 |
 | 2026-09-20 | **wall < 70s 门余量薄**：空机 54–55s，共享受载机 90s（并行度 5.1 → 3.1，各 step 单耗不变） | CI 不受此门约束（CI 只要求 exit 0）；若把该门当本地硬 SLA，受载时会假红 |
 | 2026-09-20 | T-54-C 评审留 **2 条非阻塞 nit**：3 处分片文件头注释写成 `shard a`；`tests/insertbatch_sweep_partition_test.zig:32` 一条恒真断言（`expectEqual(x, x)`） | 折进 P3 清理 —— 现在修会作废 review/test 对 `7e0c349` 的 SHA 锚点 |
+| 2026-09-20 | **T-54-F（P3a）完成并合入 `79e92bb`**：12 文件 / 48 条孤儿进默认门 + `test-one -Dfilter=` 入口 + 清掉上面 2 条 nit | impl `b49b27e`（ws1-pi1）+ review **approve**（ws1-pi3）+ test **PASS**（ws1-pi2）；总数构成 437+47+48=532 精确核算 |
+| 2026-09-20 | **裁决**：`freelist_amp_red_test.zig`（6 条）**不进默认门** —— 它是 T-39-A 的 RED 纪律文件，RED #1 在 main 上**本来就红**（T-39-C 降级记录：「整链重写策略下恒写满链」），接进 = 恒 exit 1 | 编成命名 step `test-t39-red`（按需跑，同 long-run 模式）；`test-one` 闭包仍包含它，迭代时可见 |
+| 2026-09-20 | **勘误**：契约初版期望总数 538 是 **conductor 闭包分析漏计**（只数 `test "` 个数、没跑过，漏了 RED #1 的红色）→ 实际 **532** | 由实施者发现；conductor 核实 T-39-C / T-39 文档链与源码后采纳 |
+| 2026-09-20 | **修**：`deleterange_mem_budget_test.zig` 2 条信息性 print 改 verbose 门控 —— 修 P3a 引入的 `failed command:` 回归 | check.sh v2 新增「`failed command:` 计数 = 0」门防复发 |
+| 2026-09-20 | **已知缺口**（review 发现，非阻塞）：`test-one` 聚合闭包缺 6 文件 / 31 条（`tomb_chain_guard` / `open_meta_guard` / `t38_3_write_path` / `t38_3_punch_hole` / `tree_depth_regression` / `batch_payload_chunking`）→ `test-one -Dfilter` 对这 31 条**静默命中 0**；且 `build.zig:898` 与 `test_one_aggregator.zig:8` 的「除 4 分片外全覆盖」注释不实 | 记入 **T-54-G 必做项**（G 会重做这套接线与闭包） |
 
 ---
 

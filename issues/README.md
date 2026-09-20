@@ -3,7 +3,7 @@
 本目录记录开发/评审/整合过程中发现的问题，每个问题一个带编号与状态的 `.md` 文件。
 本文件是**总索引**：想快速知道「还剩哪些没修、卡在哪、下一步是什么」，看这里即可。
 
-> 最后更新：2026-09-20（T-54 P1 已达成：wall 182.6s → 55s）。main = `d56d49d`。
+> 最后更新：2026-09-20（T-54 P3a 已达成：48 条孤儿进默认门 + `test-one` 迭代入口）。main = `79e92bb`。
 
 **布局约定**：`issues/` 根目录**只放仍活跃的 issue**（`open` / `proposed` / `fixing` / `partial`）。
 一旦置为 `closed` 并通过验收，**立即 `git mv` 进 `archived/`**，文件名不变。
@@ -55,7 +55,7 @@
 | **T-45** | T-43 sweep 回归测试 overwrite 步骤使用 stale root（测试瑕疵） | `proposed` | 测试语义瑕疵，sweep 有效性不受影响；待决定是否修 | — |
 | **T-47** | `docs/lecture_btree.html` 与 T-43/T-46 后实现脱节 | `proposed` | **已交付但搁置**：交付物 `4632fcb` 未合入，评审 REQUEST_CHANGES；待返工或弃用 | — |
 | **T-53** | 「torn meta」方向仍可被当 fresh DB 打开：双槽 torn 时可能覆盖既有数据页 | `open` | medium，数据破坏面（与 T-49 同族，需双重损坏或单提交库 torn 触发）。T-53 任务只闭合了 invalid-meta 方向；torn 方向留待评估 heuristic 拒绝 | `1c6ce1d`（T-53 主任务已合入） |
-| **T-54** | 测试效率：单个 180s step 独占 wall time + 49 个测试从不执行 | `partial` | **P0（量准）+ P1（拆长尾）+ P4.1/P4.2（17GB 内存炸弹 + 日志误导）已合入验收**（P1 实测 wall 182.6s → **55s**，btree_storage step 180s→14s）。还剩 **P2（迭代入口 <5s）**、**P3（49+1 个孤儿测试接进验收 + `build.zig` 844→<150 行 + 清理 T-54-C 的 2 条 nit）**、P4.3（README 说明） | `b43dcd6`、`4a27c22`、`d56d49d` |
+| **T-54** | 测试效率：单个 180s step 独占 wall time + 49 个测试从不执行 | `partial` | **P0（量准）+ P1（拆长尾）+ P3a（48 条孤儿进默认门 + `test-one` 入口）+ P4.1/P4.2 已合入验收**（P1 实测 wall 182.6s → **55s**；P3a 实测 78 steps / **532 tests** / `failed command:` 0）。还剩 **P3b（递归自动发现 + 删 15 个重复编译 + `build.zig` 845→<150 行 + 修 `test-one` 闭包缺口 6 文件/31 条）**、P4.3（README 说明） | `b43dcd6`、`4a27c22`、`d56d49d`、`79e92bb` |
 
 ### 值得先看的
 
@@ -67,7 +67,9 @@
   崩溃模型下**做不到**。别把它们当成两个独立的小问题。
   与 P4（17G→1G、诊断默认静默）已合入，**主收益 P1 也已达成**：wall 182.6s → **55s**
   （T4 fault sweep 拆 4 片并行，`btree_storage` step 180s → 14s），82 个故障点零损失。
-  **还剩** P2（迭代入口）、P3（49+1 个孤儿测试仍未进过 CI，含整个 fuzz 套件；`build.zig` 844 行）、P4.3。
+  **还剩** P3b（递归自动发现 + 删 15 个重复编译 + `build.zig` <150 行；并修 review 发现的
+  `test-one` 闭包缺口 6 文件/31 条）、P4.3。孤儿测试已闭合：48 条进默认门，另 7 条是按需例外
+  （`long_run_2min` 2 分钟长跑 + `freelist_amp_red` 6 条 KNOWN-RED）。
 
 ---
 
