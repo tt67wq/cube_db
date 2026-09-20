@@ -246,6 +246,7 @@ try db.deleteRange(null, null); // 清空全库
 - 反向/空区间（`min >= max`，均非 null）：no-op 成功，不报错。
 - 对已不存在的 key 幂等：再次删除同一区间仍成功。
 - 删除后 `entryCount()` 相应减少（与单条 `delete` 记账一致）。
+- 区间内没有任何可见 key 时，`deleteRange` 是**零副作用 no-op**：不建碑、不写链页、不递增 sequence（T-38-4）。
 
 ### 3.4 显式事务（LMDB 式）
 
@@ -323,6 +324,19 @@ try db.compact(); // 立即回收所有脏页（需要无活跃 reader）
 - compact 会自动 flush 所有可 flush 的 pending_free。
 
 ### 3.7 选项：Options
+
+### 3.6b 墓碑链回收：gcTombstones
+
+`gcTombstones()` 收割「遮蔽不了任何东西」的墓碑区间：对链上每个区间做一次 raw 扫描（不跳遮蔽），
+区间内已无任何物理 entry → 丢弃；仍有物理 entry → 保留（丢掉会让被遮蔽的 key 复活）。
+
+```zig
+try db.gcTombstones(); // 收割空区间；链上没有可收割的区间时是零副作用 no-op
+```
+
+- 与 `compact()` 分工明确：**compact 仍是 O(1)**（只写 meta，不碰链），不负责墓碑回收；
+  gcTombstones 是独立的收敛出口，两者互不替代。
+- 没有链、或没有任何可收割区间时：不写 meta、不递增 sequence，零副作用返回。
 
 ```zig
 var db = try Db.open(allocator, store, .{
