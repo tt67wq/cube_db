@@ -338,15 +338,5 @@ test "btree: insert returns WriteResult with correct live_delta and count_delta"
     try std.testing.expectEqual(@as(i64, 0), wr4.count_delta);
     try std.testing.expectEqual(@as(i64, 0), wr4.live_delta);
 }
-// T-5/T-8/T-12/T-17: test hookup (comptime imports; test-btree runs these tests)
-comptime {
-    _ = @import("btree_decode_corrupt_test.zig");
-    _ = @import("endian_consistency_test.zig");
-    _ = @import("btree_overflow_chain_test.zig");
-    _ = @import("btree_readfast_consistency_test.zig");
-    _ = @import("btree_leaf_budget_test.zig");
-    _ = @import("splice_leak_test.zig");
-    _ = @import("insertbatch_owned_test.zig");
-    _ = @import("insert_split_budget_test.zig");
-    _ = @import("near_max_depth_regression_test.zig");
-}
+// T-54-G: 移除 comptime 子文件聚合（gate 4：含 test 的文件不得互 import；
+// 子文件由 build.zig 递归发现各建二进制，test-btree step 也已删除）。

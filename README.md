@@ -130,7 +130,7 @@ Latest benchmark data: [`bench/results/`](bench/results/)
 
 ```bash
 zig build test test-fuzz        # all unit/integration + fuzz regression
-zig build test-format test-ps test-btree test-writer test-mvcc test-db test-compact test-overflow  # per-module
+zig build test-one -Dfilter=btree  # fast iteration: files whose test names or paths contain the substring
 ```
 
 ## Project structure

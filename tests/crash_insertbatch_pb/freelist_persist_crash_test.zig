@@ -42,7 +42,7 @@ const cube = @import("cube_db");
 const f2 = cube.format;
 const Db = cube.Db;
 const FilePageStore = cube.file_page_store.FilePageStore;
-const part = @import("../core_format/page_partition.zig");
+const part = @import("page_partition"); // T-54-G: 改走 build.zig 模块（子目录二进制的模块路径不能 ../ 越界）
 const tdiag = @import("test_diag.zig");
 
 const c = @cImport({
