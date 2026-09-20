@@ -1,5 +1,16 @@
 # T-54-D 调查报告 — T4（branch-producer fault sweep）170s 拆解
 
+> ⚠️ **勘误（2026-09-20，T-54-C 实施时发现）**：本文的 `total=21852` / 故障窗口
+> `[21772, 21854)` 是**本调查 probe 的计数口径**（它的 CountingAllocator 把 grow 型
+> `resize`/`remap` 也计为「分配」）。而原 T4 测试与 T-54-C 分片实现用的是
+> `std.testing.FailingAllocator.allocations`，**只计 `.alloc`**（已核源码
+> `lib/std/testing/FailingAllocator.zig`：`allocations` 仅在 `alloc` 成功路径 +1）→
+> **`total = 21842`、窗口 `[21762, 21844)`**（宽度同为 82）。
+> **改动前的原 T4 一直 sweep 的就是后者**（它自己实时校准），所以实现必须保留实时校准语义；
+> 硬编码 `[21772, 21854)` 会丢 10 个真实故障点、换 12 个永不触发的空转点。
+> 本文其余结论（方案对比、推荐 (a) 4 路分片、RSS 分析）不受影响 —— 实测已达成 wall 55s。
+> 详见 `docs/design/T-54-C-branch-sweep-shard-report.md` §3 与 `issues/T-54-…md` §六。
+
 - **角色**：调查（不实施）。**本文不含任何代码改动**；worktree 与 `c09666f` 的
   `build.zig / tests/ / src/` diff 为空（已验证，`git diff c09666f -- build.zig tests/ src/` = 0 行），
   `zig build test` 复验 exit 0（44/44 steps，476/477 pass，1 skip）。

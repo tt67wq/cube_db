@@ -1,13 +1,11 @@
 # Issue T-54 — 测试效率：单个 180s step 独占 wall time + 49 个测试从不执行
 
-- **状态**: `partial` — **P0（量准）与 P4.1/P4.2（17GB 内存炸弹 + 日志误导）已合入 main 验收**；
-  **还剩 P1（拆长尾，主收益）、P2（迭代入口）、P3（补漏 + 去重）、P4.3（README 说明）**。
+- **状态**: `partial` — **P0（量准）、P1（拆长尾，主收益）、P4.1/P4.2（17GB 内存炸弹 + 日志误导）已合入 main 验收**；
+  **还剩 P2（迭代入口）、P3（补漏 + 去重）、P4.3（README 说明）**。
 - **发现于**: main `c09666f` 全量测试实测（conductor 调查，workspace `w1E`）
 - **发现时间**: 2026-09-18
 - **来源**: 项目 owner 提出「迭代后每次跑测试都要很长时间，想整理测试功能」→ conductor 实测定位
-- **关联 worker / 任务**: T-54-A（P0，`ws1-pi1`）、T-54-B（P4.1+P4.2，`ws1-pi2`）、
-  T-54-D（P1 前调研，`ws1-pi1`）、T-54-E（附带调研，`ws1-pi2`）**均已合入 main**；
-  **T-54-C（P1 实施）待派发**（建议 `ws1-pi1` 实现 / `ws1-pi3` 评审 / `ws1-pi2` 测试）
+  **T-54-C（P1 实施）已完成并合入 `d56d49d`**（实现 `ws1-pi1` / 评审 `ws1-pi3` / 测试 `ws1-pi2`）
 - **严重程度**: **medium-high**，三条独立痛点：
   - **效率面**：182s 里 **180s 由单个 step 独占**，且并行度只有 1.6x。开发者每次迭代都付这个成本
     （日常迭代应可 <5s）。
@@ -19,6 +17,10 @@
 - **合入后实测**（main `4a27c22`，**main 检出目录**，warm cache）: `zig build test` **exit 0 /
   182.6s / 44 steps / 477/477 pass（0 skip）**；crash step 70 pass 25s MaxRSS **1G**（P4.1 前为 17G）；
   btree_storage step 63 pass **3m** MaxRSS 1G（长尾未拆，P1 待做）；core_format 107 pass 43s MaxRSS 827M
+- **P1 合入后实测**（main `d56d49d`，worker worktree @ `7e0c349`，tester `ws1-pi2`）: `zig build test` **exit 0 /
+  55s / 54 steps / 484 tests（483 pass + 1 skip = worktree 缺 `zig-out/bin/cube_check`）/ `failed command:` 计数 0**；
+  btree_storage step **180s → 14s**；4 个分片 step 各 ~46–48s **并行**（实测并行度 ~5.1；串行则需 ~190s）；
+  82 个故障点铺满 `[21762,21844)`（分片 20/20/21/21）。⚠️ 共享受载机器上第 3 次运行 wall 90s（环境噪声，见 §六）
 
 ---
 
@@ -217,7 +219,7 @@ if (filter) |f| t.filters = &.{f};   // Compile.filters（0.16 支持，编译�
 |---|---|---|
 | 现状（立项时，main `c09666f`） | 182s | — |
 | 合入 P4.1/P4.2 后实测（main `4a27c22`） | **182.6s** | 内存与日志已修，**wall 不变**（长尾未拆，符合预期） |
-| + P1（拆长尾） | **~50–60s** | 最大收益，且是纯结构改动 |
+| + P1（拆长尾）**已达成**（main `d56d49d`） | **55s（实测）** | T-54-C：4 路分片并行；空机 54–55s，共享受载机 90s |
 | + P3（接进 49 个测试） | ~65–75s | 覆盖面 +49 条，时间只涨一点（多数很快） |
 | 日常迭代（P2） | **< 5s** | `test-one -Dfilter=` |
 
@@ -242,6 +244,10 @@ if (filter) |f| t.filters = &.{f};   // Compile.filters（0.16 支持，编译�
 | 2026-09-18 | **P4.1 + P4.2 完成**：crash 组 17G→1G（改 smp_allocator）、测试诊断默认静默（`CUBE_TEST_VERBOSE=1` 打开）、CI 注释同步 | T-54-B，`89bf0f2`，独立评审 approve |
 | 2026-09-18 | **P1 方案定为「T4 fault sweep 4 路分片并行」**（T-54-D 推荐方案 (a)：语义零损失、`build.zig` 可不动、预估 wall ~50s）。**否决** (c2) 减故障点 82→25、(d) 移出验收门（均触碰覆盖红线）；(c3) 优化模式因实测 RSS ~7–8G 爆 CI `--maxrss 4GB` 预算否决 | 待派发 T-54-C |
 | 2026-09-18 | T-54-A/B/D/E 合入 main（`b43dcd6`、`4a27c22`），台账 `open` → `partial` | conductor 集成验证：477/477 pass、`failed command:` 计数 0 |
+| 2026-09-20 | **T-54-C（P1）完成并合入 `d56d49d`**：T4 fault sweep 拆 4 片并行 | impl `7e0c349`（ws1-pi1）+ review **approve**（ws1-pi3）+ test **PASS**（ws1-pi2）；wall 182.6s → **55s**，82 点零损失、断言零改动 |
+| 2026-09-20 | **勘误**：T-54-D 报告的 `total=21852` / 窗口 `[21772,21854)` 系其 probe 计数口径（把 grow 型 resize/remap 也计为分配）；真实 `FailingAllocator.allocations` 口径 = **21842** → 窗口 **`[21762,21844)`**（宽度同为 82） | 已核源码 `lib/std/testing/FailingAllocator.zig`（`allocations` 仅在 `alloc` 成功路径 +1）。T-54-C 保留实时校准语义；门 v2 改为从分片自报 total 推导窗口 —— 硬编码冻结常量会丢 10 个真实故障点 |
+| 2026-09-20 | **wall < 70s 门余量薄**：空机 54–55s，共享受载机 90s（并行度 5.1 → 3.1，各 step 单耗不变） | CI 不受此门约束（CI 只要求 exit 0）；若把该门当本地硬 SLA，受载时会假红 |
+| 2026-09-20 | T-54-C 评审留 **2 条非阻塞 nit**：3 处分片文件头注释写成 `shard a`；`tests/insertbatch_sweep_partition_test.zig:32` 一条恒真断言（`expectEqual(x, x)`） | 折进 P3 清理 —— 现在修会作废 review/test 对 `7e0c349` 的 SHA 锚点 |
 
 ---
 
