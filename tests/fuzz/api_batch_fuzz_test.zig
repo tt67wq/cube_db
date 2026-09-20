@@ -126,7 +126,7 @@ fn execOneOp(input: []const u8, ctx: *FuzzCtx) !usize {
             var del_keys: [8][]u8 = undefined;
             var actual_dn: usize = 0;
 
-            for (0..dn) |i| {
+            for (0..dn) |_| {
                 if (pos + 2 > input.len) break;
                 const key_len = std.mem.readInt(u16, input[pos..][0..2], .little);
                 pos += 2;
@@ -136,8 +136,11 @@ fn execOneOp(input: []const u8, ctx: *FuzzCtx) !usize {
                 const key = input[pos..][0..actual_key_len];
                 pos += actual_key_len;
 
-                del_keys[i] = ctx.allocator.dupe(u8, key) catch return pos;
-                del_entries[i] = .{ .key = del_keys[i], .value = "", .tombstone = true };
+                // T-56 (C1): write at the COUNT index, not the loop index — a
+                // skipped zero-length key must leave NO hole, so that both
+                // [0..actual_dn] slices are always fully assigned.
+                del_keys[actual_dn] = ctx.allocator.dupe(u8, key) catch return pos;
+                del_entries[actual_dn] = .{ .key = del_keys[actual_dn], .value = "", .tombstone = true };
                 actual_dn += 1;
             }
 
