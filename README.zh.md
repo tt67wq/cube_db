@@ -108,7 +108,7 @@ defer if (v) |val| allocator.free(val);
 
 ```bash
 zig build test test-fuzz        # 全部单元/集成 + fuzz 回归
-zig build test-format test-ps test-btree test-writer test-mvcc test-db test-compact test-overflow  # 分模块
+zig build test-one -Dfilter=btree  # 快速迭代：测试名或文件路径含该子串的文件
 ```
 
 ## 项目结构

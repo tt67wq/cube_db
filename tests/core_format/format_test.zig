@@ -391,13 +391,5 @@ test "format: computePageChecksum is deterministic" {
     const cs2 = f2.computePageChecksum(&page);
     try std.testing.expectEqual(cs1, cs2);
 }
-// T-3: freelist overflow test hookup (comptime import; test-format runs these tests)
-comptime {
-    _ = @import("freelist_overflow_test.zig");
-    // T-33 RED: freelist persistence (T2/T3/T4/T6) + T7 partition helper
-    _ = @import("freelist_persist_test.zig");
-    // T-33 RED: P0 FilePageStore freelist lock (1 writer + N readers churn)
-    _ = @import("freelist_concurrent_test.zig");
-    // T-34 RED: advisory file lock (multi-process open protection)
-    _ = @import("filelock_test.zig");
-}
+// T-54-G: 移除 comptime 子文件聚合（gate 4：含 test 的文件不得互 import；
+// 子文件由 build.zig 递归发现各建二进制，test-format step 也已删除）。
