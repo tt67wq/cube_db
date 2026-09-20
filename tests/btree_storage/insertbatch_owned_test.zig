@@ -28,23 +28,25 @@
 //! branch scenario).
 //!
 //! Wiring: comptime-imported from btree_test.zig into the test-btree step.
+//!
+//! T-54-C: the branch-producer calibrated fault sweep (formerly test #4
+//! here, ~170s standalone) moved to 4 parallel shard binaries —
+//! tests/insertbatch_sweep_{a,b,c,d}_test.zig — sharing the sweep plumbing
+//! from insertbatch_sweep_helpers.zig. Same 82 fault points, same
+//! assertions, just parallelized. This file keeps the two T-42 success-path
+//! tests and the leaf-producer sweep (a few seconds).
 
 const std = @import("std");
 const cube = @import("cube_db");
-const ps = cube.page_store;
 const btree = cube.btree;
+const h = @import("insertbatch_sweep_helpers.zig");
 
-const alloc = std.testing.allocator;
-
-fn newStore() ps.MemPageStore {
-    return ps.MemPageStore.init(alloc, 100000);
-}
-
-fn fmtKey(comptime buf_len: usize, i: usize) [buf_len]u8 {
-    var buf: [buf_len]u8 = undefined;
-    _ = std.fmt.bufPrint(&buf, "k{d:0>6}", .{i}) catch unreachable;
-    return buf;
-}
+const alloc = h.alloc;
+const newStore = h.newStore;
+const fmtKey = h.fmtKey;
+const ScenarioFn = h.ScenarioFn;
+const sweepFailIndexes = h.sweepFailIndexes;
+const countAllocs = h.countAllocs;
 
 // ===== 1. Success path: zero leaks, single-leaf merge (non-splice) =====
 // std.testing.allocator's end-of-test leak check IS the assertion: any
@@ -124,49 +126,14 @@ test "T-42: insertBatch leaf-overflow splice path leaks nothing on success" {
     try std.testing.expectEqual(@as(usize, 120), count);
 }
 
-// ===== 3./4. Error paths: fault-injection sweeps ========================
+// ===== 3. Error path: leaf-producer fault-injection sweep ==============
 // Each fail_index is a fresh end-to-end run; a correct implementation
 // either succeeds or returns a clean error.OutOfMemory — never crashes
 // (UAF), never leaks (backing testing.allocator checks at test end).
 
-const ScenarioFn = fn (store: ps.PageStore, fa: std.mem.Allocator, dirty: *std.ArrayList(u32)) anyerror!void;
-
-fn sweepFailIndexes(comptime label: []const u8, comptime build: ScenarioFn, first: usize, last_exclusive: usize) !void {
-    var fail_index: usize = first;
-    while (fail_index < last_exclusive) : (fail_index += 1) {
-        var ms = newStore();
-        defer ms.deinit();
-        var dirty = std.ArrayList(u32).empty;
-        defer dirty.deinit(alloc);
-
-        var failing = std.testing.FailingAllocator.init(alloc, .{
-            .fail_index = fail_index,
-        });
-        build(ms.store(), failing.allocator(), &dirty) catch |e| {
-            if (e != error.OutOfMemory) {
-                std.debug.print("{s}: fail_index={d}: unexpected error {s}\n", .{ label, fail_index, @errorName(e) });
-                return error.UnexpectedError;
-            }
-        };
-    }
-}
-
-/// One clean run to count the scenario's total allocations (calibrates
-/// the sweep range; the producers' chunk loops live in the tail).
-fn countAllocs(comptime build: ScenarioFn) !usize {
-    var ms = newStore();
-    defer ms.deinit();
-    var dirty = std.ArrayList(u32).empty;
-    defer dirty.deinit(alloc);
-
-    var failing = std.testing.FailingAllocator.init(alloc, .{});
-    try build(ms.store(), failing.allocator(), &dirty);
-    return failing.allocations;
-}
-
 /// leaf-producer error path: leaf root + overflow batch -> the splice
 /// chunk loop inside insertBatchIntoLeaf (where the bad errdefer lives).
-fn leafOverflowScenario(store: ps.PageStore, fa: std.mem.Allocator, dirty: *std.ArrayList(u32)) anyerror!void {
+fn leafOverflowScenario(store: cube.page_store.PageStore, fa: std.mem.Allocator, dirty: *std.ArrayList(u32)) anyerror!void {
     var seed_bufs: [20][8]u8 = undefined;
     var seed: [20]btree.LeafEntry = undefined;
     for (0..20) |i| {
@@ -189,39 +156,9 @@ test "T-42: leaf-producer error path — no UAF, no leaks (full fault sweep)" {
     try sweepFailIndexes("leaf", leafOverflowScenario, 1, total + 2);
 }
 
-/// branch-producer error path: 2-level tree + overflow batch big enough to
-/// overflow the root branch -> the splice chunk loop inside
-/// insertBatchIntoBranch (second copy of the bad errdefer pattern).
-fn branchOverflowScenario(store: ps.PageStore, fa: std.mem.Allocator, dirty: *std.ArrayList(u32)) anyerror!void {
-    // 2-level tree: batches of 500 -> ~16 leaves each, root branch grows.
-    var wr = btree.WriteResult{ .new_root = btree.NULL_ROOT, .live_delta = 0, .count_delta = 0 };
-    var i: usize = 0;
-    while (i < 2000) : (i += 500) {
-        var bufs: [500][8]u8 = undefined;
-        var batch: [500]btree.LeafEntry = undefined;
-        for (0..500) |j| {
-            bufs[j] = fmtKey(8, i + j);
-            batch[j] = .{ .tombstone = false, .key = &bufs[j], .value = "vv" };
-        }
-        wr = try btree.insertBatch(fa, store, wr.new_root, &batch, dirty);
-    }
-
-    // Overflow batch beyond all existing keys -> merges into the rightmost
-    // leaf, splices ~64 children into the root branch -> branch overflow ->
-    // insertBatchIntoBranch chunk loop.
-    var bufs: [2000][8]u8 = undefined;
-    var batch: [2000]btree.LeafEntry = undefined;
-    for (0..2000) |j| {
-        bufs[j] = fmtKey(8, 10000 + j);
-        batch[j] = .{ .tombstone = false, .key = &bufs[j], .value = "ww" };
-    }
-    _ = try btree.insertBatch(fa, store, wr.new_root, &batch, dirty);
-}
-
-test "T-42: branch-producer error path — no UAF, no leaks (calibrated fault sweep)" {
-    const total = try countAllocs(branchOverflowScenario);
-    // The final ~80 allocations span the leaf chunk loop, the branch chunk
-    // loop (the two producers under test), and the splice handoff.
-    const first = total -| 80;
-    try sweepFailIndexes("branch", branchOverflowScenario, first, total + 2);
-}
+// T-54-C: the branch-producer calibrated fault sweep moved to the 4
+// parallel shard binaries tests/insertbatch_sweep_{a,b,c,d}_test.zig
+// (scenario + plumbing in insertbatch_sweep_helpers.zig). Its window
+// [total-|80, total+2) is split by h.shardRange into 4 gap-free shards;
+// the partition invariants are guarded by
+// tests/insertbatch_sweep_partition_test.zig.
