@@ -3,7 +3,7 @@
 本目录记录开发/评审/整合过程中发现的问题，每个问题一个带编号与状态的 `.md` 文件。
 本文件是**总索引**：想快速知道「还剩哪些没修、卡在哪、下一步是什么」，看这里即可。
 
-> 最后更新：2026-09-20（T-54 P3a 已达成：48 条孤儿进默认门 + `test-one` 迭代入口）。main = `79e92bb`。
+> 最后更新：2026-09-20（**T-54 全阶段完成并 closed 归档**；新立 T-55 收尾 nit）。main = `8f3671d`。
 
 **布局约定**：`issues/` 根目录**只放仍活跃的 issue**（`open` / `proposed` / `fixing` / `partial`）。
 一旦置为 `closed` 并通过验收，**立即 `git mv` 进 `archived/`**，文件名不变。
@@ -38,12 +38,12 @@
 | 状态 | 编号 |
 |---|---|
 | `fixing` | T-38 |
-| `partial` | T-39、T-54 |
+| `partial` | T-39 |
 | `proposed` | T-39-C、T-45、T-47 |
-| `open` | T-53 |
+| `open` | T-53、T-55 |
 
 **活跃 issue 共 7 条**（根目录下除本 README 外的全部 `.md`）。
-已 closed 的 14 条见下文「三、归档」。
+已 closed 的 15 条见下文「三、归档」。
 
 ### 明细
 
@@ -55,7 +55,7 @@
 | **T-45** | T-43 sweep 回归测试 overwrite 步骤使用 stale root（测试瑕疵） | `proposed` | 测试语义瑕疵，sweep 有效性不受影响；待决定是否修 | — |
 | **T-47** | `docs/lecture_btree.html` 与 T-43/T-46 后实现脱节 | `proposed` | **已交付但搁置**：交付物 `4632fcb` 未合入，评审 REQUEST_CHANGES；待返工或弃用 | — |
 | **T-53** | 「torn meta」方向仍可被当 fresh DB 打开：双槽 torn 时可能覆盖既有数据页 | `open` | medium，数据破坏面（与 T-49 同族，需双重损坏或单提交库 torn 触发）。T-53 任务只闭合了 invalid-meta 方向；torn 方向留待评估 heuristic 拒绝 | `1c6ce1d`（T-53 主任务已合入） |
-| **T-54** | 测试效率：单个 180s step 独占 wall time + 49 个测试从不执行 | `partial` | **P0（量准）+ P1（拆长尾）+ P3a（48 条孤儿进默认门 + `test-one` 入口）+ P4.1/P4.2 已合入验收**（P1 实测 wall 182.6s → **55s**；P3a 实测 78 steps / **532 tests** / `failed command:` 0）。还剩 **P3b（递归自动发现 + 删 15 个重复编译 + `build.zig` 845→<150 行 + 修 `test-one` 闭包缺口 6 文件/31 条）**、P4.3（README 说明） | `b43dcd6`、`4a27c22`、`d56d49d`、`79e92bb` |
+| **T-55** | T-54-G 遗留 nit：`is_shard` 前缀匹配把 `insertbatch_sweep_partition_test.zig`（毫秒级纯算术守卫）也排除出 `test-one` | `open` | 低（无正确性影响：它仍在默认门；`-Dfilter` 命中 0 时是**响亮 addFail** 而非静默通过）。修法：`is_shard` 改精确匹配 4 个分片文件名，或加 `!endsWith("_partition_test.zig")` | — |
 
 ### 值得先看的
 
@@ -65,17 +65,14 @@
   T-49/T-50 已由 T-53 关闭（`1c6ce1d`），**阶段 3 现可推进**。
 - **T-39 + T-39-C** 要连起来读：T-39 剩的那块之所以没做完，是因为 T-39-C 论证了它在现有
   崩溃模型下**做不到**。别把它们当成两个独立的小问题。
-  与 P4（17G→1G、诊断默认静默）已合入，**主收益 P1 也已达成**：wall 182.6s → **55s**
-  （T4 fault sweep 拆 4 片并行，`btree_storage` step 180s → 14s），82 个故障点零损失。
-  **还剩** P3b（递归自动发现 + 删 15 个重复编译 + `build.zig` <150 行；并修 review 发现的
-  `test-one` 闭包缺口 6 文件/31 条）、P4.3。孤儿测试已闭合：48 条进默认门，另 7 条是按需例外
-  （`long_run_2min` 2 分钟长跑 + `freelist_amp_red` 6 条 KNOWN-RED）。
+- **T-54（测试效率）已 `closed` 并归档**（`8f3671d`）：wall 182.6s → **55s**、`build.zig` 924→149 行、
+  重复编译 77→0、测试总数 532 coverage-neutral、`test-one -Dfilter=` 迭代 4.2s。收尾 nit 见 **T-55**。
 
 ---
 
 ## 三、归档（`archived/`）
 
-已全部 `closed`，保留供追溯，不再维护。共 14 条。
+已全部 `closed`，保留供追溯，不再维护。共 15 条。
 
 | 编号 | 标题（简） | 状态 | 关联 main |
 |---|---|---|---|
@@ -93,9 +90,10 @@
 | T-49 | 设计文档 §2「旧代码读 v3 库 = 干净拒绝打开」与源码不符：实际静默清空并覆盖数据 | `closed` | `1c6ce1d`（T-53 一并关闭；残余 torn 方向转 T-53 issue） |
 | T-50 | meta 三值判定的「第三值」是 `null`，与 fresh DB 不可区分 | `closed` | `1c6ce1d`（T-53 一并关闭） |
 | N-1 | put composite entry 溢出 panic | `closed` | `ba85d2c`、`6d1d318` |
+| T-54 | 测试效率：单个 180s step 独占 wall time + 49 个测试从不执行 | `closed` | `b43dcd6`、`d56d49d`、`79e92bb`、`8f3671d`（P1 wall 182.6s→55s；P3b `build.zig` 924→149 行、重复编译 77→0） |
 
 **引用归档文件时注意**：路径已变为 `issues/archived/<原名>.md`。
-T-38 / T-49 / T-50 / T-51 / T-52 等文件中出现的 `issues/T-5x-….md` 式引用是**归档前写的**，
+T-38 / T-49 / T-50 / T-51 / T-52 / T-54 等文件中出现的 `issues/T-5x-….md` 式引用是**归档前写的**，
 未回改，读作 `archived/` 下同名文件。
 
 ---

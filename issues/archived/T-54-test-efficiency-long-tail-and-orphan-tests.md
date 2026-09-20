@@ -1,11 +1,14 @@
 # Issue T-54 — 测试效率：单个 180s step 独占 wall time + 49 个测试从不执行
 
-- **状态**: `partial` — **P0（量准）、P1（拆长尾，主收益）、P3a（漏测面闭合）、P4.1/P4.2（17GB 内存炸弹 + 日志误导）已合入 main 验收**；
-  **还剩 P3b（递归自动发现 + 删重复编译 + 修 test-one 闭包缺口）、P4.3（README 说明）**。
+- **状态**: `closed` — **P0 / P1 / P2 / P3a / P3b / P4.1 / P4.2 / P4.3 全部完成并合入 main 验收**
+  （P1 wall 182.6s → 55s；P3b 后 `build.zig` 924→149 行、重复编译 77→0、测试总数 532 coverage-neutral、
+  `test-one` 闭包缺口闭合）。收尾 nit 另立 → `issues/T-55-t54g-partition-guard-excluded-from-test-one.md`。
 - **发现于**: main `c09666f` 全量测试实测（conductor 调查，workspace `w1E`）
 - **发现时间**: 2026-09-18
 - **来源**: 项目 owner 提出「迭代后每次跑测试都要很长时间，想整理测试功能」→ conductor 实测定位
-  **T-54-C（P1 实施）已完成并合入 `d56d49d`**（实现 `ws1-pi1` / 评审 `ws1-pi3` / 测试 `ws1-pi2`）
+- **关联 worker / 任务**: T-54-A（P0 量准，`ws1-pi1`）、T-54-B（P4.1+P4.2，`ws1-pi2`）、
+  T-54-D（P1 前调研，`ws1-pi1`）、T-54-E（附带调研，`ws1-pi2`）、T-54-C（P1 实施，`ws1-pi1`）、
+  T-54-F（P3a，`ws1-pi1`）、T-54-G（P3b，`ws1-pi1`）—— 全部三方多签合入
 - **严重程度**: **medium-high**，三条独立痛点：
   - **效率面**：182s 里 **180s 由单个 step 独占**，且并行度只有 1.6x。开发者每次迭代都付这个成本
     （日常迭代应可 <5s）。
@@ -26,6 +29,11 @@
   12 个孤儿文件 / 48 条接进默认门（总数构成独立核算 **437 + 47 + 48 = 532** 精确吻合）；
   `zig build test-one -Dfilter=T-42` 命中 3 条、**4.3s < 5s** 迭代入口可用。
   ⚠️ 已知缺口（非阻塞）：`test-one` 闭包缺 6 文件 / 31 条 → 见 §六，记入 T-54-G
+- **P3b 合入后实测**（main `8f3671d`，**main 检出目录**）: `zig build test` **exit 0 / 178 steps /
+  532/532 pass（0 skip）/ `failed command:` 计数 0**；`build.zig` **924 → 149 行**；被编进 >1 个二进制的文件
+  **77 → 0**；`zig build install` exit 0 且 **11 个工具/bench 二进制全产出**（bench 接线完好）；12 个孤儿 +
+  6 个原缺口文件全部由递归发现覆盖；`test-one -Dfilter=` 命中 open_meta 9 + t38_3 14（基线命中 0）、4.2s < 5s。
+  冷编译 107s / 热编译 64–105s（冷热差 ~40s：cube_db 模块只编一次，CI 代价可控）
 
 ---
 
@@ -226,7 +234,7 @@ if (filter) |f| t.filters = &.{f};   // Compile.filters（0.16 支持，编译�
 | 合入 P4.1/P4.2 后实测（main `4a27c22`） | **182.6s** | 内存与日志已修，**wall 不变**（长尾未拆，符合预期） |
 | + P1（拆长尾）**已达成**（main `d56d49d`） | **55s（实测）** | T-54-C：4 路分片并行；空机 54–55s，共享受载机 90s |
 | + P3a（接进 48 条孤儿）**已达成**（main `79e92bb`） | **58–111s** | 实接 **48** 条（非 49：`freelist_amp_red` 6 条是 KNOWN-RED，见 §六）；wall 受负载波动 |
-| + P3b（重构 + 删重复编译 + `build.zig` <150 行） | 待做 | 未派；含修 `test-one` 闭包缺口 6 文件 / 31 条 |
+| + P3b（重构 + 删重复编译 + `build.zig` <150 行）**已达成**（main `8f3671d`） | **64–107s（实测）** | T-54-G：`build.zig` 924→149 行、重复编译 77→0、`test-one` 缺口闭合；178 steps（88 个测试二进制） |
 | 日常迭代（P2） | **< 5s** | `test-one -Dfilter=` |
 
 ---
@@ -259,6 +267,11 @@ if (filter) |f| t.filters = &.{f};   // Compile.filters（0.16 支持，编译�
 | 2026-09-20 | **勘误**：契约初版期望总数 538 是 **conductor 闭包分析漏计**（只数 `test "` 个数、没跑过，漏了 RED #1 的红色）→ 实际 **532** | 由实施者发现；conductor 核实 T-39-C / T-39 文档链与源码后采纳 |
 | 2026-09-20 | **修**：`deleterange_mem_budget_test.zig` 2 条信息性 print 改 verbose 门控 —— 修 P3a 引入的 `failed command:` 回归 | check.sh v2 新增「`failed command:` 计数 = 0」门防复发 |
 | 2026-09-20 | **已知缺口**（review 发现，非阻塞）：`test-one` 聚合闭包缺 6 文件 / 31 条（`tomb_chain_guard` / `open_meta_guard` / `t38_3_write_path` / `t38_3_punch_hole` / `tree_depth_regression` / `batch_payload_chunking`）→ `test-one -Dfilter` 对这 31 条**静默命中 0**；且 `build.zig:898` 与 `test_one_aggregator.zig:8` 的「除 4 分片外全覆盖」注释不实 | 记入 **T-54-G 必做项**（G 会重做这套接线与闭包） |
+| 2026-09-20 | **T-54-G（P3b）完成并合入 `8f3671d`**：递归目录自动发现替代手工接线；删 6 个纯聚合器 + 18 个 per-module 命名 step；`test` 与 `test-one` **共用同一份发现清单**（两处清单漂移正是缺口的成因） | impl `06ed888`（ws1-pi1）+ review **approve**（ws1-pi3）+ test **PASS**（ws1-pi2）；`build.zig` 924→149 行、重复编译 77→0、532 coverage-neutral |
+| 2026-09-20 | 本次重构的**真实取舍**已量化：88 个测试二进制使 step 数 78→178，但**冷编译只比热编译多 ~40s**（cube_db 模块编一次 + 88 个薄 test root），CI 代价可控 | test-report §3 冷/热表；CI 是 `-j2 --maxrss 4GB` 从零编译 |
+| 2026-09-20 | **门的盲区已记录**（conductor 自查发现）：门 5 用 `rg -e 'b.step("name"'` 检查 step 存在性，而 G 把 bench/tool step 改成**表驱动**（`b.step(tool.step, …)`）后名字不在字面量里 → 该门**抓不到 bench step 丢失**。权威检查是 `zig build --help` + `zig build install`（已补做：11 个工具二进制全产出） | 后续改门时把门 5 换成 `zig build --help` |
+| 2026-09-20 | **conductor 自己的门脚本 bug**：check.sh v1 在 macOS bash 3.2 下 `$VAR` 紧贴全角字符 → `set -u` unbound variable（RED 阶段即崩）；已修 v2（`${...}`）并同步 manifest.gate_artifacts | 由 impl 发现并如实上报 |
+| 2026-09-20 | **非阻塞 nit 2 条**：`is_shard` 前缀匹配把 `insertbatch_sweep_partition_test.zig` 也排除出 `test-one`（响亮 addFail，仍在默认门）；报告 §1 的 b.step 计数笔误（35−18=17 非 15） | 第 1 条另立 **T-55**（open）；第 2 条仅笔误，留档 |
 
 ---
 
