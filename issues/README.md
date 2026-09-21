@@ -3,7 +3,7 @@
 本目录记录开发/评审/整合过程中发现的问题，每个问题一个带编号与状态的 `.md` 文件。
 本文件是**总索引**：想快速知道「还剩哪些没修、卡在哪、下一步是什么」，看这里即可。
 
-> 最后更新：2026-09-20（**T-56 深挖出新数据面缺陷 → 新立 T-57（高优先级）**；T-56/T-57 已派发 impl）。main = `77a7b32`。
+> 最后更新：2026-09-20（**T-57（空 key 遮蔽全库，数据面）+ T-56（fuzz 脚手架空洞）均已三方多签合入并 closed 归档**；新立 T-58（key 上限不一致，预存））。main = `c7b7642`。
 
 **布局约定**：`issues/` 根目录**只放仍活跃的 issue**（`open` / `proposed` / `fixing` / `partial`）。
 一旦置为 `closed` 并通过验收，**立即 `git mv` 进 `archived/`**，文件名不变。
@@ -37,12 +37,12 @@
 
 | 状态 | 编号 |
 |---|---|
-| `fixing` | T-38、T-56 |
+| `fixing` | T-38 |
 | `partial` | T-39 |
 | `proposed` | T-39-C、T-45、T-47 |
-| `open` | T-53、T-55、T-57 |
+| `open` | T-53、T-55、T-58 |
 
-**活跃 issue 共 9 条**（根目录下除本 README 外的全部 `.md`）。
+**活跃 issue 共 8 条**（根目录下除本 README 外的全部 `.md`）。
 已 closed 的 15 条见下文「三、归档」。
 
 ### 明细
@@ -56,8 +56,7 @@
 | **T-47** | `docs/lecture_btree.html` 与 T-43/T-46 后实现脱节 | `proposed` | **已交付但搁置**：交付物 `4632fcb` 未合入，评审 REQUEST_CHANGES；待返工或弃用 | — |
 | **T-53** | 「torn meta」方向仍可被当 fresh DB 打开：双槽 torn 时可能覆盖既有数据页 | `open` | medium，数据破坏面（与 T-49 同族，需双重损坏或单提交库 torn 触发）。T-53 任务只闭合了 invalid-meta 方向；torn 方向留待评估 heuristic 拒绝 | `1c6ce1d`（T-53 主任务已合入） |
 | **T-55** | T-54-G 遗留 nit：`is_shard` 前缀匹配把 `insertbatch_sweep_partition_test.zig`（毫秒级纯算术守卫）也排除出 `test-one` | `open` | 低（无正确性影响：它仍在默认门；`-Dfilter` 命中 0 时是**响亮 addFail** 而非静默通过）。修法：`is_shard` 改精确匹配 4 个分片文件名，或加 `!endsWith("_partition_test.zig")` | — |
-| **T-56** | `api_batch_fuzz_test.zig` 依赖随机 seed，使默认门（及 CI）非确定性 flaky | `fixing` | **根因已实证为两个独立缺陷**：① 脚手架 `delete_batch` 下标/计数错配（洞）→ SIGSEGV @0xaaaa（本 issue 修）；② **DB 真缺陷**（空 key 端点与 `null` 编码混淆）→ 已另立 **T-57**。分支 `t56-fuzz-harness`，RED `bcabfa1` | — |
-| **T-57** | **`put("")`（空 key）在区间墓碑库上使全部已存在 key 不可见**（`entryCount` 与 `select`/`get` 不一致） | `open` | **高优先级，数据面**。根因：`src/format.zig` 的 `TombBound` 用「存 len 0、无 flag」表示 `null`，而空 key 端点 `{bytes:"",append_zero:false}` 编码与之相同 ⇒ 给空 key 打洞留下的 `[min, "")` 段解码成 `[min, null)` = 全库。修法：产出端规范化（不改磁盘格式）。分支 `t57-empty-key`，RED `9119cc7` | — |
+| **T-58** | key 长度上限不一致：`checkKeySize` 放行 4051，但 `put(key >= 4045)` 在 commit 阶段报 `error.PayloadTooLarge` | `open` | 低-中（不破坏数据，但 API 契约不一致且失败点晚）。**预存**，由 T-57 的独立测试发现。修法：把入口校验的界收紧到 btree 实际可写上限，或把 entry 固定开销算进校验 | — |
 
 ### 值得先看的
 
@@ -65,11 +64,11 @@
   触发需双重损坏或单提交库 torn，当前无实际触发面；待评估 heuristic 拒绝。
 - **T-38** 是唯一的 `fixing`，是本仓库当前的主线工作。阶段 4a（GC 水位收割 + 链规范化）已合入
   `50af0d1` → **只剩阶段 4b（crash 矩阵扩展，T-38-5）**。
-- **T-57** 是**当前最高优先级**：数据面缺陷 —— 只要库上有区间墓碑，`put("")` 就让**整个库**
-  对 `select`/`get` 不可见（`entryCount()` 仍报真实条数，上层无从察觉）。已定位到格式层
-  `TombBound` 的 `null`/空 key 编码歧义，修法是产出端规范化（不改磁盘格式）。
-- **T-56** 已实证为**两个独立根因**（脚手架洞 + 上述 DB 缺陷），因此拆成 T-56（脚手架）
-  与 T-57（数据面）两条线并行推进；详见 `issues/T-56-*.md` 的「根因定位」一节。
+- **T-56 + T-57 已 closed 归档**（`c7b7642` / `6348171`）：一次 fuzz flaky 深挖出**两个独立根因** ——
+  脚手架 `delete_batch` 下标/计数错配（SIGSEGV）+ **DB 真缺陷**（空 key 端点与 `null` 编码混淆 ⇒
+  全库遮蔽）。两者都已修；**CI 假红恢复稳定**（修复前约 10% 假红）。
+  **顺带发现 3 条预存问题**已留档：`entryCount()` 在墓碑库上的口径（跟随活条数 delta，≠ select 可见数）、
+  `get_all` 的 `catch continue` 静默弱化通道、OOM 路径微泄漏；以及新立的 **T-58**（key 上限不一致）。
 - **T-39 + T-39-C** 要连起来读：T-39 剩的那块之所以没做完，是因为 T-39-C 论证了它在现有
   崩溃模型下**做不到**。别把它们当成两个独立的小问题。
 - **T-54（测试效率）已 `closed` 并归档**（`8f3671d`）：wall 182.6s → **55s**、`build.zig` 924→149 行、
@@ -79,7 +78,7 @@
 
 ## 三、归档（`archived/`）
 
-已全部 `closed`，保留供追溯，不再维护。共 15 条。
+已全部 `closed`，保留供追溯，不再维护。共 17 条。
 
 | 编号 | 标题（简） | 状态 | 关联 main |
 |---|---|---|---|
@@ -98,6 +97,8 @@
 | T-50 | meta 三值判定的「第三值」是 `null`，与 fresh DB 不可区分 | `closed` | `1c6ce1d`（T-53 一并关闭） |
 | N-1 | put composite entry 溢出 panic | `closed` | `ba85d2c`、`6d1d318` |
 | T-54 | 测试效率：单个 180s step 独占 wall time + 49 个测试从不执行 | `closed` | `b43dcd6`、`d56d49d`、`79e92bb`、`8f3671d`（P1 wall 182.6s→55s；P3b `build.zig` 924→149 行、重复编译 77→0） |
+| T-57 | `put("")`（空 key）在区间墓碑库上使全部已存在 key 不可见（`TombBound` 空键端点与 `null` 编码混淆） | `closed` | `6348171`（RED `9119cc7` → GREEN `9ce1859` → nitfix `687498d`） |
+| T-56 | fuzz 脚手架 `delete_batch` 下标/计数错配（空洞）→ SIGSEGV，CI 约 10% 假红 | `closed` | `c7b7642`（RED `bcabfa1` → GREEN `e4109eb`） |
 
 **引用归档文件时注意**：路径已变为 `issues/archived/<原名>.md`。
 T-38 / T-49 / T-50 / T-51 / T-52 / T-54 等文件中出现的 `issues/T-5x-….md` 式引用是**归档前写的**，
@@ -136,7 +137,7 @@ T-38 与 T-51 中都出现过 451/452 vs 452/452 的表述，它们并不矛盾�
 
 ### 4.3 编号规则
 
-编号单调递增，扫描本目录取最大值 +1。当前最大值 = **T-57**；另有独立编号 **N-1**（另一来源系列）。
+编号单调递增，扫描本目录取最大值 +1。当前最大值 = **T-58**；另有独立编号 **N-1**（另一来源系列）。
 归档不移除编号，避免历史引用失效。
 
 **注**：任务号与 issue 号可共用（如 T-52、T-53 都是「任务 `T-53` / issue `T-53`」同号），

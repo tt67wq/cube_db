@@ -1,6 +1,6 @@
 # Issue T-56 — `api_batch_fuzz_test.zig` 依赖随机 seed，使默认门（及 CI）非确定性 flaky
 
-- **状态**: `fixing`（根因已定位，impl 进行中：T-56 脚手架空洞 + T-57 DB 缺陷）
+- **状态**: `closed`（脚手架部分已合入 main `c7b7642`；数据面部分由 T-57 承接，T-57 亦已 closed）
 - **发现于**: T-38-4 实现（`ws1-pi1`）报告「环境/既有问题 1」；conductor **独立复现并定责**
 - **发现时间**: 2026-09-20
 - **来源**: T-38-4 的验收门 `zig build test` 反复出现「同一 commit 时绿时红」
@@ -136,3 +136,40 @@ get(ccc) = null
 
 按原「处置建议」第 2 条：`ModelMismatch` 判定为 **DB 缺陷** ⇒ 本 issue 只关「测试簿记」部分，
 数据面部分由 T-57 承接。两个任务的 `ModelMismatch` seed 在 T-57 落地后才应转绿。
+
+
+---
+
+## 交付与验收记录（2026-09-20，已 closed）
+
+- **分支** `t56-fuzz-harness`：RED `bcabfa1`（conductor 预写）→ GREEN `e4109eb`（impl ws1-pi2）
+  → **合并 `c7b7642`**（`--no-ff`）
+- **修法**：`delete_batch` 的赋值下标从**循环变量 `i`** 改为**计数器 `actual_dn`**
+  （循环捕获 `|i|` → `|_|`），使 `[0..actual_dn]` **恒为已赋值前缀** ——
+  undefined 条目不再被喂给 `putBatch`、undefined 指针（0xaa）不再交给 `free`。
+- **三方多签**：
+  - **review**（ws1-pi1，纯静态）**approve**，Blocking 0 / Non-blocking 4。
+    **构造性论证**（不是靠 seed 碰运气）：枚举循环**全部退出路径** ——
+    `break`（任何赋值之前）/ `continue`（任何赋值之前）/ OOM 的 `catch return`（直接退出函数，
+    数组之后不再被消费）⇒ 前缀恒稠密；消费点唯一且都落在 `[0..actual_dn]` 内。
+    并**亲测**确认两个 `ModelMismatch` seed **仍然红** ⇒ **守卫未被放水**。
+  - **test**（ws1-pi3，独立）**PASS**：门 6/6；独立构造空洞输入驱动（不依赖 RED 的两个测试）；
+    **27-seed 扫描：SIGSEGV 0 次**；守卫 seed 复跑仍红（可达性证据）；RED 逐字对比未改。
+  - **conductor** 复跑门 @ `e4109eb`：**6/6 PASS**。
+- **C7 同类排查**（实现者 + 评审各自独立扫 `tests/fuzz/` 全目录）：**仅 `delete_batch` 一处中招**；
+  `putBatch` 分支虽然也写 `[i]`，但它的 `break` 在任何赋值之前、空 key 分支也照样赋值
+  ⇒ `[0..actual_n]` 恒连续（**正确**）；`range_delete_fuzz_test.zig` / `api_fuzz_test.zig`
+  用 `consumed` 算术推进、无批量数组 ⇒ 不受影响。
+- **非阻塞（留档；均为预存问题，非本次引入）**：
+  - **NB-1** `putBatch` 空键「用 `("","")` 占位并发出去」vs `delete_batch`「跳过」的**不对称**
+    —— 预存（RED 里两侧都已是该行为）。**该占位路径正是 T-57 的触发面**（fuzz 由此 `put("","")`）；
+    T-57 落地后该不对称无害，但两侧语义差异**目前无注释说明**，后续簿记整理时值得补。
+  - **NB-2** OOM 路径微泄漏（`dupe(...) catch return pos` 会漏掉本轮已 dupe 的 key/val）——
+    **两分支预存**、`testing.allocator` 在 fuzz 中不 OOM ⇒ 当前不可达。
+  - **NB-3** `get_all` 的 `db.get(...) catch continue` 在 get 出错时**静默跳过**该 key 的模型比对
+    —— 守卫的**静默弱化通道**（预存、当前不可达；`range_delete_fuzz_test.zig` 的 `verify_all` 同模式）。
+    若要修需 conductor 定夺错误策略，未动。
+  - **NB-4** `r2` 只固定一条 seed —— 覆盖面由 review 的构造性论证补足，无需动作。
+- **集成验证**（main `c7b7642`）：`zig build test` 随机 seed **连跑 2 次均 EXIT=0**；
+  两个历史坏 seed `0xd184e5f9` / `0x37c6c92f` **均 EXIT=0** ⇒ **CI 假红恢复稳定**
+  （修复前约 10% 假红）。
