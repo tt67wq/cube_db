@@ -3,7 +3,7 @@
 - **状态**: fixing（**阶段 1 / 2 / 3 均已合入 main 并通过验收**：`baa44bd`、`88124bc`、`fe2f575`；
   **阶段 4a（GC：水位收割 + 链规范化）已合入 `50af0d1`** —— 新增显式 `Db.gcTombstones`
   + `deleteRange` 冗余区间短路 + 链恒为规范最小形式；review approve Blocking 0 / test PASS）。
-  **只剩阶段 4b 的 NB 收尾（T-38-5 已合入 `b827ae8`，4 个 non-blocking → T-38-6）**；物化清除挂 U-5 真·compact）
+  **阶段 4b 及其 NB 收尾均已合入**（T-38-5 `b827ae8` + T-38-6 `a14de09`）；物化清除挂 U-5 真·compact）
 - **优先级**: **high**（可用性缺口 + 内存安全边界；4/4 worker 全部独立提出，共识度最高）
 - **梯队**: 可用性/性能（兼正确性观感——文档承诺与实际行为差距）
 - **来源**: 演进点征集（roadmap-evo）wf-pi-1-E1、wf-pi-2-E2、wf-pi-3-E3、wf-pi-4-E2
@@ -78,7 +78,8 @@ select 迭代器 + tombstone 批量提交实现"），但**没有披露 O(range)
   test PASS @`d6c588a` + 修 NB-1/2/3 的 `8236305`；门 v2 六项绿）
 - [x] 阶段 4b（crash 矩阵扩展）：T-38-5 合入 `b827ae8`（三方多签：RED `4708732` → GREEN；check.sh 6/6；
   review approve @`b827ae8` Blocking 0 / NB 4；test PASS 6/6 @`b827ae8`，gate1 首跑假红坐实为 build_runner stderr 回显污染）。
-  NB 收尾另立 **T-38-6**（真 mid + 静默 landed 探测 + NB-3 注释）
+  NB 收尾 **T-38-6** 已合入 `a14de09`（三方多签：check.sh 5/5；review approve 0B/2NB（RED diff 逐行核过授权边界）；
+  test PASS 含反证实验：断言挖回旧开火点确实变红）。gate1 假红通道已消灭（全量 ×2 failed-command=0）
 - [ ] 回归测试 + 评审（阶段 2 起需并发 staging 交错测试）
 - [ ] 验收门稳定后关闭
 
@@ -109,7 +110,7 @@ select 迭代器 + tombstone 批量提交实现"），但**没有披露 O(range)
 | 2 | 读路径：遮蔽判定（tomb_head=0 时休眠） | **T-38-2** ✅ 已合入 `88124bc` | T-51 关闭 ✓ |
 | 3 | 写路径：新 deleteRange 流 + 打洞语义（含 F1 修正）+ entryCount 流式修正 | **T-38-3** ✅ 已合入 `fe2f575` | 阶段 2 ✓（前置 T-49/T-50/T-52 全关闭） |
 | 4a | GC：水位收割（空区间丢弃）+ 交叠/相邻归并；**新增显式 `Db.gcTombstones`**（不碰 compact 的 O(1) 公开承诺） | **T-38-4** ✅ 已合入 `50af0d1` | 阶段 3 ✓ |
-| 4b | crash 矩阵扩展：墓碑 commit 场景进 T5/T7 家族（把探路报告 §5「模型不变」从分析变实证） | **T-38-5** ✅ 已合入 `b827ae8`（NB 收尾 → T-38-6） | 阶段 4a ✓ |
+| 4b | crash 矩阵扩展：墓碑 commit 场景进 T5/T7 家族（把探路报告 §5「模型不变」从分析变实证） | **T-38-5** ✅ `b827ae8` + 收尾 **T-38-6** ✅ `a14de09` | 阶段 4a ✓ |
 
 **阶段 3 前置条件（阶段 1 评审 T-49/T-50 + 阶段 2 评审 NB-1）**：
 ① **开库路径必须区分「invalid meta」与「fresh DB」**（`issues/T-50-…`）——
