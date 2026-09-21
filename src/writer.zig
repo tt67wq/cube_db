@@ -911,6 +911,23 @@ pub const State = struct {
         if (tobs.len == 0) return &.{};
         const sorted = try a.alloc(f2.RangeTombstone, tobs.len);
         @memcpy(sorted, tobs);
+        // T-57: the empty-key bound {bytes:"", append_zero:false} is ambiguous
+        // on disk — it encodes exactly like null (stored len 0, no flag =
+        // ±infinity). As a MIN it is semantically identical to null ("" is the
+        // smallest key: k >= "" covers every key), so normalize it to null; as
+        // a MAX, [x, "") is the empty range (no key is < "") — drop the
+        // interval entirely. Normalizing here covers EVERY producer (punch
+        // split, deleteRange, gc) since both publish paths funnel through this
+        // function. See planTombPunch's matching left-segment drop in db.zig.
+        var norm: usize = 0;
+        for (sorted) |t| {
+            const min_ambiguous = t.min != null and t.min.?.bytes.len == 0 and !t.min.?.append_zero;
+            const max_ambiguous = t.max != null and t.max.?.bytes.len == 0 and !t.max.?.append_zero;
+            if (max_ambiguous) continue; // [x, "") is empty — never publish it
+            sorted[norm] = if (min_ambiguous) .{ .min = null, .max = t.max } else t;
+            norm += 1;
+        }
+        if (norm == 0) return &.{};
         const Ctx = struct {
             fn lt(_: void, x: f2.RangeTombstone, y: f2.RangeTombstone) bool {
                 const xm = x.min orelse return y.min != null; // null min = -inf → first
@@ -918,12 +935,12 @@ pub const State = struct {
                 return tombBoundCmp(xm, ym) == .lt;
             }
         };
-        std.mem.sort(f2.RangeTombstone, sorted, {}, Ctx.lt);
+        std.mem.sort(f2.RangeTombstone, sorted[0..norm], {}, Ctx.lt);
 
-        const out = try a.alloc(f2.RangeTombstone, sorted.len); // disjoint output never exceeds input length
+        const out = try a.alloc(f2.RangeTombstone, norm); // disjoint output never exceeds input length
         var n: usize = 0;
         var cur = sorted[0];
-        for (sorted[1..]) |t| {
+        for (sorted[1..norm]) |t| {
             // Merge iff t.min <= cur.max (effective). cur.max == null is +inf →
             // absorbs everything; t.min == null (sort-tie at the front) also
             // overlaps cur by construction.
