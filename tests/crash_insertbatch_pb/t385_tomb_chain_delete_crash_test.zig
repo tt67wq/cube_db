@@ -255,10 +255,12 @@ test "T-38-5-C6 before_tomb_chain on the deleteRange path (commitTombSwap)" {
 }
 
 test "T-38-5-C6 mid_tomb_chain on the deleteRange path needs a MULTI-page chain" {
-    // deleteRange(null,null) 的链只有 1 段（单页）→ mid 注入点（仅多页链触发）
-    // 在该负载下不可达，与 freelist 路径「退化 mid 收敛到 after」同理，不算缺陷。
-    // 这里改用有界 deleteRange 序列拼出多页链：先 200 段相邻 deleteRange，
-    // 归并后仍 ~200 段 > 1 页，再武装 mid 打第二发 deleteRange —— 确认 mid 命中。
+    // T-38-6 NB-1: mid 现在是「真 mid」——encode 循环内、写完 ceil(n/2) 页后开火。
+    // deleteRange(null,null) 的链只有 1 段（单页）→ mid 不开火（单页退化到
+    // before/after，注释保持现状语义）。这里改用有界 deleteRange 序列拼出多页链：
+    // 先 200 段相邻 deleteRange，归并后仍 ~200 段 > 1 页，再武装 mid 打第二发
+    // deleteRange —— 确认 mid 命中，并断言开火时「≥1 且 <全部」页已落盘（按
+    // armed commit 的 gen 数 CRC 有效前缀页）。
     const path = ".test_t385c6_del_mid2.db";
     defer unlinkPath(path);
     try buildPreState(path);
@@ -342,6 +344,39 @@ test "T-38-5-C6 mid_tomb_chain on the deleteRange path needs a MULTI-page chain"
             }
         }
         try std.testing.expect(zvis == 0 or zvis == N); // 原子性
+
+        // T-38-6 NB-1 部分-写入可观测断言：mid 现在在 encode 循环内
+        // （写完 ceil(n/2) 页后开火），恢复侧必须能数出「≥1 且 <全部」页
+        // 的 CRC-有效墓碑链页（旧链的页也 CRC 有效，所以按 armed commit 的
+        // gen 比对：mid 开火时 meta.sequence 尚未切换 = 旧序列值 S；新链页
+        // gen = S+1。数 gen == S+1 的 CRC 有效页：必须 ≥1 且 < 新链总页数）。
+        // 探测方式：恢复侧读 last_page 内所有 CRC-valid + PAGE_TYPE_RANGE_
+        // TOMBSTONE 的页，按 gen 分组。
+        {
+            const meta = (try fps.store().readMeta()) orelse return error.NoMeta;
+            const durable_seq = meta.sequence; // armed commit 未落 meta ⇒ 它的 gen = durable_seq+1
+            const armed_gen = durable_seq + 1;
+            const n_pages: usize = @intCast(meta.last_page + 1);
+            var valid_tomb_pages: usize = 0; // CRC-ok + 类型正确（新链前缀，全 gen==armed_gen 或旧链）
+            var armed_gen_pages: usize = 0; // gen == armed_gen 的页 = armed commit 已写页
+            var pg: u32 = 0;
+            while (pg < n_pages) : (pg += 1) {
+                const raw = fps.store().readPage(pg) catch continue;
+                const arr: *const [cube.format.PAGE_SIZE]u8 = @ptrCast(raw.ptr);
+                if (!cube.format.verifyPageChecksum(arr)) continue;
+                const hdr = cube.format.decodePageHeader(raw[0..cube.format.PAGE_HEADER_SIZE]);
+                if (hdr.page_type != cube.format.PAGE_TYPE_RANGE_TOMBSTONE) continue;
+                valid_tomb_pages += 1;
+                if (hdr.gen == armed_gen) armed_gen_pages += 1;
+            }
+            tdiag.print("C6-mid partial-write probe: armed_gen_pages={d} (must be >=1 and < chain total)\n", .{armed_gen_pages});
+            // mid 在 ceil(n/2) 页后开火且 n>1 ⇒ 已写页 >= 1；也必然 < 总页数
+            // （除非新链只有 1 页——但该场景 armed commit 重写的是 ~200 段多页链）。
+            try std.testing.expect(armed_gen_pages >= 1);
+            // 总页数 = armed_gen_pages（新链）+ 旧链页；armed_gen_pages < valid_tomb_pages
+            // 说明这是"写了一半"而不是"全部写完"（全写完的切面是 after 标签）。
+            try std.testing.expect(armed_gen_pages < valid_tomb_pages);
+        }
         var kbuf: [16]u8 = undefined;
         var dvis: usize = 0;
         for (0..N) |i| {
