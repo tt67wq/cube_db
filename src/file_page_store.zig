@@ -858,6 +858,9 @@ fn fireCrashHook(tag: FilePageStore.CrashTag) void {
 /// for this decl (comptime-resolved static, no indirection at runtime).
 /// Production: test_crash_hook == null => one predictable cold branch, no
 /// lock/alloc/IO.
+/// Cross-layer note (T-38-6 NB-3): these hooks fire regardless of the active
+/// backend — writer.zig reaches the FilePageStore static directly, so they
+/// fire under MemPageStore too; the hook is null unless a test arms it.
 pub fn fireCrashHookPub(tag: FilePageStore.CrashTag) void {
     fireCrashHook(tag);
 }

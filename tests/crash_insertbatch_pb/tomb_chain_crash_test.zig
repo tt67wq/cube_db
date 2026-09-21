@@ -211,6 +211,33 @@ fn expectPunchState(db: *Db, armed_landed: bool, label: []const u8) !void {
     }
 }
 
+/// expectPunchState 的静默孪生：逻辑逐条一致，但所有失败路径不打印 ——
+/// T-38-6 NB-2：投机探测（landed=true 那次尝试）按定义多半失败，若打印会让
+/// build runner 对**成功** step 回显 stderr 并打 `failed command:`（gate1 假红）。
+/// 正式校验仍走会打印的 expectPunchState（断言强度不变）。
+fn expectPunchStateSilent(db: *Db, armed_landed: bool) !void {
+    var kbuf: [16]u8 = undefined;
+    var vbuf: [16]u8 = undefined;
+    for (0..N) |i| {
+        const k = fmtKey(&kbuf, i);
+        const want_visible = armed_landed and (i % 2 == 0);
+        const got = try db.get(k);
+        defer if (got) |v| alloc.free(v);
+        if (want_visible) {
+            const v = got orelse return error.ExpectedVisible;
+            const want = fmtVal(&vbuf, i);
+            if (v.len < want.len or !std.mem.eql(u8, v[0..want.len], want)) return error.ValueMismatch;
+        } else if (got != null) {
+            return error.UnexpectedVisible;
+        }
+    }
+    const vis = try countVisible(db);
+    const ec = db.entryCount();
+    if (vis != ec) return error.CountDisagreement;
+    const want_count: usize = if (armed_landed) N / 2 else 0;
+    if (vis != want_count) return error.WrongVisibleCount;
+}
+
 /// 判断 armed commit 是否落盘（原子的两种合法态之一），并做 ④ 校验。
 fn checkAfterCrash(path: []const u8, label: []const u8) !bool {
     var fps = try FilePageStore.init(alloc, path);
@@ -219,7 +246,9 @@ fn checkAfterCrash(path: []const u8, label: []const u8) !bool {
     defer db.close();
 
     const landed = blk: {
-        expectPunchState(db, true, label) catch break :blk false;
+        // T-38-6 NB-2: speculative probe is silent (was expectPunchState(db, true, label),
+        // whose stderr prints leaked into a green build's `failed command:` line).
+        expectPunchStateSilent(db, true) catch break :blk false;
         break :blk true;
     };
     try expectPunchState(db, landed, label);

@@ -328,13 +328,14 @@ pub const State = struct {
         }
         try chunks.append(a, tobs[start..]);
 
-        // T-38-5: crash-injection points for the tomb-chain publish window.
-        // before = merge done, no tomb page written yet; mid = some (but not
-        // all) pages written — reachable only for multi-page chains (the
-        // single-page case collapses onto "after", matching the degenerate
-        // mid_chain precedent in the freelist path); after = all pages
-        // written, meta not switched (commitTombSwap/applyBatchSwap still
-        // have queuePendingFree + writeCommitMeta ahead). Production keeps
+        // T-38-5/T-38-6: crash-injection points for the tomb-chain publish
+        // window. before = merge done, no tomb page written yet; mid = the
+        // first ceil(n/2) chain pages WRITTEN (encode loop, multi-page chains
+        // only — mirrors the freelist mid_chain precedent of firing after
+        // ceil(k/2) pages; a single-page chain never fires mid and collapses
+        // onto before/after); after = ALL pages written, meta not switched
+        // (commitTombSwap/applyBatchSwap still have queuePendingFree +
+        // writeCommitMeta ahead). Production keeps
         // FilePageStore.test_crash_hook null: one predictable cold branch
         // per fire point, no lock/alloc/IO.
         fps.fireCrashHookPub(.before_tomb_chain);
@@ -344,7 +345,6 @@ pub const State = struct {
             const pn = try self.store.allocPage();
             try pages_out.append(a, pn);
         }
-        if (chunks.items.len > 1) fps.fireCrashHookPub(.mid_tomb_chain);
         for (chunks.items, 0..) |chunk, ci| {
             const pn = pages_out.items[ci];
             const buf = try self.store.writePage(pn);
@@ -352,6 +352,10 @@ pub const State = struct {
             // Planner guarantees envelope fit; packing mirrors the encoder
             // budget, so an encode error is a contract violation on our side.
             try f2.encodeTombPage(buf[0..f2.PAGE_SIZE], pn, chunk, commit_seq, next);
+            // True mid (T-38-6 NB-1): fire after ceil(n/2) pages are written —
+            // "some (but not all) pages landed" for every multi-page chain.
+            const half = (chunks.items.len + 1) / 2;
+            if (ci + 1 == half and ci + 1 < chunks.items.len) fps.fireCrashHookPub(.mid_tomb_chain);
         }
         fps.fireCrashHookPub(.after_tomb_chain_before_meta);
         return pages_out.items[0];
