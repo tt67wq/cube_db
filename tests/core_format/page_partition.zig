@@ -53,7 +53,7 @@ fn freeCap() u64 {
 /// Fixtures and tests here stay far below; anything above this is a bug in the test, not the DB.
 const max_classified_pages: u64 = 4 << 20;
 
-pub const Class = enum { unassigned, meta, tree, chain, free_entry, orphan };
+pub const Class = enum { unassigned, meta, tree, chain, free_entry, orphan, tomb_chain };
 
 pub const Overlap = struct {
     page: u32,
@@ -70,6 +70,7 @@ pub const Report = struct {
     tree_pages: std.ArrayList(u32),
     chain_pages: std.ArrayList(u32),
     free_pages: std.ArrayList(u32),
+    tomb_chain_pages: std.ArrayList(u32) = .empty,
 
     n_meta: usize = 0,
     n_tree: usize = 0,
@@ -87,6 +88,7 @@ pub const Report = struct {
         self.tree_pages.deinit(self.allocator);
         self.chain_pages.deinit(self.allocator);
         self.free_pages.deinit(self.allocator);
+        self.tomb_chain_pages.deinit(self.allocator);
     }
 
     pub fn classOf(self: *const Report, page: u32) Class {
@@ -109,6 +111,7 @@ pub const Report = struct {
             .chain => self.n_chain += 1,
             .free_entry => self.n_free += 1,
             .orphan => self.n_orphan += 1,
+            .tomb_chain => {}, // counted via tomb_chain_pages list
             .unassigned => {},
         }
     }
@@ -240,6 +243,38 @@ pub fn classify(allocator: std.mem.Allocator, store: ps.PageStore, meta: f2.Meta
     }
     if (guard >= guard_max) rep.walk_errors += 1;
 
+    // ---- T-38-5: range-tombstone chain walk (meta.tomb_head, free_next links) ----
+    {
+        var visited = std.AutoHashMapUnmanaged(u32, void){};
+        defer visited.deinit(allocator);
+        var tn: u32 = meta.tomb_head;
+        var tguard: usize = 0;
+        while (tn != 0 and tguard < n + 8) : (tguard += 1) {
+            if (tn >= n) {
+                rep.out_of_range += 1;
+                break;
+            }
+            if (rep.class_of[tn] == .tomb_chain) break; // cycle guard
+            const page = store.readPage(tn) catch {
+                rep.walk_errors += 1;
+                break;
+            };
+            const arr: *const [f2.PAGE_SIZE]u8 = @ptrCast(page.ptr);
+            const hdr = f2.decodePageHeader(page[0..f2.PAGE_HEADER_SIZE]);
+            rep.mark(tn, .tomb_chain);
+            rep.tomb_chain_pages.append(allocator, tn) catch {};
+            if (hdr.page_type != f2.PAGE_TYPE_RANGE_TOMBSTONE) {
+                rep.walk_errors += 1; // type confusion
+                break;
+            }
+            if (!f2.verifyPageChecksum(arr)) {
+                rep.walk_errors += 1; // torn / never-landed tomb page
+                break;
+            }
+            tn = hdr.free_next;
+        }
+    }
+
     // ---- persisted freelist chain walk (bounded the same way restoreFreeList must) ----
     var cur = meta.free_head;
     const cap = freeCap();
@@ -287,8 +322,8 @@ pub fn dump(self: *const Report, label: []const u8) void {
     // T-54-B: 成功路径也调用 dump（每个 checkpoint 一行），故默认静默；失败时
     // 紧随其后的重叠明细行仍无条件输出（错误上下文不丢）。
     tdiag.print(
-        "[T7 {s}] last_page={d} meta={d} tree={d} chain={d} free={d} orphan={d} walk_errors={d} out_of_range={d} overlaps={d}\n",
-        .{ label, self.last_page, self.n_meta, self.n_tree, self.n_chain, self.n_free, self.n_orphan, self.walk_errors, self.out_of_range, self.overlaps.items.len },
+        "[T7 {s}] last_page={d} meta={d} tree={d} chain={d} free={d} orphan={d} tchain={d} walk_errors={d} out_of_range={d} overlaps={d}\n",
+        .{ label, self.last_page, self.n_meta, self.n_tree, self.n_chain, self.n_free, self.n_orphan, self.tomb_chain_pages.items.len, self.walk_errors, self.out_of_range, self.overlaps.items.len },
     );
 }
 

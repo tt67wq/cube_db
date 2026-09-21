@@ -131,7 +131,18 @@ pub const FilePageStore = struct {
     freelist_stats: FreelistStatsImpl = .{},
 
     /// T-33(T5): crash-injection points of the commit write-order matrix.
-    pub const CrashTag = enum { before_chain, mid_chain, after_chain_before_meta, after_meta };
+    /// T-38-5: + three tomb-chain publish-window tags. writeTombChain goes
+    /// through the PageStore vtable, so writer.zig fires them via the pub
+    /// passthrough below — same static, same abort semantics.
+    pub const CrashTag = enum {
+        before_chain,
+        mid_chain,
+        after_chain_before_meta,
+        after_meta,
+        before_tomb_chain,
+        mid_tomb_chain,
+        after_tomb_chain_before_meta,
+    };
 
     /// Test-only crash injection (T5): the forked child arms a tag; the commit
     /// path aborts the process when the matching point is reached. Always null
@@ -835,6 +846,20 @@ fn fireCrashHook(tag: FilePageStore.CrashTag) void {
     if (FilePageStore.test_crash_hook) |armed| {
         if (armed == tag) std.process.abort();
     }
+}
+
+/// T-38-5: pub passthrough over the same static hook. writeTombChain reaches
+/// the store only through the PageStore vtable, and the vtable must stay
+/// storage-shaped (alloc/read/write/meta/sync) — injecting commit-window
+/// semantics into it would make every PageStore implementation (incl.
+/// MemPageStore) carry test-only knobs. A plain pub fn on FilePageStore keeps
+/// the hook protocol in ONE place (file_page_store.zig) while letting the
+/// writer fire the three tomb-chain tags. writer.zig imports this file only
+/// for this decl (comptime-resolved static, no indirection at runtime).
+/// Production: test_crash_hook == null => one predictable cold branch, no
+/// lock/alloc/IO.
+pub fn fireCrashHookPub(tag: FilePageStore.CrashTag) void {
+    fireCrashHook(tag);
 }
 
 const file_vtable: ps.PageStore.VTable = .{

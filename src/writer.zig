@@ -4,6 +4,9 @@ const zio = @import("zio");
 const f2 = @import("format.zig");
 const ps = @import("page_store.zig");
 const btree = @import("btree.zig");
+// T-38-5: crash-injection passthrough for the tomb-chain publish window
+// (test-only; FilePageStore.test_crash_hook is null in production).
+const fps = @import("file_page_store.zig");
 
 const PageStore = ps.PageStore;
 
@@ -325,12 +328,23 @@ pub const State = struct {
         }
         try chunks.append(a, tobs[start..]);
 
+        // T-38-5: crash-injection points for the tomb-chain publish window.
+        // before = merge done, no tomb page written yet; mid = some (but not
+        // all) pages written — reachable only for multi-page chains (the
+        // single-page case collapses onto "after", matching the degenerate
+        // mid_chain precedent in the freelist path); after = all pages
+        // written, meta not switched (commitTombSwap/applyBatchSwap still
+        // have queuePendingFree + writeCommitMeta ahead). Production keeps
+        // FilePageStore.test_crash_hook null: one predictable cold branch
+        // per fire point, no lock/alloc/IO.
+        fps.fireCrashHookPub(.before_tomb_chain);
         // Two passes: allocate all pages first, then encode (each page needs
         // its successor's number for free_next).
         for (0..chunks.items.len) |_| {
             const pn = try self.store.allocPage();
             try pages_out.append(a, pn);
         }
+        if (chunks.items.len > 1) fps.fireCrashHookPub(.mid_tomb_chain);
         for (chunks.items, 0..) |chunk, ci| {
             const pn = pages_out.items[ci];
             const buf = try self.store.writePage(pn);
@@ -339,6 +353,7 @@ pub const State = struct {
             // budget, so an encode error is a contract violation on our side.
             try f2.encodeTombPage(buf[0..f2.PAGE_SIZE], pn, chunk, commit_seq, next);
         }
+        fps.fireCrashHookPub(.after_tomb_chain_before_meta);
         return pages_out.items[0];
     }
 
