@@ -995,17 +995,11 @@ fn segmentFits(min: ?f2.TombBound, max: ?f2.TombBound) bool {
 fn planTombPunch(self: *Db, a: std.mem.Allocator, reqs: []const wrt.Request) !?wrt.State.TombSwap {
     const head = self.state.getTombHead();
     if (head == 0) return null;
-    // Any live-entry key that can be covered? Cheapest filter first: only
-    // non-tombstone requests participate (a delete inside a tomb range is
-    // already shadowed — INV-RT1 only constrains LIVE entries).
-    var has_live = false;
-    for (reqs) |r| {
-        if (!r.tombstone) {
-            has_live = true;
-            break;
-        }
-    }
-    if (!has_live) return null;
+    // T-59: tombstone requests now participate too — a point-delete of a key
+    // that is chain-shadowed but PHYSICALLY live gets insert's live→tombstone
+    // count_delta=-1 while its visibility delta is 0 (it was already excluded
+    // from the counters when the covering tomb was created). Compensation is
+    // planned below; no early-out on all-tombstone batches any more.
 
     var tobs: std.ArrayList(f2.RangeTombstone) = .empty;
     var old_pages: std.ArrayList(u32) = .empty;
@@ -1082,6 +1076,31 @@ fn planTombPunch(self: *Db, a: std.mem.Allocator, reqs: []const wrt.Request) !?w
                 revive_count += 1;
                 revive_bytes += @intCast(k.len + old_v.len + 10);
             }
+        }
+    }
+    // T-59 second pass: compensate point-deletes of chain-shadowed,
+    // physically-live keys (+1 count / +old-contribution bytes — same
+    // convention as the punch revive above). Coverage is checked against the
+    // POST-PLAN chain (after all punch splits/materializations): if a live
+    // req in this same batch removed the covering tomb at this exact key,
+    // that req's own revive compensation already accounts for the key —
+    // checking here would double-count. Tombstone reqs never punch
+    // themselves: a delete must not un-shadow OTHER keys in the range.
+    for (reqs) |r| {
+        if (!r.tombstone) continue;
+        var covered = false;
+        for (tobs.items) |t| {
+            if (tombCovers(t, r.key)) {
+                covered = true;
+                break;
+            }
+        }
+        if (!covered) continue;
+        const root = self.state.getRoot();
+        if (try btree.get(a, self.store, root, r.key)) |old_v| {
+            changed = true;
+            revive_count += 1;
+            revive_bytes += @intCast(r.key.len + old_v.len + 10);
         }
     }
     if (!changed) return null;
