@@ -1,6 +1,6 @@
 # Issue T-38 — deleteRange 高效化：全量物化 + 每 key tombstone 的 O(range) 内存与写放大
 
-- **状态**: fixing（**阶段 1 / 2 / 3 均已合入 main 并通过验收**：`baa44bd`、`88124bc`、`fe2f575`；
+- **状态**: closed（已合入 `4adf813` + `dd608e0`（T-38-7/8/9 链，三方多签全 approve；NB-1 由 T-38-9 兑现）。原跟踪：**阶段 1 / 2 / 3 均已合入 main 并通过验收**：`baa44bd`、`88124bc`、`fe2f575`；
   **阶段 4a（GC：水位收割 + 链规范化）已合入 `50af0d1`** —— 新增显式 `Db.gcTombstones`
   + `deleteRange` 冗余区间短路 + 链恒为规范最小形式；review approve Blocking 0 / test PASS）。
   **阶段 4b 及其 NB 收尾均已合入**（T-38-5 `b827ae8` + T-38-6 `a14de09`）；物化清除挂 U-5 真·compact）
@@ -80,8 +80,8 @@ select 迭代器 + tombstone 批量提交实现"），但**没有披露 O(range)
   review approve @`b827ae8` Blocking 0 / NB 4；test PASS 6/6 @`b827ae8`，gate1 首跑假红坐实为 build_runner stderr 回显污染）。
   NB 收尾 **T-38-6** 已合入 `a14de09`（三方多签：check.sh 5/5；review approve 0B/2NB（RED diff 逐行核过授权边界）；
   test PASS 含反证实验：断言挖回旧开火点确实变红）。gate1 假红通道已消灭（全量 ×2 failed-command=0）
-- [ ] 回归测试 + 评审（阶段 2 起需并发 staging 交错测试）
-- [ ] 验收门稳定后关闭
+- [x] 回归测试 + 评审（阶段 2 起需并发 staging 交错测试）— T-38-7/8/9：S1/S2/S4 + T-59/T-60 修复 + 完整 S3 交错重建，全绿合入
+- [x] 验收门稳定后关闭
 
 ---
 
