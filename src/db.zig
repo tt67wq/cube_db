@@ -1086,8 +1086,21 @@ fn planTombPunch(self: *Db, a: std.mem.Allocator, reqs: []const wrt.Request) !?w
     // that req's own revive compensation already accounts for the key —
     // checking here would double-count. Tombstone reqs never punch
     // themselves: a delete must not un-shadow OTHER keys in the range.
+    // T-60: insertBatch collapses same-key duplicates last-wins (writer.zig
+    // ordered/unordered dedup) — only ONE tree tombstone lands per key, so
+    // the insert reports a single -1: compensate at most once per key.
+    var compensated: std.ArrayList([]const u8) = .empty;
+    defer compensated.deinit(a);
     for (reqs) |r| {
         if (!r.tombstone) continue;
+        var dup = false;
+        for (compensated.items) |k| {
+            if (std.mem.eql(u8, k, r.key)) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
         var covered = false;
         for (tobs.items) |t| {
             if (tombCovers(t, r.key)) {
@@ -1101,6 +1114,7 @@ fn planTombPunch(self: *Db, a: std.mem.Allocator, reqs: []const wrt.Request) !?w
             changed = true;
             revive_count += 1;
             revive_bytes += @intCast(r.key.len + old_v.len + 10);
+            try compensated.append(a, r.key);
         }
     }
     if (!changed) return null;

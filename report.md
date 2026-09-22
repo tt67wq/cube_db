@@ -47,7 +47,10 @@ page store meta，树是链盲的，`selectChecked` 才有 raw 口径）；全�
 **成本注记**：有链的库上，纯 tombstone 批（点删路径）现在每次都要 load
 一次链来判覆盖。链空时 head==0 短路不变；链非空时这笔 I/O 与 deleteRange
 的既有成本同量级。**未覆盖 + 无补偿**的常见点删仍走 `!changed → null`
-零副作用路径（不重写链、不 bump sequence）。
+零副作用路径（不重写链、不 bump sequence）。covered+live 的点删则
+`changed=true` → 链 identity 重写（canonical 化为恒等变换）+ sequence
+bump + 旧页 pending_free 退休，量级与 punch 提交同档（可接受；同类成本
+本就存在于所有 punch 提交）。
 
 ## impact-scan 逐路径结论（§2 要求，每路径一行 + 证据）
 
@@ -89,3 +92,28 @@ P2/P4/P6 GREEN（编码既有正确语义的回归防线）；有 fix 7/7 GREEN�
 | gate5 全量 suite rc=0 failed-command=0（seed 0x8c40347c） | PASS |
 
 RESULT: PASS (5/5)，exit 0。
+
+## Round 2（T-60 回炉：B1 过度补偿，评审 aca7936 changes-requested）
+
+**评审发现（T-60）**：第二遍对 `reqs` 逐条补偿，而 `insertBatch` 对同 key
+重复 **last-wins 去重**（writer.zig 有序 :711 邻接折叠 / 无序 :775-784
+sort+dedup）→ 同 key N 条重复 tomb req 只落盘一次 -1，补偿却 +N → 净
+漂移 +(N-1)。探针：`delete("b")×2 → flush` 期望 entryCount==1，实得 2。
+
+**修复**：第二遍增 `compensated` once-set（每 key 至多补一次，镜像
+insertBatch 去重语义；与 punch 循环的天然 per-key 幂等对齐）。已补偿的
+key 才入 set——未覆盖/非物理 live 的重复 req 两次探测结果必然一致
+（planning 期不动树），无需去重。O(n²) 重复检查，n 为批内 tombstone
+req 数，planTombPunch 本身已是 O(n×链长) 量级，不增复杂度档。
+
+**新增回归用例（先 RED 后 GREEN，无 fix 时 3 条全 RED 实证）**：
+
+- **P2c** `putBatch([tomb(b), tomb(b)])`（同批纯重复直接可达）
+- **P2d** `delete("b")×2 → flush()`（micro-batch staging 主路径，评审探针原形）
+- **P2e** 同一 `WriteTxn` 内两次 `txn.delete("b")` + commit（db.zig:651 同路径）
+
+修复后 t388 10/10 GREEN、t387 family（含 S3）rc=0。
+
+**Round 2 门**（check.sh @ 本轮 commit）：5/5 PASS，exit 0（见下方门表
+重跑记录）。NB-1（完整 S3 交错重建）按评审裁决不在本轮范围，另立后续任务
+（立卡时引用 review.md §6 + T-38-7 report 场景重建指引）。

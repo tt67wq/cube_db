@@ -146,6 +146,74 @@ test "t388 P2b: same-batch [put, delete] on a shadowed-live key counts exact" {
     }
 }
 
+// ---- P2c/P2d/P2e：T-60 —— 同批同 key 纯重复 tomb req（insertBatch last-wins
+// 去重只落一次 -1，第二遍补偿须每 key 至多一次）----
+
+test "t388 P2c: same-batch duplicate [tomb, tomb] on a shadowed-live key counts exact" {
+    const o = try openDb();
+    defer {
+        o.db.close();
+        o.ms.deinit();
+        alloc.destroy(o.ms);
+    }
+    const db = o.db;
+
+    try db.put("a", "va");
+    try db.put("b", "vb");
+    try db.deleteRange("b", "c"); // b 遮蔽（物理在场），可见 a
+    try std.testing.expectEqual(@as(u64, 1), db.entryCount());
+
+    var entries = [_]cube.Entry{ tombEntry("b"), tombEntry("b") };
+    try db.putBatch(&entries);
+    try std.testing.expectEqual(@as(u64, 1), db.entryCount()); // a 仍可见，不漂移
+    try expectCountsConsistent(db);
+}
+
+test "t388 P2d: staged delete x2 then flush (one duplicate tomb batch) counts exact" {
+    const o = try openDb();
+    defer {
+        o.db.close();
+        o.ms.deinit();
+        alloc.destroy(o.ms);
+    }
+    const db = o.db;
+
+    try db.put("a", "va");
+    try db.put("b", "vb");
+    try db.deleteRange("b", "c");
+    try std.testing.expectEqual(@as(u64, 1), db.entryCount());
+
+    // micro-batch staging 主路径：同批两条 tomb(b)（评审 T-60 探针原形）
+    try db.delete("b");
+    try db.delete("b");
+    try db.flush();
+    try std.testing.expectEqual(@as(u64, 1), db.entryCount());
+    try expectCountsConsistent(db);
+}
+
+test "t388 P2e: WriteTxn with two deletes of the same key counts exact" {
+    const o = try openDb();
+    defer {
+        o.db.close();
+        o.ms.deinit();
+        alloc.destroy(o.ms);
+    }
+    const db = o.db;
+
+    try db.put("a", "va");
+    try db.put("b", "vb");
+    try db.deleteRange("b", "c");
+    try std.testing.expectEqual(@as(u64, 1), db.entryCount());
+
+    var txn = try db.beginWriteTxn();
+    defer txn.deinit();
+    try txn.delete("b");
+    try txn.delete("b");
+    try txn.commit();
+    try std.testing.expectEqual(@as(u64, 1), db.entryCount());
+    try expectCountsConsistent(db);
+}
+
 // ---- P3：deleteDirect（WriteTxn 路径，同一 planner） ----
 
 test "t388 P3: deleteDirect of a shadowed-live key (WriteTxn path) counts exact" {
