@@ -193,18 +193,22 @@ fn leafOverflowScenario(store: ps.PageStore, fa: std.mem.Allocator, dirty: *std.
         seed[6 + i] = .{ .tombstone = false, .key = k, .value = "v" };
     }
     const wr = try btree.insertBatch(fa, store, btree.NULL_ROOT, &seed, dirty);
+    var root = wr.new_root; // T-45: 每步 insert 后更新，勿向 dirty 表内排队旧页写入
 
     var m_buf: [696]u8 = undefined;
     const m_key = bigKey(&m_buf, "m");
-    _ = try btree.insert(fa, store, wr.new_root, m_key, "v", false, dirty);
+    root = (try btree.insert(fa, store, root, m_key, "v", false, dirty)).new_root;
 
     // Overwrite the last 'z' key with a big value: same byte-heavy leaf,
     // found=true path in insertIntoLeafSplit (the precheck redirects because
     // entry_start + new_entry_sz + tail > cap). Covers the overwrite-side
     // ownership (old entry must not be freed before the new dupes exist).
+    // Still hits found=true: 'z3' lives in the same leaf after the 'm'
+    // insert (m sorts between a and z, no split occurred), and the big
+    // value triggers the same precheck redirect into the overwrite path.
     var vbuf: [3000]u8 = undefined;
     @memset(&vbuf, 'w');
-    _ = try btree.insert(fa, store, wr.new_root, bigKey(&z_bufs[3], "z"), &vbuf, false, dirty);
+    _ = try btree.insert(fa, store, root, bigKey(&z_bufs[3], "z"), &vbuf, false, dirty);
 }
 
 test "T-43: leaf-overflow error path — no UAF, no leaks (full fault sweep, store+btree)" {
