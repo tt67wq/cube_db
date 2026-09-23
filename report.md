@@ -90,3 +90,54 @@ RESULT: PASS (5/5)，exit 0。
   ownership 范围）；long-run step 不吃 -Dfuzz-seed 之外的转发差异（同一
   setEnvironmentVariable 路径，行为一致）。
 - 未触碰 crash 系列（T-53-1 pi1 地盘）与 src/。
+
+## Round 2（review @bc2311e 收口：B1 裁决 + NB1/NB3/NB4）
+
+**B1 裁决（conductor 采纳 review 建议方向）**：显式 seed 的成功路径回显走
+**CUBE_TEST_VERBOSE 门控**（tdiag 同款约定），失败路径打印保持无条件——
+「红时 CI 日志可直接抄」的契约真实意图不受损。契约原文「seed 打印走 stdout 且
+每次开跑都印」经评审核实在 `--listen=-` 下物理不可实现（stdout 是 runner IPC
+协议通道；stderr 必撞 fc 噪音），按裁决记入任务口径：**失败路径必印 + 显式
+seed 时 verbose 门控回显**。
+
+代码改动（tests/fuzz/common.zig，R2 唯一代码面）：
+
+- `verbose()`：CUBE_TEST_VERBOSE 解析（test_diag.zig 同款：值非空且非 "0"，进程内缓存）
+- 显式 seed 回显 → `if (verbose()) printSeed(s)`（B1：与跑门并用时零 stderr）
+- **NB1**：非法 `CUBE_FUZZ_SEED` 不再静默回退——verbose 门控告警
+  `ignoring invalid CUBE_FUZZ_SEED='<值>' — using random seed`
+
+### B1 修复实证（fc=0 证据表，评审者探针同口径复测）
+
+| run | seed | CUBE_TEST_VERBOSE | rc | failed-command 计数 | `fuzz seed=` 行 |
+|---|---|---|---|---|---|
+| 1 | 0xc0ffee | 未设 | 0 | **0**（B1 修复前为 6） | 0 |
+| 2 | 0xc0ffee | 1 | 0 | 6（verbose 回显，预期噪音） | `fuzz seed=0xc0ffee` ✓ |
+| 3 | banana | 1 | 0 | — | NB1 告警 `ignoring invalid CUBE_FUZZ_SEED='banana'` ✓ |
+| 4 | 未设 | 未设 | 0 | 0 | 0（gate2 行为不变） |
+
+→ 任何开发者 `-Dfuzz-seed` 调试 + 跑任何 fc=0 门 = 干净通过（假红通道关闭）。
+
+**NB3**：`.agents/tasks/T-61-1/check.sh` 以 `git add -f` 提交进本分支（此前仅存
+conductor 主 checkout 磁盘，门结论不可从分支复现）——本 commit 起 gate 可复现。
+conductor 磁盘副本请以本分支版本为准（gate1/gate2 已按 B1 裁决重写，见下）。
+
+**NB4**：check.sh gate1 重写 + gate2 文案修正（"green + prints seed" →
+"green (silent on success — correct post-B1 behavior)"）。gate1 现在锁三件事：
+(a) 固定 seed 成功路径 **fc=0**（B1 回归断言）；(b) `CUBE_TEST_VERBOSE=1` 下
+seed 回显可见；(c) 非法 seed verbose 告警（NB1）。gate2/3/4/5 逻辑未动。
+
+NB2（README 断言 exit 1 / 脏主 checkout 检查）与 NB5（非 dpkg 镜像 guard）不在
+本轮裁决范围，未动。
+
+### R2 门逐条（bash .agents/tasks/T-61-1/check.sh <worktree>，分支内版本）
+
+| 门 | 结果 |
+|---|---|
+| gate1 seeded: fc=0 w/o verbose + echo under verbose + invalid warn | PASS |
+| gate2 fuzz default green (silent on success) | PASS |
+| gate3 模板齐备 | PASS |
+| gate4 src/ 零 diff | PASS |
+| gate5 全量 suite rc=0 fc=0 | PASS |
+
+RESULT: PASS (5/5)，exit 0。
