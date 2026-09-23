@@ -114,7 +114,7 @@ test "fuzz DB API — smoke (100 random iters)" {
         .model = &model,
         .allocator = std.testing.allocator,
     };
-    const seed = std.testing.random_seed;
+    const seed = fuzz.resolveSeed(); // T-61-1: CUBE_FUZZ_SEED 优先，实际 seed 总会打印
     _ = try fuzz.fuzzLoop(FuzzCtx, &ctx, apiFuzzTestOne, 100, seed);
 }
 

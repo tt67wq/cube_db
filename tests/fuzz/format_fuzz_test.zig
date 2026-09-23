@@ -37,7 +37,7 @@ fn formatDecodeTestOne(ctx: *usize, smith: *std.testing.Smith) !void {
 
 test "fuzz format decode — smoke (1000 random iters)" {
     var ctx: usize = 0;
-    const seed = std.testing.random_seed;
+    const seed = fuzz.resolveSeed(); // T-61-1: CUBE_FUZZ_SEED 优先，实际 seed 总会打印
     _ = try fuzz.fuzzLoop(usize, &ctx, formatDecodeTestOne, 1000, seed);
 }
 

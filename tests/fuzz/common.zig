@@ -12,6 +12,52 @@
 const std = @import("std");
 const Io = std.Io;
 
+// ===== T-61-1: 真 fuzz seed（区别于 zig build --seed 的图遍历随机） =====
+//
+// CUBE_FUZZ_SEED 环境变量优先（build.zig 的 -Dfuzz-seed=<n> 转发，或手动
+// export）；支持 0x 前缀 hex 与十进制。未设/非法时回退 std.testing.random_seed。
+//
+// 打印策略（T-54-B 教训：listen 模式下测试二进制任何 stderr 输出都会被
+// build_runner 当作 result_stderr 回显成 "failed command:" 行，绿 run 也算）——
+//   - 显式设 seed：resolveSeed 时回显 `fuzz seed=0x…`（用户明确要求固定，
+//     回显是预期行为；此 gate 允许该噪音）
+//   - 未设（CI 默认）：成功路径零输出；失败时由 fuzzLoop/fuzzLongRun 打
+//     `fuzz seed=0x…` + 复现提示 —— 红的时候 CI 日志可直接抄。
+var seed_printed = false;
+
+pub fn resolveSeed() u64 {
+    const seeded = blk: {
+        const v = std.c.getenv("CUBE_FUZZ_SEED") orelse break :blk null;
+        break :blk parseSeed(std.mem.span(v));
+    };
+    if (seeded) |s| {
+        printSeed(s);
+        return s;
+    }
+    return std.testing.random_seed;
+}
+
+/// 失败路径复现提示：fuzzLoop/fuzzLongRun 的 target 出错时调用（进程内一次）。
+pub fn printSeedOnFailure(seed: u64) void {
+    if (seed_printed) return;
+    seed_printed = true;
+    std.debug.print("fuzz seed=0x{x} — replay with: CUBE_FUZZ_SEED=0x{x}\n", .{ seed, seed });
+}
+
+fn printSeed(seed: u64) void {
+    if (seed_printed) return;
+    seed_printed = true;
+    std.debug.print("fuzz seed=0x{x}\n", .{seed});
+}
+
+fn parseSeed(v: []const u8) ?u64 {
+    if (v.len == 0) return null;
+    if (std.mem.startsWith(u8, v, "0x") or std.mem.startsWith(u8, v, "0X")) {
+        return std.fmt.parseInt(u64, v[2..], 16) catch null;
+    }
+    return std.fmt.parseInt(u64, v, 10) catch null;
+}
+
 /// Maximum iterations for a smoke fuzz run (CI: 30s ≈ 100k iterations).
 pub const SMOKE_ITERS: usize = 100_000;
 
@@ -40,7 +86,10 @@ pub fn fuzzLoop(
         const len = rand.intRangeAtMost(usize, 0, MAX_INPUT_BYTES);
         rand.bytes(input_buf[0..len]);
         var smith = std.testing.Smith{ .in = input_buf[0..len] };
-        try target(context, &smith);
+        target(context, &smith) catch |e| {
+            printSeedOnFailure(seed); // T-61-1: 红 run 的 CI 日志可直接抄 seed
+            return e;
+        };
     }
     return i;
 }
@@ -70,7 +119,10 @@ pub fn fuzzLongRun(
         const len = rand.intRangeAtMost(usize, 0, MAX_INPUT_BYTES);
         rand.bytes(input_buf[0..len]);
         var smith = std.testing.Smith{ .in = input_buf[0..len] };
-        try target(context, &smith);
+        target(context, &smith) catch |e| {
+            printSeedOnFailure(seed); // T-61-1: 红 run 的 CI 日志可直接抄 seed
+            return e;
+        };
         i += 1;
     }
     return i;

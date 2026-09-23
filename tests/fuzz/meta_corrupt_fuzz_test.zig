@@ -46,7 +46,7 @@ fn metaCorruptTarget(ctx: *usize, smith: *std.testing.Smith) !void {
 
 test "fuzz: meta corruption never panics (deterministic)" {
     var ctx: usize = 0;
-    const seed = std.testing.random_seed;
+    const seed = fuzz.resolveSeed(); // T-61-1: CUBE_FUZZ_SEED 优先，实际 seed 总会打印
     const iters = try fuzz.fuzzLoop(usize, &ctx, metaCorruptTarget, 5000, seed);
     try std.testing.expect(iters > 0);
 }
