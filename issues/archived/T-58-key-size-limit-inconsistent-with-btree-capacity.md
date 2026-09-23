@@ -1,6 +1,6 @@
 # Issue T-58 — key 长度上限不一致：`checkKeySize` 放行 4051，但 `put(key >= 4045)` 在 commit 阶段报 `error.PayloadTooLarge`
 
-- **状态**: `open`（**预存缺陷，非本次引入**；由 T-57 的独立测试顺带发现）
+- **状态**: closed（T-58 任务复验：数字系 pre-N-1 旧行为，当前 main 已自愈；交付 ±1 边界锁死 + usage 真值，零 src。NB：issue 原文「T-57 分支基线早于 N-1」不实，实为 tester workspace 陈旧——见评审 cd13954）（**预存缺陷，非本次引入**；由 T-57 的独立测试顺带发现）
 - **发现于**: T-57 独立测试（tester ws1-pi2，main 集成态）
 - **关联**: T-57（同一次测试发现，但与本修复无关）、T-38-3（墓碑 payload 上限）
 - **时间**: 2026-09-20

@@ -1,6 +1,6 @@
 # Issue T-64 — T-53-1 评审遗留 3 NB 集合（docs / 形态测试 / R3 收紧）
 
-- **状态**: open
+- **状态**: closed（三条全做：usage §4.1+t5/t6 专测+R3 槽位校验，双 R 轮收口合入 961068b；t6/t2 重复认账不返工）
 - **发现于**: T-53-1 独立评审（cube_db-pi2，`review(T-53-1): approve @e74aeb1` = commit `eac3feb`，NB 三条）
 - **关联**: `issues/archived/T-53-…`（母 issue，closed 时已指向本卡）
 
