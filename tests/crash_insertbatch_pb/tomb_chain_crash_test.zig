@@ -139,7 +139,7 @@ fn acceptEven(i: usize) bool {
 
 /// 前置态：400 个 key 全写入，再被一条全区间墓碑整体遮蔽。
 fn buildPreState(path: []const u8) !void {
-    var fps = try FilePageStore.init(alloc, path);
+    var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
     defer fps.deinit();
     var db = try Db.open(alloc, fps.store(), .{});
     defer db.close();
@@ -155,6 +155,7 @@ fn punchEven(db: *Db) !void {
 // ===== 子进程 =====
 
 fn childCrashAt(comptime tag_name: []const u8, comptime armed: bool, path_z: [:0]const u8) noreturn {
+    tdiag.closeInheritedFds(&.{});
     var fps = FilePageStore.init(alloc, path_z) catch c._exit(2);
     var db = Db.open(alloc, fps.store(), .{}) catch c._exit(3);
     if (armed) armCrashHook(&fps, tag_name);
@@ -240,7 +241,7 @@ fn expectPunchStateSilent(db: *Db, armed_landed: bool) !void {
 
 /// 判断 armed commit 是否落盘（原子的两种合法态之一），并做 ④ 校验。
 fn checkAfterCrash(path: []const u8, label: []const u8) !bool {
-    var fps = try FilePageStore.init(alloc, path);
+    var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
     defer fps.deinit();
     var db = try Db.open(alloc, fps.store(), .{});
     defer db.close();
@@ -273,7 +274,7 @@ fn checkAfterCrash(path: []const u8, label: []const u8) !bool {
 /// ⑤ 再写一轮（全删 + 全写，两条发布路径都走）+ 重开 + 逐 key 复查值。
 fn writeRoundAndRecheck(path: []const u8, label: []const u8) !void {
     {
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
         var db = try Db.open(alloc, fps.store(), .{});
         defer db.close();
@@ -281,7 +282,7 @@ fn writeRoundAndRecheck(path: []const u8, label: []const u8) !void {
         try putSubset(db, acceptAll); // 打洞路径（一次提交写多页链）
     }
     {
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
         var db = try Db.open(alloc, fps.store(), .{});
         defer db.close();
@@ -326,7 +327,7 @@ fn runCrashCase(comptime tag_name: []const u8, comptime armed: bool, path: []con
     try buildPreState(path);
     {
         // 前置态自检（防止 RED 因工作负载写错而假绿）
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
         var db = try Db.open(alloc, fps.store(), .{});
         defer db.close();

@@ -192,7 +192,7 @@ fn allOrNone(db: *Db, from: usize, to: usize) !bool {
 // ===== fixture: the durable prefix =====
 
 fn buildPreState(path: []const u8) !void {
-    var fps = try FilePageStore.init(alloc, path);
+    var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
     defer fps.deinit();
     var db = try Db.open(alloc, fps.store(), .{});
     defer db.close();
@@ -209,6 +209,7 @@ fn childCrashAt(
     comptime do_c4: bool,
     path_z: [:0]const u8,
 ) noreturn {
+    tdiag.closeInheritedFds(&.{});
     var fps = FilePageStore.init(alloc, path_z) catch c._exit(2);
     var db = Db.open(alloc, fps.store(), .{}) catch c._exit(3);
     if (armed) armCrashHook(&fps, tag_name);
@@ -225,7 +226,7 @@ const Landed = struct { c3: bool, c4: bool };
 
 /// ①②③④: durable prefix, causality, batch atomicity, partition + no discard.
 fn checkAfterCrash(path: []const u8, label: []const u8) !Landed {
-    var fps = try FilePageStore.init(alloc, path);
+    var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
     defer fps.deinit();
     var db = try Db.open(alloc, fps.store(), .{});
     defer db.close();
@@ -266,14 +267,14 @@ fn checkAfterCrash(path: []const u8, label: []const u8) !Landed {
 /// live page, the new round's COW would clobber data that was durable before the crash.
 fn writeRoundAndRecheck(path: []const u8, landed: Landed, label: []const u8) !void {
     {
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
         var db = try Db.open(alloc, fps.store(), .{});
         defer db.close();
         try putRange(db, 350, 400);
     }
     {
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
         var db = try Db.open(alloc, fps.store(), .{});
         defer db.close();
@@ -365,7 +366,7 @@ test "T5-r: reopen is idempotent — restoreFreeList is read-only" {
     var before_pool: usize = undefined;
     var before_discarded: bool = undefined;
     {
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
         before = (try fps.store().readMeta()) orelse return error.NoMeta;
         before_pool = poolLenOf(&fps);
@@ -381,6 +382,7 @@ test "T5-r: reopen is idempotent — restoreFreeList is read-only" {
         const pid = c.fork();
         if (pid < 0) return error.ForkFailed;
         if (pid == 0) {
+            tdiag.closeInheritedFds(&.{});
             var fps = FilePageStore.init(alloc, pz) catch c._exit(2);
             var db = Db.open(alloc, fps.store(), .{}) catch c._exit(3);
             var kbuf: [16]u8 = undefined;
@@ -394,7 +396,7 @@ test "T5-r: reopen is idempotent — restoreFreeList is read-only" {
 
     // reopen twice more: identical observable state every time, data intact, partition clean
     for (0..2) |round| {
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
         const meta = (try fps.store().readMeta()) orelse return error.NoMeta;
         try std.testing.expectEqual(before.sequence, meta.sequence);

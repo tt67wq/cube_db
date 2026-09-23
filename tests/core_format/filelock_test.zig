@@ -26,6 +26,13 @@
 //!     parent only opens after kill -9 + waitpid. No inheritance hazard.
 //!   Children use std.heap.page_allocator: a forked child shares the testing
 //!   allocator's internal state with the parent — never touch it after fork.
+//!
+//! T-62 flock 语义差（防回归注记）：macOS/BSD 的 flock 按进程关联（同进程经新 fd
+//! 再 flock 会转换成功），Linux 严格按 open file description 判冲突——同进程双开、
+//! 或锁持有者死后仍有继承者（fork 复制的 fd 表）存活，都会 error.FileLocked。
+//! 本文件的 fork 子进程入口必须调 closeInheritedFds（本文件 helper），
+//! parent 的 reopen 站点用 openWithRetry（有界重试，仅对 FileLocked）。
+//! 详见 issues/T-62-macos-flock-reopen-ci-red.md；不要删这些卫生调用。
 
 const std = @import("std");
 const cube = @import("cube_db");
@@ -57,6 +64,43 @@ const exit_opened = 7; // child opened successfully (the T-34 bug, post-GREEN im
 const exit_other = 3; // any other error / unexpected path
 
 // ===== A1: same-process second concurrent open is rejected =====
+
+
+// ===== T-62: Linux flock reopen 卫生（本文件独立副本；core_format 目录不引 test_diag） =====
+//
+// macOS/BSD 的 flock 按进程关联（同进程经新 fd 再 flock 会转换成功）；Linux 严格
+// 按 open file description 判冲突——锁持有者死后仍有继承者（fork 复制的 fd 表）存活
+// 时会 error.FileLocked。A3 的子进程入口先关闭继承 fd（保留管道写端），kill+waitpid
+// 后的 reopen 用有界重试（仅对 FileLocked）。详见 issues/T-62-macos-flock-reopen-ci-red.md。
+
+const f62_c = @cImport({
+    @cInclude("unistd.h");
+});
+
+fn closeInheritedFds(except: []const c_int) void {
+    var fd: c_int = 3;
+    while (fd < 1024) : (fd += 1) {
+        var keep = false;
+        for (except) |x| {
+            if (x == fd) keep = true;
+        }
+        if (!keep) _ = f62_c.close(fd);
+    }
+}
+
+fn initStoreWithRetry(path: []const u8, attempts: usize) !FilePageStore {
+    var attempt: usize = 0;
+    while (true) {
+        if (FilePageStore.init(alloc, path)) |fps| {
+            return fps;
+        } else |e| {
+            if (e != error.FileLocked or attempt >= attempts) return e;
+            var req: std.c.timespec = .{ .sec = 0, .nsec = 50_000_000 };
+            _ = std.c.nanosleep(&req, null);
+            attempt += 1;
+        }
+    }
+}
 
 test "filelock A1: second concurrent open of the same path returns error.FileLocked" {
     const path = ".test_filelock_a1.db";
@@ -111,6 +155,8 @@ test "filelock A1-fork: child process open while parent holds is rejected" {
     if (pid == 0) {
         // Child: fresh open → fresh OFD. Post-GREEN this must hit the flock held
         // by the parent's (inherited but unused) fd. RED on main: it opens fine.
+        // T-62: 仍先关继承 fd——锁语义不变（parent 的锁在 parent 自己的 fd 上）。
+        closeInheritedFds(&.{});
         var s = FilePageStore.init(std.heap.page_allocator, pz) catch |err| {
             c._exit(if (err == error.FileLocked) exit_got_lock else exit_other);
         };
@@ -143,6 +189,8 @@ test "filelock A3: kill -9 the holder, the lock is released by the kernel" {
     if (pid < 0) return error.ForkFailed;
     if (pid == 0) {
         _ = c.close(fds[0]);
+        // T-62: 关继承 fd，但保留管道写端 fds[1]（parent 靠它感知锁已持有）
+        closeInheritedFds(&.{fds[1]});
         var s = FilePageStore.init(std.heap.page_allocator, pz) catch c._exit(exit_other);
         _ = c.write(fds[1], "L", 1); // lock (should be) held
         // Hold until killed. sleep in a loop: nanosleep may return early.
@@ -171,6 +219,7 @@ test "filelock A3: kill -9 the holder, the lock is released by the kernel" {
     try std.testing.expectEqual(@as(c_int, c.SIGKILL), status & 0x7f);
 
     // The parent held nothing; the sole holder is dead. Reopen must succeed.
-    var b = try FilePageStore.init(alloc, pz);
+    // T-62: 有界重试——Linux 上 SIGKILL+waitpid 后的瞬态 FileLocked（CI 实证）。
+    var b = try initStoreWithRetry(pz, 10);
     b.deinit();
 }

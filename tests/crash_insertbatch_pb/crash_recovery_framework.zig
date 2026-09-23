@@ -12,6 +12,7 @@ const cube = @import("cube_db");
 const f2 = cube.format;
 const FilePageStore = cube.file_page_store.FilePageStore;
 const Db = cube.Db;
+const tdiag = @import("test_diag.zig");
 
 const alloc = std.testing.allocator;
 
@@ -39,7 +40,7 @@ test "crash_framework: reopen after single commit" {
     const path = ".test_cf_commit.db";
     defer unlinkPath(path);
     {
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
         var db = try Db.open(alloc, fps.store(), .{});
         defer db.close();
@@ -48,7 +49,7 @@ test "crash_framework: reopen after single commit" {
         try txn.commit();
     }
     {
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
         var db = try Db.open(alloc, fps.store(), .{});
         defer db.close();
@@ -64,7 +65,7 @@ test "crash_framework: reopen after 10 alternating commits" {
     defer unlinkPath(path);
     const n = 10;
     {
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
         var db = try Db.open(alloc, fps.store(), .{});
         defer db.close();
@@ -79,7 +80,7 @@ test "crash_framework: reopen after 10 alternating commits" {
         }
     }
     {
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
         var db = try Db.open(alloc, fps.store(), .{});
         defer db.close();
@@ -105,7 +106,7 @@ test "crash_framework: 5 rounds of write + reopen" {
     var vbuf: [16]u8 = undefined;
     for (0..5) |round| {
         {
-            var fps = try FilePageStore.init(alloc, path);
+            var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
             defer fps.deinit();
             var db = try Db.open(alloc, fps.store(), .{});
             defer db.close();
@@ -136,7 +137,7 @@ test "crash_framework: 100 keys batch commit then reopen" {
     defer unlinkPath(path);
     const n: usize = 100;
     {
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
         var db = try Db.open(alloc, fps.store(), .{});
         defer db.close();
@@ -155,7 +156,7 @@ test "crash_framework: 100 keys batch commit then reopen" {
         try txn.commit();
     }
     {
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
         var db = try Db.open(alloc, fps.store(), .{});
         defer db.close();
@@ -174,6 +175,7 @@ test "crash_framework: 100 keys batch commit then reopen" {
 
 /// Child process: write and commit, then exit normally
 fn childCommitExit(path: [:0]const u8, entries: []const struct { []const u8, []const u8 }) noreturn {
+    tdiag.closeInheritedFds(&.{});
     var fps = FilePageStore.init(alloc, path.ptr[0..path.len]) catch c._exit(2);
     defer fps.deinit();
     var db = Db.open(alloc, fps.store(), .{}) catch c._exit(3);
@@ -188,6 +190,7 @@ fn childCommitExit(path: [:0]const u8, entries: []const struct { []const u8, []c
 
 /// Child process: write but _exit without committing (simulated crash)
 fn childCrashNoCommit(path: [:0]const u8, committed: []const struct { []const u8, []const u8 }, uncommitted: []const struct { []const u8, []const u8 }) noreturn {
+    tdiag.closeInheritedFds(&.{});
     var fps = FilePageStore.init(alloc, path.ptr[0..path.len]) catch c._exit(2);
     defer fps.deinit();
     var db = Db.open(alloc, fps.store(), .{}) catch c._exit(3);
@@ -215,7 +218,7 @@ test "crash_framework: fork child commits cleanly, parent sees data" {
 
     // First create the DB
     {
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
     }
 
@@ -229,7 +232,7 @@ test "crash_framework: fork child commits cleanly, parent sees data" {
     _ = c.waitpid(pid, &status, 0);
     try std.testing.expectEqual(@as(c_int, 0), status);
 
-    var fps = try FilePageStore.init(alloc, path);
+    var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
     defer fps.deinit();
     var db = try Db.open(alloc, fps.store(), .{});
     defer db.close();
@@ -244,7 +247,7 @@ test "crash_framework: fork child crashes before commit, uncommitted lost" {
     defer unlinkPath(path);
     // Pre-create DB
     {
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
     }
     const pz = try pathZ(alloc, path);
@@ -259,7 +262,7 @@ test "crash_framework: fork child crashes before commit, uncommitted lost" {
     var status: c_int = 0;
     _ = c.waitpid(pid, &status, 0);
 
-    var fps = try FilePageStore.init(alloc, path);
+    var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
     defer fps.deinit();
     var db = try Db.open(alloc, fps.store(), .{});
     defer db.close();
@@ -287,7 +290,7 @@ test "crash_framework: random keys reopen persists" {
     }
 
     {
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
         var db = try Db.open(alloc, fps.store(), .{});
         defer db.close();
@@ -316,7 +319,7 @@ test "crash_framework: random keys reopen persists" {
         }
     }
     {
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
         var db = try Db.open(alloc, fps.store(), .{});
         defer db.close();
@@ -335,7 +338,7 @@ test "crash_framework: update existing key then reopen" {
     const path = ".test_cf_update.db";
     defer unlinkPath(path);
     {
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
         var db = try Db.open(alloc, fps.store(), .{});
         defer db.close();
@@ -344,7 +347,7 @@ test "crash_framework: update existing key then reopen" {
         try txn.commit();
     }
     {
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
         var db = try Db.open(alloc, fps.store(), .{});
         defer db.close();
@@ -353,7 +356,7 @@ test "crash_framework: update existing key then reopen" {
         try txn.commit();
     }
     {
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
         var db = try Db.open(alloc, fps.store(), .{});
         defer db.close();
@@ -370,7 +373,7 @@ test "crash_framework: delete then reopen" {
     const path = ".test_cf_delete.db";
     defer unlinkPath(path);
     {
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
         var db = try Db.open(alloc, fps.store(), .{});
         defer db.close();
@@ -379,7 +382,7 @@ test "crash_framework: delete then reopen" {
         try txn.commit();
     }
     {
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
         var db = try Db.open(alloc, fps.store(), .{});
         defer db.close();
@@ -388,7 +391,7 @@ test "crash_framework: delete then reopen" {
         try txn.commit();
     }
     {
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
         var db = try Db.open(alloc, fps.store(), .{});
         defer db.close();

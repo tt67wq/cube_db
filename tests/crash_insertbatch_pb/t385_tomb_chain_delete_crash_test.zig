@@ -82,7 +82,7 @@ fn countVisible(db: *Db) !usize {
 
 /// 前置态：400 个 key 全部可见（无墓碑）。
 fn buildPreState(path: []const u8) !void {
-    var fps = try FilePageStore.init(alloc, path);
+    var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
     defer fps.deinit();
     var db = try Db.open(alloc, fps.store(), .{});
     defer db.close();
@@ -95,6 +95,7 @@ fn armedDeleteRange(db: *Db) !void {
 }
 
 fn childCrashAt(comptime tag_name: []const u8, comptime armed: bool, path_z: [:0]const u8) noreturn {
+    tdiag.closeInheritedFds(&.{});
     var fps = FilePageStore.init(alloc, path_z) catch c._exit(2);
     var db = Db.open(alloc, fps.store(), .{}) catch c._exit(3);
     if (armed) {
@@ -111,7 +112,7 @@ fn childCrashAt(comptime tag_name: []const u8, comptime armed: bool, path_z: [:0
 /// 恢复后校验：armed commit 要么整体生效（0 可见），要么整体未生效（N 可见），
 /// 绝不允许中间态；且三口径一致。
 fn checkAfterCrash(path: []const u8, label: []const u8) !bool {
-    var fps = try FilePageStore.init(alloc, path);
+    var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
     defer fps.deinit();
     var db = try Db.open(alloc, fps.store(), .{});
     defer db.close();
@@ -180,7 +181,7 @@ fn checkAfterCrash(path: []const u8, label: []const u8) !bool {
 /// armed 之后再写一轮 + 重开复查（双分配守卫）。
 fn writeRoundAndRecheck(path: []const u8, label: []const u8) !void {
     {
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
         var db = try Db.open(alloc, fps.store(), .{});
         defer db.close();
@@ -188,7 +189,7 @@ fn writeRoundAndRecheck(path: []const u8, label: []const u8) !void {
         try putRange(db, acceptAll); // 打洞路径：全部复活
     }
     {
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
         var db = try Db.open(alloc, fps.store(), .{});
         defer db.close();
@@ -222,7 +223,7 @@ fn runCrashCase(comptime tag_name: []const u8, path: []const u8) !void {
     try buildPreState(path);
     {
         // 前置态自检
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
         var db = try Db.open(alloc, fps.store(), .{});
         defer db.close();
@@ -267,7 +268,7 @@ test "T-38-5-C6 mid_tomb_chain on the deleteRange path needs a MULTI-page chain"
 
     // 先不武装地建一条多页链：逐段 deleteRange（每段 2 个 key 的宽度，400/2=200 段）。
     {
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
         var db = try Db.open(alloc, fps.store(), .{});
         defer db.close();
@@ -290,6 +291,7 @@ test "T-38-5-C6 mid_tomb_chain on the deleteRange path needs a MULTI-page chain"
     const pid = c.fork();
     if (pid < 0) return error.ForkFailed;
     if (pid == 0) {
+        tdiag.closeInheritedFds(&.{});
         var fps = FilePageStore.init(alloc, pz) catch c._exit(2);
         var db = Db.open(alloc, fps.store(), .{}) catch c._exit(3);
         FilePageStore.test_crash_hook = .mid_tomb_chain;
@@ -330,7 +332,7 @@ test "T-38-5-C6 mid_tomb_chain on the deleteRange path needs a MULTI-page chain"
     // 恢复校验（mid2 专属态）：armed 的 deleteRange("z","z~") 要么整体生效
     // （z 全遮蔽，d-key 状态不变），要么整体未生效（z 全可见）。两种都是合法态。
     {
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
         var db = try Db.open(alloc, fps.store(), .{});
         defer db.close();

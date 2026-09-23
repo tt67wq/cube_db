@@ -38,6 +38,7 @@ fn pathZ(allocator: std.mem.Allocator, path: []const u8) ![:0]u8 {
 /// Child process: perform the putBatch write. Optional delay injection points.
 /// mode: 0=exit normally after writing, 1=kill after partial write, 2=kill after write without fsync
 fn childPutBatch(path: [:0]const u8, n: usize, mode: i32) noreturn {
+    tdiag.closeInheritedFds(&.{});
     var fps = FilePageStore.init(alloc, path.ptr[0..path.len]) catch c._exit(2);
     var db = Db.open(alloc, fps.store(), .{ .fsync = true }) catch c._exit(3);
 
@@ -96,7 +97,7 @@ fn forkKill9(path: [:0]const u8, n: usize, mode: i32, kill_delay_ms: i32) !i32 {
 
 /// Verify post-reopen data consistency: must be the complete old state or the complete new state
 fn verifyConsistent(path: []const u8, n: usize) !void {
-    var fps = try FilePageStore.init(alloc, path);
+    var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
     defer fps.deinit();
     var db = try Db.open(alloc, fps.store(), .{});
     defer db.close();
@@ -136,7 +137,7 @@ test "crash_putbatch: normal putBatch+fsync, all data persists" {
     _ = c.waitpid(pid, &status, 0);
     try std.testing.expectEqual(@as(c_int, 0), status);
 
-    var fps = try FilePageStore.init(alloc, path);
+    var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
     defer fps.deinit();
     var db = try Db.open(alloc, fps.store(), .{});
     defer db.close();
@@ -151,7 +152,7 @@ test "crash_putbatch: kill before commit, old state preserved" {
 
     // write a batch of committed data first as the "old state"
     {
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
         var db = try Db.open(alloc, fps.store(), .{});
         defer db.close();
@@ -168,7 +169,7 @@ test "crash_putbatch: kill before commit, old state preserved" {
     _ = status;
 
     // reopen: the old state must be fully preserved
-    var fps = try FilePageStore.init(alloc, path);
+    var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
     defer fps.deinit();
     var db = try Db.open(alloc, fps.store(), .{});
     defer db.close();
@@ -193,7 +194,7 @@ test "crash_putbatch: kill after commit before fsync, consistent state" {
 
     // create the DB first
     {
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
     }
 
@@ -217,7 +218,7 @@ test "crash_putbatch: 10 rounds of kill -9, always consistent" {
     for (0..10) |round| {
         // write a batch of committed data first as the old state
         {
-            var fps = try FilePageStore.init(alloc, path);
+            var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
             defer fps.deinit();
             var db = try Db.open(alloc, fps.store(), .{});
             defer db.close();
@@ -248,7 +249,7 @@ test "crash_putbatch: 1000-entry batch kill -9, consistent" {
     const n: usize = 1000;
 
     {
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
     }
 
