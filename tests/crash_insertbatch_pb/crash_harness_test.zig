@@ -1,11 +1,19 @@
 //! crash_harness_test.zig - P4 TDD: real process-crash harness (fork+kill)
 //! Crash simulation: fork a child that writes (or not) then _exit; the parent reopens and verifies consistency.
 //! COW + atomic meta switching guarantee: uncommitted writes never pollute committed data after a crash.
+//!
+//! T-62 flock 语义差（防回归注记）：macOS/BSD 的 flock 按进程关联（同进程经新 fd
+//! 再 flock 会转换成功），Linux 严格按 open file description 判冲突——同进程双开、
+//! 或锁持有者死后仍有继承者（fork 复制的 fd 表）存活，都会 error.FileLocked。
+//! 本文件的 fork 子进程入口必须调 closeInheritedFds（本文件 helper），
+//! parent 的 reopen 站点用 openWithRetry（有界重试，仅对 FileLocked）。
+//! 详见 issues/T-62-macos-flock-reopen-ci-red.md；不要删这些卫生调用。
 
 const std = @import("std");
 const cube = @import("cube_db");
 const FilePageStore = cube.file_page_store.FilePageStore;
 const Db = cube.Db;
+const tdiag = @import("test_diag.zig");
 
 const alloc = std.testing.allocator;
 
@@ -29,6 +37,7 @@ fn pathZ(allocator: std.mem.Allocator, path: []const u8) ![:0]u8 {
 
 /// Child process: write and commit (fsync), then exit normally
 fn childCommitExit(path: [:0]const u8, k: []const u8, v: []const u8) noreturn {
+    tdiag.closeInheritedFds(&.{});
     var fps = FilePageStore.init(alloc, path) catch c._exit(2);
     defer fps.deinit();
     var db = Db.open(alloc, fps.store(), .{}) catch c._exit(3);
@@ -53,7 +62,7 @@ test "crash harness: child commits cleanly, parent reopens sees data" {
     _ = c.waitpid(pid, &status, 0);
     try std.testing.expectEqual(@as(c_int, 0), status); // child exited normally
 
-    var fps = try FilePageStore.init(alloc, path);
+    var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
     defer fps.deinit();
     var db = try Db.open(alloc, fps.store(), .{});
     defer db.close();
@@ -64,6 +73,7 @@ test "crash harness: child commits cleanly, parent reopens sees data" {
 
 /// Child process: write but _exit before commit (crash) -> parent reopen must not see the write
 fn childCrashBeforeCommit(path: [:0]const u8, committed_k: []const u8, committed_v: []const u8, lost_k: []const u8, lost_v: []const u8) noreturn {
+    tdiag.closeInheritedFds(&.{});
     var fps = FilePageStore.init(alloc, path) catch c._exit(2);
     defer fps.deinit();
     var db = Db.open(alloc, fps.store(), .{}) catch c._exit(3);
@@ -84,7 +94,7 @@ test "crash harness: child crashes before commit, uncommitted write lost, commit
     defer unlinkPath(path);
     // parent creates an empty DB first
     {
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
         var db = try Db.open(alloc, fps.store(), .{});
         defer db.close();
@@ -99,7 +109,7 @@ test "crash harness: child crashes before commit, uncommitted write lost, commit
     var status: c_int = 0;
     _ = c.waitpid(pid, &status, 0);
 
-    var fps = try FilePageStore.init(alloc, path);
+    var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
     defer fps.deinit();
     var db = try Db.open(alloc, fps.store(), .{});
     defer db.close();

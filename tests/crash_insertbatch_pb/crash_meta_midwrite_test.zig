@@ -13,6 +13,7 @@ const cube = @import("cube_db");
 const f2 = cube.format;
 const FilePageStore = cube.file_page_store.FilePageStore;
 const Db = cube.Db;
+const tdiag = @import("test_diag.zig");
 
 const alloc = std.testing.allocator;
 
@@ -38,6 +39,7 @@ fn pathZ(allocator: std.mem.Allocator, path: []const u8) ![:0]u8 {
 /// Child process: putBatch a set of keys with fsync=false, _exit after commit (sync never called).
 /// writeMeta has run (meta page written into mmap) but fsync was not called -> simulates a crash between writeMeta and sync.
 fn childCommitNoSync(path: [:0]const u8, n: usize) noreturn {
+    tdiag.closeInheritedFds(&.{});
     var fps = FilePageStore.init(alloc, path) catch c._exit(2);
     defer fps.deinit();
     // fsync=false: commit goes through writeMeta but skips sync
@@ -63,6 +65,7 @@ fn childCommitNoSync(path: [:0]const u8, n: usize) noreturn {
 /// Child process: putBatch a set of keys with fsync=true, then gets kill -9 mid-commit.
 /// The parent kills after a short delay, which may hit the window between writeMeta and sync.
 fn childCommitKillable(path: [:0]const u8, n: usize) noreturn {
+    tdiag.closeInheritedFds(&.{});
     var fps = FilePageStore.init(alloc, path) catch c._exit(2);
     var db = Db.open(alloc, fps.store(), .{ .fsync = true }) catch c._exit(3);
 
@@ -84,7 +87,7 @@ fn childCommitKillable(path: [:0]const u8, n: usize) noreturn {
 
 /// Verify post-reopen data consistency: all-or-nothing, meta checksum valid
 fn verifyMetaConsistency(path: []const u8, n: usize) !void {
-    var fps = try FilePageStore.init(alloc, path);
+    var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
     defer fps.deinit();
     var db = try Db.open(alloc, fps.store(), .{});
     defer db.close();
@@ -113,7 +116,7 @@ test "crash_meta: fsync=false commit then exit, reopen meta consistent" {
 
     // create an empty DB first
     {
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
     }
 
@@ -142,7 +145,7 @@ test "crash_meta: kill -9 during commit, reopen meta consistent" {
     // write the old state first (committed data)
     const n: usize = 100;
     {
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
         var db = try Db.open(alloc, fps.store(), .{});
         defer db.close();
@@ -164,7 +167,7 @@ test "crash_meta: kill -9 during commit, reopen meta consistent" {
     _ = c.waitpid(pid, &status, 0);
 
     // reopen: old data must be present, new data either all present or all absent
-    var fps = try FilePageStore.init(alloc, path);
+    var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
     defer fps.deinit();
     var db = try Db.open(alloc, fps.store(), .{});
     defer db.close();
@@ -193,7 +196,7 @@ test "crash_meta: 5 rounds of nosync commit, always consistent" {
     defer unlinkPath(path);
 
     {
-        var fps = try FilePageStore.init(alloc, path);
+        var fps = try tdiag.initStoreWithRetry(FilePageStore, alloc, path, 10);
         defer fps.deinit();
     }
 
