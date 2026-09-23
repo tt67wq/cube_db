@@ -1,6 +1,6 @@
 # Issue T-62 — crash 测试的 reopen 站点依赖 macOS 宽容 flock 语义，Linux CI 必红（FileLocked）
 
-- **状态**: fixing（T-62 任务已派 cube_db-pi1）
+- **状态**: closed（43e1e74 三方多签合入 `a76f683`；评审 storm 独立复证 base 5红/fix 0红）
 - **发现于**: CI run 35564844844（09-21）与 35697695176（09-22，main @9c25325）— `Run full test suite` 步骤
 - **失败点**: `crash_harness_test.zig:56` 与 `freelist_persist_crash_test.zig:397`（T5-r），均 `FilePageStore.init → error.FileLocked`
 
