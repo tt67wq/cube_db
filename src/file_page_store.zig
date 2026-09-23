@@ -290,6 +290,16 @@ pub const FilePageStore = struct {
     }
 
     /// Flush the meta buffers to the file (visible in the mmap region)
+    /// T-53-1: 槽页是否全零（全零 = 从未写过任何 meta）。
+    /// 判据基础：双槽协议下「从未提交」当且仅当双槽全零；任何非零槽都证明
+    /// 至少有一次提交尝试。见 vtReadMeta 的 torn 门。
+    fn isZeroPage(page: *const [PAGE_SIZE]u8) bool {
+        for (page) |b| {
+            if (b != 0) return false;
+        }
+        return true;
+    }
+
     fn flushMetaBuffer(self: *FilePageStore, page_no: u32) void {
         const buf = if (page_no == f2.META_PAGE_0) &self.meta0 else &self.meta1;
         const dst = self.pagePtr(page_no);
@@ -717,7 +727,29 @@ pub const FilePageStore = struct {
         // (a cross-process writer may have written)
         @memcpy(self.meta0[0..PAGE_SIZE], self.pagePtr(f2.META_PAGE_0)[0..PAGE_SIZE]);
         @memcpy(self.meta1[0..PAGE_SIZE], self.pagePtr(f2.META_PAGE_1)[0..PAGE_SIZE]);
-        return f2.readMetaPage(&self.meta0, &self.meta1);
+        // T-53-1: torn-meta freshness gate. readMetaPage nulls torn/zeroed
+        // slots, and callers interpreted null as "fresh DB" — with the old
+        // single-slot alternating protocol a single-commit library whose only
+        // written slot was torn (or a double-torn multi-commit library) then
+        // opened fresh with next_free = FIRST_DATA_PAGE, silently overwriting
+        // committed data pages (issues/T-53 adv4b). With the dual-slot meta
+        // protocol (vtWriteMeta writes BOTH slots every commit) "never
+        // committed" is exactly "both slots zeroed": a non-zero unreadable
+        // slot proves a commit attempt, so BOTH slots non-zero-but-unreadable
+        // refuses the open instead of fresh-opening over possibly-committed
+        // data. Exactly one torn slot + one all-zero slot is the protocol's
+        // mid-FIRST-commit shape (meta0 is written before meta1; meta1 can
+        // never be torn while meta0 is still zero) — no committed data can
+        // exist there, so fresh open is the correct recovery. Known residue:
+        // pre-T-53-1 single-commit libraries (old protocol, one written slot)
+        // are fingerprint-identical to that mid-first-commit shape — the
+        // impossibility is documented in the task report.
+        const r = f2.readMetaPage(&self.meta0, &self.meta1) catch |e| return e;
+        if (r) |meta| return meta;
+        if (!isZeroPage(&self.meta0) and !isZeroPage(&self.meta1)) {
+            return error.TornMetaNoFreshEvidence;
+        }
+        return null;
     }
 
     fn vtWriteMeta(ptr: *anyopaque, meta: *const f2.MetaPage) !void {
@@ -770,12 +802,38 @@ pub const FilePageStore = struct {
         self.chain_prev = self.chain_cur;
         self.chain_cur = outcome.owned;
 
-        // (5) Meta write (existing alternating-slot protocol, unchanged).
+        // (5) Meta write — T-53-1 dual-slot protocol (was: alternating single
+        // slot). Why: the old protocol let a single-commit library hold its
+        // meta in ONE slot; tearing that slot left both slots unreadable and
+        // the open path treated the file as fresh (next_free =
+        // FIRST_DATA_PAGE), silently overwriting committed data pages
+        // (issues/T-53 adv4b). Writing BOTH slots every commit makes "never
+        // committed" exactly "both slots zeroed", so vtReadMeta can refuse
+        // ambiguous torn states (error.TornMetaNoFreshEvidence) instead of
+        // fresh-opening them.
+        //
+        // Crash safety is unchanged: at every instant at least one slot holds
+        // the newest fully-written meta.
+        //   - crash before slot 1: both slots = previous state → recovery
+        //     rolls back (same as the old protocol);
+        //   - crash during slot 1: slot 1 torn (unreadable), slot 2 = previous
+        //     valid meta → recovery takes the previous state;
+        //   - crash after slot 1 (before/during slot 2): slot 1 = new valid
+        //     (sequence N+1) → recovery takes the new state — identical to the
+        //     old protocol's post-write window.
+        // The chain-retirement discipline is untouched: chain(N-1) is retired
+        // (step 1) exactly when slot 1 overwrites meta N-1's slot, and meta N
+        // (the fallback if slot 1 tears) keeps chain(N) until commit N+2.
         fireCrashHook(.after_chain_before_meta);
         const page = if (self.meta_index == 0) &self.meta0 else &self.meta1;
         const page_no = if (self.meta_index == 0) f2.META_PAGE_0 else f2.META_PAGE_1;
         f2.writeMetaPage(page, &meta_copy, self.meta_index);
         self.flushMetaBuffer(page_no);
+        // Second (redundant) copy into the other slot — see the rationale above.
+        const page2 = if (self.meta_index == 0) &self.meta1 else &self.meta0;
+        const page_no2 = if (self.meta_index == 0) f2.META_PAGE_1 else f2.META_PAGE_0;
+        f2.writeMetaPage(page2, &meta_copy, 1 - self.meta_index);
+        self.flushMetaBuffer(page_no2);
         self.meta_index = 1 - self.meta_index;
 
         // (6) Meta is in the mmap (the process-crash-model "landed" point); the

@@ -63,10 +63,15 @@ pub const Db = struct {
         // T-53 (T-49/T-50): store.readMeta() now fails with error.InvalidMeta
         // when a meta slot is CRC-valid but unrecognized (bad magic / v1 / v4+)
         // — readMetaPage keeps torn/zeroed slots null (crash-safe fallback to
-        // the other slot), so "null" still means fresh. Invalid is never
-        // treated as fresh — that was the T-49/T-50 silent-empty-open +
-        // data-overwrite bug. FilePageStore's vtReadMeta re-syncs its meta
-        // buffers from the mmap first, so cross-process writers land too.
+        // the other slot). Invalid is never treated as fresh — that was the
+        // T-49/T-50 silent-empty-open + data-overwrite bug.
+        // T-53-1: the remaining "null means fresh" ambiguity is closed at the
+        // FPS layer too (dual-slot meta protocol + torn gate): with both slots
+        // written on every commit, both-slots-zero is the ONLY fresh evidence;
+        // both slots non-zero-but-unreadable fails with error.TornMetaNoFresh-
+        // Evidence instead of silently overwriting committed data pages.
+        // FilePageStore's vtReadMeta re-syncs its meta buffers from the mmap
+        // first, so cross-process writers land too.
         if (try store.readMeta()) |meta| {
             // T-38-3 (R1): root + tomb_head publish as ONE packed word —
             // deleteRange swaps tomb_head from now on, so the phase-2
