@@ -1,109 +1,90 @@
-# T-64 Report — T-53-1 评审 3 NB 集合（usage 文档 / 单撕+单零形态专测 / R3 收紧）
+# T-58 Report — key 尺寸入口校验与 btree 实际容量对齐（复验 + 边界锁死）
 
-- **分支**: `t64-nbs`（基于 main `7b9288c`）
-- **结论**: **GREEN** —— check.sh 5/5 PASS（gate rc=0，含 Linux 容器冒烟）
-- **改动面**: `docs/usage.md`（§4.1 + 错误表两行）+ `tests/txn_writer_db/t535_torn_meta_test.zig`（新增 t5/t6/t7 + 2 个构造 helper，t1-t4 零改动）+ `src/file_page_store.zig`（R3 校验，白名单内唯一 src 文件）
+- **分支**: `t58-keysize`（基于 main `d490c1c`）
+- **结论**: **GREEN** —— check.sh 6/6 PASS（gate rc=0，双平台）；**核心复验结论：issue 的
+  不一致在当前 main 上已不存在**（N-1 已闭合），无 src/ 改动；交付 = 复验证据 +
+  ±1 边界回归锁死 + mutation 验证 + usage.md 真值
+- **src/ 改动**: **0**（白名单内零 diff；理由见「两案择一」）
+- **改动面**: `tests/txn_writer_db/t58_keysize_test.zig`（新，4 用例）+ `docs/usage.md` §3.3 + `.agents/tasks/T-58/check.sh` 入库（git add -f，gate4 验收项）
 
-## 1. usage.md 新错误文档（NB-1）
+## 1. 复验（立项数字必须实测——issue 数字过期）
 
-- 错误表（§4）补两行：`InvalidMeta`（CRC 合法但不被识别 / 槽位伪造）与
-  `TornMetaNoFreshEvidence`（双槽均非零且皆不可读——单次崩溃只可能撕一槽，
-  双撕只能是外源损坏；拒绝当 fresh 以保护可能已提交的数据页）。
-- 新增 **§4.1 打开失败处置**：两错误的形态区分 + 用户处置四步——确认无并行
-  写者（`InvalidMeta` 最常见原因）→ **先备份原文件** → 优先从备份恢复 →
-  确认弃数据才重建，且有条件先 `cube_check scrub`（链接 docs/cube-check.md）
-  诊断，勿盲目 force 重建覆盖现场。
-- 体例沿用既有 §4 错误表 + 小节结构；diff 仅 docs/usage.md。
+实测扫描（MemPageStore，k∈[4020,4070] 逐长度独立建库 putDirect / staged，四 value 剖面）：
 
-## 2. 形态专测 t5/t6（NB-2，只新增不改 t1-t4）
+| value 剖面 | last_ok | 首个错误 | 错误点 |
+|---|---|---|---|
+| empty（0B） | **4051** | KeyTooLarge @4052 | 入口 |
+| "v"（1B） | **4051** | KeyTooLarge @4052 | 入口 |
+| "x"×100 | **4051** | KeyTooLarge @4052 | 入口 |
+| "x"×5000（溢出链） | **4051** | KeyTooLarge @4052 | 入口 |
+| staged "v"（put+flush） | **4051** | KeyTooLarge @4052 | 入口 |
 
-**t5（放行分支直断言）**：构造「恰一槽非零 torn + 另一槽全零」（单提交库 →
-撕 META_PAGE_0 一字节 + 整页清零 META_PAGE_1；构造即 T-53-1 已裁决的
-impossibility 残余指纹，等价 mid-first-commit 形态）：
+**当前真实上界 = 4051 可写 / 4052 入口 `KeyTooLarge`**——与 `MAX_KEY_SIZE` 的推导
+精确一致，入口校验就是首个报错点，**不存在 issue 声称的「4044 可写 / 4045
+commit 期 PayloadTooLarge」**（四剖面 + staged 路径均不复现）。
 
-- `fps.next_free == ps.FIRST_DATA_PAGE`（**next_free 语义**：fresh 判定 →
-  分配指针在数据区起点，不接续已消失的旧提交）
-- 放行后可写：`putDirect` + `get` 正常
-- **无复活**：entryCount==0，被撕槽里的旧提交数据不出现
-- 放行语义跨 reopen 保持（构造即双槽协议下的合法恢复态）
+## 2. 「7 字节」构成拆解（逐项对 src/btree.zig，非猜）
 
-**t6（拒绝路径对照，与 t5 一字节之差）**：同构造但 slot1 撕坏而非清零 →
-双槽均非零且皆不可读 → 必须拒绝。锁死「t5 的放行不是把门整个拆了」。
+`MAX_KEY_SIZE`（btree.zig:173）= `NODE_PAYLOAD_CAP(4068 = PAGE_SIZE 4096 −
+页头 24 − 尾 CRC 4)` − 叶头 **3**（encodeLeafPayload：kind 1 + nkeys 2）− 单
+entry 最小编码 **14**（tombstone 1 + klen 4 + vlen 4 + flags 1 + 溢出页号 4，
+btree.zig:268-277 leafPayloadSize）= **4051**。假设链的最后一环「value 恒可逃
+逸到溢出链（叶内仅占 4B 页号）」由 N-1 的组合感知 `inlineValueBudget` 保证
+（btree.zig:147-159：key+value 组合超页预算时无论 value 多小都走溢出链）。
 
-## 3. R3 收紧（TDD RED→GREEN）
+**issue 的 7 字节差 = vlen(11) − 溢出指针(4)**，是 **N-1（6d1d318，9-15）之前**
+的旧行为：旧判定 value ≤ 3800 一律内联，vlen=11 的 value 在 k=4045 时叶
+payload = 3+10+4045+11 = 4069 > 4068 → commit 期 `PayloadTooLarge`；k=4044
+时恰 4068 = cap → 可写。**4044/4045 与 issue 数字精确吻合**——tester 的实测
+跑在 pre-N-1 基线上（T-57 分支基线早于 9-15），issue 立项（9-20）引用了过期
+数字。N-1 的 RED 测试文件（tests/n1_composite_overflow_test.zig 头注与 #8 系列
+用例）独立佐证了这一机制与时间线。
 
-**手搓 meta 站点 grep 结论**（任务要求先查）：`writeMetaPage`/`META_PAGE_*`
-手搓站点 7 处——open_meta_guard(:109-148)、format_test(:209-292)、
-crc_regression(:57/:216)、meta_corrupt_fuzz(:28)、freelist_persist(:226)、
-range_tombstone_format、page_store_test——**全部槽号与写入 index 匹配**
-（format_test/page_store_test 是纯格式层/内存层，不过 FPS vtReadMeta；
-过 FPS 的站点 idx 均与槽一致）→ 判定不受影响。
+## 3. 两案择一 → **两案都不需要**（理由）
 
-**RED（t7 新增）**：`buildDb(1)` → `copySlotPage(META_PAGE_0 → META_PAGE_1)`
-（字节级把 meta0 复制进 meta1 槽：CRC 是对整页算的，搬页不改字节 → CRC 合法、
-payload 自洽）。修前 `Db.open` 接受（t7 RED 实测：`RED: forged slot-swap meta
-(page_no mismatch) was accepted`）。
+- 案 1（收紧 checkKeySize 到实际可写上限）：实际可写上限**就是** 4051 =
+  `MAX_KEY_SIZE`，checkKeySize 无需收紧；
+- 案 2（入口校验计入 btree 固定开销）：同理已计入（推导即此构成）。
 
-**GREEN**：`src/file_page_store.zig` `vtReadMeta` 顶部（memcpy 重同步之后、
-readMetaPage 与 torn 门之前——必须在 `if (r) |meta| return meta` 快捷返回之前，
-否则合法槽会短路掉伪造槽的检查）新增：
+强行改 src 只会是保守多杀（违反硬约束「别拿保守值交差，±1 精确」）。故 src/
+零改动，错误语义保持入口层（本就正确）。
 
-```zig
-fn slotPageNoMismatch(page: *const [PAGE_SIZE]u8, expected: u32) bool {
-    if (!f2.verifyPageChecksum(page)) return false; // torn/zero → 既有门处理
-    const hdr = f2.decodePageHeader(page[0..f2.PAGE_HEADER_SIZE]);
-    return hdr.page_type == f2.PAGE_TYPE_META and hdr.page_no != expected;
-}
-// vtReadMeta: 任一槽 CRC 合法 META 页 page_no ≠ 槽位页号 → error.InvalidMeta
-```
+## 4. RED→GREEN 的实现方式（mutation 验证，注入物未提交）
 
-错误族归属：与 T-53 的「CRC 合法但不认识 → InvalidMeta」同族（信任链同型号
-松动点），复用既有错误与传播路径（`Db.open` 的 `try store.readMeta()`）。
-torn/zero 页 checksum 先行短路，与 T-53-1 双门零交互。
+复验发现当前态已对齐，契约预设的「当前态红在上限不一致」无从做起（如实记录，
+不造假红）。改用 **mutation 验证**证明边界测试确实锁死该不一致类：临时把
+`MAX_KEY_SIZE` 虚放宽 4B（→4055，即 issue 的「checkKeySize 放行但实际不可写」
+形态）→ **t1/t3/t4 即红**（4052..4055 在 commit 期 PayloadTooLarge，入口却放行）
+→ 还原后全绿。RED 证据成立（注入物已还原，工作区 src/ 干净）。
 
-**回归证据**：t535 全家（t1-t7）rc=0；open_meta_guard / crc_regression /
-meta_corrupt_fuzz / freelist_persist / crash_insertbatch_pb 全 rc=0。
-（`-Dfilter=format` 的红是 T-39 RED-by-design 用例被子串误抓，BASE 上同样红，
-非本次改动——已 stash 对照实证。）
+## 5. 交付物
 
-## 门逐条（bash check.sh <worktree>）
+- **tests/txn_writer_db/t58_keysize_test.zig**（新文件，不改既有测试）：
+  - t1：MAX_KEY_SIZE(4051) 三 value 剖面（empty / 内联恰满 4B / 5000B 溢出链）
+    put+commit 成功、读回逐字节一致
+  - t2：MAX+1(4052) 全入口恰报 `error.KeyTooLarge`（put/putDirect/delete/
+    putBatch/WriteTxn.put），staged 未被写入（入口拒绝先于 staging）
+  - t3：FilePageStore 真落盘 staged put(4051) + flush + reopen 持久；4052 仍入口拒
+  - t4：墓碑面自查——MAX key 的 delete（墓碑 entry 3+10+4051=4064 ≤ 4068）
+    走通且幂等；deleteRange 近-MAX 端点不受 checkKeySize 影响
+    （**item 5**：墓碑端点 4052B 紧凑编码是 `TOMB_PAYLOAD_SIZE` 独立约束面，
+    与入口 key 界正交；t38 家族全绿 = 不误伤实证，含 gate6 容器内 range_tombstone）
+- **docs/usage.md §3.3**：补 key 上限真值 **4051B** + 入口错误语义 +
+  构成说明 + 墓碑端点独立约束说明（原文档无任何 key 上限记载，非「改假值」而是「补真值」）。
+- **check.sh git add -f 入库**（gate4：`git ls-files --error-unmatch` 实证）。
 
-| 门 | 结果 |
-|---|---|
-| gate1 t535（含 t5/t6/R3）×3 无 flake | PASS |
-| gate2 src/ 白名单（仅 file_page_store.zig） | PASS |
-| gate3 usage.md touched | PASS |
-| gate4 macOS 全量 rc=0 fc=0 | PASS |
-| gate5 Linux 容器（t62-debian-arm64，git archive 原生 fs）：t535 + crash_insertbatch_pb | PASS |
-
-RESULT: PASS (5/5)，exit 0。
-
-## 备注
-
-- R3 只收紧 FPS 读门（`vtReadMeta`）；`FilePageStore.init` 保持非失败语义不变
-  （诊断工具仍可打开坏文件，硬门在 Db.open——与 T-53 既有分层一致）。
-  `MemPageStore` 不在白名单且无此攻击面（内存层，无跨进程伪造场景）。
-- `readMetaPageSingle`（单页读，无槽位上下文）不改——crc_regression 等直接
-  调用者语义不变。
-
-## Round 2（回炉：B1/B2，评审 21c678a changes-requested；R1 技术面全部合格已锁定）
-
-- **B1**：`.agents/tasks/T-64/check.sh` 以 `git add -f` 单提交入库（NB3 二犯升级
-  Blocking 的裁决即本提交）；check.sh blob 与 conductor 门完全一致（未改动门逻辑）。
-  自此「check.sh 5/5 PASS」可从分支复现。
-- **B2**：usage.md §4.1 步骤 4 补一行限定——两拒绝态下 `cube_check scrub` 因同一
-  打开门（第一步 `readMeta()`）同样无法运行；scrub 仅适用于可打开文件（如备份
-  恢复副本）；对拒绝打开的原文件只能字节级取证/依赖备份。
-- **NB-1 认账**（不返工）：t6 与 t2 走同一门分支（双非零皆坏），字节偏移差异不
-  构成新分支覆盖；NB-2（单撕+单零形态）的兑现靠 t5 本体，t6 只贡献对照对完整性。
-- 门（按裁决只重跑两项）：gate1（t535×3）+ gate4（check.sh 入库），其余 diff
-  （docs 限定行除外）未动，采信 R1 已锁定的实证。
-
-### R2 门复跑
+## 6. 门退出码（bash check.sh <worktree>）
 
 | 门 | 结果 |
 |---|---|
-| gate1 t535 ×3 无 flake | PASS |
-| gate4 check.sh tracked on branch | PASS |
+| gate1 t58 ×3 无 flake | PASS |
+| gate2 src/ 白名单（db/btree，零 diff 亦过） | PASS |
+| gate3 usage.md updated | PASS |
+| gate4 check.sh tracked on branch（NB3 纪律） | PASS |
+| gate5 macOS 全量 rc=0 fc=0 | PASS |
+| gate6 Linux 容器（t62-debian-arm64 原生 fs）：t58 + range_tombstone | PASS |
 
-RESULT: 两门 PASS（其余门 R1 已锁定，diff 未动）。
+RESULT: PASS (6/6)，exit 0。
+
+（process note：一次 gate6 FAIL 为时序自摆乌龙——gate 在 fix commit 前 archive 了
+HEAD；commit 后复跑即过。评审可无视。）

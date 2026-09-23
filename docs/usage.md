@@ -167,6 +167,14 @@ std.debug.print("hello = {s}\n", .{buf[0..n]});
 
 ### 3.3 写：put / putBatch / delete / flush
 
+**Key 尺寸上限（T-58）**：单条 key 最长 **4051 字节**（`btree.MAX_KEY_SIZE`）。
+超长在**入口**即报 `error.KeyTooLarge`（先于 staging/commit，全入口：`put` /
+`putBatch` / `putDirect` / `delete` / `deleteDirect` / `WriteTxn.put` / `WriteTxn.delete`）。
+value 长度无固定上限（超内联预算自动走溢出页链）。构成：单叶页净荷 4068 字节
+（页 4096 − 页头 24 − 尾 CRC 4）− 叶头 3 − 单 entry 最小编码 14（tombstone 1 +
+klen 4 + vlen 4 + flags 1 + 溢出页号 4）。墓碑端点（`deleteRange` 边界）是
+独立约束面（单端紧凑编码最长 4052B，见 `TOMB_PAYLOAD_SIZE`），不受此限。
+
 ```zig
 try db.put("hello", "world");   // 单条，1 次 commit
 try db.delete("hello");         // tombstone
