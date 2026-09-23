@@ -109,7 +109,7 @@
 
 <div class="note warn" role="note">⚠️ 注意 <b>容量选型：</b>叶 32 entry、branch 64 children 是 4KB 页下的经验值——
 变长 key/value 的实际占用由 <code>leafPayloadSize</code> 动态算，<code>LEAF_MAX_ENTRIES</code> 只卡条数上限。
-若单条 value 极大（&gt; <code>MAX_INLINE_VALUE</code>），走溢出页，不影响条数计数。</div>
+若单条 value 超出内联预算（<code>inlineValueBudget(key)</code>，N-1 复合阈值），走溢出页，不影响条数计数。</div>
 
 <h3 id="s13">1.3 核心数据类型与 COW 总体思路</h3>
 
@@ -215,8 +215,17 @@
 
 <h3 id="s21">2.1 LeafEntry 与内联上限</h3>
 
-<pre><code><span class="cm">/// 最大内联值大小（留余量给页头和多个 entry）</span>
+<pre><code><span class="cm">/// 最大内联值大小（留余量给页头和多个 entry）——两个阈值之一，
+/// 另一个是 key+value 复合上限（N-1）</span>
 <span class="kw">pub const</span> MAX_INLINE_VALUE: <span class="ty">usize</span> = <span class="nu">3800</span>;
+
+<span class="cm">/// N-1: 复合感知的内联预算。value 内联当且仅当
+/// value.len ≤ inlineValueBudget(key.len)；否则走溢出链。</span>
+<span class="kw">pub fn</span> <span class="fn">inlineValueBudget</span>(key_len: <span class="ty">usize</span>) <span class="ty">usize</span> {
+    <span class="kw">const</span> combined = NODE_PAYLOAD_CAP - <span class="nu">3</span> - <span class="nu">10</span>;
+    <span class="kw">if</span> (key_len &gt;= combined) <span class="kw">return</span> <span class="nu">0</span>; <span class="cm">// 饱和：全部溢出</span>
+    <span class="kw">return</span> @<span class="fn">min</span>(MAX_INLINE_VALUE, combined - key_len);
+}
 
 <span class="cm">/// 溢出页最多可存 payload 字节数</span>
 <span class="kw">const</span> OVERFLOW_PAYLOAD: <span class="ty">usize</span> = f2.PAGE_SIZE - f2.PAGE_HEADER_SIZE - <span class="nu">4</span>;
@@ -224,7 +233,10 @@
 <span class="cm">/// flags: 1 = 溢出页</span>
 <span class="kw">const</span> LEAF_FLAG_OVERFLOW: <span class="ty">u8</span> = <span class="nu">1</span>;</code></pre>
 
-<p><code>MAX_INLINE_VALUE = 3800</code> 是内联阈值：value ≤ 3800 字节直接放 leaf payload，&gt; 3800 走溢出页。
+<p><code>MAX_INLINE_VALUE = 3800</code> 是内联阈值之一：另一个是复合上限——页内要能装下
+「叶头 3 + 每条固定 10 字节 + key + value」（N-1）。实际判定用
+<code>inlineValueBudget(key.len) = min(3800, 复合余量)</code>：value ≤ 预算直接放 leaf payload，
+超出则走溢出页——哪怕 value 本身不大，只要 key 很长也可能被推出内联。
 这个值给页头、entry 元数据（每条至少 10 字节开销）和多条 entry 留了余量，避免单条大 value 把叶撑爆。
 <code>OVERFLOW_PAYLOAD = 4068</code> 是单个溢出页能存的数据字节（页头 24B + CRC 4B 之外全可用）。</p>
 
@@ -237,7 +249,7 @@
 };
 
 <span class="kw">fn</span> <span class="fn">needsOverflow</span>(entry: <span class="ty">LeafEntry</span>) <span class="ty">bool</span> {
-    <span class="kw">return</span> entry.value.len > MAX_INLINE_VALUE;
+    <span class="kw">return</span> entry.value.len > <span class="fn">inlineValueBudget</span>(entry.key.len); <span class="cm">// N-1</span>
 }</code></pre>
 
 <div class="note warn" role="note">⚠️ 注意 <b>DecodedLeafEntry.value 的二义性：</b>内联时 <code>value</code> 是 payload 内的字节切片；
@@ -281,7 +293,7 @@ payload 区存 value 的一个 chunk（最多 <code>OVERFLOW_PAYLOAD</code> 字�
 }</code></pre>
 
 <div class="flow">
-<span class="step">value &gt; 3800B</span>
+<span class="step">value 超内联预算</span>
 <span class="arrow">→</span>
 <span class="step">allocPage 首页</span>
 <span class="arrow">→</span>
@@ -324,7 +336,7 @@ value 截断。读取走 <code>readNodePayload</code>（CRC 校验）而非 Fast
     <span class="kw">var</span> n: <span class="ty">usize</span> = <span class="nu">1</span> + <span class="nu">2</span>;  <span class="cm">// kind(1) + count(2)</span>
     <span class="kw">for</span> (entries) |e| {
         <span class="cm">// tombstone(1) + klen(4) + key + vlen(4) + flags(1) + value</span>
-        <span class="kw">const</span> value_sz = <span class="kw">if</span> (e.value.len > MAX_INLINE_VALUE) @as(<span class="ty">usize</span>, <span class="nu">4</span>) <span class="kw">else</span> e.value.len;
+        <span class="kw">const</span> value_sz = <span class="kw">if</span> (e.value.len > <span class="fn">inlineValueBudget</span>(e.key.len)) @as(<span class="ty">usize</span>, <span class="nu">4</span>) <span class="kw">else</span> e.value.len; <span class="cm">// N-1</span>
         n += <span class="nu">1</span> + <span class="nu">4</span> + e.key.len + <span class="nu">4</span> + <span class="nu">1</span> + value_sz;
     }
     <span class="kw">return</span> n;
@@ -342,7 +354,7 @@ value 截断。读取走 <code>readNodePayload</code>（CRC 校验）而非 Fast
     buf[pos] = LEAF_KIND;            pos += <span class="nu">1</span>;
     std.mem.<span class="fn">writeInt</span>(<span class="ty">u16</span>, buf[pos..][<span class="nu">0</span>..<span class="nu">2</span>], @intCast(entries.len), .little); pos += <span class="nu">2</span>;
     <span class="kw">for</span> (entries) |e| {
-        <span class="kw">const</span> is_ov = e.value.len > MAX_INLINE_VALUE;
+        <span class="kw">const</span> is_ov = e.value.len > <span class="fn">inlineValueBudget</span>(e.key.len); <span class="cm">// N-1</span>
         buf[pos] = <span class="kw">if</span> (e.tombstone) @as(<span class="ty">u8</span>, <span class="nu">1</span>) <span class="kw">else</span> <span class="nu">0</span>; pos += <span class="nu">1</span>;
         std.mem.<span class="fn">writeInt</span>(<span class="ty">u32</span>, buf[pos..][<span class="nu">0</span>..<span class="nu">4</span>], @intCast(e.key.len), .little); pos += <span class="nu">4</span>;
         @memcpy(buf[pos..][<span class="nu">0</span>..e.key.len], e.key); pos += e.key.len;
@@ -631,7 +643,7 @@ COW 保证旧页不被改写（写者分配新页），因此切片在调用方�
 
 <h3 id="s51">5.1 insert 入口与 root 溢出重建</h3>
 
-<p><code>insert</code>（btree.zig:1461-1521）是单条写入的对外入口，返回
+<p><code>insert</code>（btree.zig:1497-1561）是单条写入的对外入口，返回
 <code>WriteResult{ new_root, live_delta, count_delta }</code>。它自己不碰 entry 的字节布局，只做三件事：
 空树建档、判定 root 类型后递归、处理只有 root 才会冒泡上来的溢出重建（splice）。子层的活见 §5.2-§5.4，
 本节拆入口本身的三条路。</p>
@@ -683,7 +695,7 @@ flowchart TD
 <ol>
 <li>构造单 entry 数组（key/value 先 <code>allocator.dupe</code>）；</li>
 <li><code>leafPayloadSize</code>（§2.3）预估字节数；</li>
-<li>栈缓冲上 <code>encodeLeafPayload</code>（§2.4）——value 超 <code>MAX_INLINE_VALUE</code>=3800 时
+<li>栈缓冲上 <code>encodeLeafPayload</code>（§2.4）——value 超 <code>inlineValueBudget(key)</code>（N-1 复合阈值）时
 内部自动 <code>writeOverflowPages</code>（§2.2）；</li>
 <li><code>writeNodePage(LEAF, nkeys=1)</code>（§1.4）。</li>
 </ol>
@@ -706,11 +718,11 @@ tombstone 的 value 落盘时按空串处理（dupe 时直接换成 <code>""</co
 <p>细节两则：key/value 先 <code>allocator.dupe</code> 进 entry 数组、encode 完成后由 <code>defer</code>
 立即释放（编码过程只读，caller 切片在此期间并无失效风险，属防御性拷贝）；
 <code>dirty</code> 全程未动——没有旧页要回收，且 <code>encodeLeafPayload</code> 的 dirty 形参
-在实现里本来就是空操作（<code>_ = dirty;</code>，btree.zig:247）。</p>
+在实现里本来就是空操作（<code>_ = dirty;</code>，btree.zig:280）。</p>
 
 <h4>② root 类型判定：payload[0] 一个字节定路由</h4>
 
-<p>非空树先 <code>readNodePayload(store, root)</code>（§1.4，btree.zig:52-58）：CRC 校验后返回
+<p>非空树先 <code>readNodePayload(store, root)</code>（§1.4，btree.zig:52-57）：CRC 校验后返回
 <code>[24 .. 4092)</code> 的 payload 切片。要紧的是：它返回的是<strong>借用</strong>而非拷贝——
 栈上只多一个切片头（ptr+len），数据本体仍在 Store 的页存储里（生产 FilePageStore 是 1TB mmap
 区的裸指针；测试用 MemPageStore 是 <code>AutoHashMap</code> 的 value）。PageStore 接口不保证借用长存：
@@ -780,7 +792,7 @@ branch 溢出改为整层重建打包），旧字段于 T-46 删除。保留这�
 <p><strong>触发条件</strong>：insert 的递归返回 <code>sub.splice != null</code>。
 只有两种来源：root 是叶 → insertIntoLeafSplit 重建了它（§5.2）；root 是 branch →
 insertIntoBranch 自身溢出重建（§5.4）。此时 insert 调 <code>buildBranchLevels(sp.children, sp.keys)</code>
-把重建出的页打包成新 root（btree.zig:1508-1521 的 splice 分支）：</p>
+把重建出的页打包成新 root（btree.zig:1535-1555 的 splice 分支）：</p>
 
 <div class="mermaid">
 flowchart LR
@@ -795,7 +807,7 @@ flowchart LR
 </div>
 
 <ul>
-<li><code>buildBranchLevels</code>（btree.zig:1671，T-37-B 从 insertBatchSplitLeaves 提取）是
+<li><code>buildBranchLevels</code>（btree.zig:1707，T-37-B 从 insertBatchSplitLeaves 提取）是
 “重建层级”的唯一实现：每层按 <code>BRANCH_MAX_CHILDREN</code>=64 <strong>且字节预算</strong>（T-40）
 切块，尾块保持 ≥ 2 children（T-36/T-44），逐层向上压缩到一个 root 页——新高度是
 children 数的<strong>最小可能值</strong>。</li>
@@ -810,17 +822,18 @@ children 数的<strong>最小可能值</strong>。</li>
 <ul>
 <li><strong>btree 层——把废弃页“点名”进 dirty</strong>。insert 入口自己没有对旧 root 做
 <code>dirty.append</code>，但并不遗漏：旧 root 正是递归调用的 page_no，已经在子函数里标记过
-（root 是叶 → §5.2 第④步，btree.zig:1043；root 是 branch → §5.4 递归返回后立即标记，
-btree.zig:1304）。</li>
+（root 是叶 → §5.2 第④步，btree.zig:1079；root 是 branch → §5.4 递归返回后立即标记，
+btree.zig:1340）。</li>
 <li><strong>事务层——物理回收</strong>。writer.zig 的 applyBatch 在事务末尾把 batch_dirty
 加锁搬进 <code>pending_free</code>，最终 <code>store.freePage</code> 归还
 （有活跃读者时延迟到末位读者 flush）。</li>
 </ul>
 
-<p><strong>为什么这是树长高的唯一时机</strong>：非 root 节点的分裂都在 insertIntoBranch
-内部就地消化——分裂成左右两页、上提一个键给父层，对更上层至多表现为“child 指针变了”
-（快路径 patch）；只有 root 上面没有父层可接上提键，分裂结果才冒泡到 insert 入口造
-新 root。高度 +1 当且仅当走这条路。</p>
+<p><strong>为什么这是树长高的唯一时机</strong>：非 root 节点的溢出都在 insertIntoBranch
+内部就地消化——子层以 <code>splice{keys, children}</code> 上抛，父层在 ci 处整合后重编码
+（§5.4 慢路径），自己装得下就返回单个新页，装不下再整层重建、继续上抛；对更上层至多表现为
+“child 指针变了”（快路径 patch）。只有 root 上面没有父层可接上抛的 splice，溢出重建的结果
+才冒泡到 insert 入口调 <code>buildBranchLevels</code> 造新 root。高度 +1 当且仅当走这条路。</p>
 
 <div class="note warn" role="note">⚠️ 注意 <b>nkeys 字段的两义性：</b>同一个页头字段，leaf 页记
 entry 数，branch 页记 children 数（key 数 = nkeys − 1）。新 root branch 是“1 key + 2 children”，
@@ -969,7 +982,7 @@ old_payload[尾部区间 .. entries_end]</code>。尾部区间的起点取决于
 传入的是 <code>old_page_buf</code>（栈副本），不是可能已失效的 <code>readPage</code> 借用。</li>
 <li>否则在第二个栈缓冲 <code>new_payload</code>（大小恰为一个 payload 区：4096 − 24 − 4）里三段拼接：
 写 3B header（kind + 新 count）→ <code>@memcpy</code> 前半段 <code>[3 .. entry_start]</code> →
-手工编码新 entry（tombstone / klen+key / vlen；value 超 <code>MAX_INLINE_VALUE</code>=3800 时置
+手工编码新 entry（tombstone / klen+key / vlen；value 超 <code>inlineValueBudget(key)</code>（N-1 复合阈值）时置
 <code>LEAF_FLAG_OVERFLOW</code> 并现场 <code>writeOverflowPages</code> 写链、内联 4B 首页号）→
 <code>@memcpy</code> 后半段（区间起点按覆盖/插入二选一，终点恒为 <code>entries_end</code>）。</li>
 </ul>
