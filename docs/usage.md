@@ -415,8 +415,11 @@ db.put("k", "v") catch |err| switch (err) {
 1. 先确认没有第二个进程/版本在写同一文件（`InvalidMeta` 的最常见原因）。
 2. 备份原文件后再做任何处置。
 3. 如有同期备份/快照，优先从备份恢复。
-4. 确认要放弃数据时才重建；有条件时先用 `cube_check scrub`（见 docs/cube-check.md）做完整性诊断，
-   不要盲目 force 重建覆盖现场。
+4. 确认要放弃数据时才重建；有条件时先用 `cube_check scrub`（见 docs/cube-check.md）做完整性诊断。
+   **注意（T-64 R2/B2）**：处于这两个错误态时，`cube_check scrub` 因同一打开门
+   （第一步就 `readMeta()`）同样无法运行——scrub 只适用于可打开的文件
+   （如从备份恢复出的副本）；对拒绝打开的原文件只能字节级取证 / 依赖备份，
+   不要指望 scrub 给出诊断报告。
 
 ---
 

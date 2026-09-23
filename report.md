@@ -85,3 +85,25 @@ RESULT: PASS (5/5)，exit 0。
   `MemPageStore` 不在白名单且无此攻击面（内存层，无跨进程伪造场景）。
 - `readMetaPageSingle`（单页读，无槽位上下文）不改——crc_regression 等直接
   调用者语义不变。
+
+## Round 2（回炉：B1/B2，评审 21c678a changes-requested；R1 技术面全部合格已锁定）
+
+- **B1**：`.agents/tasks/T-64/check.sh` 以 `git add -f` 单提交入库（NB3 二犯升级
+  Blocking 的裁决即本提交）；check.sh blob 与 conductor 门完全一致（未改动门逻辑）。
+  自此「check.sh 5/5 PASS」可从分支复现。
+- **B2**：usage.md §4.1 步骤 4 补一行限定——两拒绝态下 `cube_check scrub` 因同一
+  打开门（第一步 `readMeta()`）同样无法运行；scrub 仅适用于可打开文件（如备份
+  恢复副本）；对拒绝打开的原文件只能字节级取证/依赖备份。
+- **NB-1 认账**（不返工）：t6 与 t2 走同一门分支（双非零皆坏），字节偏移差异不
+  构成新分支覆盖；NB-2（单撕+单零形态）的兑现靠 t5 本体，t6 只贡献对照对完整性。
+- 门（按裁决只重跑两项）：gate1（t535×3）+ gate4（check.sh 入库），其余 diff
+  （docs 限定行除外）未动，采信 R1 已锁定的实证。
+
+### R2 门复跑
+
+| 门 | 结果 |
+|---|---|
+| gate1 t535 ×3 无 flake | PASS |
+| gate4 check.sh tracked on branch | PASS |
+
+RESULT: 两门 PASS（其余门 R1 已锁定，diff 未动）。
