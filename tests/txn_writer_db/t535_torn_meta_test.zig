@@ -23,6 +23,7 @@ const c = @cImport({
 });
 const cube = @import("cube_db");
 const f2 = cube.format;
+const ps = cube.page_store;
 const FilePageStore = cube.file_page_store.FilePageStore;
 const dbi = cube.db;
 
@@ -38,6 +39,45 @@ fn unlinkPath(path: []const u8) void {
 
 fn pathZ(path: []const u8) ![:0]u8 {
     return try alloc.dupeZ(u8, path);
+}
+
+/// 把槽页 page_no 整页清零（T-64 t5：「一撕 + 一零」形态的零侧构造）。
+fn zeroSlotPage(path: []const u8, page_no: u32) !void {
+    var pbuf: [256]u8 = undefined;
+    if (path.len >= pbuf.len) return error.PathTooLong;
+    @memcpy(pbuf[0..path.len], path);
+    pbuf[path.len] = 0;
+
+    const fd = c.open(@ptrCast(&pbuf), @as(c_int, c.O_RDWR));
+    if (fd < 0) return error.OpenFailed;
+    defer _ = c.close(fd);
+
+    const zeros = [_]u8{0} ** f2.PAGE_SIZE;
+    const abs_off: c.off_t = @intCast(@as(u64, page_no) * f2.PAGE_SIZE);
+    const wn = c.pwrite(fd, &zeros, f2.PAGE_SIZE, abs_off);
+    if (wn != @as(isize, f2.PAGE_SIZE)) return error.WriteFailed;
+    if (c.fsync(fd) != 0) return error.SyncFailed;
+}
+
+/// 字节级把 from_slot 页复制到 to_slot 页（T-64 t7/R3：CRC 合法的槽位伪造）。
+fn copySlotPage(path: []const u8, from_slot: u32, to_slot: u32) !void {
+    var pbuf: [256]u8 = undefined;
+    if (path.len >= pbuf.len) return error.PathTooLong;
+    @memcpy(pbuf[0..path.len], path);
+    pbuf[path.len] = 0;
+
+    const fd = c.open(@ptrCast(&pbuf), @as(c_int, c.O_RDWR));
+    if (fd < 0) return error.OpenFailed;
+    defer _ = c.close(fd);
+
+    var page: [f2.PAGE_SIZE]u8 = undefined;
+    const from_off: c.off_t = @intCast(@as(u64, from_slot) * f2.PAGE_SIZE);
+    const to_off: c.off_t = @intCast(@as(u64, to_slot) * f2.PAGE_SIZE);
+    const rn = c.pread(fd, &page, f2.PAGE_SIZE, from_off);
+    if (rn != @as(isize, f2.PAGE_SIZE)) return error.ReadFailed;
+    const wn = c.pwrite(fd, &page, f2.PAGE_SIZE, to_off);
+    if (wn != @as(isize, f2.PAGE_SIZE)) return error.WriteFailed;
+    if (c.fsync(fd) != 0) return error.SyncFailed;
 }
 
 /// 把槽页 page_no 的第 `off` 字节按位取反（破坏 CRC → torn，且保持非零）。
@@ -213,4 +253,85 @@ test "t535 t4: genuinely fresh db (both slots zero) still opens writable" {
     const got = try db.get("a");
     defer if (got) |v| alloc.free(v);
     try std.testing.expectEqualStrings("1", got.?);
+}
+
+// =====================================================================
+// t5 — T-64/NB-2（形态专测）：恰一槽非零 torn + 另一槽全零 → fresh 放行
+//
+// 这是双槽协议下「首提交中途 crash」的合法恢复态（无已提交数据，fresh 即
+// 正确恢复；判据表第二行）。此前只被 crash 家族间接覆盖，无直断言——防未来
+// 重构把该形态误接进拒绝分支。构造方式：单提交库（双槽均非零）→ 整页清零
+// slot1 + 撕 slot1... 即撕 slot0、清零 slot1 → 指纹与 mid-first-commit 全同
+//（构造即 T-53-1 已裁决的 impossibility 残余形态）。断言面：放行、可写、
+// next_free 语义（fresh = FIRST_DATA_PAGE）、无数据复活、reopen 保持。
+// =====================================================================
+test "t535 t5: one-torn-plus-one-zero slot shape opens fresh (mid-first-commit recovery)" {
+    const path = ".test_t535_mixed_shape.db";
+    defer unlinkPath(path);
+    try buildDb(path, 1); // 双槽协议：单提交即双槽均非零
+
+    // slot0 撕（非零坏），slot1 整页清零 → 「恰一撕 + 一零」形态
+    try corruptSlotByte(path, f2.META_PAGE_0, 200);
+    try zeroSlotPage(path, f2.META_PAGE_1);
+
+    var fps = try FilePageStore.init(alloc, path);
+    defer fps.deinit();
+    // next_free 语义：fresh 判定 → 分配指针在数据区起点（不接续已消失的旧提交）
+    try std.testing.expectEqual(ps.FIRST_DATA_PAGE, fps.next_free);
+
+    var db = try dbi.Db.open(alloc, fps.store(), .{});
+    defer db.close();
+    // 无数据复活：被撕槽里的旧提交数据不出现（fresh 语义）
+    try std.testing.expectEqual(@as(u64, 0), db.entryCount());
+    if (try db.get("keep0")) |v| {
+        alloc.free(v);
+        return error.ResurrectedFromTornSlot;
+    }
+    // 放行后可写
+    try db.putDirect("post", "v");
+    const got = try db.get("post");
+    defer if (got) |vv| alloc.free(vv);
+    try std.testing.expectEqualStrings("v", got.?);
+}
+
+// 拒绝路径对照（与 t5 同构造、一字节之差）：slot1 不清零而是撕坏 →
+// 双槽均非零且皆不可读 → 必须拒绝。锁死「t5 的放行不是门被拆掉」。
+test "t535 t6: the same construction with slot1 torn (not zeroed) is refused — contrast to t5" {
+    const path = ".test_t535_contrast.db";
+    defer unlinkPath(path);
+    try buildDb(path, 1);
+
+    try corruptSlotByte(path, f2.META_PAGE_0, 200);
+    try corruptSlotByte(path, f2.META_PAGE_1, 400); // 撕而非清零 → 双非零坏
+
+    var fps = try FilePageStore.init(alloc, path);
+    defer fps.deinit();
+    if (dbi.Db.open(alloc, fps.store(), .{})) |db| {
+        db.close();
+        std.debug.print("\nRED: contrast shape (both torn) was accepted (t535 t6)\n", .{});
+        return error.AcceptedTornMetaAsFresh;
+    } else |_| {}
+}
+
+// =====================================================================
+// t7 — T-64/R3：CRC 合法的 meta 页落在错误槽位（page_no ≠ 槽位页号）→ 拒绝
+//
+// 攻击面（T-53-1 report R3）：字节级把 meta0 复制到 meta1 槽——CRC 仍合法
+//（CRC 是对整页算的，搬页不改字节）、payload 自洽，修前被当有效 meta 接受。
+// 修后 vtReadMeta 校验 hdr.page_no 与槽位对应 → error.InvalidMeta。
+// =====================================================================
+test "t535 t7: CRC-valid meta page forged into the wrong slot (page_no mismatch) is refused" {
+    const path = ".test_t535_forge_slot.db";
+    defer unlinkPath(path);
+    try buildDb(path, 1);
+
+    try copySlotPage(path, f2.META_PAGE_0, f2.META_PAGE_1); // meta0 → meta1 槽，字节级
+
+    var fps = try FilePageStore.init(alloc, path);
+    defer fps.deinit();
+    if (dbi.Db.open(alloc, fps.store(), .{})) |db| {
+        db.close();
+        std.debug.print("\nRED: forged slot-swap meta (page_no mismatch) was accepted (t535 t7)\n", .{});
+        return error.AcceptedForgedMetaSlot;
+    } else |_| {}
 }
