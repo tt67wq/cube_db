@@ -12,6 +12,68 @@
 const std = @import("std");
 const Io = std.Io;
 
+// ===== T-61-1: 真 fuzz seed（区别于 zig build --seed 的图遍历随机） =====
+//
+// CUBE_FUZZ_SEED 环境变量优先（build.zig 的 -Dfuzz-seed=<n> 转发，或手动
+// export）；支持 0x 前缀 hex 与十进制。未设/非法时回退 std.testing.random_seed。
+//
+// 打印策略（T-54-B/T-61-1 R2 裁决：listen 模式下测试二进制任何 stderr 输出都会被
+// build_runner 当作 result_stderr 回显成 "failed command:" 行，绿 run 也算——
+// 无条件回显会炸掉所有 fc=0 门）——
+//   - 显式设 seed：回显 `fuzz seed=0x…` 仅在 CUBE_TEST_VERBOSE=1 下（tdiag 同款
+//     约定；与 `-Dfuzz-seed` + 跑门并用时必须零噪音，B1 修复）
+//   - 非法 seed：verbose 门控告警（NB1：用户以为固定了其实没有）
+//   - 未设（CI 默认）：成功路径零输出；失败时由 fuzzLoop/fuzzLongRun 打
+//     `fuzz seed=0x…` + 复现提示 —— 红的时候 CI 日志可直接抄。
+// （契约原文「stdout + 每次开跑都印」在 --listen=- 下物理不可实现：stdout 是
+// runner IPC 协议通道，stderr 必撞 fc 噪音 —— 见 T-61-1 review B1 裁决。）
+var seed_printed = false;
+var cached_verbose: ?bool = null;
+
+/// CUBE_TEST_VERBOSE（test_diag.zig 同款约定：值非空且非 "0" 即开，进程内缓存）。
+fn verbose() bool {
+    if (cached_verbose) |v| return v;
+    const v = if (std.c.getenv("CUBE_TEST_VERBOSE")) |s| blk: {
+        const val = std.mem.span(s);
+        break :blk val.len > 0 and !std.mem.eql(u8, val, "0");
+    } else false;
+    cached_verbose = v;
+    return v;
+}
+
+pub fn resolveSeed() u64 {
+    if (std.c.getenv("CUBE_FUZZ_SEED")) |raw| {
+        const v = std.mem.span(raw);
+        if (parseSeed(v)) |s| {
+            if (verbose()) printSeed(s); // B1: 显式回显仅 verbose 门控
+            return s;
+        }
+        if (verbose()) std.debug.print("T-61-1: ignoring invalid CUBE_FUZZ_SEED='{s}' — using random seed\n", .{v}); // NB1
+    }
+    return std.testing.random_seed;
+}
+
+/// 失败路径复现提示：fuzzLoop/fuzzLongRun 的 target 出错时调用（进程内一次）。
+pub fn printSeedOnFailure(seed: u64) void {
+    if (seed_printed) return;
+    seed_printed = true;
+    std.debug.print("fuzz seed=0x{x} — replay with: CUBE_FUZZ_SEED=0x{x}\n", .{ seed, seed });
+}
+
+fn printSeed(seed: u64) void {
+    if (seed_printed) return;
+    seed_printed = true;
+    std.debug.print("fuzz seed=0x{x}\n", .{seed});
+}
+
+fn parseSeed(v: []const u8) ?u64 {
+    if (v.len == 0) return null;
+    if (std.mem.startsWith(u8, v, "0x") or std.mem.startsWith(u8, v, "0X")) {
+        return std.fmt.parseInt(u64, v[2..], 16) catch null;
+    }
+    return std.fmt.parseInt(u64, v, 10) catch null;
+}
+
 /// Maximum iterations for a smoke fuzz run (CI: 30s ≈ 100k iterations).
 pub const SMOKE_ITERS: usize = 100_000;
 
@@ -40,7 +102,10 @@ pub fn fuzzLoop(
         const len = rand.intRangeAtMost(usize, 0, MAX_INPUT_BYTES);
         rand.bytes(input_buf[0..len]);
         var smith = std.testing.Smith{ .in = input_buf[0..len] };
-        try target(context, &smith);
+        target(context, &smith) catch |e| {
+            printSeedOnFailure(seed); // T-61-1: 红 run 的 CI 日志可直接抄 seed
+            return e;
+        };
     }
     return i;
 }
@@ -70,7 +135,10 @@ pub fn fuzzLongRun(
         const len = rand.intRangeAtMost(usize, 0, MAX_INPUT_BYTES);
         rand.bytes(input_buf[0..len]);
         var smith = std.testing.Smith{ .in = input_buf[0..len] };
-        try target(context, &smith);
+        target(context, &smith) catch |e| {
+            printSeedOnFailure(seed); // T-61-1: 红 run 的 CI 日志可直接抄 seed
+            return e;
+        };
         i += 1;
     }
     return i;

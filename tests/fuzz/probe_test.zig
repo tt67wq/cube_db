@@ -16,7 +16,7 @@ fn probeTestOne(ctx: *usize, smith: *std.testing.Smith) !void {
 
 test "fuzz probe — smoke (1000 random iters)" {
     var ctx: usize = 0;
-    const seed = std.testing.random_seed;
+    const seed = fuzz.resolveSeed(); // T-61-1: CUBE_FUZZ_SEED 优先，实际 seed 总会打印
     _ = try fuzz.fuzzLoop(usize, &ctx, probeTestOne, 1000, seed);
 }
 
@@ -40,7 +40,7 @@ test "fuzz probe — deterministic corpus replay from known inputs" {
 
 test "fuzz probe — long run stops at 50ms deadline" {
     var ctx: usize = 0;
-    const seed = std.testing.random_seed;
+    const seed = fuzz.resolveSeed(); // T-61-1: CUBE_FUZZ_SEED 优先，实际 seed 总会打印
     const start_ns = std.Io.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .awake).nanoseconds;
     const iters = try fuzz.fuzzLongRun(usize, &ctx, probeTestOne, 50, seed);
     const elapsed_ns = std.Io.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .awake).nanoseconds - start_ns;

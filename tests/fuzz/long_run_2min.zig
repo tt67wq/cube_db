@@ -26,7 +26,7 @@ fn fmtLongRun(ctx: *usize, smith: *std.testing.Smith) !void {
 
 test "Format 2min long run" {
     var ctx: usize = 0;
-    const seed = std.testing.random_seed;
+    const seed = fuzz.resolveSeed(); // T-61-1: CUBE_FUZZ_SEED 优先，实际 seed 总会打印
     _ = try fuzz.fuzzLongRun(usize, &ctx, fmtLongRun, 120_000, seed);
     std.debug.print("  Format: {d} iters in 2m\n", .{fmt_iters});
 }

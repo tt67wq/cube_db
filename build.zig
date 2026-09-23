@@ -78,6 +78,10 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const bench_scale = b.option([]const u8, "bench-scale", "Bench scale filter: all|small|large") orelse "all";
+    // T-61-1: 真 fuzz seed（区别于 zig build 自身的 --seed 图遍历选项）。
+    // 设置时以 CUBE_FUZZ_SEED 环境变量转发给所有测试二进制；fuzz 测试优先读它，
+    // 未设则随机并在测试开始时打印实际 seed。不设时行为完全不变。
+    const fuzz_seed = b.option([]const u8, "fuzz-seed", "Fix the fuzz seed (hex like 0xc0ffee or decimal); forwarded as CUBE_FUZZ_SEED");
     const zio_mod = b.dependency("zio", .{ .target = target, .optimize = optimize }).module("zio");
     const mod = b.addModule("cube_db", .{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize });
     mod.addImport("zio", zio_mod);
@@ -133,6 +137,7 @@ pub fn build(b: *std.Build) void {
         const is_freelist = std.mem.eql(u8, rel, "core_format/freelist_amp_red_test.zig"); // 裁决 2
         const is_shard = std.mem.startsWith(u8, rel, "insertbatch_sweep_"); // T-54-C 分片 ~45s×4
         const run = testRun(b, target, optimize, mod, zio_mod, cube_check_mod, part_mod, path);
+        if (fuzz_seed) |s| run.setEnvironmentVariable("CUBE_FUZZ_SEED", s); // T-61-1
         if (!is_long_run and !is_freelist) test_step.dependOn(&run.step);
         if (std.mem.startsWith(u8, rel, "fuzz/") and !is_long_run) fuzz_step.dependOn(&run.step);
         if (is_long_run) long_run_step.dependOn(&run.step);
