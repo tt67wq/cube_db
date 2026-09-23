@@ -1,6 +1,6 @@
 # Issue T-63 — 流程事故：worker 把 impl commit 落在 conductor 主 checkout，差点产生假合入
 
-- **状态**: open
+- **状态**: open（**2026-09-23 复发**：T-53-1 轮 pi1 再次把分支 checkout+commit 落在主 checkout，conductor 的 `git merge`/gate 差点再踩一次；建议措施优先级升为「契约模板必含硬约束行 + conductor merge 前机械断言」，两者均已进 T-61-1 交付物）
 - **发现于**: T-62 合入环节（conductor 自查，main @ a76f683 之前）
 - **症状**: 主 checkout 的 reflog 出现 `checkout: moving from main to t62-flock-reopen` + `commit: fix(T-62)`——修复 commit 实际写在 **conductor 的 main 工作目录**（pi1 的 worktree 是 quiet-forest-161d，本不应碰主 checkout）
 - **后果（已避开）**: conductor 在主 checkout 执行 `git merge --no-ff t62-flock-reopen` 时变成"merge 自己"→ "Already up to date"，且 `git push origin main` 推的是**不含修复的 9c25325**。若没核对 `git rev-parse HEAD main` 的差异，CI 会继续红且归因错误
