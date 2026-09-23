@@ -289,6 +289,15 @@ pub const FilePageStore = struct {
         return self.mmap_ptr + @as(usize, @intCast(page_no)) * PAGE_SIZE;
     }
 
+    /// T-64 (R3): true iff the page is a CRC-valid META page whose header
+    /// page_no doesn't match the slot it sits in (forged/swapped slot).
+    /// Checksum-invalid pages return false — they belong to the torn gate.
+    fn slotPageNoMismatch(page: *const [PAGE_SIZE]u8, expected: u32) bool {
+        if (!f2.verifyPageChecksum(page)) return false;
+        const hdr = f2.decodePageHeader(page[0..f2.PAGE_HEADER_SIZE]);
+        return hdr.page_type == f2.PAGE_TYPE_META and hdr.page_no != expected;
+    }
+
     /// Flush the meta buffers to the file (visible in the mmap region)
     /// T-53-1: 槽页是否全零（全零 = 从未写过任何 meta）。
     /// 判据基础：双槽协议下「从未提交」当且仅当双槽全零；任何非零槽都证明
@@ -727,6 +736,17 @@ pub const FilePageStore = struct {
         // (a cross-process writer may have written)
         @memcpy(self.meta0[0..PAGE_SIZE], self.pagePtr(f2.META_PAGE_0)[0..PAGE_SIZE]);
         @memcpy(self.meta1[0..PAGE_SIZE], self.pagePtr(f2.META_PAGE_1)[0..PAGE_SIZE]);
+        // T-64 (R3): a CRC-valid META page whose header page_no doesn't match
+        // its slot is not a legitimate meta for this position (byte-level
+        // forgery / slot swap — e.g. copying meta0 onto the meta1 slot leaves
+        // the checksum valid). Same trust-chain family as T-53's
+        // unrecognized-magic gate: refuse with error.InvalidMeta. Torn/zero
+        // pages are unaffected (checksum fails first → torn 门/零性门处理).
+        if (slotPageNoMismatch(&self.meta0, f2.META_PAGE_0) or
+            slotPageNoMismatch(&self.meta1, f2.META_PAGE_1))
+        {
+            return error.InvalidMeta;
+        }
         // T-53-1: torn-meta freshness gate. readMetaPage nulls torn/zeroed
         // slots, and callers interpreted null as "fresh DB" — with the old
         // single-slot alternating protocol a single-commit library whose only

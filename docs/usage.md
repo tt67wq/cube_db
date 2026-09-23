@@ -388,6 +388,8 @@ compact 是 O(1) 的（meta 页切换，不重写数据）。
 | `PageNotFound` | 页号无效（文件损坏） |
 | `MapFull` | 页空间耗尽（mapsize 不足） |
 | `FileLocked` | 文件已被另一个打开者锁定（T-34 多进程防护，见下节） |
+| `InvalidMeta` | meta 页 CRC 合法但不被识别（其它/更新版本写入器产生，或 meta 槽位伪造——page_no 与槽位不符，T-64/R3）|
+| `TornMetaNoFreshEvidence` | 双 meta 槽均非零且皆不可读（T-53-1）：单次崩溃只可能撕一槽，双撕只能来自外源损坏——拒绝当 fresh 打开以保护可能已提交的数据页（T-49 同族数据破坏面） |
 
 ```zig
 db.put("k", "v") catch |err| switch (err) {
@@ -395,6 +397,26 @@ db.put("k", "v") catch |err| switch (err) {
     else => return err,
 };
 ```
+
+### 4.1 打开失败：`InvalidMeta` 与 `TornMetaNoFreshEvidence` 的处置（T-53-1/T-64）
+
+`Db.open` 读到既非「有效 meta」也非「全新库（双槽全零）」的 meta 态时拒绝打开，
+而不是静默当 fresh——当 fresh 会把分配指针重置到数据区起点，后续写入覆盖既有
+数据页。两个错误对应两种形态：
+
+- **`InvalidMeta`**：某槽 CRC 合法但 magic/version 不被识别（别的/更新的二进制写过），
+  或 meta 页被搬到错误槽位（`page_no` 与槽不符）。
+- **`TornMetaNoFreshEvidence`**：双槽均非零但皆不可读（CRC 坏）。协议保证单次崩溃
+  只会撕坏一个槽（另一槽保有上一提交），双撕只能是外源损坏（磁盘坏块、误写、
+  蓄意破坏）。
+
+**用户处置**：拿到这两个错误说明文件异常，**切勿删除重建**（会丢掉可能尚在的数据）：
+
+1. 先确认没有第二个进程/版本在写同一文件（`InvalidMeta` 的最常见原因）。
+2. 备份原文件后再做任何处置。
+3. 如有同期备份/快照，优先从备份恢复。
+4. 确认要放弃数据时才重建；有条件时先用 `cube_check scrub`（见 docs/cube-check.md）做完整性诊断，
+   不要盲目 force 重建覆盖现场。
 
 ---
 
