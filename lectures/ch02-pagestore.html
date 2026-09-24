@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 2 章 · PageStore 抽象 —— 把磁盘变成可替换的插头</title>
+<style>
+  :root {
+    --bg: #f7f8fa;
+    --card: #ffffff;
+    --ink: #24292f;
+    --muted: #6b7280;
+    --accent: #2563eb;
+    --accent-soft: #dbeafe;
+    --green: #16a34a;
+    --green-soft: #dcfce7;
+    --orange: #d97706;
+    --orange-soft: #fef3c7;
+    --purple: #7c3aed;
+    --purple-soft: #ede9fe;
+    --red: #dc2626;
+    --red-soft: #fee2e2;
+    --border: #e5e7eb;
+    --mono: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0 16px 80px;
+    background: var(--bg); color: var(--ink);
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+    line-height: 1.75; font-size: 16px;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; }
+  header.hero {
+    background: linear-gradient(135deg, #1e3a8a, #2563eb);
+    color: #fff; border-radius: 0 0 18px 18px;
+    padding: 40px 32px 32px; margin: 0 -16px 32px;
+  }
+  header.hero h1 { margin: 0 0 8px; font-size: 30px; }
+  header.hero p { margin: 4px 0; opacity: .92; }
+  header.hero .tag {
+    display: inline-block; background: rgba(255,255,255,.18);
+    border-radius: 999px; padding: 2px 12px; font-size: 13px; margin-right: 6px;
+  }
+  header.hero .navlinks a { color: #fff; opacity: .85; }
+  nav.toc {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 12px; padding: 18px 24px; margin-bottom: 28px;
+  }
+  nav.toc h2 { margin: 0 0 8px; font-size: 16px; color: var(--muted); }
+  nav.toc ol { margin: 0; padding-left: 22px; }
+  nav.toc a { color: var(--accent); text-decoration: none; }
+  nav.toc a:hover { text-decoration: underline; }
+  section {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 14px; padding: 26px 30px; margin-bottom: 26px;
+  }
+  h2 {
+    font-size: 22px; margin: 0 0 14px;
+    padding-bottom: 10px; border-bottom: 2px solid var(--accent-soft);
+  }
+  h2 .no {
+    display: inline-block; background: var(--accent); color: #fff;
+    width: 30px; height: 30px; line-height: 30px; text-align: center;
+    border-radius: 8px; font-size: 15px; margin-right: 10px;
+  }
+  h3 { font-size: 17px; margin: 22px 0 8px; }
+  p { margin: 10px 0; }
+  code {
+    font-family: var(--mono); font-size: 87%;
+    background: #eef1f5; border-radius: 5px; padding: 1px 6px;
+  }
+  pre {
+    font-family: var(--mono); font-size: 13.5px; line-height: 1.6;
+    background: #0f172a; color: #e2e8f0; border-radius: 10px;
+    padding: 16px 18px; overflow-x: auto; margin: 14px 0;
+  }
+  pre .c { color: #94a3b8; }
+  pre .k { color: #93c5fd; }
+  pre .s { color: #fcd34d; }
+  .analogy {
+    background: var(--orange-soft); border-left: 4px solid var(--orange);
+    border-radius: 0 10px 10px 0; padding: 12px 18px; margin: 14px 0;
+  }
+  .analogy::before { content: "🍊 类比"; display: block; font-weight: 700; color: var(--orange); margin-bottom: 4px; }
+  .keypoint {
+    background: var(--green-soft); border-left: 4px solid var(--green);
+    border-radius: 0 10px 10px 0; padding: 12px 18px; margin: 14px 0;
+  }
+  .keypoint::before { content: "💡 划重点"; display: block; font-weight: 700; color: var(--green); margin-bottom: 4px; }
+  .why {
+    background: var(--purple-soft); border-left: 4px solid var(--purple);
+    border-radius: 0 10px 10px 0; padding: 12px 18px; margin: 14px 0;
+  }
+  .why::before { content: "❓ 为什么这么设计"; display: block; font-weight: 700; color: var(--purple); margin-bottom: 4px; }
+  table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 15px; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: #f0f3f8; }
+  td code { white-space: nowrap; }
+  .file { font-family: var(--mono); font-size: 13.5px; color: var(--accent); font-weight: 600; }
+  figure {
+    background: #fbfcfe; border: 1px dashed #c7d2e3; border-radius: 12px;
+    padding: 18px; margin: 18px 0; text-align: center; overflow-x: auto;
+  }
+  figcaption { color: var(--muted); font-size: 13.5px; margin-top: 8px; }
+  .diagram-label { font-size: 13px; font-family: var(--mono); }
+  svg text { font-family: -apple-system, "PingFang SC", sans-serif; }
+  svg .mono { font-family: var(--mono); }
+  ul.checklist { list-style: none; padding-left: 4px; }
+  ul.checklist li { margin: 6px 0; }
+  ul.checklist li::before { content: "☑ "; color: var(--green); font-weight: 700; }
+  footer { color: var(--muted); font-size: 13.5px; text-align: center; margin-top: 40px; }
+  .pill { display:inline-block; border-radius:999px; padding:1px 10px; font-size:12.5px; font-weight:600; margin-right:4px; }
+  .pill.blue { background: var(--accent-soft); color: var(--accent); }
+  .pill.green { background: var(--green-soft); color: var(--green); }
+  .pill.purple { background: var(--purple-soft); color: var(--purple); }
+</style>
+</head>
+<body>
+<header class="hero">
+  <div class="wrap">
+    <h1>第 2 章 · PageStore 抽象</h1>
+    <p>把磁盘变成可替换的插头 —— 本章兼作一节 Zig 语言补课</p>
+    <p>
+      <span class="tag">主角代码：src/page_store.zig（261 行）</span>
+      <span class="tag">配角：src/file_page_store.zig 概览</span>
+    </p>
+    <p class="navlinks">
+      <a href="ch01-format.html">← 上一章：页与文件格式</a> ·
+      <a href="ch03-btree-read.html">下一章：B-tree 读路径 →</a>
+    </p>
+  </div>
+</header>
+
+<div class="wrap">
+
+<nav class="toc">
+  <h2>本章目录</h2>
+  <ol>
+    <li><a href="#s1">Zig 没有 interface：手工 vtable 多态</a></li>
+    <li><a href="#s2">接口只切四刀：allocPage / freePage / readPage / writePage</a></li>
+    <li><a href="#s3">MemPageStore：纯内存实现，给谁用</a></li>
+    <li><a href="#s4">页号从 3 开始：三个特殊席位</a></li>
+    <li><a href="#s5">分层收益复盘 + 动手小实验</a></li>
+    <li><a href="#s6">本章自测</a></li>
+  </ol>
+</nav>
+
+<!-- ============ 2.1 ============ -->
+<section id="s1">
+  <h2><span class="no">1</span>Zig 没有 interface：手工 vtable 多态长什么样</h2>
+
+  <p><strong>是什么</strong>：你可能用过 Java 的 <code>interface</code>、Go 的 <code>interface{}</code>、C++ 的虚函数——
+  它们都是「多态」：<em>同一段调用代码，运行时可以接到不同实现上</em>。Zig 语言故意不提供这个语法，
+  于是 cube_db 在 <span class="file">src/page_store.zig:17</span> 手工搭了一个，行话叫
+  <strong>vtable（virtual table，函数表：一张「这个类型会哪些动作」的表格）</strong>。整个结构只有两个成员：</p>
+
+<pre>
+<span class="k">pub const</span> PageStore = struct {          <span class="c">// ← src/page_store.zig:17</span>
+    ptr: *anyopaque,                    <span class="c">// 指向「真实现」的指针（anyopaque = 未知类型，void* 的 Zig 版）</span>
+    vtable: *const VTable,              <span class="c">// 指向函数表的指针（表在编译期就固定了）</span>
+    ...
+};
+</pre>
+
+  <p>函数表 <code>VTable</code> 在 <span class="file">src/page_store.zig:21</span>，每一格就是一个函数指针。
+  以「分配一页」为例，表里的格子长这样：</p>
+
+<pre>
+<span class="k">pub const</span> VTable = struct {             <span class="c">// ← src/page_store.zig:21</span>
+    allocPage: *const fn (ptr: *anyopaque) anyerror!u32,
+    <span class="c">//  ↑ 一格 = 一个函数指针：输入一个实现指针，返回页号或错误</span>
+    ...
+};
+</pre>
+
+  <p>调用方的体验和用 interface 没区别。真正的多态发生在
+  <span class="file">src/page_store.zig:54</span> 这层薄包装里：</p>
+
+<pre>
+<span class="k">pub fn</span> allocPage(self: PageStore) !u32 {
+    <span class="k">return</span> self.vtable.allocPage(self.ptr);   <span class="c">// 查表 → 调到真实现的那份函数</span>
+}
+</pre>
+
+  <p>翻译成人话：<code>PageStore</code> 本身不干任何活，它只是一对「转接头 + 遥控器」。
+  按下遥控器上的 <code>allocPage</code> 按钮，遥控器去查 vtable 这张「接线表」，把信号转给接在上面的那台真机器。</p>
+
+  <figure>
+    <svg viewBox="0 0 760 400" width="760" height="400" role="img" aria-label="vtable 插头结构图">
+      <defs>
+        <marker id="arr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#6b7280"/></marker>
+      </defs>
+      <g font-size="13">
+        <!-- caller -->
+        <rect x="230" y="14" width="300" height="66" rx="10" fill="#ede9fe" stroke="#7c3aed"/>
+        <text x="380" y="40" text-anchor="middle" font-weight="700" fill="#5b21b6">上层调用方（btree.zig / writer.zig）</text>
+        <text x="380" y="62" text-anchor="middle" fill="#374151">只认 PageStore，不知道底下是谁</text>
+
+        <line x1="380" y1="80" x2="380" y2="106" stroke="#6b7280" stroke-width="1.8" marker-end="url(#arr)"/>
+
+        <!-- the plug -->
+        <rect x="150" y="106" width="460" height="106" rx="10" fill="#dbeafe" stroke="#2563eb"/>
+        <text x="380" y="130" text-anchor="middle" font-weight="700" fill="#1e3a8a" font-size="15">PageStore（插座 + 遥控器）</text>
+        <text x="170" y="156" class="mono" fill="#374151">ptr    ──→ 真实现的地址（接哪台机器）</text>
+        <text x="170" y="178" class="mono" fill="#374151">vtable ──→ 函数表（接线表）</text>
+        <text x="170" y="200" class="mono" fill="#6b7280" font-size="12">page_store.zig:17-93</text>
+
+        <line x1="270" y1="212" x2="200" y2="258" stroke="#6b7280" stroke-width="1.8" marker-end="url(#arr)"/>
+        <line x1="490" y1="212" x2="560" y2="258" stroke="#6b7280" stroke-width="1.8" marker-end="url(#arr)"/>
+
+        <!-- two impls -->
+        <rect x="30" y="258" width="320" height="118" rx="10" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="190" y="284" text-anchor="middle" font-weight="700" fill="#166534">MemPageStore（内存版插头）</text>
+        <text x="50" y="308" class="mono" fill="#374151" font-size="12">page_store.zig:95 · 261 行里的后半段</text>
+        <text x="50" y="330" class="mono" fill="#374151" font-size="12">vtAllocPage = 从 freelist 弹一个 / 递增发号</text>
+        <text x="50" y="352" class="mono" fill="#374151" font-size="12">readPage    = 直接返回内存里的那页</text>
+
+        <rect x="410" y="258" width="320" height="118" rx="10" fill="#fef3c7" stroke="#d97706"/>
+        <text x="570" y="284" text-anchor="middle" font-weight="700" fill="#92400e">FilePageStore（文件版插头）</text>
+        <text x="430" y="308" class="mono" fill="#374151" font-size="12">file_page_store.zig · mmap 预留 1TB 虚拟地址</text>
+        <text x="430" y="330" class="mono" fill="#374151" font-size="12">vtAllocPage = 同样逻辑，页 = 文件偏移</text>
+        <text x="430" y="352" class="mono" fill="#374151" font-size="12">readPage    = 指进 mmap 区域，零拷贝</text>
+
+        <text x="380" y="394" text-anchor="middle" fill="#6b7280" font-size="12.5">两个实现的函数签名一模一样，所以随便换：上层一行代码都不用改。</text>
+      </g>
+    </svg>
+    <figcaption>手工 vtable = 「ptr 指实现 + vtable 指函数表」两个指针撑起来的多态。换插头，不换墙上的插座。</figcaption>
+  </figure>
+
+  <div class="analogy">
+    墙上的<strong>插座</strong>是国标定的：两个孔一个地线，形状永不改变。电饭锅、吹风机、台灯都是「插头」，
+    谁符合标准谁就能插上去。插座（<code>PageStore</code>）从不在乎插上来的是发热的（文件实现）还是发光的（内存实现），
+    它只保证「插上了就有电」——在这里，「电」就是那 9 个函数。
+  </div>
+
+  <div class="why">
+    Zig 是 2020 年代的新语言，它砍掉 interface 是坚持「显式优于隐式」：虚函数表、动态分发这些事一旦发生，
+    就应该像上面这样<em>写在你眼前</em>，而不是藏在编译器的魔法里。代价是每个类型要手写一份 vt* 函数
+    （<span class="file">src/page_store.zig:164-231</span>，九个 <code>vt</code> 开头的小函数 + 一个静态的
+    <code>mem_vtable</code> 表）；好处是没有隐藏的运行时机制，你看到的两个指针就是多态的全部。
+  </div>
+
+  <div class="keypoint">
+    <code>@ptrCast(@alignCast(ptr))</code> 是这套路数里唯一的「咒语」：把无所不知的
+    <code>*anyopaque</code> 变回具体类型（如 <code>*MemPageStore</code>），出现在每个 vt 函数的第一行
+    （如 <span class="file">src/page_store.zig:165</span>）。看不懂没关系，记住它只干一件事：<strong>把 void* 变回真身</strong>。
+  </div>
+</section>
+
+<!-- ============ 2.2 ============ -->
+<section id="s2">
+  <h2><span class="no">2</span>接口只切四刀：为什么这九个动作就够了</h2>
+
+  <p><strong>是什么</strong>：VTable 一共九格（<span class="file">src/page_store.zig:21-51</span>），但核心只有「四刀」
+  ——对页的四种操作，外加 meta 页和刷盘相关动作：</p>
+
+  <table>
+    <tr><th>VTable 槽位</th><th>干什么</th><th>人话</th></tr>
+    <tr>
+      <td><code>allocPage</code></td>
+      <td>要一个空页，返回<strong>页号</strong></td>
+      <td>「给我一间空房，房号多少？」—— 优先复用回收站，没有就发新号</td>
+    </tr>
+    <tr>
+      <td><code>freePage</code></td>
+      <td>把一个页<strong>还回去</strong>（进 <strong>freelist</strong>（空闲页登记表：被删数据腾出来的页号清单））</td>
+      <td>「这间房退了，下次可以再租」——只登记房号，不抹房间里的东西</td>
+    </tr>
+    <tr>
+      <td><code>readPage</code></td>
+      <td>读一页，返回 <code>[]const u8</code>（只读切片）</td>
+      <td>「房号 7 的房间让我看一眼」—— 借给你看，不许改</td>
+    </tr>
+    <tr>
+      <td><code>writePage</code></td>
+      <td>写一页，返回 <code>[]u8</code>（可写切片）</td>
+      <td>「房号 7 的房间钥匙给我」—— 拿到钥匙随便改</td>
+    </tr>
+    <tr>
+      <td><code>readMeta</code> / <code>writeMeta</code></td>
+      <td>读写<strong>meta 页</strong>（数据库总目录，上一章的主角）</td>
+      <td>单独两刀，因为 meta 走「双页交替写」的特殊安全协议</td>
+    </tr>
+    <tr>
+      <td><code>syncDataPages</code> / <code>sync</code></td>
+      <td>把数据页 / 全部刷到稳定存储</td>
+      <td>内存版里是空操作；文件版里是 fsync——「断电后东西还在」的最后一步</td>
+    </tr>
+    <tr>
+      <td><code>mapsize</code></td>
+      <td>告诉我总容量（最多多少页）</td>
+      <td>让上层知道「什么时候会满」</td>
+    </tr>
+  </table>
+
+  <p>注意两个返回类型的差别，这是 Zig <strong>借用（borrowing：把东西「借」给你用，所有权还在主人手里）</strong>惯例的活教材：
+  <code>readPage</code> 返回的切片是「借」的——主人保证它一直有效，你也只许看不许改
+  （契约写在 <span class="file">src/page_store.zig:65</span> 的注释里）；要自己的副本，请自己 <code>dupe</code>。
+  而 <code>writePage</code> 返回的切片可以直接写入，因为它本来就是拿来改的。</p>
+
+  <div class="why">
+    为什么不把接口做成「读写任意字节区间」或「append 一段日志」？因为上层的全部需求，恰好就是
+    <strong>「页号 ↔ 整页内容」</strong>这一个形状：B-tree 的每个节点 = 一页，COW 写 = 写新页，回收 = freePage，
+    提交 = 写 meta。接口多一刀，将来每换一个实现就多一刀要兑现；接口少一刀，上层就得自己绕。切在这四刀上，
+    是「上层需求」和「底层能力」的最小公共面。文件版实现里有大量复杂代码（freelist 链、崩溃恢复），
+    但都藏在九格函数后面，从没泄漏到接口上——这就是接口厚的意义：<strong>复杂度被关在实现里，不传染</strong>。
+  </div>
+</section>
+
+<!-- ============ 2.3 ============ -->
+<section id="s3">
+  <h2><span class="no">3</span>MemPageStore：纯内存实现，给谁用</h2>
+
+  <p><strong>是什么</strong>：<span class="file">src/page_store.zig:95</span> 起的 <code>MemPageStore</code>，
+  是 PageStore 的「实验室版」：所有页就是一块块 4096 字节的堆内存，说「读页」就是读内存，说「刷盘」就是什么都不做
+  （<code>vtSync</code> 是空函数，<span class="file">src/page_store.zig:217</span>）。看它的核心字段就明白了：</p>
+
+<pre>
+<span class="k">pub const</span> MemPageStore = struct {                 <span class="c">// ← src/page_store.zig:95</span>
+    pages: std.ArrayList(*[f2.PAGE_SIZE]u8),      <span class="c">// 页号 → 页内存 的数组（存的是指针）</span>
+    freelist: std.ArrayList(u32),                 <span class="c">// 回收站：退回来的页号，LIFO</span>
+    next_free: u32,                               <span class="c">// 发号器：下一个全新页号</span>
+    meta0: [f2.PAGE_SIZE]u8, meta1: [f2.PAGE_SIZE]u8,  <span class="c">// 两份总目录，内存里现成的</span>
+    ...
+};
+</pre>
+
+  <p>它怎么兑现那四刀（代码都在 <span class="file">src/page_store.zig:164-231</span>）：</p>
+
+  <ul>
+    <li><strong>allocPage</strong>（:164）：回收站里有货就弹一个（<code>freelist.pop()</code>，后进先出——刚退的房最容易再租）；
+        没货就发新号 <code>next_free</code>，同时 <code>ensurePage</code>（:144）现分配一块 4KB 内存。
+        发号器顶到 <code>max_pages</code> 就报 <code>error.MapFull</code>——「库满了」。</li>
+    <li><strong>freePage</strong>（:176）：把页号塞回回收站。完事。不擦数据。</li>
+    <li><strong>readPage / writePage</strong>（:183, :195）：页号 1、2 直接返回 meta0/meta1；普通页查数组返回那块内存。</li>
+    <li><strong>writeMeta</strong>（:210）：这次写 meta0、下次写 meta1，轮流来——双页交替协议在内存版里也认真演练，
+        这样上层代码在内存里测到的行为，和文件版落盘的行为一致。</li>
+  </ul>
+
+  <div class="analogy">
+    MemPageStore 是飞行模拟器：座舱（上层接口）和真飞机一模一样，仪表都会动，唯独不真的飞。
+    测试要的是「跟真的一样的座舱 + 随便坠机不心疼」——内存版让每个测试都能完整跑一遍分配、写树、提交、回收的全流程，
+    毫秒级完成，还不会在硬盘上留下一堆 <code>.db</code> 尸体文件。
+  </div>
+
+  <div class="why">
+    一个容易忽略的细节：pages 数组里存的是<strong>指针</strong>，每一页是独立的一块堆内存（:98-103 的注释）。
+    为什么这么讲究？因为数组自己长大时会搬家（整块内存 realloc 到新地址），如果页数据直接放在数组里，
+    别人借出去的 <code>readPage</code> 切片就指向了旧地址——悬空、崩溃。存指针的话，数组搬家只是挪动一串门牌号，
+    页本身纹丝不动。这是第 1 节「借用契约」能在 MemPageStore 里兑现的物理前提。
+  </div>
+</section>
+
+<!-- ============ 2.4 ============ -->
+<section id="s4">
+  <h2><span class="no">4</span>页号从 3 开始：NULL / meta0 / meta1 三个特殊席位</h2>
+
+  <p><strong>是什么</strong>：<span class="file">src/page_store.zig:8</span> 有一行再简单不过、却贯穿整个引擎的常量：</p>
+
+<pre>
+<span class="c">/// First data page number (0=NULL, 1=meta0, 2=meta1)</span>
+<span class="k">pub const</span> FIRST_DATA_PAGE: u32 = 3;      <span class="c">// ← src/page_store.zig:8</span>
+</pre>
+
+  <p>意思是：<strong>页号 0、1、2 是保留的特殊席位，第一个普通数据页从 3 号开始</strong>。
+  MemPageStore 的发号器出厂值就是它（<code>.next_free = FIRST_DATA_PAGE</code>，<span class="file">src/page_store.zig:120</span>），
+  文件版的 <code>init</code> 也用它算出「文件至少要有 3 页」（<span class="file">src/file_page_store.zig:183</span>）。</p>
+
+  <table>
+    <tr><th>页号</th><th>席位</th><th>为什么必须单独留座</th></tr>
+    <tr>
+      <td><code>0</code></td>
+      <td>NULL（<span class="file">src/format.zig:21</span>）</td>
+      <td>「没有页」要有个能写进 4 字节的表示。指针字段的类型是 <code>u32</code> 页号，不是可空类型，
+          于是 0 号被征用为「此处无页」。B-tree 空树的根指针、页头里各种「没有下一页」都写 0。</td>
+    </tr>
+    <tr>
+      <td><code>1</code> / <code>2</code></td>
+      <td>meta0 / meta1（<span class="file">src/format.zig:22-23</span>）</td>
+      <td>总目录要有两个席位才能「乒乓交替写」：这次写 1，下次写 2。任何时刻断电，至少一席是完整的上一版目录
+          ——这是全引擎崩溃安全的锚点（第 0 章第 7 节讲过）。</td>
+    </tr>
+  </table>
+
+  <figure>
+    <svg viewBox="0 0 760 210" width="760" height="210" role="img" aria-label="页号布局：三个特殊席位">
+      <g font-size="13">
+        <rect x="24" y="46" width="90" height="86" rx="8" fill="#f3f4f6" stroke="#9ca3af"/>
+        <text x="69" y="30" text-anchor="middle" class="mono" fill="#6b7280">页 0</text>
+        <text x="69" y="82" text-anchor="middle" font-weight="700" fill="#374151">NULL</text>
+        <text x="69" y="104" text-anchor="middle" fill="#6b7280" font-size="11.5">「没有页」的占位值</text>
+
+        <rect x="122" y="46" width="110" height="86" rx="8" fill="#dbeafe" stroke="#2563eb"/>
+        <text x="177" y="30" text-anchor="middle" class="mono" fill="#6b7280">页 1</text>
+        <text x="177" y="78" text-anchor="middle" font-weight="700" fill="#1e3a8a">meta0</text>
+        <text x="177" y="100" text-anchor="middle" fill="#374151" font-size="11.5">总目录 · 乒乓位 A</text>
+
+        <rect x="240" y="46" width="110" height="86" rx="8" fill="#dbeafe" stroke="#2563eb"/>
+        <text x="295" y="30" text-anchor="middle" class="mono" fill="#6b7280">页 2</text>
+        <text x="295" y="78" text-anchor="middle" font-weight="700" fill="#1e3a8a">meta1</text>
+        <text x="295" y="100" text-anchor="middle" fill="#374151" font-size="11.5">总目录 · 乒乓位 B</text>
+
+        <rect x="368" y="46" width="86" height="86" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="411" y="30" text-anchor="middle" class="mono" fill="#6b7280">页 3</text>
+        <text x="411" y="86" text-anchor="middle" font-weight="700" fill="#166534">数据</text>
+        <rect x="462" y="46" width="86" height="86" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="505" y="30" text-anchor="middle" class="mono" fill="#6b7280">页 4</text>
+        <text x="505" y="86" text-anchor="middle" font-weight="700" fill="#166534">数据</text>
+        <rect x="556" y="46" width="86" height="86" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="599" y="30" text-anchor="middle" class="mono" fill="#6b7280">页 5</text>
+        <text x="599" y="86" text-anchor="middle" font-weight="700" fill="#166534">数据</text>
+        <text x="676" y="96" text-anchor="middle" fill="#6b7280" font-size="16">…</text>
+
+        <line x1="360" y1="30" x2="360" y2="146" stroke="#16a34a" stroke-width="2" stroke-dasharray="6 4"/>
+        <text x="360" y="170" text-anchor="middle" fill="#16a34a" font-size="12.5" font-weight="700">↑ 界线：FIRST_DATA_PAGE = 3（page_store.zig:8）</text>
+      </g>
+    </svg>
+    <figcaption>页号布局图：0/1/2 是特殊席位，数据页从 3 号起。发号器 next_free 的起点就是这条界线。</figcaption>
+  </figure>
+
+  <div class="analogy">
+    影院前三个座位永远<strong>用胶带封住不卖票</strong>：一号座坐着「空位」的牌子（NULL，标明「这里没人」本身也是信息），
+    二、三号座是放映员的目录台（meta0/meta1）。检票系统（发号器）的票号永远从 4 号座（=页 3）开始发，
+    谁也别想把目录台当观众席卖出去。
+  </div>
+</section>
+
+<!-- ============ 2.5 ============ -->
+<section id="s5">
+  <h2><span class="no">5</span>分层收益复盘：同一棵树，跑内存也跑文件</h2>
+
+  <p><strong>是什么</strong>：把前三节串起来看收益。B-tree、事务提交、MVCC 这些上层代码，
+  全都只握着 <code>PageStore</code> 这个插座。于是同一个引擎出现两个世界：</p>
+
+  <table>
+    <tr><th></th><th>MemPageStore 插上</th><th>FilePageStore 插上</th></tr>
+    <tr><td>数据在哪</td><td>堆内存里的 4KB 小块</td><td>mmap 映射的 DB 文件（1TB 预留地址空间）</td></tr>
+    <tr><td>断电后</td><td>全没了（<code>vtSync</code> 空操作）</td><td>fsync 保证已提交数据还在</td></tr>
+    <tr><td>速度</td><td>纯内存，微秒级跑完一个事务</td><td>真实磁盘语义</td></tr>
+    <tr><td>上层代码改了几行</td><td colspan="2"><strong>0 行。</strong>btree.zig / writer.zig / db.zig 完全不知道换了插头</td></tr>
+  </table>
+
+  <p><strong>动手小实验</strong>：打开 <span class="file">tests/txn_writer_db/overflow_test.zig</span>（测试「超过一页的大 value」），
+  头几行是这样的：</p>
+
+<pre>
+var ms = ps.MemPageStore.init(std.testing.allocator, 10000);  <span class="c">// 建一间内存实验室，限 10000 页</span>
+<span class="k">defer</span> ms.deinit();                                           <span class="c">// 实验结束全部销毁</span>
+var db = try dbi.Db.open(std.testing.allocator, ms.store(), .{});  <span class="c">// 把内存插座插给完整数据库！</span>
+<span class="k">defer</span> db.close();
+
+try db.put(<span class="s">"big"</span>, big);        <span class="c">// 之后照常 put/get —— 代码和生产路径一模一样</span>
+</pre>
+
+  <p>注意 <code>ms.store()</code>（<span class="file">src/page_store.zig:137</span>）：它就是把
+  <code>ptr</code> 和 <code>vtable</code> 打包成插座形状的一行胶水。接下来整个数据库——B-tree、事务、overflow 页链——
+  都跑在这个「假磁盘」上。这个测试文件里没有一行代码关心「页到底在内存还是在文件」。</p>
+
+  <div class="keypoint">
+    这就是本章标题的全部含义：<strong>磁盘不是引擎的一部分，磁盘是插在引擎上的外设</strong>。
+    测试与 fuzz 之所以能像流水线一样铺开（tests/ 下几十个文件全用 MemPageStore），地基就是这一层接口。
+  </div>
+
+  <div class="why">
+    复盘一下这一刀切在哪、为什么值钱。「算法」（树怎么组织数据）和「介质」（字节躺在哪）是两条独立演化的轴：
+    算法层以后可能加压缩、加并发结构；介质层以后可能换网络盘、换加密文件。接口把它们钉死在九个函数上，
+    两边各自狂奔互不牵连。这个模式不止数据库用——图形引擎把「渲染器」做成接口，音频库把「输出设备」做成接口，
+    都是同一招：把最难替换的东西，变成一个插头。
+  </div>
+</section>
+
+<!-- ============ 自测 ============ -->
+<section id="s6">
+  <h2><span class="no">6</span>本章自测</h2>
+
+  <p>能用自己的话回答，才算真懂。答案都藏在前文里，想不起来就回头翻。</p>
+
+  <ol>
+    <li><strong>Zig 没有 interface，那 <code>PageStore</code> 凭什么能「运行时换实现」？</strong>
+      <br>提示：只有两个成员。想想 <code>ptr</code> 和 <code>vtable</code> 各自管什么，
+      以及 <span class="file">src/page_store.zig:54</span> 那层包装函数里发生了什么。</li>
+    <li><strong>为什么 <code>readPage</code> 返回只读切片（<code>[]const u8</code>）、而 <code>writePage</code> 返回可写切片（<code>[]u8</code>）？
+      借用契约要求实现方（MemPageStore / FilePageStore）额外保证什么物理前提？</strong>
+      <br>提示：第 3 节讲过「数组里存指针」的原因。</li>
+    <li><strong>如果不留 FIRST_DATA_PAGE=3 这三个特殊席位，而让数据页从 0 号开始用，会出什么乱子？</strong>
+      <br>提示：分别考虑「0 号被当作普通页分配出去」和「总目录只有一页可写」两种情况，
+      后者会杀死整个崩溃安全设计。</li>
+  </ol>
+
+  <div class="keypoint">
+    三个问题的参考答案骨架：① 一个指针找实现、一个指针找函数表，包装函数查表转发，多态就是两个指针；
+    ② 类型本身就是契约——只读切片保护读方不改数据，实现方必须保证页数据地址永不搬家（独立堆分配 / 固定 mmap）；
+    ③ 0 号若可分配，「空指针」语义就没了；meta 只有一页则乒乓交替写不存在，断电可能落在「目录写了一半」的瞬间。
+  </div>
+</section>
+
+<footer>
+  cube_db 详解 · 第 2 章 · 对应源码 src/page_store.zig（261 行）—— 下一章我们插好插座，顺着 B-tree 从根走到叶子：<a href="ch03-btree-read.html">第 3 章</a>
+</footer>
+
+</div>
+</body>
+</html>

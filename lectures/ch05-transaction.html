@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 5 章 · 事务与提交 —— 六步仪式逐步走</title>
+<style>
+  :root {
+    --bg: #f7f8fa;
+    --card: #ffffff;
+    --ink: #24292f;
+    --muted: #6b7280;
+    --accent: #2563eb;
+    --accent-soft: #dbeafe;
+    --green: #16a34a;
+    --green-soft: #dcfce7;
+    --orange: #d97706;
+    --orange-soft: #fef3c7;
+    --purple: #7c3aed;
+    --purple-soft: #ede9fe;
+    --red: #dc2626;
+    --red-soft: #fee2e2;
+    --border: #e5e7eb;
+    --mono: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0 16px 80px;
+    background: var(--bg); color: var(--ink);
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+    line-height: 1.75; font-size: 16px;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; }
+  header.hero {
+    background: linear-gradient(135deg, #1e3a8a, #2563eb);
+    color: #fff; border-radius: 0 0 18px 18px;
+    padding: 40px 32px 32px; margin: 0 -16px 32px;
+  }
+  header.hero h1 { margin: 0 0 8px; font-size: 30px; }
+  header.hero p { margin: 4px 0; opacity: .92; }
+  header.hero .tag {
+    display: inline-block; background: rgba(255,255,255,.18);
+    border-radius: 999px; padding: 2px 12px; font-size: 13px; margin-right: 6px;
+  }
+  header.hero .navlinks a { color: #fff; opacity: .85; }
+  nav.toc {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 12px; padding: 18px 24px; margin-bottom: 28px;
+  }
+  nav.toc h2 { margin: 0 0 8px; font-size: 16px; color: var(--muted); }
+  nav.toc ol { margin: 0; padding-left: 22px; }
+  nav.toc a { color: var(--accent); text-decoration: none; }
+  nav.toc a:hover { text-decoration: underline; }
+  section {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 14px; padding: 26px 30px; margin-bottom: 26px;
+  }
+  h2 {
+    font-size: 22px; margin: 0 0 14px;
+    padding-bottom: 10px; border-bottom: 2px solid var(--accent-soft);
+  }
+  h2 .no {
+    display: inline-block; background: var(--accent); color: #fff;
+    width: 30px; height: 30px; line-height: 30px; text-align: center;
+    border-radius: 8px; font-size: 15px; margin-right: 10px;
+  }
+  h3 { font-size: 17px; margin: 22px 0 8px; }
+  p { margin: 10px 0; }
+  code {
+    font-family: var(--mono); font-size: 87%;
+    background: #eef1f5; border-radius: 5px; padding: 1px 6px;
+  }
+  pre {
+    font-family: var(--mono); font-size: 13.5px; line-height: 1.6;
+    background: #0f172a; color: #e2e8f0; border-radius: 10px;
+    padding: 16px 18px; overflow-x: auto; margin: 14px 0;
+  }
+  pre .c { color: #94a3b8; }
+  pre .k { color: #93c5fd; }
+  pre .s { color: #fcd34d; }
+  .analogy {
+    background: var(--orange-soft); border-left: 4px solid var(--orange);
+    border-radius: 0 10px 10px 0; padding: 12px 18px; margin: 14px 0;
+  }
+  .analogy::before { content: "🍊 类比"; display: block; font-weight: 700; color: var(--orange); margin-bottom: 4px; }
+  .keypoint {
+    background: var(--green-soft); border-left: 4px solid var(--green);
+    border-radius: 0 10px 10px 0; padding: 12px 18px; margin: 14px 0;
+  }
+  .keypoint::before { content: "💡 划重点"; display: block; font-weight: 700; color: var(--green); margin-bottom: 4px; }
+  .why {
+    background: var(--purple-soft); border-left: 4px solid var(--purple);
+    border-radius: 0 10px 10px 0; padding: 12px 18px; margin: 14px 0;
+  }
+  .why::before { content: "❓ 为什么这么设计"; display: block; font-weight: 700; color: var(--purple); margin-bottom: 4px; }
+  table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 15px; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: #f0f3f8; }
+  td code { white-space: nowrap; }
+  .file { font-family: var(--mono); font-size: 13.5px; color: var(--accent); font-weight: 600; }
+  figure {
+    background: #fbfcfe; border: 1px dashed #c7d2e3; border-radius: 12px;
+    padding: 18px; margin: 18px 0; text-align: center; overflow-x: auto;
+  }
+  figcaption { color: var(--muted); font-size: 13.5px; margin-top: 8px; }
+  .diagram-label { font-size: 13px; font-family: var(--mono); }
+  svg text { font-family: -apple-system, "PingFang SC", sans-serif; }
+  svg .mono { font-family: var(--mono); }
+  ul.checklist { list-style: none; padding-left: 4px; }
+  ul.checklist li { margin: 6px 0; }
+  ul.checklist li::before { content: "☑ "; color: var(--green); font-weight: 700; }
+  footer { color: var(--muted); font-size: 13.5px; text-align: center; margin-top: 40px; }
+  .pill { display:inline-block; border-radius:999px; padding:1px 10px; font-size:12.5px; font-weight:600; margin-right:4px; }
+  .pill.blue { background: var(--accent-soft); color: var(--accent); }
+  .pill.green { background: var(--green-soft); color: var(--green); }
+  .pill.purple { background: var(--purple-soft); color: var(--purple); }
+</style>
+</head>
+<body>
+<header class="hero">
+  <div class="wrap">
+    <h1>第 5 章 · 事务与提交</h1>
+    <p>六步仪式逐步走 —— 从 <code style="background:rgba(255,255,255,.15)">beginWriteTxn</code> 到 fsync 落地的完整旅程</p>
+    <p>
+      <span class="tag">主角代码：src/db.zig（1185 行）+ src/writer.zig（1047 行）</span>
+      <span class="tag">对应纲要第 5 节「一次写入的旅程」</span>
+    </p>
+    <p class="navlinks">
+      <a href="ch04-cow-write.html">← 上一章：COW 写路径</a> ·
+      <a href="ch06-mvcc.html">下一章：MVCC 与页回收 →</a>
+    </p>
+  </div>
+</header>
+
+<div class="wrap">
+
+<nav class="toc">
+  <h2>本章目录</h2>
+  <ol>
+    <li><a href="#s1">API 形状：beginWriteTxn → put/delete → commit/abort</a></li>
+    <li><a href="#s2">staging：改动先进暂存区，立刻 dup 进 arena</a></li>
+    <li><a href="#s3">micro-batch：把多次 commit 拼成一班车</a></li>
+    <li><a href="#s4">commit 全程走查：六步仪式逐步走</a></li>
+    <li><a href="#s5">「原子」到底原子在哪：sequence 判新旧</a></li>
+    <li><a href="#s6">持久性旋钮：Durability 两档 + Db.sync()</a></li>
+    <li><a href="#s7">abort 与错误路径：dirty 页去哪了</a></li>
+    <li><a href="#s8">本章自测</a></li>
+  </ol>
+</nav>
+
+<!-- ============ 5.1 ============ -->
+<section id="s1">
+  <h2><span class="no">1</span>API 形状：beginWriteTxn → put/delete → commit/abort</h2>
+
+  <p><strong>是什么</strong>：<strong>事务（transaction：一串操作要么全生效、要么全不算的打包单位）</strong>
+  的用法是标准三段式，跟 SQLite 的 BEGIN/COMMIT 一个形状：</p>
+
+<pre>
+var txn = try db.beginWriteTxn();     <span class="c">// ① 开事务（拿到「单写者」的锁）</span>
+try txn.put(<span class="s">"alice"</span>, <span class="s">"100"</span>);
+try txn.delete(<span class="s">"bob"</span>);                <span class="c">// ② 攒改动（都在内存里，还没碰树）</span>
+try txn.commit();                     <span class="c">// ③ 一锤定音：全生效</span>
+<span class="c">// 或者 txn.abort() —— 全不算</span>
+</pre>
+
+  <p>这三个动作分布在两个文件里。<code>beginWriteTxn</code> 在 <span class="file">src/db.zig:562</span>，
+  第一件事就是抓 <strong>write_mutex（单写者互斥锁：同一时刻只允许一个写事务在跑）</strong>；抓不到直接返回
+  <code>error.LockFailed</code>。WriteTxn 结构体本体在 <span class="file">src/db.zig:598</span>，
+  put/delete/commit/abort 四个方法分别位于 :605、:616、:629、:664。
+  读这边对称地有 <code>beginReadTxn</code>（<span class="file">src/db.zig:576</span>）返回 ReadTxn——
+  它<strong>不抓写锁</strong>，只登记一个 MVCC 快照（下一章的主角），所以读写互不阻塞。</p>
+
+  <table>
+    <tr><th>方法</th><th>位置</th><th>干了什么</th><th>锁</th></tr>
+    <tr><td><code>beginWriteTxn</code></td><td><span class="file">db.zig:562</span></td><td>抓写锁 + 建暂存区</td><td>占用 write_mutex 直到 commit/abort</td></tr>
+    <tr><td><code>txn.put / txn.delete</code></td><td><span class="file">db.zig:605/616</span></td><td>改动追加进内存暂存列表</td><td>不加锁（写锁已在手）</td></tr>
+    <tr><td><code>txn.commit</code></td><td><span class="file">db.zig:629</span></td><td>批量应用 + 写 meta + fsync</td><td>持有中，结束释放</td></tr>
+    <tr><td><code>txn.abort</code></td><td><span class="file">db.zig:664</span></td><td>丢弃暂存，什么都不应用</td><td>释放</td></tr>
+    <tr><td><code>txn.deinit</code></td><td><span class="file">db.zig:673</span></td><td>兜底：忘叫 abort/commit 也会释放锁</td><td>（防泄漏）</td></tr>
+  </table>
+
+  <div class="why">
+    为什么整个引擎只允许一个写者？不是为了偷懒——是 B-tree 的 COW 写路径天然以「整棵树」为工作单位
+    （上一章讲的 applyBatch 一次重写一条路径）。两个写者同时改树，冲突合并的复杂度是灾难级的。
+    LMDB、SQLite（默认模式）都做了同样的取舍：<strong>写串行，读并发</strong>。读不受限的前提是 MVCC
+    （多版本：写者改的是新副本，读者看的旧页原地不动），这正是第 2 节 staging 和第 4 节提交仪式能成立的地基。
+  </div>
+
+  <div class="analogy">
+    写事务像银行的<strong>VIP 柜台</strong>：柜台只有一个（write_mutex），进去先取号独占；
+    你在柜台前填的单子（put/delete）只是<em>攒</em>在手上，柜员还没动账本；
+    最后说「办理」（commit），柜员才一次性把所有改动写进正式账本、盖章、归档。
+    中途你改主意了（abort），单子揉掉就走，账本一个字没变。
+  </div>
+</section>
+
+<!-- ============ 5.2 ============ -->
+<section id="s2">
+  <h2><span class="no">2</span>staging：改动先进暂存区，key/value 立刻 dup 进 arena</h2>
+
+  <p><strong>是什么</strong>：<code>txn.put</code> 内部非常朴素——不碰树、不碰磁盘，只做两件事
+  （<span class="file">src/db.zig:605-614</span>）：</p>
+
+<pre>
+<span class="k">pub fn</span> put(self: *WriteTxn, key: []const u8, value: []const u8) !void {
+    try checkKeySize(key);             <span class="c">// 超大 key 在这里就拒收，不用等到 commit</span>
+    if (self.finished) <span class="k">return</span> error.TxnFinished;
+    <span class="k">const</span> alloc = self.staging_arena.allocator();
+    <span class="k">const</span> k = try alloc.dupe(u8, key);   <span class="c">// ← 立刻复制一份 key</span>
+    <span class="k">const</span> v = try alloc.dupe(u8, value); <span class="c">// ← 立刻复制一份 value</span>
+    try self.staged.append(alloc, .{ .key = k, .value = v, .tombstone = false });
+}
+</pre>
+
+  <p>两个关键词都要解释。<strong>staging（暂存：改动先攒在内存列表里，不立刻生效）</strong>列表就是
+  <code>staged</code> 这个 ArrayList，攒的是 <code>(key, value, tombstone)</code> 三元组。
+  <strong>arena（内存竞技场：一种「只管分配、最后一把全释放」的分配器）</strong>是
+  <code>staging_arena</code>——每个事务开张时建一个（<span class="file">src/db.zig:570</span>），
+  commit 或 abort 时 <code>deinit()</code> 一口气全释放，中间不逐个 free，也不用配对回收。</p>
+
+  <div class="why">
+    为什么要 <code>dupe</code> 复制？看 :608 那行注释：<em>the caller's slice (e.g. a stack buffer) may not
+    live until commit</em>。调用方传来的 key/value 可能是栈上的临时缓冲区，事务可能要跑很久才 commit，
+    等到提交那一刻，那块栈内存早被别人用了。所以<strong>入口处立刻拷进 arena，把所有权收归事务</strong>。
+    为什么用 arena 而不是普通分配？一个事务可能攒上万条 put，普通分配器要逐条 malloc/free 上万次；
+    arena 就是「先划一块地，随便圈，散场一起平」——提交路径里到处是同样的手法（下一节的 commit_arena、
+    applyBatchSwap 里的 COW arena，<span class="file">src/writer.zig:661</span>）。
+  </div>
+
+  <div class="analogy">
+    点奶茶用<strong>小票</strong>：店员不会你说一杯就立刻做一杯，而是先把「三分糖、去冰、加珍珠」抄在小票上。
+    抄的时候用的是店里自己的纸（arena 复制），不是你手机屏幕（调用方的内存）——你手机等会儿可能关屏（栈帧销毁），
+    小票不能跟着消失。等到叫号（commit），才按小票一口气做。
+  </div>
+</section>
+
+<!-- ============ 5.3 ============ -->
+<section id="s3">
+  <h2><span class="no">3</span>put 走批（micro-batch）：把多次 commit 拼成一班车</h2>
+
+  <p><strong>是什么</strong>：每次 commit 都有一笔固定开销——COW 重写路径 + 写 meta 页 + fsync。
+  如果程序连续 <code>db.put</code> 一万次，难道要付一万次这笔钱？micro-batch（微批：把多次小提交合并成一次大提交）
+  就是干这个的。开关在 <span class="file">src/writer.zig:164</span>：</p>
+
+<pre>
+<span class="k">pub const</span> MicroBatchConfig = struct {
+    <span class="c">/// Max staged entries before auto-flush. 0 = disabled (direct commit).</span>
+    batch_threshold: usize = 0,     <span class="c">// 默认关：每次 put 直接走完整提交</span>
+};
+</pre>
+
+  <p>打开后（<code>batch_threshold &gt; 0</code>），<code>db.put</code> 走另一条路
+  （<span class="file">src/db.zig:147-163</span>）：改动先 dup 进 <code>pending</code> 暂存列表，
+  攒够 <code>batch_threshold</code> 条就自动 <code>flush()</code>。flush 的活法很讲究
+  （<span class="file">src/db.zig:202-221</span>）：在 staging_mutex 保护下<strong>原子地偷走整个 pending 列表</strong>
+  （换一个空列表回去），松锁，然后把偷来的整批交给 <code>putBatch</code>（:224）走一次完整提交。
+  另外还有绕过 micro-batch 的直通车 <code>putDirect / deleteDirect</code>
+  （<span class="file">src/db.zig:179/187</span>）——它们内部就是「开一个隐式 WriteTxn、put 一条、立刻 commit」。</p>
+
+  <table>
+    <tr><th>入口</th><th>行为</th><th>适合</th></tr>
+    <tr><td><code>db.put</code>（threshold=0，默认）</td><td>经 putDirect：一条 = 一个事务 = 一次 fsync</td><td>零散写入，要求每条立刻持久</td></tr>
+    <tr><td><code>db.put</code>（threshold&gt;0）</td><td>先攒 pending，攒够自动 flush；也可手动 <code>db.flush()</code></td><td>连续导入、灌数据</td></tr>
+    <tr><td><code>db.putBatch</code></td><td>一次性提交一批，完全绕开 staging</td><td>调用方自己手里就有一批数据</td></tr>
+    <tr><td><code>db.beginWriteTxn</code></td><td>显式事务：攒什么、何时提交全由你控制</td><td>需要「全生效或全不算」语义</td></tr>
+  </table>
+
+  <div class="analogy">
+    <strong>拼车</strong>：去机场的固定成本（车费 = COW + fsync）是绕不开的，但一辆车坐 4 个人就摊薄成 1/4。
+    <code>batch_threshold</code> 是「凑满 4 人发车」；<code>db.flush()</code> 是「不等了，现在就发」；
+    <code>putDirect</code> 是「包车」——贵，但随叫随走。三种方式到达同一个机场（数据落盘），只差成本分摊。
+  </div>
+
+  <div class="why">
+    注意一个容易误解的点：micro-batch 攒批期间，<strong>数据还没提交</strong>——进程这时候崩了，
+    pending 列表（纯内存）就没了，这批 put 等于没发生过。所以 micro-batch 适合「可以重放的批量导入」
+    （fuzz 测试、灌数据脚本），不适合「每一笔都不能丢」的记账场景——后者请用默认的直接提交模式。
+    这是性能和持久性之间明码标价的旋钮，不是魔法。
+  </div>
+</section>
+
+<!-- ============ 5.4 ============ -->
+<section id="s4">
+  <h2><span class="no">4</span>commit 全程走查：publishSnapshot → 树应用 → freelist 持久化 → 交替写 meta + fsync</h2>
+
+  <p><strong>是什么</strong>：<code>txn.commit</code>（<span class="file">src/db.zig:629</span>）先做三件家务：
+  标记 <code>finished</code>、注册两个 <code>defer</code>（松锁 + 释放 staging arena——不管成败都会执行）、
+  空事务直接返回。然后把 staged 列表打包成 Request 数组，交给
+  <code>applyBatchSwap</code>（<span class="file">src/writer.zig:619</span>）——
+  这才是六步仪式的正戏。逐步对号：</p>
+
+  <figure>
+    <svg viewBox="0 0 760 560" width="760" height="560" role="img" aria-label="commit 六步流程图">
+      <defs>
+        <marker id="arr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#6b7280"/></marker>
+        <marker id="arrg" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#16a34a"/></marker>
+      </defs>
+      <g font-size="12.5">
+        <rect x="20" y="18" width="180" height="70" rx="9" fill="#eef2ff" stroke="#4f46e5"/>
+        <text x="110" y="42" text-anchor="middle" font-weight="700" fill="#3730a3">① 快照当前状态</text>
+        <text x="110" y="60" text-anchor="middle" fill="#374151">cur_root / cur_sequence</text>
+        <text x="110" y="76" text-anchor="middle" class="mono" fill="#6b7280" font-size="11">writer.zig:639</text>
+
+        <rect x="290" y="18" width="200" height="70" rx="9" fill="#eef2ff" stroke="#4f46e5"/>
+        <text x="390" y="42" text-anchor="middle" font-weight="700" fill="#3730a3">② 批量应用进 B-tree</text>
+        <text x="390" y="60" text-anchor="middle" fill="#374151">insert / insertBatch（COW 重写）</text>
+        <text x="390" y="76" text-anchor="middle" fill="#374151">收集 dirty 旧页</text>
+
+        <rect x="560" y="18" width="180" height="70" rx="9" fill="#eef2ff" stroke="#4f46e5"/>
+        <text x="650" y="42" text-anchor="middle" font-weight="700" fill="#3730a3">③ 旧页挂回收站</text>
+        <text x="650" y="60" text-anchor="middle" fill="#374151">pending_free，带 release_seq</text>
+        <text x="650" y="76" text-anchor="middle" class="mono" fill="#6b7280" font-size="11">writer.zig:797</text>
+
+        <rect x="290" y="150" width="200" height="80" rx="9" fill="#fef3c7" stroke="#d97706"/>
+        <text x="390" y="176" text-anchor="middle" font-weight="700" fill="#92400e">④ 写 meta + 刷盘</text>
+        <text x="390" y="194" text-anchor="middle" fill="#374151">writeCommitMeta（writer.zig:279）</text>
+        <text x="390" y="210" text-anchor="middle" fill="#374151">freelist 持久化在这里由</text>
+        <text x="390" y="224" text-anchor="middle" fill="#374151">FilePageStore.vtWriteMeta 代劳</text>
+
+        <rect x="560" y="150" width="180" height="80" rx="9" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="650" y="176" text-anchor="middle" font-weight="700" fill="#166534">⑤ 发布快照</text>
+        <text x="650" y="196" text-anchor="middle" fill="#374151">publishSnapshot（writer.zig:257）</text>
+        <text x="650" y="214" text-anchor="middle" fill="#166534" font-weight="700">← 提交点在这里！</text>
+
+        <rect x="20" y="150" width="200" height="80" rx="9" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="120" y="176" text-anchor="middle" font-weight="700" fill="#166534">⑥ 叫号</text>
+        <text x="120" y="196" text-anchor="middle" fill="#374151">每个请求 future.set({})</text>
+        <text x="120" y="214" text-anchor="middle" fill="#374151">txn.commit 返回成功</text>
+
+        <g stroke="#6b7280" stroke-width="1.8" fill="none" marker-end="url(#arr)">
+          <line x1="200" y1="53" x2="290" y2="53"/>
+          <line x1="490" y1="53" x2="560" y2="53"/>
+          <path d="M650,88 L650,150"/>
+          <path d="M560,190 L490,190"/>
+          <path d="M290,190 L220,190"/>
+        </g>
+
+        <!-- timeline annotation -->
+        <rect x="20" y="270" width="720" height="120" rx="10" fill="#f8fafc" stroke="#cbd5e1"/>
+        <text x="36" y="296" font-weight="700" fill="#334155">时间线视角（从左到右）：什么时候算「提交成功」？</text>
+        <text x="36" y="320" fill="#374151">② 新页落进 mmap · ④ meta 写到「另一个」meta 页 + fsync · ⑤ root/sequence 原子发布（读者从这一刻能看到新数据）</text>
+        <text x="36" y="344" fill="#374151">崩溃在 ⑤ 之前：meta 还指着旧树 → 本次事务等于没发生过（回滚）；崩溃在 ⑤ 之后：meta 指着新树 → 本次事务生效。</text>
+        <text x="36" y="370" fill="#6b7280" font-size="12" class="mono">两条分界线之间没有任何灰色地带 —— 这就是「原子」的完整含义。</text>
+
+        <!-- six steps mapping -->
+        <rect x="20" y="420" width="720" height="120" rx="10" fill="#f0fdf4" stroke="#86efac"/>
+        <text x="36" y="446" font-weight="700" fill="#166534">和纲要第 5 节「六步」的对号入座</text>
+        <text x="36" y="470" fill="#374151">① 攒改动 = 本章第 2 节 staging　　② 批量应用进树 = 上图②　　③ 旧页入回收站 = 上图③</text>
+        <text x="36" y="494" fill="#374151">④ 写新页到磁盘 = COW 页直写 mmap（第 4 章讲过）　　⑤ 原子切换 meta + fsync = 上图④　　⑥ 读者退场后回收 = 第 6 章</text>
+        <text x="36" y="522" fill="#6b7280" font-size="12">一个变化：⑥ 的「叫号」(future.set, writer.zig:887) 在发布快照之后立刻执行，页回收则由水位线异步推进（下一章）。</text>
+      </g>
+    </svg>
+    <figcaption>commit 的六步仪式：⑤ 发布快照（publishSnapshot）是唯一的「提交点」，之前崩 = 回滚，之后崩 = 生效。</figcaption>
+  </figure>
+
+  <p>几个图上看不见、但值得知道的细节：</p>
+  <ul>
+    <li><strong>步骤②是智能的</strong>：单条改动直接走 <code>btree.insert</code> 快路；多条则先探测是否已按序
+        （O(n) 扫一遍），有序就免排序直接 <code>insertBatch</code>，乱序才「复制进 arena → 排序 → 相邻去重
+        （后写覆盖先写）」再批量插入（<span class="file">src/writer.zig:670-780</span> 附近的三个分支）。</li>
+    <li><strong>freelist 持久化不在这六步里显式出现</strong>：meta 里的 free_head/free_count 由
+        FilePageStore 的 <code>vtWriteMeta</code> 在写 meta 的瞬间自动塞进去（第 2 章提过：store 是唯一知道
+        这些值的层）。所以图④一格就涵盖了它。</li>
+    <li><strong>power_fail 档的额外一步</strong>：写 meta 前先 <code>syncDataPages</code> 把数据页先刷盘
+        （见第 6 节），这是图④内部的一个可选前缀。</li>
+  </ul>
+
+  <div class="keypoint">
+    整场仪式里，<strong>「提交点」只有一处：publishSnapshot</strong>（<span class="file">src/writer.zig:879</span>，
+    函数本体 :257）。它把新 root 和 sequence 用原子写（release 语义）发布出去——从这一纳秒起，
+    所有新读者看到的都是新树。在此之前进程崩了，磁盘上的 meta 还指着旧树，新写的那些页成了无人认领的孤儿
+    （无害，第 7 节讲）；在此之后崩了，meta 已指向新树，事务「已经在」盘上了。
+  </div>
+</section>
+
+<!-- ============ 5.5 ============ -->
+<section id="s5">
+  <h2><span class="no">5</span>「原子」到底原子在哪：单页写 + 双 meta 乒乓 + sequence 判新旧</h2>
+
+  <p><strong>是什么</strong>：上一节的结论依赖一个物理事实——<em>meta 页的切换是「原子的」</em>。
+  它由三件事合力保证：</p>
+
+  <h3>① meta 只有几百字节，写它基本是一瞬间</h3>
+  <p>meta 页的有效内容远小于 4096 字节，磁盘写入这么一小段的窗口期极短。但「极短」不等于「零」——
+  所以还需要②。</p>
+
+  <h3>② 双 meta 乒乓：任何时刻都有一份完整的上一版</h3>
+  <p>引擎准备了 meta0（页 1）和 meta1（页 2）两个席位（第 2 章第 4 节）。这次提交写 meta1，下次写 meta0，
+  　轮流覆盖。于是<strong>任何一版 meta 都有一个「上一版」安然躺在另一个席位上</strong>——
+  写到一半断电毁掉的只是「即将成为最新版」的那份，上一版完好。</p>
+
+  <h3>③ sequence 号：重启时怎么知道哪份更新</h3>
+  <p>每份 meta 里都盖着一个单调递增的 <strong>sequence（序号：每次成功提交 +1 的计数器，谁的号大谁新）</strong>。
+  本次提交的序号 = 上次 + 1（<code>new_sequence = cur_sequence + 1</code>，<span class="file">src/writer.zig:821</span>）。
+  重启恢复时两份都读出来，<strong>取 sequence 大的当真相</strong>（<span class="file">src/format.zig:285</span> 的
+  <code>readMetaPage</code> 最后一行：<code>m0.sequence &gt;= m1.sequence ? m0 : m1</code>；
+  FilePageStore 开机恢复用同样规则，<span class="file">src/file_page_store.zig:229</span>）。</p>
+
+  <figure>
+    <svg viewBox="0 0 760 330" width="760" height="330" role="img" aria-label="双 meta 乒乓与崩溃点分析">
+      <g font-size="13">
+        <rect x="40" y="30" width="180" height="64" rx="9" fill="#e0e7ff" stroke="#4f46e5"/>
+        <text x="130" y="56" text-anchor="middle" font-weight="700" fill="#3730a3" class="mono">meta0 · sequence=41</text>
+        <text x="130" y="78" text-anchor="middle" fill="#6b7280" font-size="12">当前生效的目录</text>
+        <rect x="40" y="120" width="180" height="64" rx="9" fill="#f3f4f6" stroke="#9ca3af" stroke-dasharray="5 3"/>
+        <text x="130" y="146" text-anchor="middle" font-weight="700" fill="#6b7280" class="mono">meta1 · sequence=40</text>
+        <text x="130" y="168" text-anchor="middle" fill="#6b7280" font-size="12">上一版（还在，别删！）</text>
+
+        <line x1="220" y1="62" x2="330" y2="62" stroke="#16a34a" stroke-width="2" marker-end="url(#arrg)"/>
+        <text x="275" y="48" text-anchor="middle" fill="#166534" font-size="12">本次提交写这里</text>
+
+        <rect x="330" y="30" width="180" height="64" rx="9" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="420" y="56" text-anchor="middle" font-weight="700" fill="#166534" class="mono">meta1 · sequence=42 ✓</text>
+        <text x="420" y="78" text-anchor="middle" fill="#374151" font-size="12">写完 + fsync = 提交完成</text>
+
+        <!-- crash windows -->
+        <rect x="550" y="30" width="190" height="154" rx="9" fill="#fee2e2" stroke="#dc2626"/>
+        <text x="645" y="56" text-anchor="middle" font-weight="700" fill="#991b1b">两种断电时刻</text>
+        <text x="566" y="82" fill="#374151" font-size="12.5">写 meta1 写到一半断电：</text>
+        <text x="566" y="102" fill="#374151" font-size="12.5">meta1 CRC 坏 → 读不出来</text>
+        <text x="566" y="122" fill="#374151" font-size="12.5">→ 用 meta0(41) = 回滚</text>
+        <text x="566" y="150" fill="#374151" font-size="12.5">写完才断电（fsync 没来得及？）</text>
+        <text x="566" y="170" fill="#374151" font-size="12.5">→ 下次启动取 sequence 更大的</text>
+
+        <text x="40" y="230" fill="#374151" font-size="13" font-weight="700">恢复算法（format.zig:285 readMetaPage）：</text>
+        <text x="40" y="256" fill="#374151" font-size="13">两份都验 CRC → CRC 好的里面取 sequence 大的 → 拿到 root 页号，整棵树从这复活。O(1)：只读两页。</text>
+        <text x="40" y="300" fill="#6b7280" font-size="12.5">注意顺序语义：m0.sequence >= m1.sequence 时取 m0——相等时偏向 meta0，因为「相等」只可能出现在从未分开写过的初始状态。</text>
+      </g>
+    </svg>
+    <figcaption>双 meta 乒乓 + sequence 判新旧：崩溃只会落在「回滚」或「生效」两个格子之一，没有中间态。</figcaption>
+  </figure>
+
+  <div class="analogy">
+    <strong>两本轮流抄的账本</strong>：账本 A 记到第 41 笔，会计这次往账本 B 抄第 42 笔。
+    抄到一半钢笔没水了（断电）？没关系，A 还完整——对外宣布「第 42 笔作废」，从 A 继续。
+    抄完了？B 完整，且页脚的笔数（42）比 A 的 41 大——宣布 B 是账本。
+    会计永远不需要「回滚日志」这种东西，因为<em>上一本永远是完整的</em>。
+  </div>
+
+  <div class="why">
+    为什么不用「在 meta 里写一个 in-progress 标志位」这种方案？因为标志位本身也占字节、也要写，
+    「写标志位」这个动作自己又可能被打断——问题原地踏步。乒乓双副本是唯一不需要任何额外假设的方案：
+    它把「写入原子性」这个不可能的承诺，换成了「两份副本至少一份完整」这个必然成立的承诺。
+    CPU 和 OS 层面还有一层：publishSnapshot 用原子变量（release/acquire 语义）发布，保证内存里的读者
+    也绝看不到「写了一半的 root」。
+  </div>
+</section>
+
+<!-- ============ 5.6 ============ -->
+<section id="s6">
+  <h2><span class="no">6</span>持久性旋钮：Durability 两档 + Options{fsync} + Db.sync()</h2>
+
+  <p><strong>是什么</strong>：同样的提交仪式，刷盘的力度可以调。旋钮在
+  <span class="file">src/writer.zig:145</span> 和 <span class="file">src/writer.zig:152</span>：</p>
+
+<pre>
+<span class="k">pub const</span> Durability = enum { process_crash, power_fail };  <span class="c">// writer.zig:145</span>
+
+<span class="k">pub const</span> Options = struct {
+    fsync: bool = <span class="k">true</span>,                          <span class="c">// 提交时是否同步刷盘</span>
+    micro_batch: MicroBatchConfig = .{},          <span class="c">// 上一节的拼车开关</span>
+    durability: Durability = .process_crash,      <span class="c">// 崩溃模型档位</span>
+    crc_check: CrcCheck = .off,                   <span class="c">// 读路径 CRC 分档（第 3 章讲过）</span>
+};
+</pre>
+
+  <p>两档 <strong>Durability（持久性档位：防到哪一级崩溃的保险等级）</strong>的区别，就是提交时多一次还是少一次 fsync：</p>
+
+  <table>
+    <tr><th>档位</th><th>提交流程</th><th>防什么</th><th>代价</th></tr>
+    <tr>
+      <td><code>process_crash</code>（默认）</td>
+      <td>写 meta → <strong>一次</strong> fsync（<span class="file">writer.zig:300</span>）</td>
+      <td>进程崩（kill -9、panic）——OS 页缓存还在，数据丢不了</td>
+      <td>最快；但机器<strong>断电</strong>时，已提交事务的数据页可能还没真正落盘</td>
+    </tr>
+    <tr>
+      <td><code>power_fail</code></td>
+      <td><strong>先</strong> syncDataPages（数据页落盘）→ 写 meta → 再 fsync（<span class="file">writer.zig:296-302</span>）</td>
+      <td>整机断电——meta 落盘的那一刻，它指向的数据页必然已经在盘上了</td>
+      <td>每次提交两次 fsync，单条 put 延迟约翻倍</td>
+    </tr>
+  </table>
+
+  <p>而 <code>Options.fsync</code> 是另一个独立旋钮：设成 <code>false</code> 进入「异步模式」——
+  commit 只写不刷，想什么时候稳，什么时候手动调 <code>db.sync()</code>
+  （<span class="file">src/db.zig:550</span>，内部就一行：<code>store.sync()</code>，即整个文件的 fsync）。
+  这个异步档只在 process_crash 档有意义（power_fail 的正确性依赖强制双刷，见 :143 注释）。</p>
+
+  <div class="analogy">
+    <strong>快递保价</strong>：process_crash = 普通快递（放驿站 = OS 页缓存），丢件风险只在「驿站着火」（断电）；
+    power_fail = 送到手签收（数据页先 fsync），贵一倍但火烧不到；fsync=false + Db.sync() = 你自己决定
+    什么时候去驿站取件攒着的一堆包裹——攒得越久越快，着火全没。
+  </div>
+
+  <div class="keypoint">
+    选型口诀：<strong>怕进程死 → 默认档；怕拔电源 → power_fail；要极限吞吐且能接受最后几秒丢失 →
+    fsync=false + 手动 sync()</strong>。三档都成立的前提是仪式本身没错——「meta 指到的数据页必须不新于 meta」
+    这条顺序约束，power_fail 用「先刷数据页」满足，默认档靠「页缓存不丢」满足。
+  </div>
+</section>
+
+<!-- ============ 5.7 ============ -->
+<section id="s7">
+  <h2><span class="no">7</span>abort 与错误路径：提交前失败时那些 dirty 页去哪了</h2>
+
+  <p><strong>是什么</strong>：先分两种情况。</p>
+
+  <h3>情况 A：commit 还没开始（abort 或 put 阶段报错）</h3>
+  <p><code>txn.abort</code>（<span class="file">src/db.zig:664</span>）做的几乎是「什么都不做」：
+  标记 finished、释放 staging arena（暂存列表连同里面的 key/value 一起蒸发）、松锁。
+  树没被碰过、磁盘没被碰过——因为第 2 节的设计，<strong>改动在 commit 之前对树是零接触的</strong>，
+  abort 天然干净。甚至你忘了调 abort，<code>deinit</code>（:673）也会兜底松锁防死锁。</p>
+
+  <h3>情况 B：commit 跑到一半报错（比如磁盘满 MapFull）</h3>
+  <p>这才是有意思的：步骤②往树上写的时候，<strong>新页已经写进去了</strong>（mmap 区域里已经有多余的页）。
+  提交失败，这些页岂不是脏了盘？答案藏在前几章的伏笔里：</p>
+
+  <ul>
+    <li><strong>meta 没切换 → 新页不可达</strong>。meta 还指着旧 root，从旧 root 出发遍历整棵树，
+        走不到任何本次新写的页。它们成了<strong>孤儿页（orphan：占着页号但从目录走不到的页）</strong>。</li>
+    <li><strong>孤儿无害</strong>：不会被读到（不可达），不会被复用（freelist 没登记它们——登记发生在
+        vtWriteMeta 的持久化链里，而那步没走到）。它们只是浪费空间，这就是注释里反复出现的
+        「leak direction is safe」（泄漏方向安全：出错宁可浪费空间，绝不误用数据）原则。</li>
+    <li><strong>谁报错谁兜底</strong>：applyBatchSwap 里任何一步失败，都会给这批请求的 future 塞进错误
+        （<span class="file">src/writer.zig:675</span> 等处），txn.commit 原样抛给调用方；
+        序号不 +1、meta 不写、快照不发布——仪式中途退场等于仪式没开始。</li>
+  </ul>
+
+  <div class="analogy">
+    舞台剧<strong>彩排</strong>：commit 开始 = 大幕拉开。布景组（COW 写页）已经把新布景搬上台了，
+    结果主演忘词（错误）导演喊停——大幕没关过，观众（读者）从头到尾只看过上一幕；
+    台上多出来的那套新布景（孤儿页）下次换幕时拆掉回收，不影响演出。
+    真正不能出错的只有换幕那一秒（meta 切换）——而那一秒短到几乎不可能失败。
+  </div>
+
+  <div class="keypoint">
+    把本章串成一句话：<strong>事务的原子性 = 「staging 隔离 + 单一提交点 + 双 meta 乒乓」三件套</strong>。
+    staging 保证 commit 前零接触；单一提交点保证崩溃只有回滚/生效两态；乒乓保证提交点本身崩不坏。
+    三者各管一段，缺一不可。
+  </div>
+</section>
+
+<!-- ============ 自测 ============ -->
+<section id="s8">
+  <h2><span class="no">8</span>本章自测</h2>
+
+  <p>能用自己的话回答，才算真懂。想不起来就回头翻对应小节。</p>
+
+  <ol>
+    <li><strong>为什么 txn.put 必须把 key/value 立刻 dup 进 arena？如果直接存调用方的切片，会出什么事故？</strong>
+      <br>提示：第 2 节。想想调用方的内存（栈缓冲）和事务的生命周期哪个长。</li>
+    <li><strong>commit 执行到「批量应用进树」之后、「写 meta」之前，进程被 kill -9。重启后：这批改动生效了吗？
+      那些已经写进 mmap 的新页会污染数据吗？</strong>
+      <br>提示：第 4、7 节。meta 指向谁？从旧 root 能走到新页吗？</li>
+    <li><strong>power_fail 档为什么必须「先刷数据页、再写 meta」？顺序反了会发生什么？</strong>
+      <br>提示：第 6 节。假设 meta 先落盘、数据页还在页缓存里，此时拔电源——重启后 meta 指向的页在盘上吗？</li>
+  </ol>
+
+  <div class="keypoint">
+    参考答案骨架：① 调用方切片可能活不过当前函数（栈帧销毁/缓冲复用），commit 在未来某个时刻才用它，
+    必须入口处复制收权；② 不生效——meta 仍指旧树，恢复走旧 root；新页不可达、不在 freelist，只是空间浪费，
+    完全无害；③ 顺序反了，重启后 meta（已落盘）指向的数据页可能还在页缓存里没落盘——根页号指向盘上的空洞，
+    「目录说有、货架是空的」，这就是必须先 syncDataPages 的原因。
+  </div>
+</section>
+
+<footer>
+  cube_db 详解 · 第 5 章 · 对应源码 src/db.zig + src/writer.zig —— 下一章看旧页什么时候才能死：<a href="ch06-mvcc.html">第 6 章 · MVCC 与页回收</a>
+</footer>
+
+</div>
+</body>
+</html>
