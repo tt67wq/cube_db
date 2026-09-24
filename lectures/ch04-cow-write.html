@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 4 章 · COW 写路径——树怎么改而不涂 — cube_db 详解讲义</title>
+<style>
+  :root {
+    --bg: #f7f8fa;
+    --card: #ffffff;
+    --ink: #24292f;
+    --muted: #6b7280;
+    --accent: #2563eb;
+    --accent-soft: #dbeafe;
+    --green: #16a34a;
+    --green-soft: #dcfce7;
+    --orange: #d97706;
+    --orange-soft: #fef3c7;
+    --purple: #7c3aed;
+    --purple-soft: #ede9fe;
+    --red: #dc2626;
+    --red-soft: #fee2e2;
+    --border: #e5e7eb;
+    --mono: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0 16px 80px;
+    background: var(--bg); color: var(--ink);
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+    line-height: 1.75; font-size: 16px;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; }
+  header.hero {
+    background: linear-gradient(135deg, #1e3a8a, #2563eb);
+    color: #fff; border-radius: 0 0 18px 18px;
+    padding: 40px 32px 32px; margin: 0 -16px 32px;
+  }
+  header.hero h1 { margin: 0 0 8px; font-size: 30px; }
+  header.hero p { margin: 4px 0; opacity: .92; }
+  header.hero .tag {
+    display: inline-block; background: rgba(255,255,255,.18);
+    border-radius: 999px; padding: 2px 12px; font-size: 13px; margin-right: 6px;
+  }
+  .chapter-nav { margin-top: 16px; font-size: 14px; }
+  .chapter-nav a { color: #fff; background: rgba(255,255,255,.18); border-radius: 999px; padding: 3px 14px; text-decoration: none; margin-right: 8px; }
+  .chapter-nav a:hover { background: rgba(255,255,255,.32); }
+  nav.toc {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 12px; padding: 18px 24px; margin-bottom: 28px;
+  }
+  nav.toc h2 { margin: 0 0 8px; font-size: 16px; color: var(--muted); }
+  nav.toc ol { margin: 0; padding-left: 22px; columns: 2; column-gap: 40px; }
+  nav.toc li { margin: 3px 0; break-inside: avoid; }
+  nav.toc a { color: var(--accent); text-decoration: none; }
+  nav.toc a:hover { text-decoration: underline; }
+  section {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 14px; padding: 26px 30px; margin-bottom: 26px;
+  }
+  h2 {
+    font-size: 22px; margin: 0 0 14px;
+    padding-bottom: 10px; border-bottom: 2px solid var(--accent-soft);
+  }
+  h2 .no {
+    display: inline-block; background: var(--accent); color: #fff;
+    width: 30px; height: 30px; line-height: 30px; text-align: center;
+    border-radius: 8px; font-size: 15px; margin-right: 10px;
+  }
+  h3 { font-size: 17px; margin: 22px 0 8px; }
+  p { margin: 10px 0; }
+  code {
+    font-family: var(--mono); font-size: 87%;
+    background: #eef1f5; border-radius: 5px; padding: 1px 6px;
+  }
+  .analogy {
+    background: var(--orange-soft); border-left: 4px solid var(--orange);
+    border-radius: 0 10px 10px 0; padding: 12px 18px; margin: 14px 0;
+  }
+  .analogy::before { content: "🍊 类比"; display: block; font-weight: 700; color: var(--orange); margin-bottom: 4px; }
+  .keypoint {
+    background: var(--green-soft); border-left: 4px solid var(--green);
+    border-radius: 0 10px 10px 0; padding: 12px 18px; margin: 14px 0;
+  }
+  .keypoint::before { content: "💡 划重点"; display: block; font-weight: 700; color: var(--green); margin-bottom: 4px; }
+  .why {
+    background: var(--purple-soft); border-left: 4px solid var(--purple);
+    border-radius: 0 10px 10px 0; padding: 12px 18px; margin: 14px 0;
+  }
+  .why::before { content: "❓ 为什么这么设计"; display: block; font-weight: 700; color: var(--purple); margin-bottom: 4px; }
+  table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 15px; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: #f0f3f8; }
+  td code { white-space: nowrap; }
+  .file { font-family: var(--mono); font-size: 13.5px; color: var(--accent); font-weight: 600; }
+  figure {
+    background: #fbfcfe; border: 1px dashed #c7d2e3; border-radius: 12px;
+    padding: 18px; margin: 18px 0; text-align: center; overflow-x: auto;
+  }
+  figcaption { color: var(--muted); font-size: 13.5px; margin-top: 8px; }
+  svg text { font-family: -apple-system, "PingFang SC", sans-serif; }
+  svg .mono { font-family: var(--mono); }
+  ul.checklist { list-style: none; padding-left: 4px; }
+  ul.checklist li { margin: 6px 0; }
+  ul.checklist li::before { content: "☑ "; color: var(--green); font-weight: 700; }
+  footer { color: var(--muted); font-size: 13.5px; text-align: center; margin-top: 40px; }
+</style>
+</head>
+<body>
+<header class="hero">
+  <div class="wrap">
+    <h1>第 4 章 · COW 写路径——树怎么改而不涂</h1>
+    <p>一次 put 在磁盘上到底产生了哪几页？分裂、大 value、批量、删除，各自的账怎么算</p>
+    <p>
+      <span class="tag">对应源码：src/btree.zig 写侧 + src/writer.zig 提交编排</span>
+      <span class="tag">前置：第 1 章（页格式）· 第 3 章（读路径）</span>
+    </p>
+    <p class="chapter-nav">
+      <a href="ch03-btree-read.html">← 上一章：B-tree 读路径</a>
+      <a href="ch05-txn-commit.html">下一章：事务与提交 →</a>
+    </p>
+  </div>
+</header>
+
+<div class="wrap">
+
+<nav class="toc">
+  <h2>本章目录</h2>
+  <ol>
+    <li><a href="#s1">复习 COW：一次插入产生一串新副本页</a></li>
+    <li><a href="#s2">单条 insert 的路径复制</a></li>
+    <li><a href="#s3">页满了怎么办：分裂</a></li>
+    <li><a href="#s4">大 key / 大 value 的特殊账</a></li>
+    <li><a href="#s5">insertBatch：一万条 put 为什么便宜得多</a></li>
+    <li><a href="#s6">删除的真面目：tombstone 与区间墓碑</a></li>
+    <li><a href="#s7">写放大账本</a></li>
+    <li><a href="#s8">本章自测</a></li>
+  </ol>
+</nav>
+
+<!-- ============ 4.1 ============ -->
+<section id="s1">
+  <h2><span class="no">1</span>复习 COW：一次插入产生一串新副本页</h2>
+
+  <p><strong>COW（Copy-On-Write，写时复制，改数据时先复制一份新副本再改，绝不覆盖原件）</strong>
+  在第 0 章我们打过比方：改论文不在原稿上涂改，而是誊一份新的。本章把这比方落到页的粒度上——
+  <strong>一次插入，究竟誊了哪几页？</strong></p>
+
+  <p>答案：从被修改的叶子页一路到根，<strong>路径上的每一页都复制一份</strong>，旧页一页不碰。</p>
+
+  <div class="analogy">
+    修改图书馆里的一本书：你只复印<strong>被改的那一页</strong>（叶子页）、
+    以及<strong>目录卡片柜里指向这本书的几张索引卡</strong>（分支页和根页）——
+    因为卡片上写着页号，新页换了页号，卡片也得重做。
+    书架上其他人正在读的旧书、旧卡片原封不动（这就是 MVCC 读快照的前提）。
+  </div>
+
+  <p>为什么这么折腾？两个回报：</p>
+  <ul>
+    <li><strong>崩溃安全</strong>：提交前任何时刻断电，旧树完好无损——新页从目录上走不到，等于没写（第 5 章的 meta 乒乓负责「官宣」）。</li>
+    <li><strong>读不加锁</strong>：读者永远拿着自己快照的根页号在旧页上行走，和写者井水不犯河水。</li>
+  </ul>
+
+  <div class="keypoint">
+    COW 的代价是「多写几页」，收益是「旧版本永远完好」。本章剩下的内容都在算这本账：
+    什么时候必须复制（4.2）、页装不下了怎么分裂（4.3）、太大的 value 往哪塞（4.4）、
+    怎么让一万条修改只付一次复制的钱（4.5）、删除为什么不删（4.6）、最后总账是多少（4.7）。
+  </div>
+</section>
+
+<!-- ============ 4.2 ============ -->
+<section id="s2">
+  <h2><span class="no">2</span>单条 insert 的路径复制</h2>
+
+  <p><strong>是什么：</strong>入口是 <code>insert()</code>（<code>src/btree.zig:1497</code>）。
+  它先把超大 key 挡在门外（<code>key.len > MAX_KEY_SIZE</code> 直接报
+  <code>error.KeyTooLarge</code>，<code>src/btree.zig:1508</code>），
+  空树则直接造第一个叶子页（<code>src/btree.zig:1509</code>）。否则递归下行：</p>
+
+  <figure>
+    <svg viewBox="0 0 760 400" width="760" height="400" role="img" aria-label="单条插入的 COW 路径复制流程图">
+      <defs><marker id="arr4" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#6b7280"/></marker></defs>
+      <g font-size="12.5">
+        <rect x="20" y="20" width="200" height="72" rx="9" fill="#eef2ff" stroke="#4f46e5"/>
+        <text x="120" y="44" text-anchor="middle" font-weight="700" fill="#3730a3">① 下行找叶子</text>
+        <text x="120" y="63" text-anchor="middle" fill="#374151">insert → insertIntoBranch</text>
+        <text x="120" y="80" text-anchor="middle" fill="#374151">逐层比较 key 选孩子（只读）</text>
+
+        <rect x="280" y="20" width="200" height="72" rx="9" fill="#eef2ff" stroke="#4f46e5"/>
+        <text x="380" y="44" text-anchor="middle" font-weight="700" fill="#3730a3">② 叶子：整页复印到栈缓冲</text>
+        <text x="380" y="63" text-anchor="middle" fill="#374151">insertIntoLeaf 先 @memcpy 一份</text>
+        <text x="380" y="80" text-anchor="middle" fill="#374151">旧页从此只读（src/btree.zig:924-926）</text>
+
+        <rect x="540" y="20" width="200" height="72" rx="9" fill="#eef2ff" stroke="#4f46e5"/>
+        <text x="640" y="44" text-anchor="middle" font-weight="700" fill="#3730a3">③ 在副本上改 + 写新页</text>
+        <text x="640" y="63" text-anchor="middle" fill="#374151">拼新 payload → allocPage 新页号</text>
+        <text x="640" y="80" text-anchor="middle" fill="#374151">writeNodePage 写入+算 CRC</text>
+
+        <rect x="150" y="150" width="460" height="66" rx="9" fill="#fef3c7" stroke="#d97706"/>
+        <text x="380" y="174" text-anchor="middle" font-weight="700" fill="#92400e">④ 每复制一页，把旧页号记进 dirty 列表</text>
+        <text x="380" y="194" text-anchor="middle" fill="#374151">叶子 src/btree.zig:1079 · 分支 src/btree.zig:1340 · 批量 1925/2012</text>
+
+        <rect x="150" y="250" width="460" height="120" rx="9" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="380" y="275" text-anchor="middle" font-weight="700" fill="#166534">⑤ 回程：父亲把「指向孩子」的指针改到新页</text>
+        <text x="380" y="297" text-anchor="middle" fill="#374151">孩子没分裂：cowBranchNoSplit —— 整页复印 + 只补 4 字节孩子指针</text>
+        <text x="380" y="315" text-anchor="middle" fill="#374151">（src/btree.zig:880）+ 重算 CRC，每层各产一页新分支</text>
+        <text x="380" y="340" text-anchor="middle" fill="#374151">一路补到根；根若溢出 → buildBranchLevels 造新根（高度只在这里长）</text>
+      </g>
+    </svg>
+    <figcaption>单条插入的 COW 路径。①只读不写；②③⑤每步都「另起一页」；④收集的 dirty 列表就是本章的主角之一。</figcaption>
+  </figure>
+
+  <h3>dirty 列表：被替换下来的旧页去哪了</h3>
+  <p><strong>dirty 页（脏页，COW 之后被「淘汰出局」的旧页——它们还装着合法的旧版本数据，只是不再被新树引用）</strong>
+  不是垃圾，是待回收资产。insert 全程把它们的页号 <code>append</code> 进一个列表
+  （叶子在 <code>src/btree.zig:1079</code>，分支在 <code>src/btree.zig:1340</code>），
+  随 <code>WriteResult{new_root, live_delta, count_delta}</code> 一起交回上层。
+  提交编排者 <code>writer.zig</code> 接手后，给每个旧页打上「本次提交序号」放进
+  <code>pending_free</code> 队列（<code>src/writer.zig:797-815</code>）——
+  <strong>等所有还在读旧快照的读者退场，才放回 freelist 复用</strong>（第 6 章专讲这个水位线）。</p>
+
+  <div class="why">
+    为什么叶子修改前先整页 @memcpy 到栈缓冲（<code>src/btree.zig:924-926</code>）？
+    因为后面 <code>allocPage</code> 可能触发底层存储的扩容/重排，之前借来的页指针会失效。
+    先抄一份到自己的栈上，就谁也动不了它——这是贯穿整个写侧的防御习惯
+    （<code>src/btree.zig:41-49</code> 的注释原话：copy the whole page to a stack buffer before modifying）。
+  </div>
+</section>
+
+<!-- ============ 4.3 ============ -->
+<section id="s3">
+  <h2><span class="no">3</span>页满了怎么办：分裂</h2>
+
+  <p><strong>是什么：</strong>一页容量有硬顶——叶子最多 32 条记录
+  （<code>LEAF_MAX_ENTRIES</code>，<code>src/btree.zig:12</code>），
+  分支最多 64 个孩子（<code>src/btree.zig:14</code>），
+  而且不管条数多少，正文不能超过 4068 字节（<code>NODE_PAYLOAD_CAP</code>，<code>src/btree.zig:370</code>）。
+  装不下就<strong>分裂（split，把一个装满的页拆成几个新页，并在父页里补上分隔 key）</strong>。</p>
+
+  <p>插入时的两级检查（<code>insertIntoLeaf</code>，<code>src/btree.zig:913</code>）：</p>
+  <ul>
+    <li>条数检查：新条数 &gt; 32 → 走分裂路径（<code>src/btree.zig:1082</code>）；</li>
+    <li>字节数检查：就算 ≤32 条，拼完超过 4068 字节也要分裂（<code>src/btree.zig:1089-1103</code>，
+        31 条小记录加一条大记录就能踩中这个坑）。</li>
+  </ul>
+
+  <p>分裂本体在 <code>insertIntoLeafSplit</code>（<code>src/btree.zig:1189</code>）：
+  把旧叶解码进内存、应用本次插入，然后按 <code>leafChunkLen</code>
+  <strong>按字节预算切块</strong>——每块 ≤32 条且 ≤4068B（<code>src/btree.zig:1247-1269</code>），
+  每块写成一个新叶子页，块与块之间的分隔 key 取「下一块第一条记录的 key」。</p>
+
+  <figure>
+    <svg viewBox="0 0 760 300" width="760" height="300" role="img" aria-label="叶子分裂图解">
+      <g font-size="12.5">
+        <!-- old leaf full -->
+        <rect x="40" y="40" width="300" height="70" rx="9" fill="#fee2e2" stroke="#dc2626"/>
+        <text x="190" y="65" text-anchor="middle" font-weight="700" fill="#991b1b">旧叶子页 #50（已满 32 条）</text>
+        <text x="190" y="88" text-anchor="middle" class="mono" fill="#374151">[apple…cat] [dog…zebra]</text>
+        <!-- new pages -->
+        <rect x="40" y="170" width="180" height="70" rx="9" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="130" y="195" text-anchor="middle" font-weight="700" fill="#166534">新页 #77</text>
+        <text x="130" y="218" text-anchor="middle" class="mono" fill="#374151">apple…cat…dog</text>
+        <rect x="240" y="170" width="180" height="70" rx="9" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="330" y="195" text-anchor="middle" font-weight="700" fill="#166534">新页 #78</text>
+        <text x="330" y="218" text-anchor="middle" class="mono" fill="#374151">elephant…zebra</text>
+        <!-- parent -->
+        <rect x="500" y="170" width="220" height="70" rx="9" fill="#dbeafe" stroke="#2563eb"/>
+        <text x="610" y="195" text-anchor="middle" font-weight="700" fill="#1e3a8a">父分支（新副本）</text>
+        <text x="610" y="218" text-anchor="middle" class="mono" fill="#374151">keys: [dog] → 77, 78</text>
+        <!-- arrows -->
+        <g stroke="#6b7280" stroke-width="1.8" fill="none" marker-end="url(#arr4)">
+          <line x1="130" y1="110" x2="130" y2="170"/>
+          <line x1="250" y1="110" x2="320" y2="170"/>
+          <line x1="420" y1="205" x2="500" y2="205"/>
+        </g>
+        <text x="60" y="140" fill="#92400e" font-size="12">分隔 key = 下一块第一条 key（src/btree.zig:1278-1283）</text>
+        <text x="470" y="275" fill="#6b7280" font-size="12">旧页 #50 旧页进 dirty 待回收；两块新页经 splice 上交给父页整合</text>
+        <text x="40" y="130" fill="#6b7280" font-size="12">↓</text>
+      </g>
+    </svg>
+    <figcaption>叶子分裂：装满的页按字节预算切成几块新页，分隔 key 上交给父亲。父亲也满？同样切——直到根。</figcaption>
+  </figure>
+
+  <p>分裂是<strong>向上传染</strong>的：叶子切出的新页组（代码里叫
+  <strong>splice，一组「新页号 + 分隔 key」的包裹，交给上一层去整合</strong>）交给父分支整合；
+  父分支也装不下（条数 &gt; 64 或字节超预算，检查在 <code>src/btree.zig:1413</code>）就把自己重建成
+  几个满装分支页再向上交；只有根溢出时，<code>buildBranchLevels</code>
+  （<code>src/btree.zig:1707</code>）把整组重建成层层分支、加一个新根——
+  <strong>树高只在这里长</strong>（<code>src/btree.zig:1535-1538</code> 注释原话：Height grows HERE and only here）。</p>
+
+  <div class="why">
+    课本上的 B-tree 分裂是「对半分」，还规定兄弟至少半满（LEAF_MIN_ENTRIES=16、
+    BRANCH_MIN_CHILDREN=32 这两个常量就定义在 <code>src/btree.zig:13 和 15</code>）。
+    但 cube_db 的分裂是<strong>「装箱式」</strong>：尽量装满一块再开下一块，而且
+    <strong>全代码没有合并（merge）逻辑</strong>——删除不缩页，所以永远不会出现「太空」的页，
+    半满规则自然用不上。这是「删除走逻辑墓碑」（4.6 节）换来的整个简化：没有下溢，就没有回溯再平衡。
+  </div>
+
+  <div class="analogy">
+    高速公路满员的巴士不搞「对半拆客」，而是<strong>装满一辆发一辆</strong>：32 个座位坐满就关门发车（写成一页），
+    下一辆重新装。因为没人下车摘座位（删除不物理腾位），永远不会有「只剩一半人还占着整车」的浪费。
+  </div>
+</section>
+
+<!-- ============ 4.4 ============ -->
+<section id="s4">
+  <h2><span class="no">4</span>大 key / 大 value 的特殊账</h2>
+
+  <p><strong>是什么：</strong>一页 4068 字节正文，一条记录想住进去，得先过两道尺寸闸门。</p>
+
+  <h3>闸门一：key 的硬上限 MAX_KEY_SIZE = 4051 字节</h3>
+  <p>推导写在 <code>src/btree.zig:154-173</code>：一页最多也要装得下<strong>一条</strong>记录——</p>
+  <table>
+    <tr><th>成分</th><th>字节</th><th>说明</th></tr>
+    <tr><td>正文容量</td><td>4068</td><td>4096 − 页头 24 − 页尾 CRC 4（第 1 章）</td></tr>
+    <tr><td>叶子头</td><td>3</td><td>kind 1 + 条数 2</td></tr>
+    <tr><td>每条固定开销</td><td>14</td><td>tombstone 1 + klen 4 + vlen 4 + flags 1 + overflow 页号 4</td></tr>
+    <tr><td><strong>key 剩余空间</strong></td><td><strong>4051</strong></td><td>4068 − 3 − 14。<code>MAX_KEY_SIZE</code>（<code>src/btree.zig:173</code>）</td></tr>
+  </table>
+  <p>为什么 key 是「硬」的而 value 不是？因为 value 装不下可以<strong>搬去 overflow 页</strong>（下面讲），
+  叶子里只留 4 字节页号；key 没有地方可搬——它必须留在叶子里供比较。这就是 key 上限比 value 严格的原因。</p>
+
+  <h3>闸门二：value 的复合预算 inlineValueBudget</h3>
+  <p>value 想内联（直接塞在叶子里）要满足
+  <code>value.len ≤ inlineValueBudget(key.len) = min(3800, 4068 − 3 − 10 − key.len)</code>
+  （<code>src/btree.zig:148-152</code>）。两个条件任一不满足就溢出：</p>
+  <ul>
+    <li><code>MAX_INLINE_VALUE = 3800</code>（<code>src/btree.zig:134</code>）：给同页其他条目留地方，不让一个胖 value 独占整页；</li>
+    <li><strong>复合上限</strong>：key + value 合计必须装进一页——key 很大时，哪怕 value 只有几百字节也得溢出。</li>
+  </ul>
+
+  <h3>overflow 链：装不下的 value 挂「外仓」</h3>
+  <p><code>writeOverflowPages</code>（<code>src/btree.zig:183</code>）把 value 按
+  每页 4068 字节切块，写成 <code>OVERFLOW</code> 类型（第 1 章的类型 4）的页链，
+  链接用页头的 <code>free_next</code> 字段（注释自嘲 MVP 没用 nkeys 记长度，链就靠 free_next，<code>src/btree.zig:182</code>）。
+  叶子里只存 flags=1 + 链头页号（<code>src/btree.zig:1142-1148</code>）。
+  判断走不走外仓就一行：<code>needsOverflow</code>（<code>src/btree.zig:264-266</code>）。</p>
+
+  <div class="analogy">
+    保险柜（叶子页）格子小，大件行李（大 value）不放柜里，贴一张<strong>「寄存单」</strong>（4 字节链头页号），
+    行李本身送去仓库（overflow 页），仓库一格装不下就寄存在相邻格子里并留「下一格」字条（free_next）。
+    取的时候按单子一格一格走。
+  </div>
+
+  <p>条目被覆盖或删除时，它的旧 overflow 链整条回收进 dirty 列表
+  （<code>freeOverflowPages</code>，<code>src/btree.zig:252-261</code>）——
+  外仓的格子跟着主格子一起进回收流程。</p>
+
+  <div class="keypoint">
+    有个顺序细节值得记住：overflow 链的回收<strong>必须在确认走快路径之后</strong>才做
+    （<code>src/btree.zig:1107-1112</code> 注释）——若最终走了分裂路径，链已由另一处回收，
+    提前回收会把同一个页号塞进 dirty 两次 → 一页被分配两份 → 数据串页。回收要「谁最后负责谁动手」。
+  </div>
+</section>
+
+<!-- ============ 4.5 ============ -->
+<section id="s5">
+  <h2><span class="no">5</span>insertBatch：一万条 put 为什么比一万次 insert 便宜得多</h2>
+
+  <p><strong>是什么：</strong><code>insertBatch</code>（<code>src/btree.zig:1569</code>）把一批
+  <strong>已按 key 排序</strong>的条目在<strong>一趟</strong>树遍历里全部插入。
+  它的文档注释就是本节结论（<code>src/btree.zig:1565-1567</code>）：
+  <em>同一叶子范围内的条目只复制页面一次，避免逐条 COW</em>。</p>
+
+  <p>省的钱来自三层：</p>
+  <table>
+    <tr><th>层</th><th>一次 insert（×10000）</th><th>一次 insertBatch（×1）</th></tr>
+    <tr><td>页复制</td><td>每条都复制「叶子+沿途分支」</td><td>同一个叶子页里的 N 条只付一次复制钱</td></tr>
+    <tr><td>内存分配</td><td>每条约 145 次 alloc/free</td><td>整个批次用一个 arena（内存竞技场，一块大内存上像切豆腐一样顺序划分、最后整体释放）一次性分配（<code>src/writer.zig:658-662</code>）</td></tr>
+    <tr><td>提交开销</td><td>每条一次 meta 写 + fsync</td><td>一批一次（第 5 章）</td></tr>
+  </table>
+
+  <p>调用方 <code>writer.zig</code> 还做了排序 smart path：收到的请求如果已按 key 有序（O(n) 检测，
+  <code>src/writer.zig:694-712</code>），直接引用调用方内存、相邻重复 key 就地去重（后写赢）；
+  无序则拷进一块连续缓冲、排序、去重（<code>src/writer.zig:715-780</code>）。
+  排序是前提——只有排好序，「同一叶子的条目挨在一起」才成立，一趟遍历才走得通。</p>
+
+  <div class="analogy">
+    快递员送 100 个包裹到同一栋楼：挨家挨户跑 100 趟（逐条 insert），还是<strong>按楼层排好序一次上楼、
+    一层一次把该层的都放下</strong>（insertBatch）？楼梯（树路径）只爬一次，每层的门（叶子页）只敲一次。
+  </div>
+
+  <div class="why">
+    为什么不在用户侧自动永远开批量？<code>MicroBatchConfig.batch_threshold</code> 默认 0 = 关闭
+    （<code>src/writer.zig:164-169</code>，<code>Options</code> 在 <code>src/writer.zig:152</code>）。
+    批量意味着「攒一攒再提交」，牺牲单条提交的即时持久性换吞吐——这是用户的安全/速度旋钮（第 5 章展开），
+    不该替用户拧。单条快路径也保留着：批里只有一条时直接走 <code>btree.insert</code> 免去排序开销
+    （<code>src/writer.zig:673-681</code>）。
+  </div>
+</section>
+
+<!-- ============ 4.6 ============ -->
+<section id="s6">
+  <h2><span class="no">6</span>删除的真面目：tombstone 与区间墓碑</h2>
+
+  <p><strong>是什么：</strong>删除一个 key，磁盘上<strong>什么都没消失</strong>——
+  只是写了一条「这个 key 已删」的记录。<strong>tombstone（墓碑，一个 value 为空、
+  打了 tombstone=1 标记的叶子条目，表示「这个 key 作废」）</strong>。</p>
+
+  <p>单删的旅程：<code>WriteTxn.delete</code> 只是把一条 <code>tombstone=true</code> 的条目
+  存进暂存区（<code>src/db.zig:616-622</code>）；提交时它变成一条普通请求，
+  走 <code>btree.insert(..., tombstone=true, ...)</code>（单条快路径 <code>src/writer.zig:673-681</code>）。
+  在叶子里，它的写法和普通条目一样，只是 tombstone 字节置 1、value 长度记 0
+  （<code>src/btree.zig:1133-1139</code>）——<strong>旧条目在新副本里被墓碑顶替</strong>，
+  旧的 overflow 链回收进 dirty。读路径（第 3 章）撞见墓碑就当 key 不存在；
+  计数也配合：活→墓碑 <code>count_delta = -1</code>（<code>src/btree.zig:1064-1070</code>）。</p>
+
+  <p><strong>为什么不物理删除？</strong>两个理由：
+  ① 正在读旧快照的读者还需要旧条目在那儿（COW/MVCC 的前提——旧页不许动）；
+  ② 物理删除会引起「页变空 → 下溢 → 合并再平衡」整套复杂机器。墓碑方案下树只会分裂不会萎缩，
+  4.3 节「没有合并逻辑」正是从这里换来的。</p>
+
+  <h3>deleteRange：一段区间一个链页，扫描时才生效</h3>
+  <p>删一千万个连续 key，逐个写墓碑要一千万条。<code>deleteRange</code>
+  （<code>src/db.zig:271</code>）改用第 1 章讲过的 range-tombstone 页链（类型 5）：
+  <strong>不碰树，只换「墓碑链」</strong>。流程（<code>src/db.zig:271-347</code>）：</p>
+
+  <figure>
+    <svg viewBox="0 0 760 260" width="760" height="260" role="img" aria-label="deleteRange 的墓碑链交换流程">
+      <defs><marker id="arr5" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#6b7280"/></marker></defs>
+      <g font-size="12.5">
+        <rect x="20" y="20" width="170" height="76" rx="9" fill="#eef2ff" stroke="#4f46e5"/>
+        <text x="105" y="45" text-anchor="middle" font-weight="700" fill="#3730a3">① 边界检查</text>
+        <text x="105" y="64" text-anchor="middle" fill="#374151">区间端点太大塞不进</text>
+        <text x="105" y="81" text-anchor="middle" fill="#374151">单条墓碑？→ 逐条兜底路径</text>
+
+        <rect x="210" y="20" width="170" height="76" rx="9" fill="#eef2ff" stroke="#4f46e5"/>
+        <text x="295" y="45" text-anchor="middle" font-weight="700" fill="#3730a3">② 幂等短路</text>
+        <text x="295" y="64" text-anchor="middle" fill="#374151">区间已被现有墓碑覆盖？</text>
+        <text x="295" y="81" text-anchor="middle" fill="#374151">→ 直接返回，零副作用</text>
+
+        <rect x="400" y="20" width="160" height="76" rx="9" fill="#eef2ff" stroke="#4f46e5"/>
+        <text x="480" y="45" text-anchor="middle" font-weight="700" fill="#3730a3">③ 流式计数</text>
+        <text x="480" y="64" text-anchor="middle" fill="#374151">扫描可见的区间内 key，</text>
+        <text x="480" y="81" text-anchor="middle" fill="#374151">记条数与字节数（O(1) 内存）</text>
+
+        <rect x="580" y="20" width="160" height="76" rx="9" fill="#eef2ff" stroke="#4f46e5"/>
+        <text x="660" y="45" text-anchor="middle" font-weight="700" fill="#3730a3">④ 合并新区间</text>
+        <text x="660" y="64" text-anchor="middle" fill="#374151">与新墓碑一起规范化：</text>
+        <text x="660" y="81" text-anchor="middle" fill="#374151">排序 + 重叠合并（canonical）</text>
+
+        <rect x="120" y="150" width="520" height="86" rx="9" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="380" y="176" text-anchor="middle" font-weight="700" fill="#166534">⑤ commitTombSwap：一次提交 = 写新链页 + 换 meta 里的链头指针</text>
+        <text x="380" y="198" text-anchor="middle" fill="#374151">树（root）一页都没动；旧链页进 pending_free（src/writer.zig:996-1053）</text>
+        <text x="380" y="218" text-anchor="middle" fill="#374151">被删条目还在叶子里躺着——扫描撞上墓碑区间时才被「遮住」</text>
+        <g stroke="#6b7280" stroke-width="1.8" fill="none" marker-end="url(#arr5)">
+          <line x1="190" y1="58" x2="210" y2="58"/><line x1="380" y1="58" x2="400" y2="58"/><line x1="560" y1="58" x2="580" y2="58"/>
+          <line x1="660" y1="96" x2="640" y2="150"/>
+        </g>
+      </g>
+    </svg>
+    <figcaption>deleteRange 全程不修改 B-tree：墓碑链是一棵独立的「遮蔽层」，提交只是把链头指针原子换新。</figcaption>
+  </figure>
+
+  <p>细节三则：端点太大连一条墓碑都装不下时，退回「每 256 条一批的逐条墓碑」兜底
+  （<code>deleteRangeMaterialized</code>，<code>src/db.zig:360</code>）；
+  链头指针 <code>tomb_head</code> 和树根打包成一个 64 位原子量一起发布
+  （<code>publishSnapshot</code>，<code>src/writer.zig:257-260</code>），
+  读者一次加载拿到配套的（根，链头）——不会出现「新树配旧墓碑」的撕裂；
+  第一次写墓碑后，meta 版本永久升到 3（sticky，<code>src/writer.zig:879-880</code>）。</p>
+
+  <div class="analogy">
+    墓碑链像<strong>一块盖在地图上的毛玻璃</strong>：地图（树）没重画，只是在「某街区已拆除」的范围上盖了玻璃。
+    游客（扫描查询）走到玻璃下就什么都看不到；换新玻璃（swap）只改「玻璃挂哪」这一个挂钩（tomb_head），
+    旧玻璃留给还在看它的游客（旧快照读者）。
+  </div>
+</section>
+
+<!-- ============ 4.7 ============ -->
+<section id="s7">
+  <h2><span class="no">7</span>写放大账本</h2>
+
+  <p><strong>写放大（write amplification，实际写进磁盘的字节数 ÷ 用户要写的逻辑数据量）</strong>
+  是存储引擎的头号成本指标。cube_db 一次单条提交碰几页？按树高算：</p>
+
+  <ul>
+    <li>1 个新叶子页（被改的那页）；</li>
+    <li>沿途每个分支一页新副本（<code>cowBranchNoSplit</code>，一页只补 4 字节）；</li>
+    <li>偶发：分裂的额外页；</li>
+    <li>1 个 meta 页 + freelist 维护（第 5/7 章）。</li>
+  </ul>
+  <p>百万级 key 约 3 层高，即一次单条提交写 3~5 页 ≈ 12~20KB——对小记录这账不好看；
+  但配合批量（4.5 节），同叶条目共享复制，长期平均就贴着数据本身的大小走。
+  更关键的是<strong>没有任何隐性的重复写</strong>：</p>
+
+  <table>
+    <tr><th>引擎类型</th><th>写路径</th><th>写放大来源</th></tr>
+    <tr><td>LSM-tree（LevelDB/RocksDB 一族）</td><td>先写日志，再写 memtable，后台一层层压实（compaction，把多层有序文件反复归并重写）</td><td>同一条数据被压缩过程重写多层，典型 10~30×</td></tr>
+    <tr><td>原地更新 B-tree + WAL</td><td>数据页原地改，先写预写日志（WAL）</td><td>每条数据写两遍：日志一遍 + 页一遍</td></tr>
+    <tr><td><strong>cube_db（COW + freelist）</strong></td><td>COW 写新页，旧页经 freelist 原地复用，无日志、无压实</td><td>只有「改路径上的页」本身；批量摊薄后 ≈ 数据量级。旧页回收复用，文件不无限膨胀</td></tr>
+  </table>
+
+  <p>第 0 章引用过 README 的说法：「写放大约 1×、永不整体重写（compact 是 O(1)）」。
+  现在你能解释它了：<strong>COW 天然是「只写增量」</strong>；freelist 让旧页原地翻新（不追加新空间）；
+  崩溃安全靠双 meta 乒乓而不是日志——三件事互相成全，才把账压到这么低。</p>
+
+  <div class="why">
+    天下没有免费的午餐，cube_db 把写放大的省，换成了<strong>空间放大</strong>：
+    已删的条目（墓碑顶替前的旧值）、旧版本页都还在文件里躺着，直到读者水位线放行（第 6 章）、
+    页被 freelist 复用才真正「翻篇」。顺序是：先用空间换写少，再用 MVCC 期限把空间收回。
+  </div>
+
+  <div class="keypoint">
+    本章链条串起来：COW 复制路径（4.2）→ 装满就装箱分裂（4.3）→ 装不下的 value 寄外仓（4.4）→
+    批量共享复制（4.5）→ 删除只贴墓碑不拆房（4.6）→ 于是写路径永远「只写增量、原地翻新」（4.7）。
+    第 5 章看这些新页如何在 commit 的一瞬间「官宣生效」。
+  </div>
+</section>
+
+<!-- ============ 8 自测 ============ -->
+<section id="s8">
+  <h2><span class="no">8</span>本章自测</h2>
+  <p>不看上文，用自己的话回答。</p>
+
+  <ol>
+    <li><strong>页数账</strong>：向一棵 3 层高的树（根分支→分支→叶子）插入一条不引发分裂的小记录，
+      会新写几页？每一页分别是什么？被替换下来的旧页立刻被新事务复用吗，为什么？
+      <em>（提示：4.2 节——叶子 + 两个分支 + 计 meta；旧页先去 pending_free 排队等读者退场。）</em></li>
+    <li><strong>分裂的方向</strong>：课本 B-tree 分裂是对半分并保证兄弟半满，cube_db 却是「装箱式」切满块，
+      且没有合并逻辑。为什么在这个设计里「不合并」是自洽的而不是 bug？
+      <em>（提示：4.3 + 4.6——删除不物理腾位，页永远不会变空。）</em></li>
+    <li><strong>两种删除的成本差</strong>：删一个 key 和删 [a, z) 区间一千万个 key，
+      各自在磁盘上产生什么？为什么区间删除时树根和叶子的页号一个都没变？
+      <em>（提示：4.6——单删是墓碑条目进树；区间删除只换 tomb_head 指针，遮蔽发生在扫描时。）</em></li>
+  </ol>
+
+  <div class="keypoint">
+    三题都答顺了，你已经明白「COW 写路径」的全部骨架。下一章进入提交仪式：
+    这些散落的新页如何在一次 meta 写 + fsync 里原子生效。
+  </div>
+</section>
+
+<footer>
+  cube_db 详解 · 第 4 章 · 源码基准：src/btree.zig / src/writer.zig @ 当前 HEAD —— 下一章：<a href="ch05-txn-commit.html">事务与提交</a>
+</footer>
+
+</div>
+</body>
+</html>
