@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 7 章 · 落地到操作系统——mmap、freelist 链与文件锁</title>
+<style>
+  :root {
+    --bg: #f7f8fa;
+    --card: #ffffff;
+    --ink: #24292f;
+    --muted: #6b7280;
+    --accent: #2563eb;
+    --accent-soft: #dbeafe;
+    --green: #16a34a;
+    --green-soft: #dcfce7;
+    --orange: #d97706;
+    --orange-soft: #fef3c7;
+    --purple: #7c3aed;
+    --purple-soft: #ede9fe;
+    --red: #dc2626;
+    --red-soft: #fee2e2;
+    --border: #e5e7eb;
+    --mono: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0 16px 80px;
+    background: var(--bg); color: var(--ink);
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+    line-height: 1.75; font-size: 16px;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; }
+  header.hero {
+    background: linear-gradient(135deg, #1e3a8a, #2563eb);
+    color: #fff; border-radius: 0 0 18px 18px;
+    padding: 40px 32px 32px; margin: 0 -16px 32px;
+  }
+  header.hero h1 { margin: 0 0 8px; font-size: 30px; }
+  header.hero p { margin: 4px 0; opacity: .92; }
+  header.hero .tag {
+    display: inline-block; background: rgba(255,255,255,.18);
+    border-radius: 999px; padding: 2px 12px; font-size: 13px; margin-right: 6px;
+  }
+  nav.toc {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 12px; padding: 18px 24px; margin-bottom: 28px;
+  }
+  nav.toc h2 { margin: 0 0 8px; font-size: 16px; color: var(--muted); }
+  nav.toc ol { margin: 0; padding-left: 22px; columns: 2; column-gap: 40px; }
+  nav.toc li { margin: 3px 0; break-inside: avoid; }
+  nav.toc a { color: var(--accent); text-decoration: none; }
+  nav.toc a:hover { text-decoration: underline; }
+  section {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 14px; padding: 26px 30px; margin-bottom: 26px;
+  }
+  h2 {
+    font-size: 22px; margin: 0 0 14px;
+    padding-bottom: 10px; border-bottom: 2px solid var(--accent-soft);
+  }
+  h2 .no {
+    display: inline-block; background: var(--accent); color: #fff;
+    width: 30px; height: 30px; line-height: 30px; text-align: center;
+    border-radius: 8px; font-size: 15px; margin-right: 10px;
+  }
+  h3 { font-size: 17px; margin: 22px 0 8px; }
+  p { margin: 10px 0; }
+  code {
+    font-family: var(--mono); font-size: 87%;
+    background: #eef1f5; border-radius: 5px; padding: 1px 6px;
+  }
+  .analogy {
+    background: var(--orange-soft); border-left: 4px solid var(--orange);
+    border-radius: 0 10px 10px 0; padding: 12px 18px; margin: 14px 0;
+  }
+  .analogy::before { content: "🍊 类比"; display: block; font-weight: 700; color: var(--orange); margin-bottom: 4px; }
+  .keypoint {
+    background: var(--green-soft); border-left: 4px solid var(--green);
+    border-radius: 0 10px 10px 0; padding: 12px 18px; margin: 14px 0;
+  }
+  .keypoint::before { content: "💡 划重点"; display: block; font-weight: 700; color: var(--green); margin-bottom: 4px; }
+  .why {
+    background: var(--purple-soft); border-left: 4px solid var(--purple);
+    border-radius: 0 10px 10px 0; padding: 12px 18px; margin: 14px 0;
+  }
+  .why::before { content: "❓ 为什么这么设计"; display: block; font-weight: 700; color: var(--purple); margin-bottom: 4px; }
+  table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 15px; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: #f0f3f8; }
+  td code { white-space: nowrap; }
+  .file { font-family: var(--mono); font-size: 13.5px; color: var(--accent); font-weight: 600; }
+  figure {
+    background: #fbfcfe; border: 1px dashed #c7d2e3; border-radius: 12px;
+    padding: 18px; margin: 18px 0; text-align: center; overflow-x: auto;
+  }
+  figcaption { color: var(--muted); font-size: 13.5px; margin-top: 8px; }
+  .diagram-label { font-size: 13px; font-family: var(--mono); }
+  svg text { font-family: -apple-system, "PingFang SC", sans-serif; }
+  svg .mono { font-family: var(--mono); }
+  ul.checklist { list-style: none; padding-left: 4px; }
+  ul.checklist li { margin: 6px 0; }
+  ul.checklist li::before { content: "☑ "; color: var(--green); font-weight: 700; }
+  footer { color: var(--muted); font-size: 13.5px; text-align: center; margin-top: 40px; }
+  .quiz { background: #f0f9ff; border-left: 4px solid #0ea5e9; border-radius: 0 10px 10px 0; padding: 12px 18px; margin: 14px 0; }
+  .quiz::before { content: "🧪 自测题"; display: block; font-weight: 700; color: #0284c7; margin-bottom: 4px; }
+</style>
+</head>
+<body>
+<header class="hero">
+  <div class="wrap">
+    <h1>第 7 章 · 落地到操作系统</h1>
+    <p>—— mmap、freelist 链与文件锁</p>
+    <p>
+      <span class="tag">对应代码：src/file_page_store.zig（1040 行）+ spike_mmap.zig</span>
+      <span class="tag">前置：第 2 章（PageStore 接口）· 第 5 章（提交与 fsync）· 第 6 章（freelist 复用）</span>
+    </p>
+    <p>
+      <a href="ch06-mvcc-reclaim.html" style="color:#bfdbfe">← 上一章：MVCC 与页回收</a>
+      &nbsp;|&nbsp;
+      <a href="ch08-reliability.html" style="color:#bfdbfe">下一章：可靠性工程 →</a>
+    </p>
+  </div>
+</header>
+
+<div class="wrap">
+
+<nav class="toc">
+  <h2>本章目录</h2>
+  <ol>
+    <li><a href="#s1">mmap 补课：把文件变成一块内存</a></li>
+    <li><a href="#s2">1TB 预留戏法：只占门牌号不占地皮</a></li>
+    <li><a href="#s3">写路径：writePage / msync / fsync 的分工</a></li>
+    <li><a href="#s4">freelist 两副面孔：内存池与磁盘链</a></li>
+    <li><a href="#s5">flock：一山不容二进程</a></li>
+    <li><a href="#s6">崩溃注入钩子：在指定步骤「模拟断电」</a></li>
+    <li><a href="#s7">本章自测</a></li>
+  </ol>
+</nav>
+
+<!-- ============ 1 ============ -->
+<section id="s1">
+  <h2><span class="no">1</span>mmap 补课：把文件变成一块内存</h2>
+
+  <p><strong>是什么</strong>：<code>file_page_store.zig</code> 是第 2 章那个 PageStore 接口的生产实现 ——
+  真正跟磁盘打交道的那个。它的全部魔法建立在一个系统调用上：<strong>mmap（memory map，内存映射）</strong>。</p>
+
+  <p>普通读文件的方式：你的程序调 <code>read(fd, buf, n)</code>，内核把数据从磁盘拷到内核缓冲区，
+  再从内核缓冲区拷到你的 buf —— <strong>两次拷贝，一次系统调用</strong>，每个字节都要「过手」。
+  mmap 换了个思路（<code>src/file_page_store.zig:192</code>）：
+  让操作系统把文件<strong>直接映射进进程的地址空间</strong>，参数 <code>MAP_SHARED</code> 表示
+  「映射和文件是同一份」—— 你改这块内存等于改文件，别人改文件你能立刻看见。
+  映射好之后，读第 N 页就是读 <code>base + N × 4096</code> 这 4096 个字节 ——
+  <strong>没有 read() 调用，没有拷贝，就是一次普通的内存访问（指针解引用）</strong>。这就是「读路径零拷贝」的全部含义。</p>
+
+  <p>对应到第 3 章讲的 B-tree 下降：get 每层「读一页」在实现上只是
+  <code>pagePtr(page_no)</code> 算个地址（file_page_store.zig:288），连系统调用都没有 ——
+  树的高度决定访存次数，仅此而已。</p>
+
+  <div class="analogy">
+    普通文件读写像<strong>叫外卖</strong>：每吃一口都要下订单（系统调用），商家（磁盘）打包、骑手（内核）送货到家（你的缓冲区）——
+    又慢又占地。mmap 像<strong>把厨房直接盖在你家隔壁</strong>：想吃什么自己伸手拿，盘子（页缓存）和厨房（磁盘）天然同步。
+    开销从「每次配送」变成「一次装修」。
+  </div>
+
+  <div class="why">
+    为什么敢把数据库文件直接暴露成内存？因为前几章的地基在这层兑现：COW 保证没有任何指针会被原地失效，
+    CRC 能发现字节级损坏，页是定长的 —— 所以「地址 = 页号 × 4096」这个公式永远成立。
+    <strong>上层越守纪律，底层越能耍大胆的优化。</strong>反过来，file_page_store 也只做存储这一件事，
+    不理解页里装的是什么 —— 第 2 章切接口的那一刀在这里收红利。
+  </div>
+</section>
+
+<!-- ============ 2 ============ -->
+<section id="s2">
+  <h2><span class="no">2</span>1TB 预留戏法：只占门牌号不占地皮</h2>
+
+  <p><strong>是什么</strong>：打开数据库时，mmap 一次性映射 <code>REGION_SIZE = 1 << 40</code> ——
+  <strong>1TB 的虚拟地址空间</strong>（file_page_store.zig:25、192）。你的数据库只有 10MB？没关系，
+  照样预留 1TB。关键在理解两件事的区别：</p>
+
+  <table>
+    <tr><th></th><th>虚拟地址空间</th><th>磁盘空间</th></tr>
+    <tr><td>预留 1TB 时</td><td>立刻占用（只是一段地址编号，像门牌号区间）</td><td>一点不占（文件还是实际大小）</td></tr>
+    <tr><td>文件增长（ftruncate，file_page_store.zig:326）</td><td>无需任何操作</td><td>按需多占</td></tr>
+  </table>
+
+  <p>为什么这是<strong>戏法</strong>：文件用 <code>ftruncate</code> 长大后（比如从 4KB 长到 8KB），
+  <strong>同一块映射里的新字节立刻可见</strong> —— 不需要重新 mmap、不需要换指针、所有旧引用继续有效。
+  这个假设是整个方案的地基，而地基是先拿小实验验证过的：<code>spike_mmap.zig</code>（63 行的独立探针程序）
+  在 macOS 上真的做了「映射 1TB → ftruncate 翻倍 → 立刻读新字节」的全流程，
+  确认不炸（无 SIGBUS）、新数据可见（spike_mmap.zig:14-62），结论写在最后一行：
+  <em>scheme I viable</em>（方案 I 可行）。先探路，再盖楼 —— 这是仓库里 spike/ 目录存在的意义。</p>
+
+  <figure>
+    <svg viewBox="0 0 760 300" width="760" height="300" role="img" aria-label="1TB 虚拟预留示意图">
+      <g font-size="12.5">
+        <!-- virtual space -->
+        <rect x="60" y="40" width="640" height="56" rx="8" fill="#dbeafe" stroke="#2563eb"/>
+        <text x="380" y="63" text-anchor="middle" font-weight="700" fill="#1e3a8a">进程虚拟地址空间：一次性预留 1TB（REGION_SIZE = 1&lt;&lt;40）</text>
+        <text x="380" y="82" text-anchor="middle" fill="#374151" font-size="11.5">只是地址编号 —— 像小区先把 1~10000 号门牌全领了</text>
+        <!-- mapping arrow -->
+        <text x="380" y="122" text-anchor="middle" fill="#6b7280" font-size="11.5">mmap(MAP_SHARED) 把这段地址绑到文件（file_page_store.zig:192），之后再也不动</text>
+        <line x1="380" y1="96" x2="380" y2="135" stroke="#6b7280" stroke-width="1.4" marker-end="url(#none)"/>
+        <!-- file growth -->
+        <rect x="60" y="150" width="150" height="46" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="135" y="170" text-anchor="middle" fill="#166534" font-weight="700">文件 4KB</text>
+        <text x="135" y="187" text-anchor="middle" fill="#374151" font-size="11">刚建库：meta×2 + 空</text>
+        <rect x="240" y="150" width="230" height="46" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="355" y="170" text-anchor="middle" fill="#166534" font-weight="700">文件 ftruncate 到 24KB</text>
+        <text x="355" y="187" text-anchor="middle" fill="#374151" font-size="11">写了几页数据（file_page_store.zig:326）</text>
+        <rect x="500" y="150" width="200" height="46" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="600" y="170" text-anchor="middle" fill="#166534" font-weight="700">文件继续长大…</text>
+        <text x="600" y="187" text-anchor="middle" fill="#374151" font-size="11">每次写新页时按需增长</text>
+        <!-- visibility annotations -->
+        <rect x="60" y="225" width="640" height="52" rx="8" fill="#fef3c7" stroke="#d97706"/>
+        <text x="380" y="246" text-anchor="middle" fill="#92400e" font-weight="700">关键性质（spike_mmap.zig 验证过）：文件每长大一段，映射里对应字节立刻可见</text>
+        <text x="380" y="264" text-anchor="middle" fill="#374151" font-size="11.5">不需要 remap、不需要换指针 —— 所有「页号 × 4096」的地址公式终身有效</text>
+      </g>
+    </svg>
+    <figcaption>1TB 预留：虚拟地址一次包圆，磁盘空间按需 growth。增长不触发重映射，旧指针永远有效。</figcaption>
+  </figure>
+
+  <div class="analogy">
+    电梯房<strong>整层买断</strong>：开盘时把 1~64 室的房号（虚拟地址）一次性登记在你名下，
+    但只装修已入住的几间（文件实际大小）。以后每搬进一户新邻居（ftruncate 增长），
+    你的门牌、电梯卡、快递地址全都不用换。<strong>先圈地址、后填内容</strong>，扩张零成本。
+  </div>
+</section>
+
+<!-- ============ 3 ============ -->
+<section id="s3">
+  <h2><span class="no">3</span>写路径：writePage / fsync 的分工</h2>
+
+  <p><strong>是什么</strong>：读是白拿，写要负责。<code>vtWritePage</code>（file_page_store.zig:721）
+  做的事少得惊人：确认文件长到位（<code>ensureFileGrowth</code>，按需 ftruncate，:319）、
+  然后返回页在 mmap 里的可写指针 —— 写入本身就是往这块内存 <code>memcpy</code>。
+  但「进程觉得写完了」和「数据扛得住断电」是两回事，中间隔着一层<strong>页缓存</strong>：
+  操作系统为性能把脏页攒着，延迟刷盘。断电时页缓存蒸发 —— 所以提交协议里必须有强制刷盘的一步。</p>
+
+  <p>这一层只提供一个诚实的原语 <code>vtSync</code>（file_page_store.zig:864）：
+  <code>fsync(fd)</code> —— 让内核把该文件的所有脏数据（含 mmap 写入）真正落到磁盘才返回。
+  什么时候调它，是第 5 章 durability 的地盘；本层还多送一个 <code>syncDataPages</code>（:905）：
+  只刷数据页、不刷 meta，用于 power_fail 档「先数据后 meta」的顺序承诺 ——
+  源码注释（:878-903）详细记录了为什么不选 fdatasync 和 msync：
+  fdatasync 允许跳过文件长度这类 inode 元数据，而本项目靠 ftruncate 长大文件，
+  「字节落了、长度没落」会让重启后的文件尾变成黑洞 —— 正是必须防的悬空根。</p>
+
+  <div class="keypoint">
+    第 5 章的六步仪式在本层的对应关系：步骤④「写新页」= writePage（mmap 拷贝）；
+    步骤⑤「meta + fsync」= writeMeta（:775，双 meta 槽都写）+ sync（fsync 落盘）。
+    <strong>引擎层的「提交」到这一层全部化归为：memcpy + 一次 fsync。</strong>
+  </div>
+
+  <div class="analogy">
+    作家交稿：写进电脑（mmap 拷贝）只等于「我写完了」，笔记本还没通电到出版社（页缓存）；
+    <strong>fsync 才是「确认出版社收到纸质存档」</strong>—— 这一步不回来， manuscripts 随时可能随火灾蒸发。
+    快递单上「先发货后改收货地址」还是「先改地址后发货」（data-before-meta 顺序），
+    决定的是收件人到底是谁 —— 顺序错了，整个包裹寄给错误版本。
+  </div>
+</section>
+
+<!-- ============ 4 ============ -->
+<section id="s4">
+  <h2><span class="no">4</span>freelist 两副面孔：内存池与磁盘链</h2>
+
+  <p><strong>是什么</strong>：第 6 章讲过页回收进 freelist。但 freelist 活在两个世界 ——
+  <strong>进程内存里</strong>是一个数组池（快，随便改），<strong>磁盘文件里</strong>必须也是持久数据
+  （重启后还得知道哪些页空闲）。这一层负责让两副面孔保持一致：</p>
+
+  <ul>
+    <li><strong>内存侧</strong>：<code>popPoolLocked</code> / <code>pushPoolLocked</code>（file_page_store.zig:341、366）——
+      分配从池尾弹一个（LIFO），回收往池里塞一个；配一张哈希镜像 <code>pool_set</code> 做 O(1) 查重，
+      保证「重复归还」自动变空操作（注释里的 INV-F1：free 错两次绝不能导致页被分出去两次）。池空了才
+      <code>bumpPageLocked</code>（:387）开新页、顺带 ftruncate 长文件；</li>
+    <li><strong>磁盘侧</strong>：一条由 FREE 页串成的链表。每页能装 1016 个空闲页号
+      （<code>MAX_FREE_ENTRIES_PER_PAGE</code>，format.zig:34 —— (4096−24−4−4)/4），
+      页与页之间用页头的 <code>free_next</code> 字段相连（第 3 章 overflow 链的同一招）。</li>
+  </ul>
+
+  <figure>
+    <svg viewBox="0 0 760 330" width="760" height="330" role="img" aria-label="freelist 内存池与磁盘链双视图">
+      <defs><marker id="arr7" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#6b7280"/></marker></defs>
+      <g font-size="12.5">
+        <!-- memory side -->
+        <rect x="40" y="30" width="290" height="150" rx="10" fill="#dbeafe" stroke="#2563eb"/>
+        <text x="185" y="52" text-anchor="middle" font-weight="700" fill="#1e3a8a">内存视图：freelist 数组池</text>
+        <rect x="65" y="66" width="240" height="30" rx="6" fill="#fff" stroke="#93c5fd"/>
+        <text x="185" y="85" text-anchor="middle" fill="#374151" class="mono" font-size="11.5">[7, 12, 3, 41, 15, …]（LIFO）</text>
+        <text x="185" y="118" text-anchor="middle" fill="#374151" font-size="11.5">alloc：从尾部弹一个（popPoolLocked :341）</text>
+        <text x="185" y="136" text-anchor="middle" fill="#374151" font-size="11.5">free：塞回去，哈希查重防双记（:366）</text>
+        <text x="185" y="160" text-anchor="middle" fill="#6b7280" font-size="11">池空 → bumpPageLocked 开新页（:387）</text>
+
+        <!-- disk side -->
+        <rect x="430" y="30" width="290" height="150" rx="10" fill="#fef3c7" stroke="#d97706"/>
+        <text x="575" y="52" text-anchor="middle" font-weight="700" fill="#92400e">磁盘视图：FREE 页链</text>
+        <rect x="450" y="66" width="110" height="44" rx="6" fill="#fff" stroke="#d97706"/>
+        <text x="505" y="84" text-anchor="middle" fill="#374151" font-size="10.5">FREE 页 88</text>
+        <text x="505" y="99" text-anchor="middle" fill="#92400e" class="mono" font-size="10">free_next→52</text>
+        <rect x="590" y="66" width="110" height="44" rx="6" fill="#fff" stroke="#d97706"/>
+        <text x="645" y="84" text-anchor="middle" fill="#374151" font-size="10.5">FREE 页 52</text>
+        <text x="645" y="99" text-anchor="middle" fill="#92400e" class="mono" font-size="10">free_next→0</text>
+        <line x1="560" y1="88" x2="590" y2="88" stroke="#6b7280" stroke-width="1.5" marker-end="url(#arr7)"/>
+        <text x="575" y="130" text-anchor="middle" fill="#374151" font-size="11.5">每页装 1016 个页号（format.zig:34）</text>
+        <text x="575" y="148" text-anchor="middle" fill="#374151" font-size="11.5">meta 页里只记：链头 free_head + 总数 free_count</text>
+        <text x="575" y="166" text-anchor="middle" fill="#6b7280" font-size="11">persistChainLocked 每次提交整链重写（:434）</text>
+
+        <!-- bridge arrows -->
+        <text x="380" y="215" text-anchor="middle" fill="#374151" font-weight="700">两副面孔的交接仪式 = 每次 writeMeta（:775）</text>
+        <path d="M185,180 C185,240 330,240 430,120" fill="none" stroke="#16a34a" stroke-width="1.6" stroke-dasharray="5 3" marker-end="url(#arr7)"/>
+        <path d="M575,180 C575,250 300,250 200,185" fill="none" stroke="#4f46e5" stroke-width="1.6" stroke-dasharray="5 3" marker-end="url(#arr7)"/>
+        <text x="380" y="252" text-anchor="middle" fill="#166534" font-size="11.5">提交时：内存池 → 序列化成新链页落盘（链页号从池里自己出，gen 盖章 = 本次 sequence）</text>
+        <text x="380" y="272" text-anchor="middle" fill="#3730a3" font-size="11.5">重启时：restoreFreeList（:505）沿链走一遍，逐页验 CRC/类型/gen/页号，全对才收编进内存池</text>
+        <text x="380" y="308" text-anchor="middle" fill="#6b7280" font-size="12">任何一步验不过 → 整条链作废（free_list_discarded），页变孤儿泄漏 —— 宁可漏记，不可错记（INV-F2）</text>
+      </g>
+    </svg>
+    <figcaption>freelist 的双视图：内存里是随取随还的数组池，磁盘上是一条带完整验伤的 FREE 页链。交接点在每次 writeMeta。</figcaption>
+  </figure>
+
+  <p><strong>为什么 restoreFreeList 疑心病这么重</strong>（file_page_store.zig:505-610）：
+  重启时读到的链是<strong>磁盘上未经验证的字节</strong> —— 可能是写一半断电的、可能是磁盘慢慢烂掉的。
+  链上每一页要过七道关：CRC 合法、页类型真是 FREE、页号自洽、gen 戳等于 meta 的 sequence
+  （防旧一代的链「诈尸」）、无环、条目不越界、总数严丝合缝。
+  任何一道不过，<strong>整条链丢弃</strong>：页既不回收也不复用，变孤儿。
+  错的方向只有一个是安全的 —— <strong>漏记一个空闲页 = 浪费空间；错记一个在用页 = 数据被覆写</strong>。</p>
+
+  <div class="analogy">
+    换班交接的仓库盘点单：下班前把空闲货架位抄成新清单（persistChain），清单本身也占用货架位、也要登记；
+    接班人（restoreFreeList）拿到清单<strong>先逐格核对</strong> —— 编号在不在范围内、有没有重复、
+    有没有把「货架自己」也写进清单、字迹是不是这批交接的（gen 戳）。
+    核对不过就整单作废重新实盘：多浪费几个格子事小，把有人用的货架当空位发出去事大。
+  </div>
+
+  <div class="keypoint">
+    注意 persistChain 的「整链重写」是个 <code>ponytail:</code> 标注的已知上限（file_page_store.zig:434 附近注释）：
+    每次提交把整条空闲链重写一遍，10 万空闲页 ≈ 400KB 的 mmap 拷贝 —— 目前够快，profile 里冒头再优化。
+    工程里「先跑通、留升级路径」的自觉，比一上来就造增量链表可靠得多。
+  </div>
+</section>
+
+<!-- ============ 5 ============ -->
+<section id="s5">
+  <h2><span class="no">5</span>flock：一山不容二进程</h2>
+
+  <p><strong>是什么</strong>：本章开头说过 mmap 的 MAP_SHARED 是「别人改文件你能看见」——
+  如果「别人」是另一个 cube_db 进程，两个写者同时改一棵树就是灾难。防线在 open 的第二步（file_page_store.zig:160-176）：</p>
+
+  <p><code>flock(fd, LOCK_EX | LOCK_NB)</code> —— <strong>文件锁</strong>（flock，给整个文件上排他锁），
+  <code>LOCK_NB</code> 表示非阻塞：抢不到立刻失败，不排队干等。
+  抢锁失败且错误码是 <code>EWOULDBLOCK</code>/<code>EAGAIN</code>（:168，被别人占了）→ 返回
+  <code>error.FileLocked</code>，第二个进程打不开这个库；其他 flock 错误一律按打开失败处理。</p>
+
+  <p>注释里的几个细节值得咀嚼（file_page_store.zig:160-165）：
+  flock 锁的是「打开文件描述」—— 同一进程 fork 出的子进程继承同一个 fd，<strong>不会自己跟自己冲突</strong>；
+  锁在最后一个 fd 关闭时自动释放，<strong>进程崩溃也照样释放</strong>（内核替你兜底，不需要「清理代码」）；
+  但 NFS（网络文件系统）上 flock 语义没有保证 —— 所以文档明确只支持本地文件系统。</p>
+
+  <div class="analogy">
+    会议室的门上挂一块「使用中」的牌子（flock）：<strong>挂牌和摘牌由大楼物业（内核）管理</strong>，
+    挂牌的公司倒闭（进程崩溃），物业立刻收牌子，房间不会永远锁死；
+    第二家想进（另一个进程 open），看到牌子扭头就走（EWOULDBLOCK → FileLocked），不堵在门口等。
+    注意牌子只防「走前门的体面人」—— 直接撬窗（绕过本程序改文件）它管不着，这叫<strong>建议锁（advisory lock）</strong>。
+  </div>
+
+  <div class="why">
+    为什么不做「多进程并发写」？因为那需要跨进程的锁协议、页级仲裁、共享缓存一致性 ——
+    复杂度翻几倍，而嵌入式 KV 的典型部署就是「一个进程独占一个文件」（SQLite 也曾是这副面孔）。
+    <strong>用 16 行代码买走一整类并发 bug</strong>，这笔账很划算 —— 剩下的并发（多线程读写）
+    在进程内用第 5、6 章的 Mutex + MVCC 解决。
+  </div>
+</section>
+
+<!-- ============ 6 ============ -->
+<section id="s6">
+  <h2><span class="no">6</span>崩溃注入钩子：在指定步骤「模拟断电」</h2>
+
+  <p><strong>是什么</strong>：「任何时刻断电都不坏」这种话，靠人脑推演是证不出来的 —— 得让机器把<strong>每一个断电时刻</strong>都试一遍。
+  这一层提供的工具小得可笑（file_page_store.zig:137-150）：</p>
+
+  <p>一个枚举 <code>CrashTag</code>，罗列提交路径上的关键射击点：
+  <code>before_chain / mid_chain / after_chain_before_meta / after_meta</code>（freelist 链的四个时刻，:137-144）
+  外加三个墓碑链时刻（T-38-5 加的 <code>before_tomb_chain</code> 等）；
+  一个全局变量 <code>pub var test_crash_hook: ?CrashTag = null</code>（:150，生产恒为 null）；
+  以及开火函数 <code>fireCrashHook</code>（:923）—— 命中就 <code>std.process.abort()</code>，
+  <strong>进程当场暴毙，什么都来不及收尾</strong>，完美模拟拔电源。</p>
+
+  <p>用法（第 8 章主角）：测试 fork 出子进程， arm 一个 tag（比如 <code>after_chain_before_meta</code>——
+  链页写完、meta 还没写的悬崖边），跑到那一枪进程死掉；父进程再打开数据库做<strong>恢复对账</strong>：
+  数据完整性必须和「断电前最后一个已提交事务」一致。提交路径上每个 <code>fireCrashHook</code> 调用点
+  就是一个被测试覆盖的断电时刻 —— freelist 链写一半（mid_chain 的「半数页」时机，
+  file_page_store.zig:493-494）、meta 写完之前/之后……每一点都要能恢复。</p>
+
+  <div class="keypoint">
+    三个设计自觉：① 生产零成本 —— <code>test_crash_hook</code> 为 null 时每个射击点只是一次可预测的分支，无锁无 IO；
+    ② 钩子归存储层 —— writer.zig 只为墓碑链的三个 tag 走 <code>fireCrashHookPub</code> 透传（:942），
+    PageStore 接口本身保持存储形状，不被测试语义污染；
+    ③ abort 不是 return —— 模拟断电要的就是「没有清理机会」，任何「优雅退出」都会让测试失真。
+  </div>
+
+  <div class="analogy">
+    消防演习不能「假装撤离」—— 要真的拉警报、真的断电梯、真的从消防梯下楼。
+    CrashTag 就是<strong>在提交流程里预埋的警报按钮</strong>：想在「链页写一半」这个环节演练吗？
+    按 mid_chain 这个钮，整栋楼（进程）瞬间停电。
+    演习后清点人数（恢复对账），少一个都算设计失败。
+    「崩溃安全」不是推理题，是<strong>演习记录</strong>。
+  </div>
+</section>
+
+<!-- ============ 7 ============ -->
+<section id="s7">
+  <h2><span class="no">7</span>本章自测</h2>
+
+  <div class="quiz">
+    <strong>①</strong> 数据库文件从 10MB 长到 10GB 的过程中，mmap 做了几次？第 3 章里 get 下降时算出的
+    <code>页号 × 4096</code> 地址，在文件增长后为什么依然有效？（提示：1TB 预留 + ftruncate 的可见性，spike_mmap.zig 验证的是什么）
+  </div>
+
+  <div class="quiz">
+    <strong>②</strong> restoreFreeList 为什么宁可整条链作废让页「泄漏」，也不接收一条有疑点的链？
+    两种错误的后果分别是什么 —— 漏掉一个空闲页 vs 错收一个在用页，哪个能被 CRC 抓到、哪个是静默数据损坏？
+  </div>
+
+  <div class="quiz">
+    <strong>③</strong> 两个 cube_db 进程同时 open 同一个文件，第二个会遇到什么？进程被 kill -9 后锁去哪了？
+    如果第二个进程不走 cube_db 而是直接编辑文件，flock 拦得住吗？（建议锁的含义）
+  </div>
+
+  <div class="keypoint">
+    最后一章（第 8 章）是全书的收官：CRC 硬件加速、cube_check 体检工具、模型检验式 fuzz、
+    以及用本章 CrashTag 闭环出来的「崩溃安全证明」。你会看到前七章的每个机制如何被机器逐一验证。
+  </div>
+</section>
+
+<footer>
+  cube_db 讲义 · 第 7 章 · 行号以当前 HEAD 为准（file_page_store.zig 1040 行）—— 读完建议跑一次 spike_mmap.zig，亲眼看 1TB 预留的戏法。
+</footer>
+
+</div>
+</body>
+</html>
