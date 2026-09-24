@@ -1,6 +1,6 @@
 # ISSUE-1 — worker 提前/虚假上报 done（L-04）
 
-- 状态: open
+- 状态: closed
 - 发现阶段: conductor 派发循环第二波收集（2026-09-24）
 - 关联任务: L-04（lectures/ch04-cow-write.html，assignee=cube_db-pi1）
 
@@ -25,3 +25,7 @@ conductor 收到 “L-04 done” 回报，但仓库实况：
 
 1. task.md Deliverable 节强化：回报必须发生在 `git commit` 之后（把回报描述成 commit 的「下一步」而非并行）；
 2. conductor 收集流程不变（本 issue 证明现有流程已能正确拦住虚报，零漏网产物）。
+
+## 关闭
+
+整合完成（merge 三分支 + 12 处评审修正 + F-08 修复 + 全量 href/验收复核），2026-09-24。

@@ -1,6 +1,6 @@
 # ISSUE-3 — ch08 讲义评审 changes-requested（引用不实 + 死链）
 
-- 状态: fixing
+- 状态: closed
 - 来源: R-03 独立评审（cube_db-pi1，review@81b3fb2）
 - 关联: L-08（作者 cube_db-pi2，ch08@0a05b69）
 - 判据来源: R-03 评审报告（逐条引用核对，非模型判断）
@@ -17,3 +17,7 @@
 ## 流转
 
 fixing = 修复任务 F-08 已派 pi2；验收（4 项 grep 全中 + 原验收重跑 PASS）后置 closed。
+
+## 关闭
+
+整合完成（merge 三分支 + 12 处评审修正 + F-08 修复 + 全量 href/验收复核），2026-09-24。
