@@ -126,7 +126,7 @@
       <span class="tag">配角：tests/fuzz + tests/crash_* + docs/fuzz-testing.md</span>
     </p>
     <p class="navlinks">
-      <a href="ch07-crash.html">← 上一章：提交与崩溃注入</a> ·
+      <a href="ch07-filepagestore-mmap.html">← 上一章：落地到操作系统——mmap、freelist 链与文件锁</a> ·
       <a href="index.html">目录页 →</a>
     </p>
   </div>
@@ -165,8 +165,8 @@
 </pre>
 
   <p>ARM64 路径用的是 ARMv8 的 CRC 专属 CPU 指令（<code>crc32x/w/h/b</code>，
-  <span class="file">src/crc32_hw.zig:91-130</span> 的内联汇编包装），一次吃进 8 字节；软件路径
-  <code>crc32Sw</code>（:13）用查表法——预生成一张 256 格的表，逐字节迭代。两者的产出
+  <span class="file">src/crc32_hw.zig:91-128</span> 的内联汇编包装），一次吃进 8 字节；软件路径
+  <code>crc32Sw</code>（:16）用查表法——预生成一张 256 格的表，逐字节迭代。两者的产出
   <strong>逐位一致</strong>，因为用的是同一条生成多项式（IEEE 802.3，0xEDB88320，文件头注释 :6-8 写明）。</p>
 
   <div class="why">
@@ -379,8 +379,8 @@
 <section id="s5">
   <h2><span class="no">5</span>崩溃测试闭环：每个提交点都「拉电闸」</h2>
 
-  <p><strong>是什么</strong>：上一章埋的伏笔在这里收线。第 7 章看到 commit 路径里埋着七个
-  <code>fireCrashHook</code> 站点（<span class="file">src/file_page_store.zig:137</span> 的
+  <p><strong>是什么</strong>：上一章埋的伏笔在这里收线。第 7 章看到 commit 路径里埋着 7 个 <code>CrashTag</code> 变体（8 个触发点，其中 mid_chain 在两处触发）
+  （<span class="file">src/file_page_store.zig:137</span> 的
   <code>CrashTag</code> 枚举：before_chain / mid_chain / after_chain_before_meta / after_meta +
   三个 tomb_chain 变体；全局开关 <code>test_crash_hook</code> 在 :150，生产恒为 null）。
   本章看它怎么被用成一台「断电发生器」。以
