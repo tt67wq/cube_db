@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 6 章 · MVCC 与页回收——旧页什么时候才能死</title>
+<style>
+  :root {
+    --bg: #f7f8fa;
+    --card: #ffffff;
+    --ink: #24292f;
+    --muted: #6b7280;
+    --accent: #2563eb;
+    --accent-soft: #dbeafe;
+    --green: #16a34a;
+    --green-soft: #dcfce7;
+    --orange: #d97706;
+    --orange-soft: #fef3c7;
+    --purple: #7c3aed;
+    --purple-soft: #ede9fe;
+    --red: #dc2626;
+    --red-soft: #fee2e2;
+    --border: #e5e7eb;
+    --mono: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0 16px 80px;
+    background: var(--bg); color: var(--ink);
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+    line-height: 1.75; font-size: 16px;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; }
+  header.hero {
+    background: linear-gradient(135deg, #1e3a8a, #2563eb);
+    color: #fff; border-radius: 0 0 18px 18px;
+    padding: 40px 32px 32px; margin: 0 -16px 32px;
+  }
+  header.hero h1 { margin: 0 0 8px; font-size: 30px; }
+  header.hero p { margin: 4px 0; opacity: .92; }
+  header.hero .tag {
+    display: inline-block; background: rgba(255,255,255,.18);
+    border-radius: 999px; padding: 2px 12px; font-size: 13px; margin-right: 6px;
+  }
+  nav.toc {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 12px; padding: 18px 24px; margin-bottom: 28px;
+  }
+  nav.toc h2 { margin: 0 0 8px; font-size: 16px; color: var(--muted); }
+  nav.toc ol { margin: 0; padding-left: 22px; columns: 2; column-gap: 40px; }
+  nav.toc li { margin: 3px 0; break-inside: avoid; }
+  nav.toc a { color: var(--accent); text-decoration: none; }
+  nav.toc a:hover { text-decoration: underline; }
+  section {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 14px; padding: 26px 30px; margin-bottom: 26px;
+  }
+  h2 {
+    font-size: 22px; margin: 0 0 14px;
+    padding-bottom: 10px; border-bottom: 2px solid var(--accent-soft);
+  }
+  h2 .no {
+    display: inline-block; background: var(--accent); color: #fff;
+    width: 30px; height: 30px; line-height: 30px; text-align: center;
+    border-radius: 8px; font-size: 15px; margin-right: 10px;
+  }
+  h3 { font-size: 17px; margin: 22px 0 8px; }
+  p { margin: 10px 0; }
+  code {
+    font-family: var(--mono); font-size: 87%;
+    background: #eef1f5; border-radius: 5px; padding: 1px 6px;
+  }
+  .analogy {
+    background: var(--orange-soft); border-left: 4px solid var(--orange);
+    border-radius: 0 10px 10px 0; padding: 12px 18px; margin: 14px 0;
+  }
+  .analogy::before { content: "🍊 类比"; display: block; font-weight: 700; color: var(--orange); margin-bottom: 4px; }
+  .keypoint {
+    background: var(--green-soft); border-left: 4px solid var(--green);
+    border-radius: 0 10px 10px 0; padding: 12px 18px; margin: 14px 0;
+  }
+  .keypoint::before { content: "💡 划重点"; display: block; font-weight: 700; color: var(--green); margin-bottom: 4px; }
+  .why {
+    background: var(--purple-soft); border-left: 4px solid var(--purple);
+    border-radius: 0 10px 10px 0; padding: 12px 18px; margin: 14px 0;
+  }
+  .why::before { content: "❓ 为什么这么设计"; display: block; font-weight: 700; color: var(--purple); margin-bottom: 4px; }
+  table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 15px; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: #f0f3f8; }
+  td code { white-space: nowrap; }
+  .file { font-family: var(--mono); font-size: 13.5px; color: var(--accent); font-weight: 600; }
+  figure {
+    background: #fbfcfe; border: 1px dashed #c7d2e3; border-radius: 12px;
+    padding: 18px; margin: 18px 0; text-align: center; overflow-x: auto;
+  }
+  figcaption { color: var(--muted); font-size: 13.5px; margin-top: 8px; }
+  .diagram-label { font-size: 13px; font-family: var(--mono); }
+  svg text { font-family: -apple-system, "PingFang SC", sans-serif; }
+  svg .mono { font-family: var(--mono); }
+  ul.checklist { list-style: none; padding-left: 4px; }
+  ul.checklist li { margin: 6px 0; }
+  ul.checklist li::before { content: "☑ "; color: var(--green); font-weight: 700; }
+  footer { color: var(--muted); font-size: 13.5px; text-align: center; margin-top: 40px; }
+  .quiz { background: #f0f9ff; border-left: 4px solid #0ea5e9; border-radius: 0 10px 10px 0; padding: 12px 18px; margin: 14px 0; }
+  .quiz::before { content: "🧪 自测题"; display: block; font-weight: 700; color: #0284c7; margin-bottom: 4px; }
+</style>
+</head>
+<body>
+<header class="hero">
+  <div class="wrap">
+    <h1>第 6 章 · MVCC 与页回收</h1>
+    <p>—— 旧页什么时候才能死</p>
+    <p>
+      <span class="tag">对应代码：src/writer.zig（Reader / PendingPage / 水位线）+ src/db.zig（ReadTxn）</span>
+      <span class="tag">前置：第 3 章（B-tree 读路径）· 第 4 章（COW 写路径）· 第 5 章（事务与提交）</span>
+    </p>
+    <p>
+      <a href="ch05-transactions.html" style="color:#bfdbfe">← 上一章：事务与提交</a>
+      &nbsp;|&nbsp;
+      <a href="ch07-os.html" style="color:#bfdbfe">下一章：落地到操作系统 →</a>
+    </p>
+  </div>
+</header>
+
+<div class="wrap">
+
+<nav class="toc">
+  <h2>本章目录</h2>
+  <ol>
+    <li><a href="#s1">问题引入：一个足以毁掉数据的时序</a></li>
+    <li><a href="#s2">Reader 句柄：beginRead / endRead 的形状</a></li>
+    <li><a href="#s3">sequence 与最老读者水位线</a></li>
+    <li><a href="#s4">pending_free：旧页的完整生命周期</a></li>
+    <li><a href="#s5">ReadTxn 的 pin：谁替旧页「挡刀」</a></li>
+    <li><a href="#s6">慢读者的代价：空间放大</a></li>
+    <li><a href="#s7">本章自测</a></li>
+  </ol>
+</nav>
+
+<!-- ============ 1 ============ -->
+<section id="s1">
+  <h2><span class="no">1</span>问题引入：一个足以毁掉数据的时序</h2>
+
+  <p><strong>是什么问题</strong>：前几章建立了两件事 —— COW 写路径会不断产生「被替换下来的旧页」，
+  这些旧页要进 freelist（空闲页登记表）等下次复用；同时读事务拿着旧快照在树上随便走，完全不加锁。
+  这两件事单独看都对，<strong>合起来有一个致命的缝隙</strong>：freelist 复用一个「还有读者正在看」的页会怎样？</p>
+
+  <p>构造一个具体时序（这就是 6.1 要你先看见事故，再来看保险丝）：</p>
+
+  <figure>
+    <svg viewBox="0 0 760 330" width="760" height="330" role="img" aria-label="页复用竞态时序图">
+      <g font-size="12.5">
+        <!-- reader lane -->
+        <text x="30" y="30" font-weight="700" fill="#166534">读者（读事务）</text>
+        <text x="420" y="30" font-weight="700" fill="#3730a3">写者（提交事务）</text>
+        <line x1="30" y1="40" x2="730" y2="40" stroke="#e5e7eb" stroke-width="2"/>
+
+        <rect x="30" y="55" width="290" height="40" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="175" y="73" text-anchor="middle" fill="#166534" font-weight="700">T1 开始读，拿到旧快照</text>
+        <text x="175" y="89" text-anchor="middle" fill="#374151" font-size="11.5">root 指向树 v10（页 77 是其中一片叶子）</text>
+
+        <rect x="380" y="55" width="330" height="40" rx="8" fill="#eef2ff" stroke="#4f46e5"/>
+        <text x="545" y="73" text-anchor="middle" fill="#3730a3" font-weight="700">T2 提交 v11</text>
+        <text x="545" y="89" text-anchor="middle" fill="#374151" font-size="11.5">COW：页 77 被新页替换 → 进 freelist</text>
+
+        <rect x="30" y="115" width="290" height="44" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="175" y="133" text-anchor="middle" fill="#166534" font-weight="700">T1 继续下降，下一站页 77</text>
+        <text x="175" y="149" text-anchor="middle" fill="#374151" font-size="11.5">它不知道页 77 已经「易主」</text>
+
+        <rect x="380" y="115" width="330" height="44" rx="8" fill="#fef3c7" stroke="#d97706"/>
+        <text x="545" y="133" text-anchor="middle" fill="#92400e" font-weight="700">T3 提交 v12，需要新页</text>
+        <text x="545" y="149" text-anchor="middle" fill="#374151" font-size="11.5">freelist 出手阔绰：把页 77 分配给了 T3</text>
+
+        <rect x="30" y="180" width="290" height="44" rx="8" fill="#fee2e2" stroke="#dc2626"/>
+        <text x="175" y="198" text-anchor="middle" fill="#991b1b" font-weight="700">T1 读页 77 → 读到 T3 刚写的新数据</text>
+        <text x="175" y="214" text-anchor="middle" fill="#374151" font-size="11.5">读一半更好：页正被覆写，读到半新半旧的字节</text>
+
+        <rect x="380" y="180" width="330" height="60" rx="8" fill="#fee2e2" stroke="#dc2626"/>
+        <text x="545" y="202" text-anchor="middle" fill="#991b1b" font-weight="700">后果</text>
+        <text x="545" y="220" text-anchor="middle" fill="#374151" font-size="11.5">快照读隔离被击穿（读到未来）；更糟时 CRC/解析炸掉</text>
+        <text x="545" y="235" text-anchor="middle" fill="#374151" font-size="11.5">—— 而且这种错几乎无法复现，全看线程调度心情</text>
+
+        <text x="30" y="275" fill="#374151" font-weight="700">缺的那块保险丝：</text>
+        <text x="145" y="275" fill="#374151">页 77 从「被替换」到「被复用」之间，缺一道闸 ——</text>
+        <text x="145" y="293" fill="#374151">「还有没有人拿着旧快照，可能走到这页？」没人回答，freelist 就敢发。</text>
+        <text x="30" y="318" fill="#6b7280" font-size="12">本章主角 pending_free（暂缓回收队列）+ 水位线，就是这道闸。代码：src/writer.zig:28（PendingPage）、src/writer.zig:533（reclaimPendingFree）</text>
+      </g>
+    </svg>
+    <figcaption>页复用竞态：没有 MVCC 闸门时，旧页被复用 = 读者读到不属于自己快照的数据，甚至读到写了一半的字节。</figcaption>
+  </figure>
+
+  <div class="analogy">
+    酒店退房：你（写者）退了 302 房（旧页进 freelist），前台立刻把它挂到「可入住」名单；
+    另一位客人（读者）手里还攥着 302 的旧房卡，慢悠悠走到门口 —— 房里已经住进了新人，行李（数据）全换了。
+    保险丝的做法：<strong>退房先进「待清扫」状态，登记上「还有谁拿着这间房的旧房卡」</strong>，
+    最后一反应卡作废了，才挂回「可入住」。本章讲的就是这套登记簿。
+  </div>
+
+  <div class="keypoint">
+    术语速查（后文反复出现）：<strong>快照</strong>（snapshot）= 读事务开始那一刻的数据版本，像给整棵树拍了张照；
+    <strong>sequence</strong> = 提交号，每 commit 一次加 1，是「版本」的数字坐标；
+    <strong>MVCC</strong>（多版本并发控制）= 靠「保留旧版本」让读写互不阻塞的总策略 —— COW 是它的地基（第 0 章概念④）。
+  </div>
+</section>
+
+<!-- ============ 2 ============ -->
+<section id="s2">
+  <h2><span class="no">2</span>Reader 句柄：beginRead / endRead 的形状</h2>
+
+  <p><strong>是什么</strong>：读者的注册制度只有两个函数（<code>src/writer.zig:400</code> 与 <code>writer.zig:446</code>）：</p>
+
+  <table>
+    <tr><th>API</th><th>签名</th><th>做什么</th></tr>
+    <tr>
+      <td><code>beginRead</code></td>
+      <td><code>() *Reader</code></td>
+      <td>登记一个读者，返回一个<strong>显式句柄</strong> <code>*Reader</code>；句柄里存着本读者的快照 sequence（<code>writer.zig:424-429</code>：当前 <code>sequence</code> 原子读进来，挂进活跃读者链表）</td>
+    </tr>
+    <tr>
+      <td><code>endRead</code></td>
+      <td><code>(reader: *Reader) void</code></td>
+      <td>拿着<strong>当初返回的那个句柄</strong>来注销：从活跃链表摘下（<code>writer.zig:453-458</code>）、句柄回池复用；如果积压的待回收页还没清，顺手触发一次 <code>reclaimPendingFree</code>（<code>writer.zig:465-467</code>）</td>
+    </tr>
+  </table>
+
+  <h3>一段值得读的演化史（T-30 → T-32）</h3>
+  <p>这个 API 不是一开始就长这样的。旧版 <code>endRead()</code> <strong>不带任何参数</strong> ——
+  它不知道注销的是「哪一个」读者，只能猜。源码注释（writer.zig:10-14）留下了当年为「猜身份」堆出的全套机关：
+  thread-local 栈（每个线程自己记 beginRead 的顺序）、固定 64 槽数组、页号最高位当「占用标记」的编码、
+  溢出时退化成计数器兜底……四套机制互相打补丁，只为回答一个问题：<em>「我的 beginRead 当时占了哪个槽？」</em></p>
+  <p>T-32 的修法是釜底抽薪：<strong>beginRead 返回句柄，endRead 必须交回同一个句柄</strong>。
+  身份不再靠猜，「哪个槽」这个问题连同它的四套补丁一起被删除了。</p>
+
+  <div class="analogy">
+    游泳池的手牌制度：进场发手牌（beginRead 返回 *Reader），出场<strong>交回你手里那块</strong>（endRead(reader)）。
+    旧方案像不发票、出场时让保安猜「你是几点进的、用的哪个格子放鞋」—— 猜错就是别人的鞋。
+    <strong>让 API 把身份还给人，是删代码最好的方式。</strong>
+  </div>
+
+  <p><strong>为什么句柄还要做「池」</strong>：beginRead 是热路径（每次 get/每次迭代器都要调），不能每次 malloc。
+  State 里埋了一个 8 个槽的<strong>嵌入式句柄池</strong>（<code>EMBEDDED_READERS = 8</code>，writer.zig:39；
+  池在首次使用时惰性接线，writer.zig:409-414 —— 因为 init 按值返回，自引用指针只能等地址定型后再接），
+  用完的句柄挂回空闲链表复用（writer.zig:460-461）；并发更深时再退回堆分配，同样走空闲链表回收。
+  所以「开一千次读事务」的分配次数上限是「历史峰值并发读者数」，而不是一千。</p>
+
+  <div class="why">
+    注释里的 <strong>B1 不变量</strong>（writer.zig:402-408）值得念一遍：<code>reader_count</code> 先加（在拿
+    <code>pending_free_mu</code> 锁<strong>之前</strong>），快照 sequence 在锁内读、读者在同一个临界区里挂进活跃链表 ——
+    这样写者的「无读者快速回收路径」（见 6.4）永远不可能在「一个读者已经出现但还没登记完」的缝隙里把页放走。
+    顺序错了就是竞态，顺序对了就是证明。多线程正确性经常不在代码量，而在这种<strong>先后关系</strong>里。
+  </div>
+</section>
+
+<!-- ============ 3 ============ -->
+<section id="s3">
+  <h2><span class="no">3</span>sequence 与最老读者水位线</h2>
+
+  <p><strong>是什么</strong>：现在回答 6.1 的闸门问题——「旧页什么时候确定没人看了」。
+  核心数据结构小到不像话（<code>src/writer.zig:28</code>）：</p>
+
+  <p><code>pub const PendingPage = struct { page_no: u32, release_seq: u64 }</code></p>
+  <p>每个被替换下来的旧页登记两样：页号，和「是哪一次提交让它退役的」（release_seq = 那次提交的新 sequence，写入点在 writer.zig:810）。
+  回收规则就写在它头顶的注释里（writer.zig:23-27）：</p>
+
+  <div class="keypoint">
+    <strong>回收规则</strong>：当 <code>release_seq &lt; 最老活跃读者的快照号</code>（水位线）时，页才可回收。
+    为什么是严格小于？因为快照号 ≥ 水位线的读者「可能」还引用着它；把边界也算上（≤ 会误杀），
+    宁可多留一版，绝不放走一页 —— 注释原话：<em>the correctness floor, conservatively including the boundary</em>。
+  </div>
+
+  <p><strong>水位线怎么算</strong>（<code>reclaimPendingFree</code>，writer.zig:533；水位线取值 552-555）：</p>
+  <ul>
+    <li>没有活跃读者 → 水位线 = <code>sequence + 1</code>，所有 release_seq ≤ sequence 的页全部回收（快速路径）；</li>
+    <li>有活跃读者 → 水位线 = <code>min(sequence + 1, 所有活跃读者快照号的最小值)</code>。
+      取全体读者快照的最小值（<code>readerWatermark</code>，writer.zig:573-581）——
+      <strong>最慢的那个读者决定所有人能回收多远</strong>，这就是「水位线」这个名字的意象。</li>
+  </ul>
+
+  <p><code>sequence + 1</code> 这个下限不是装饰，注释（writer.zig:546-551）讲了它救过的事故（T-33 P0 fix）：
+  正在飞行中的提交，它的 COW 受害页带着 <code>release_seq = sequence+1</code> 排进队列；
+  此刻一个新读者注册进来（快照号 = 当前 sequence），它要走的树<strong>仍然引用着这些页</strong>。
+  旧代码在 count==0 时无视 release_seq 全量放页，结果新读者的下行路径被下一笔分配覆盖 —— 页在脚下蒸发。
+  加上下限后，「没有读者」也只回收 <code>release_seq ≤ sequence</code> 的页，缝隙焊死。</p>
+
+  <figure>
+    <svg viewBox="0 0 760 300" width="760" height="300" role="img" aria-label="水位线回收规则图">
+      <g font-size="12.5">
+        <!-- number line -->
+        <line x1="40" y1="150" x2="720" y2="150" stroke="#374151" stroke-width="2"/>
+        <!-- sequence ticks -->
+        <g class="mono" fill="#374151" font-size="11.5" text-anchor="middle">
+          <text x="100" y="180">seq 40</text><line x1="100" y1="143" x2="100" y2="157" stroke="#374151"/>
+          <text x="220" y="180">seq 41</text><line x1="220" y1="143" x2="220" y2="157" stroke="#374151"/>
+          <text x="340" y="180">seq 42</text><line x1="340" y1="143" x2="340" y2="157" stroke="#374151"/>
+          <text x="460" y="180">seq 43</text><line x1="460" y1="143" x2="460" y2="157" stroke="#374151"/>
+          <text x="620" y="180">seq 44（进行中）</text><line x1="620" y1="143" x2="620" y2="157" stroke="#374151"/>
+        </g>
+        <!-- watermark -->
+        <rect x="328" y="60" width="24" height="70" rx="4" fill="#dbeafe" stroke="#2563eb"/>
+        <text x="340" y="45" text-anchor="middle" font-weight="700" fill="#1e3a8a">水位线 = 42</text>
+        <text x="340" y="58" text-anchor="middle" fill="#1e3a8a" font-size="11">最老读者的快照</text>
+        <!-- zones -->
+        <rect x="40" y="205" width="290" height="46" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="185" y="224" text-anchor="middle" fill="#166534" font-weight="700">release_seq &lt; 42 → 可回收 ✓</text>
+        <text x="185" y="241" text-anchor="middle" fill="#374151" font-size="11.5">所有读者快照 ≥ 42 &gt; release_seq，没人能走到这些页</text>
+        <rect x="345" y="205" width="375" height="46" rx="8" fill="#fef3c7" stroke="#d97706"/>
+        <text x="532" y="224" text-anchor="middle" fill="#92400e" font-weight="700">release_seq ≥ 42 → 留在 pending_free</text>
+        <text x="532" y="241" text-anchor="middle" fill="#374151" font-size="11.5">老快照可能还引用（含 seq=42 的边界页，与 seq=43 的飞行中受害页）</text>
+        <line x1="185" y1="170" x2="185" y2="205" stroke="#16a34a" stroke-width="1.4" stroke-dasharray="4 3"/>
+        <line x1="532" y1="170" x2="532" y2="205" stroke="#d97706" stroke-width="1.4" stroke-dasharray="4 3"/>
+        <text x="40" y="282" fill="#6b7280" font-size="12">代码：水位线与比较在 reclaimPendingFree（writer.zig:552-565）；最小快照在 readerWatermark（writer.zig:573）</text>
+      </g>
+    </svg>
+    <figcaption>水位线规则：一条数字轴上，「比最老读者还老的旧页」放行，「水位线上的及更新被退役的」扣下 —— 边界从严。</figcaption>
+  </figure>
+
+  <div class="analogy">
+    地铁末班车按「最慢的乘客」发车确认：站台要清人，得等<strong>跑得最慢的那位</strong>也上了车（水位线 = 最老读者快照）；
+    而且边界的判定永远往安全侧偏 —— 拿不准这个人到底走没走，就当他在站台（保守包含边界）。
+    宁可晚关门一分钟，不把人关在车外。
+  </div>
+</section>
+
+<!-- ============ 4 ============ -->
+<section id="s4">
+  <h2><span class="no">4</span>pending_free：旧页的完整生命周期</h2>
+
+  <p><strong>是什么</strong>：把前两节串起来，一页从「被替换」到「重获新生」的完整一生是这样的：</p>
+
+  <figure>
+    <svg viewBox="0 0 760 340" width="760" height="340" role="img" aria-label="旧页生命周期图">
+      <defs><marker id="arr6" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#6b7280"/></marker></defs>
+      <g font-size="12.5">
+        <!-- stations -->
+        <rect x="20" y="30" width="200" height="70" rx="9" fill="#eef2ff" stroke="#4f46e5"/>
+        <text x="120" y="52" text-anchor="middle" font-weight="700" fill="#3730a3">① COW 写路径替换旧页</text>
+        <text x="120" y="70" text-anchor="middle" fill="#374151">commit 的新树不再指向它，</text>
+        <text x="120" y="86" text-anchor="middle" fill="#374151">但页内容原封未动（COW）</text>
+
+        <rect x="280" y="30" width="200" height="70" rx="9" fill="#fef3c7" stroke="#d97706"/>
+        <text x="380" y="52" text-anchor="middle" font-weight="700" fill="#92400e">② 登记 pending_free</text>
+        <text x="380" y="70" text-anchor="middle" fill="#374151">{页号, release_seq}</text>
+        <text x="380" y="86" text-anchor="middle" fill="#374151">applyBatchSwap 第 3 步 · writer.zig:810</text>
+
+        <rect x="540" y="30" width="200" height="70" rx="9" fill="#ede9fe" stroke="#7c3aed"/>
+        <text x="640" y="52" text-anchor="middle" font-weight="700" fill="#5b21b6">③ 等待：水位线推进</text>
+        <text x="640" y="70" text-anchor="middle" fill="#374151">release_seq &lt; 水位线？</text>
+        <text x="640" y="86" text-anchor="middle" fill="#374151">读者还拿着旧快照 → 再等等</text>
+
+        <rect x="540" y="180" width="200" height="70" rx="9" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="640" y="202" text-anchor="middle" font-weight="700" fill="#166534">④ 归还 freelist</text>
+        <text x="640" y="220" text-anchor="middle" fill="#374151">reclaimPendingFree 逐页判定，</text>
+        <text x="640" y="236" text-anchor="middle" fill="#374151">达标的 store.freePage · writer.zig:559</text>
+
+        <rect x="280" y="180" width="200" height="70" rx="9" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="380" y="202" text-anchor="middle" font-weight="700" fill="#166534">⑤ 重新分配 = 复用</text>
+        <text x="380" y="220" text-anchor="middle" fill="#374151">下一次 commit 的 allocPage</text>
+        <text x="380" y="236" text-anchor="middle" fill="#374151">优先从 freelist 拿 → 写放大 ≈ 1</text>
+
+        <!-- recycle arrows -->
+        <line x1="220" y1="65" x2="280" y2="65" stroke="#6b7280" stroke-width="1.6" marker-end="url(#arr6)"/>
+        <line x1="480" y1="65" x2="540" y2="65" stroke="#6b7280" stroke-width="1.6" marker-end="url(#arr6)"/>
+        <line x1="640" y1="100" x2="640" y2="180" stroke="#6b7280" stroke-width="1.6" marker-end="url(#arr6)"/>
+        <line x1="540" y1="215" x2="480" y2="215" stroke="#6b7280" stroke-width="1.6" marker-end="url(#arr6)"/>
+
+        <!-- trigger annotations -->
+        <rect x="20" y="180" width="220" height="88" rx="9" fill="#f3f4f6" stroke="#9ca3af"/>
+        <text x="130" y="202" text-anchor="middle" font-weight="700" fill="#374151">谁去推 ③→④ 这一步？</text>
+        <text x="130" y="222" text-anchor="middle" fill="#374151" font-size="11.5">· endRead 出口顺手清（writer.zig:465）</text>
+        <text x="130" y="238" text-anchor="middle" fill="#374151" font-size="11.5">· 每次 commit 首尾无读者时清</text>
+        <text x="130" y="254" text-anchor="middle" fill="#374151" font-size="11.5">  （writer.zig:634 / 892）</text>
+        <text x="130" y="268" text-anchor="middle" fill="#6b7280" font-size="11">读者走一个清一批，不必等最后一个</text>
+
+        <text x="20" y="308" fill="#374151" font-weight="700">反面教材（已删除的 flushPendingFree）：</text>
+        <text x="20" y="326" fill="#6b7280" font-size="12">旧代码在锁外检查 reader_count==0 就全量放页 —— 检查和放页之间读者可以插进来，T-33 P0 竞态。现在统一走锁内重查的 reclaimPendingFree（writer.zig:526-532 注释）。</text>
+      </g>
+    </svg>
+    <figcaption>旧页生命周期：替换 → 登记 → 等水位线 → 归还 → 复用。五个站，每一步都有明确的责任人和代码位置。</figcaption>
+  </figure>
+
+  <p><strong>为什么回收是「顺手做」而不是一个后台线程</strong>：三个触发点全在既有路径上 ——
+  读者退场时（我走了，我压着的页放了吧）、每次 commit 的开头和结尾（没人读就立刻清，别攒着）。
+  好处：<strong>没有后台线程、没有定时器，回收延迟天然跟负载走</strong>。
+  读者走得勤，pending_free 几乎永远是空的；没有读者时，每次 commit 首尾各清一次，旧页生命周期不超过一次 commit。</p>
+
+  <div class="keypoint">
+    注意一个反直觉点：<strong>freePage 不等于「清零覆写」</strong>，只是把页号记回 freelist 可用。
+    所以「旧页」在被复用前，磁盘上内容一直完好 —— 这正是快照读免费的原因：
+    读旧版本 = 照着旧树走，页还在原地。第 5 章的「崩溃安全」用的也是同一份完好性。
+  </div>
+</section>
+
+<!-- ============ 5 ============ -->
+<section id="s5">
+  <h2><span class="no">5</span>ReadTxn 的 pin：谁替旧页「挡刀」</h2>
+
+  <p><strong>是什么</strong>：上层 API（db.zig）是水位线机制的「用户」。三种读入口，三种 pin（钉住）方式：</p>
+
+  <table>
+    <tr><th>入口</th><th>pin 的注入点</th><th>存活期</th></tr>
+    <tr>
+      <td><code>Db.get</code> / <code>Db.getInto</code></td>
+      <td>下行前 <code>beginRead</code>，<code>defer endRead</code>（db.zig:130-134）—— 短命 pin，走完树就退</td>
+      <td>单次查询期间</td>
+    </tr>
+    <tr>
+      <td><code>beginReadTxn</code> → <code>ReadTxn</code></td>
+      <td><code>beginReadTxn</code> 里 beginRead + 捕获快照（db.zig:576-582）；<code>ReadTxn.end/deinit</code> 时注销（db.zig:737-745）。读期间走的是<strong>固定的 <code>snapshot_root</code></strong>（db.zig:689）</td>
+      <td>整个读事务</td>
+    </tr>
+    <tr>
+      <td><code>select</code> 惰性迭代器</td>
+      <td>select 时 beginRead，把句柄塞进迭代器的 <code>pin_ctx/pin_deinit</code> 回调（db.zig:481、732-733；回调 <code>endReadPin</code> db.zig:751）；迭代器 <code>deinit()</code> 时才退</td>
+      <td>迭代器存活全程</td>
+    </tr>
+  </table>
+
+  <p><strong>为什么 select 需要特殊处理</strong>：迭代器是<strong>惰性</strong>的 —— select() 只定位起点，
+  之后的每一页都是 <code>next()</code> 走到时才读，且吐出的 key/value 是<strong>借用</strong>（指向 mmap 里的字节，第 3 章讲过）。
+  这意味着从 select 到最后一次 next 之间，<strong>任何一秒都可能跨着别人的一次 commit</strong>：
+  不 pin 住快照，下一次 next 踩到的可能就是刚被复用的页。
+  而 btree 层不认识 MVCC（它只管树），所以 db.zig 通过两个函数指针把 pin「注入」进迭代器
+  —— 依赖倒置：树算法保持纯净，生命周期管理留给上层。</p>
+
+  <p>ReadTxn.select 还有个细节（db.zig:715-718 注释）：迭代器会再开<strong>自己的</strong>一个 reader 槽，和事务的 pin 叠加
+  （reader 计数是增量的）—— 这样就算先 <code>txn.end()</code> 再 <code>it.deinit()</code> 的顺序失误，
+  迭代器自己的 pin 仍护着它借用的页。防御性设计，但只花一个槽的代价。</p>
+
+  <div class="analogy">
+    图书馆借阅登记的三种形态：查一句话（Db.get）= 进门登记、查完就销记；
+    办借书证（ReadTxn）= 证件有效期内的旧版馆藏都为你保留；
+    长期借阅（select 迭代器）= 书不离手期间，馆里<strong>不许回收你手里那几页的存放架位</strong> ——
+    还书（it.deinit）那一刻架位才解放。三种粒度对应三种使用时长，登记制度是同一套。
+  </div>
+
+  <div class="why">
+    为什么快照要「先注册、后取根」？顺序反过来（先拿 root 再注册）会出现：拿到的 root 属于版本 vN，
+    而注册的快照号却是 vN+1 的 —— 水位线会高估「没有读者需要 vN 的页」，把 root 正引用的页放走。
+    db.zig:416 注释管这叫 <strong>register-then-capture</strong>，与 writer.zig B1 不变量是同一思想的两端：
+    <strong>先声明你在，再拿你要看的东西。</strong>
+  </div>
+</section>
+
+<!-- ============ 6 ============ -->
+<section id="s6">
+  <h2><span class="no">6</span>慢读者的代价：空间放大</h2>
+
+  <p><strong>是什么</strong>：水位线被拖住时会发生什么？答案是 README 的这句话：
+  <em>dirty pages held until readers drain</em>（脏页扣着不放，直到读者散场）。</p>
+
+  <p>推演一个具体场景：一个读者抱着半小时前的快照做全表扫描（select 后一直不 next 完）。
+  这半小时里写者照常提交 —— 每一次 commit 的 COW 受害页全部<strong>合法地</strong>堆进 pending_free
+  （release_seq 都 ≥ 读者快照，一个都放不了）。后果：</p>
+  <ul>
+    <li><strong>文件膨胀</strong>：freelist 没有页可复用，每次 commit 只能从文件尾开新页 —— 文件长度 ≈ 「活跃数据 + 所有被读者压住的旧版本」；</li>
+    <li><strong>不是泄漏，是滞留</strong>：读者一退场（endRead 触发 reclaim），积压页一次性全数归还，文件停止增长；
+      已长出来的部分也会被后续 commit 优先复用消化；</li>
+    <li><strong>内存无放大</strong>：pending_free 只是一个 <code>{u32, u64}</code> 的数组（writer.zig:225），百万页积压也就 12 字节/页的账本钱 —— 真正的成本在磁盘空间，不在内存。</li>
+  </ul>
+
+  <div class="analogy">
+    自助餐的传菜带：传菜带（freelist）要循环使用盘子，但<strong>桌上还有人正在吃的盘子不能收</strong>。
+    一位客人（慢读者）抱着盘子拍照两小时，厨房只能上新盘子 —— 台面（文件）越堆越满；
+    客人一走，旧盘子瞬间全收（回收爆发），台面立刻恢复周转。
+    代价真实存在，但它是<strong>暂时的空间换正确的时间</strong>，且完全自愈。
+  </div>
+
+  <p><strong>为什么这个取舍是对的</strong>：对比一下其他选项 —— 等读者（本章做法）代价是暂时的空间；
+  强行回收（6.1 的竞态）代价是数据损坏；让读者加锁阻塞写者，代价是 MVCC 白做、读写互相卡死。
+  存储引擎领域这几乎是标准答案：LMDB 同样靠「读事务压住旧页」，文档里给的忠告也一样 ——
+  <strong>读事务别开着不用</strong>。工程上唯一的纪律是：长扫描要及时 <code>end()/deinit()</code>，
+  不要把 ReadTxn 挂在全局变量里过夜。</p>
+
+  <div class="keypoint">
+    一句话总结本章：COW 让「旧页不死」变得便宜，水位线让「旧页该死时才死」变得精确。
+    两者咬合，读者才敢无锁读、写者才敢一路狂奔 —— 这就是 README 里 MVCC reader safety 的全部内容。
+  </div>
+</section>
+
+<!-- ============ 7 ============ -->
+<section id="s7">
+  <h2><span class="no">7</span>本章自测</h2>
+
+  <div class="quiz">
+    <strong>①</strong> pending_free 里一页的 <code>release_seq = 43</code>，当前活跃读者的快照号是 42 和 45，sequence 已推进到 45。这页能回收吗？
+    如果读者 42 退场后（只剩快照 45 的读者）呢？边界（release_seq == 水位线）时放还是不放？
+  </div>
+
+  <div class="quiz">
+    <strong>②</strong> 旧版 <code>endRead()</code> 为什么不得不搞出「thread-local 栈 + 64 槽 + 位编码 + 计数器兜底」四件套？
+    T-32 的显式句柄用哪个 API 改动删掉了这四件套？（提示：beginRead 的返回值类型）
+  </div>
+
+  <div class="quiz">
+    <strong>③</strong> 一个读者挂着 30 分钟前的快照不退出，期间数据库持续写入。文件会发生什么？读者退场后呢？
+    这段设计里，「空间」和「正确性」是怎么交换的 —— 如果让你改成「读者超过 10 秒就强制失效」，你会失去什么？
+  </div>
+
+  <div class="keypoint">
+    下一章（第 7 章）下沉到操作系统层：mmap 是什么、为什么读路径连系统调用都没有、
+    1TB 地址空间预留的戏法、freelist 在磁盘上的链页实现 —— 本章讲的「登记簿」，在那里将看到它的物理形态。
+  </div>
+</section>
+
+<footer>
+  cube_db 讲义 · 第 6 章 · 行号以当前 HEAD 为准（writer.zig 1047 行 / db.zig 1185 行）—— 读完请把 beginRead→commit→endRead→reclaim 在源码里连走一遍。
+</footer>
+
+</div>
+</body>
+</html>
