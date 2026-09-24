@@ -117,7 +117,7 @@
     </p>
     <p class="chapter-nav">
       <a href="ch03-btree-read.html">← 上一章：B-tree 读路径</a>
-      <a href="ch05-txn-commit.html">下一章：事务与提交 →</a>
+      <a href="ch05-transaction.html">下一章：事务与提交 →</a>
     </p>
   </div>
 </header>
@@ -371,7 +371,7 @@
   </table>
 
   <p>调用方 <code>writer.zig</code> 还做了排序 smart path：收到的请求如果已按 key 有序（O(n) 检测，
-  <code>src/writer.zig:694-712</code>），直接引用调用方内存、相邻重复 key 就地去重（后写赢）；
+  <code>src/writer.zig:712-734</code>），直接引用调用方内存、相邻重复 key 就地去重（后写赢）；
   无序则拷进一块连续缓冲、排序、去重（<code>src/writer.zig:715-780</code>）。
   排序是前提——只有排好序，「同一叶子的条目挨在一起」才成立，一趟遍历才走得通。</p>
 
@@ -531,7 +531,7 @@
 </section>
 
 <footer>
-  cube_db 详解 · 第 4 章 · 源码基准：src/btree.zig / src/writer.zig @ 当前 HEAD —— 下一章：<a href="ch05-txn-commit.html">事务与提交</a>
+  cube_db 详解 · 第 4 章 · 源码基准：src/btree.zig / src/writer.zig @ 当前 HEAD —— 下一章：<a href="ch05-transaction.html">事务与提交</a>
 </footer>
 
 </div>

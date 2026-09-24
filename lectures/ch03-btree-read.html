@@ -345,7 +345,7 @@
     <tr><td>4</td><td><code>klen</code>：key 长度（u32 小端）</td></tr>
     <tr><td>klen</td><td>key 本体（变长）</td></tr>
     <tr><td>4</td><td><code>vlen</code>：value 长度（u32 小端）</td></tr>
-    <tr><td>1 + ?</td><td>flags（1B）：普通值 = 后面直接跟 value 本体；overflow 位（btree.zig:178 的 <code>LEAF_FLAG_OVERFLOW</code>）= 后面只跟 4 字节溢出页号</td></tr>
+    <tr><td>1 + ?</td><td>flags（1B）：普通值 = 后面直接跟 value 本体；overflow 位（btree.zig:179 的 <code>LEAF_FLAG_OVERFLOW</code>）= 后面只跟 4 字节溢出页号</td></tr>
   </table>
 
   <div class="analogy">
@@ -451,7 +451,7 @@
   <p>迭代器本体在 btree.zig:2203。它维护一个<strong>下沉栈</strong>：
   定长数组 <code>frames: [MAX_DEPTH]Frame</code>（MAX_DEPTH = 64，btree.zig:2243），每帧记
   <code>{ page_no, child_idx }</code> —— 「我在这一层的这个分支页，正看着第几个孩子」。
-  当前叶子扫完后，<code>stepToNextLeaf</code>（btree.zig:2348）：</p>
+  当前叶子扫完后，<code>stepToNextLeaf</code>（btree.zig:2338）：</p>
   <ul>
     <li>把栈顶帧的 <code>child_idx + 1</code>：右边还有孩子 → 进去一路「最左边」扎到底（<code>descendLeftmost</code>），落到下一片叶子；</li>
     <li>右边没了 → 弹栈，回到上一层的分支页继续找 —— 和二叉树的中序遍历是同一个思想。</li>

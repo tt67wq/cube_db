@@ -118,7 +118,7 @@
     </p>
     <p class="chapter-nav">
       <a href="code-overview.html">← 上一章：代码纲要</a>
-      <a href="ch02-page-store.html">下一章：PageStore 抽象 →</a>
+      <a href="ch02-pagestore.html">下一章：PageStore 抽象 →</a>
     </p>
   </div>
 </header>
@@ -214,7 +214,7 @@
           <line x1="640" y1="156" x2="640" y2="164" stroke="#c7d2e3"/>
         </g>
         <text x="40" y="210" fill="#374151">页头里的 <tspan class="mono">gen</tspan> 字段（8 字节序号）在 meta 页上存的就是 <tspan class="mono">sequence</tspan> —— src/format.zig:241</text>
-        <text x="40" y="228" fill="#6b7280" font-size="12">页头只声明了 19 字节字段，剩下的 5 字节是 padding（留白），解码时直接丢弃 —— src/format.zig:87</text>
+        <text x="40" y="228" fill="#6b7280" font-size="12">页头只声明了 19 字节字段，剩下的 5 字节是 padding（留白），解码时直接丢弃 —— src/format.zig:87-90</text>
       </g>
     </svg>
     <figcaption>一页 4096 字节 = 24B 页头 + 4068B 正文 + 4B CRC。这套「信封格式」对所有 6 种页类型一视同仁。</figcaption>
@@ -390,7 +390,7 @@
   <p>cube_db 的指纹规则（<code>src/format.zig:118-136</code>）：</p>
   <ul>
     <li>计算范围是 <strong>整页的前 4092 字节</strong>（<code>page[0 .. PAGE_SIZE - 4]</code>，<code>src/format.zig:128</code>）；</li>
-    <li>结果（4 字节，小端序）写在<strong>页的最后 4 字节</strong>（<code>setPageChecksum</code>，<code>src/format.zig:135</code>）；</li>
+    <li>结果（4 字节，小端序）写在<strong>页的最后 4 字节</strong>（<code>setPageChecksum</code>，<code>src/format.zig:133-143</code>）；</li>
     <li>验证 = 重算一遍，和页尾存的比对（<code>verifyPageChecksum</code>，<code>src/format.zig:138-143</code>）。</li>
   </ul>
 
@@ -535,7 +535,7 @@
 </section>
 
 <footer>
-  cube_db 详解 · 第 1 章 · 源码基准：src/format.zig @ 当前 HEAD —— 下一章：<a href="ch02-page-store.html">PageStore 抽象</a>
+  cube_db 详解 · 第 1 章 · 源码基准：src/format.zig @ 当前 HEAD —— 下一章：<a href="ch02-pagestore.html">PageStore 抽象</a>
 </footer>
 
 </div>

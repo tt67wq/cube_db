@@ -130,7 +130,7 @@
   <ol>
     <li><a href="#s1">mmap 补课：把文件变成一块内存</a></li>
     <li><a href="#s2">1TB 预留戏法：只占门牌号不占地皮</a></li>
-    <li><a href="#s3">写路径：writePage / msync / fsync 的分工</a></li>
+    <li><a href="#s3">写路径：writePage / fsync 的分工</a></li>
     <li><a href="#s4">freelist 两副面孔：内存池与磁盘链</a></li>
     <li><a href="#s5">flock：一山不容二进程</a></li>
     <li><a href="#s6">崩溃注入钩子：在指定步骤「模拟断电」</a></li>
@@ -388,7 +388,7 @@
   链页写完、meta 还没写的悬崖边），跑到那一枪进程死掉；父进程再打开数据库做<strong>恢复对账</strong>：
   数据完整性必须和「断电前最后一个已提交事务」一致。提交路径上每个 <code>fireCrashHook</code> 调用点
   就是一个被测试覆盖的断电时刻 —— freelist 链写一半（mid_chain 的「半数页」时机，
-  file_page_store.zig:493-494）、meta 写完之前/之后……每一点都要能恢复。</p>
+  file_page_store.zig:490-491）、meta 写完之前/之后……每一点都要能恢复。</p>
 
   <div class="keypoint">
     三个设计自觉：① 生产零成本 —— <code>test_crash_hook</code> 为 null 时每个射击点只是一次可预测的分支，无锁无 IO；

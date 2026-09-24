@@ -116,9 +116,9 @@
       <span class="tag">前置：第 3 章（B-tree 读路径）· 第 4 章（COW 写路径）· 第 5 章（事务与提交）</span>
     </p>
     <p>
-      <a href="ch05-transactions.html" style="color:#bfdbfe">← 上一章：事务与提交</a>
+      <a href="ch05-transaction.html" style="color:#bfdbfe">← 上一章：事务与提交</a>
       &nbsp;|&nbsp;
-      <a href="ch07-os.html" style="color:#bfdbfe">下一章：落地到操作系统 →</a>
+      <a href="ch07-filepagestore-mmap.html" style="color:#bfdbfe">下一章：落地到操作系统 →</a>
     </p>
   </div>
 </header>
@@ -245,7 +245,7 @@
   所以「开一千次读事务」的分配次数上限是「历史峰值并发读者数」，而不是一千。</p>
 
   <div class="why">
-    注释里的 <strong>B1 不变量</strong>（writer.zig:402-408）值得念一遍：<code>reader_count</code> 先加（在拿
+    注释里的 <strong>B1 不变量</strong>（writer.zig:390-403）值得念一遍：<code>reader_count</code> 先加（在拿
     <code>pending_free_mu</code> 锁<strong>之前</strong>），快照 sequence 在锁内读、读者在同一个临界区里挂进活跃链表 ——
     这样写者的「无读者快速回收路径」（见 6.4）永远不可能在「一个读者已经出现但还没登记完」的缝隙里把页放走。
     顺序错了就是竞态，顺序对了就是证明。多线程正确性经常不在代码量，而在这种<strong>先后关系</strong>里。
