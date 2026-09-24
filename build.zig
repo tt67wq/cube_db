@@ -135,7 +135,11 @@ pub fn build(b: *std.Build) void {
         if (verdict == .helper) continue; // 纯 helper（test_diag/common/…）不建二进制
         const is_long_run = std.mem.eql(u8, rel, "fuzz/long_run_2min.zig"); // 裁决 1
         const is_freelist = std.mem.eql(u8, rel, "core_format/freelist_amp_red_test.zig"); // 裁决 2
-        const is_shard = std.mem.startsWith(u8, rel, "insertbatch_sweep_"); // T-54-C 分片 ~45s×4
+        // T-55: 精确匹配 4 个真分片；partition 守卫（毫秒级）不得被前缀误排
+        const is_shard = std.mem.eql(u8, rel, "insertbatch_sweep_a_test.zig") or
+            std.mem.eql(u8, rel, "insertbatch_sweep_b_test.zig") or
+            std.mem.eql(u8, rel, "insertbatch_sweep_c_test.zig") or
+            std.mem.eql(u8, rel, "insertbatch_sweep_d_test.zig"); // T-54-C 分片 ~45s×4
         const run = testRun(b, target, optimize, mod, zio_mod, cube_check_mod, part_mod, path);
         if (fuzz_seed) |s| run.setEnvironmentVariable("CUBE_FUZZ_SEED", s); // T-61-1
         if (!is_long_run and !is_freelist) test_step.dependOn(&run.step);

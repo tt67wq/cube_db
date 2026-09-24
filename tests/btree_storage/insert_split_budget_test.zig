@@ -190,21 +190,33 @@ fn leafOverflowScenario(store: ps.PageStore, fa: std.mem.Allocator, dirty: *std.
     }
     for (0..5) |i| {
         const k = bigKey(&z_bufs[i], "z");
+        // R2(T-45): z 键互异（'z','a'+'i','k'…，长度不变）。若五个 z 键全同，
+        // m 切块后 branch 的分隔键与 overwrite 键相等，路由 ≥ 落到只有 z4 的
+        // 尾块页（entry_start=3，预检 3+3688 ≤ 4068）→ 走快路径，split found=true
+        // 覆盖归零（评审 01b6879 实证）。互异后 z3<'ze' 落在尾块前页页尾，
+        // 预检 2867+3688+0 > 4068 → 必进 insertIntoLeafSplit found=true。
+        z_bufs[i][1] = 'a' + @as(u8, @intCast(i));
         seed[6 + i] = .{ .tombstone = false, .key = k, .value = "v" };
     }
     const wr = try btree.insertBatch(fa, store, btree.NULL_ROOT, &seed, dirty);
+    const z3_key = seed[6 + 3].key; // R2: 保存互异后的 z3 键——步骤 3 不能再用 bigKey 重填（会抹掉 'd' 变回 zkk…）
+    var root = wr.new_root; // T-45: 每步 insert 后更新，勿向 dirty 表内排队旧页写入
 
     var m_buf: [696]u8 = undefined;
     const m_key = bigKey(&m_buf, "m");
-    _ = try btree.insert(fa, store, wr.new_root, m_key, "v", false, dirty);
+    root = (try btree.insert(fa, store, root, m_key, "v", false, dirty)).new_root;
 
-    // Overwrite the last 'z' key with a big value: same byte-heavy leaf,
+    // Overwrite z3 (now the last entry of its chunk page) with a big value:
     // found=true path in insertIntoLeafSplit (the precheck redirects because
     // entry_start + new_entry_sz + tail > cap). Covers the overwrite-side
     // ownership (old entry must not be freed before the new dupes exist).
+    // m 必切块（93+707+3445=4245 > 4068）；切块后 z3 位于尾块前页（payload
+    // 3556）的最后一条，entry_start=2867、tail=0，3688 的新 entry 使预检
+    // 2867+3688+0=6555 > 4068 → insertIntoLeafSplit found=true（inline 变体：
+    // 3000 ≤ inlineValueBudget(678)=3377）。insert 返回 splice → root 再重建。
     var vbuf: [3000]u8 = undefined;
     @memset(&vbuf, 'w');
-    _ = try btree.insert(fa, store, wr.new_root, bigKey(&z_bufs[3], "z"), &vbuf, false, dirty);
+    _ = try btree.insert(fa, store, root, z3_key, &vbuf, false, dirty);
 }
 
 test "T-43: leaf-overflow error path — no UAF, no leaks (full fault sweep, store+btree)" {
