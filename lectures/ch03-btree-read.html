@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 3 章 · B-tree 读路径——从根走到一片叶子</title>
+<style>
+  :root {
+    --bg: #f7f8fa;
+    --card: #ffffff;
+    --ink: #24292f;
+    --muted: #6b7280;
+    --accent: #2563eb;
+    --accent-soft: #dbeafe;
+    --green: #16a34a;
+    --green-soft: #dcfce7;
+    --orange: #d97706;
+    --orange-soft: #fef3c7;
+    --purple: #7c3aed;
+    --purple-soft: #ede9fe;
+    --red: #dc2626;
+    --red-soft: #fee2e2;
+    --border: #e5e7eb;
+    --mono: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0 16px 80px;
+    background: var(--bg); color: var(--ink);
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+    line-height: 1.75; font-size: 16px;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; }
+  header.hero {
+    background: linear-gradient(135deg, #1e3a8a, #2563eb);
+    color: #fff; border-radius: 0 0 18px 18px;
+    padding: 40px 32px 32px; margin: 0 -16px 32px;
+  }
+  header.hero h1 { margin: 0 0 8px; font-size: 30px; }
+  header.hero p { margin: 4px 0; opacity: .92; }
+  header.hero .tag {
+    display: inline-block; background: rgba(255,255,255,.18);
+    border-radius: 999px; padding: 2px 12px; font-size: 13px; margin-right: 6px;
+  }
+  nav.toc {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 12px; padding: 18px 24px; margin-bottom: 28px;
+  }
+  nav.toc h2 { margin: 0 0 8px; font-size: 16px; color: var(--muted); }
+  nav.toc ol { margin: 0; padding-left: 22px; columns: 2; column-gap: 40px; }
+  nav.toc li { margin: 3px 0; break-inside: avoid; }
+  nav.toc a { color: var(--accent); text-decoration: none; }
+  nav.toc a:hover { text-decoration: underline; }
+  section {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 14px; padding: 26px 30px; margin-bottom: 26px;
+  }
+  h2 {
+    font-size: 22px; margin: 0 0 14px;
+    padding-bottom: 10px; border-bottom: 2px solid var(--accent-soft);
+  }
+  h2 .no {
+    display: inline-block; background: var(--accent); color: #fff;
+    width: 30px; height: 30px; line-height: 30px; text-align: center;
+    border-radius: 8px; font-size: 15px; margin-right: 10px;
+  }
+  h3 { font-size: 17px; margin: 22px 0 8px; }
+  p { margin: 10px 0; }
+  code {
+    font-family: var(--mono); font-size: 87%;
+    background: #eef1f5; border-radius: 5px; padding: 1px 6px;
+  }
+  .analogy {
+    background: var(--orange-soft); border-left: 4px solid var(--orange);
+    border-radius: 0 10px 10px 0; padding: 12px 18px; margin: 14px 0;
+  }
+  .analogy::before { content: "🍊 类比"; display: block; font-weight: 700; color: var(--orange); margin-bottom: 4px; }
+  .keypoint {
+    background: var(--green-soft); border-left: 4px solid var(--green);
+    border-radius: 0 10px 10px 0; padding: 12px 18px; margin: 14px 0;
+  }
+  .keypoint::before { content: "💡 划重点"; display: block; font-weight: 700; color: var(--green); margin-bottom: 4px; }
+  .why {
+    background: var(--purple-soft); border-left: 4px solid var(--purple);
+    border-radius: 0 10px 10px 0; padding: 12px 18px; margin: 14px 0;
+  }
+  .why::before { content: "❓ 为什么这么设计"; display: block; font-weight: 700; color: var(--purple); margin-bottom: 4px; }
+  table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 15px; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: #f0f3f8; }
+  td code { white-space: nowrap; }
+  .file { font-family: var(--mono); font-size: 13.5px; color: var(--accent); font-weight: 600; }
+  figure {
+    background: #fbfcfe; border: 1px dashed #c7d2e3; border-radius: 12px;
+    padding: 18px; margin: 18px 0; text-align: center; overflow-x: auto;
+  }
+  figcaption { color: var(--muted); font-size: 13.5px; margin-top: 8px; }
+  .diagram-label { font-size: 13px; font-family: var(--mono); }
+  svg text { font-family: -apple-system, "PingFang SC", sans-serif; }
+  svg .mono { font-family: var(--mono); }
+  ul.checklist { list-style: none; padding-left: 4px; }
+  ul.checklist li { margin: 6px 0; }
+  ul.checklist li::before { content: "☑ "; color: var(--green); font-weight: 700; }
+  footer { color: var(--muted); font-size: 13.5px; text-align: center; margin-top: 40px; }
+  .pill { display:inline-block; border-radius:999px; padding:1px 10px; font-size:12.5px; font-weight:600; margin-right:4px; }
+  .pill.blue { background: var(--accent-soft); color: var(--accent); }
+  .pill.green { background: var(--green-soft); color: var(--green); }
+  .pill.purple { background: var(--purple-soft); color: var(--purple); }
+  .quiz { background: #f0f9ff; border-left: 4px solid #0ea5e9; border-radius: 0 10px 10px 0; padding: 12px 18px; margin: 14px 0; }
+  .quiz::before { content: "🧪 自测题"; display: block; font-weight: 700; color: #0284c7; margin-bottom: 4px; }
+</style>
+</head>
+<body>
+<header class="hero">
+  <div class="wrap">
+    <h1>第 3 章 · B-tree 读路径</h1>
+    <p>—— 从根走到一片叶子</p>
+    <p>
+      <span class="tag">对应代码：src/btree.zig 读侧</span>
+      <span class="tag">前置：第 1 章（页格式）· 第 2 章（PageStore）</span>
+    </p>
+    <p>
+      <a href="ch02-pagestore.html" style="color:#bfdbfe">← 上一章：PageStore 抽象</a>
+      &nbsp;|&nbsp;
+      <a href="ch04-cow-write.html" style="color:#bfdbfe">下一章：COW 写路径 →</a>
+    </p>
+  </div>
+</header>
+
+<div class="wrap">
+
+<nav class="toc">
+  <h2>本章目录</h2>
+  <ol>
+    <li><a href="#s1">树形与容量账：为什么百万数据只要走几页</a></li>
+    <li><a href="#s2">cmpKey：key 是「排序的字节串」</a></li>
+    <li><a href="#s3">get 的一次旅程：meta → root → branch → leaf</a></li>
+    <li><a href="#s4">叶子页 payload 编码：4KB 里怎么塞记录</a></li>
+    <li><a href="#s5">大 value 的去处：overflow 页链</a></li>
+    <li><a href="#s6">select 与 Iterator：范围扫描、getInto 零拷贝</a></li>
+    <li><a href="#s7">读时的 CRC 分档：off / sample / full</a></li>
+    <li><a href="#s8">本章自测</a></li>
+  </ol>
+</nav>
+
+<!-- ============ 1 ============ -->
+<section id="s1">
+  <h2><span class="no">1</span>树形与容量账：为什么百万数据只要走几页</h2>
+
+  <p><strong>是什么</strong>：cube_db 的所有键值对都组织在一棵 <strong>B-tree</strong> 里。
+  第 0 章说过：B-tree 是「多叉搜索树」的磁盘版，每个节点正好占一页（4096 字节）。
+  节点分两种：<strong>分支页（branch）</strong>只存「路标」，不存数据；
+  <strong>叶子页（leaf）</strong>才真正存 key 和 value。</p>
+
+  <p>这棵树的体型由两个常量定死（<code>src/btree.zig:12-15</code>）：</p>
+
+  <table>
+    <tr><th>常量</th><th>值</th><th>含义</th></tr>
+    <tr><td><code>LEAF_MAX_ENTRIES</code></td><td>32</td><td>一片叶子页最多装 32 条记录</td></tr>
+    <tr><td><code>BRANCH_MAX_CHILDREN</code></td><td>64</td><td>一个分支页最多有 64 个孩子</td></tr>
+  </table>
+
+  <p>现在做一道小学算术，看看这两个数字为什么「够用」：</p>
+  <ul>
+    <li>根分支页：64 个岔口 → 第 2 层有 64 个分支页</li>
+    <li>每个分支页又是 64 岔 → 第 3 层有 64 × 64 = 4096 个分支页</li>
+    <li>再来一层岔口：4096 × 64 = 262144 片叶子 × 32 条/片 ≈ <strong>838 万条记录</strong></li>
+  </ul>
+  <p>也就是说，从根到叶子只需读 <strong>4 页</strong>（根 → 分支 → 分支 → 叶子）就能在 800 多万条数据里定位任意一个 key。
+  一百万条数据更宽松 —— 64 × 64 × 32 ≈ 13 万/层，三四层绰绰有余。
+  这就是 B-tree 相比二叉树的全部秘密：<strong>每层岔口极多，所以层数极少</strong>。</p>
+
+  <figure>
+    <svg viewBox="0 0 760 300" width="760" height="300" role="img" aria-label="三层 B-tree 容量图">
+      <g font-size="13">
+        <!-- root -->
+        <rect x="300" y="20" width="160" height="46" rx="9" fill="#dbeafe" stroke="#2563eb"/>
+        <text x="380" y="40" text-anchor="middle" font-weight="700" fill="#1e3a8a">根（分支页）</text>
+        <text x="380" y="58" text-anchor="middle" fill="#374151" font-size="12">64 个岔口</text>
+        <!-- level 2 -->
+        <rect x="90" y="110" width="150" height="42" rx="9" fill="#ede9fe" stroke="#7c3aed"/>
+        <text x="165" y="128" text-anchor="middle" font-weight="700" fill="#5b21b6" font-size="12.5">分支页 ×64</text>
+        <text x="165" y="145" text-anchor="middle" fill="#374151" font-size="11.5">各 64 岔</text>
+        <rect x="560" y="110" width="150" height="42" rx="9" fill="#ede9fe" stroke="#7c3aed"/>
+        <text x="635" y="128" text-anchor="middle" font-weight="700" fill="#5b21b6" font-size="12.5">分支页 ×64</text>
+        <text x="635" y="145" text-anchor="middle" fill="#374151" font-size="11.5">（共 4096 个）</text>
+        <!-- level 3 leaves -->
+        <rect x="60" y="210" width="120" height="42" rx="9" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="120" y="228" text-anchor="middle" font-weight="700" fill="#166534" font-size="12.5">叶子页 ×64</text>
+        <text x="120" y="245" text-anchor="middle" fill="#374151" font-size="11.5">32 条记录/页</text>
+        <rect x="330" y="210" width="130" height="42" rx="9" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="395" y="228" text-anchor="middle" font-weight="700" fill="#166534" font-size="12.5">…共 262144 片</text>
+        <text x="395" y="245" text-anchor="middle" fill="#374151" font-size="11.5">总计 ≈ 838 万条</text>
+        <rect x="600" y="210" width="120" height="42" rx="9" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="660" y="228" text-anchor="middle" font-weight="700" fill="#166534" font-size="12.5">叶子页 ×64</text>
+        <text x="660" y="245" text-anchor="middle" fill="#374151" font-size="11.5">32 条记录/页</text>
+        <!-- arrows -->
+        <g stroke="#6b7280" stroke-width="1.6" fill="none">
+          <line x1="340" y1="66" x2="180" y2="110"/>
+          <line x1="420" y1="66" x2="620" y2="110"/>
+          <line x1="150" y1="152" x2="125" y2="210"/>
+          <line x1="180" y1="152" x2="370" y2="210"/>
+          <line x1="620" y1="152" x2="395" y2="205"/>
+          <line x1="650" y1="152" x2="658" y2="210"/>
+        </g>
+        <text x="380" y="285" text-anchor="middle" fill="#6b7280" font-size="12.5">根→岔→岔→叶子 = 4 次页读取，即可定位 838 万条记录中的任意一条（生产上经由 mmap，连系统调用都没有，见第 7 章）</text>
+      </g>
+    </svg>
+    <figcaption>容量账：64 岔 × 64 岔 × 64 岔 × 32 条 ≈ 838 万。层数 = 每页岔口数的「幂」，这就是 B-tree 选大叉的原因。</figcaption>
+  </figure>
+
+  <div class="analogy">
+    查字典从来不是从第一页翻起：先翻「部首目录」（根分支页），再翻「拼音索引」（下层分支页），
+    最后落到印着正文的那一页（叶子页）。目录每层分得越细（岔口越多），需要翻的次数就越少 ——
+    64 岔的树翻 4 次，二叉树（每页只有 2 岔）翻同样次数只能覆盖 16 条数据。
+  </div>
+
+  <div class="why">
+    为什么偏偏是 32 和 64？不是拍脑袋：一片 4096 字节的叶子页去掉页头（24B，format.zig:6）和页尾 CRC（4B）后，
+    还要装下 32 条「key + value + 每条十来字节的元信息」，再大就要溢出页了；
+    分支页的一个岔口只占 4 字节（一个 u32 页号），64 个岔口加路标 key 刚好也在一页内。
+    <strong>常量是被「一页装得下」这个物理约束倒推出来的</strong>，第 4 章讲分裂时会再见到它们的另一半
+    （LEAF_MIN_ENTRIES = 16，半满规则）。
+  </div>
+</section>
+
+<!-- ============ 2 ============ -->
+<section id="s2">
+  <h2><span class="no">2</span>cmpKey：key 是「排序的字节串」</h2>
+
+  <p><strong>是什么</strong>：整个树里所有「往左还是往右」的判断，最终都落在同一个函数上
+  （<code>src/btree.zig:33</code>）：</p>
+
+  <p><code>pub fn cmpKey(a: []const u8, b: []const u8) std.math.Order</code> ——
+  一行代码，直接调标准库的 <code>std.mem.order(u8, a, b)</code>：
+  按无符号字节逐个比，返回 lt / eq / gt。</p>
+
+  <p><strong>为什么需要它</strong>：KV 引擎的 key 不是「字符串」而是<strong>字节数组（byte string）</strong>。
+  两者排序规则不同：</p>
+  <ul>
+    <li>字符串比较可能涉及编码、大小写折叠、本地化规则（「Apple」和「apple」谁在前？取决于你问谁）；</li>
+    <li>字节串比较只有一条铁律：逐字节比 <code>u8</code> 值，结果永远确定、永远一致。</li>
+  </ul>
+  <p>为什么必须「永远一致」？因为<strong>磁盘上的记录是按 key 排好序物理摆放的</strong>。
+  写入时按这个顺序放，读取时按这个顺序找 —— 两边必须用同一个 <code>cmpKey</code>，
+  否则找 key 时「该往左」的数据被写到了右边，树就废了。
+  字节序比较没有丝毫歧义，是唯一能让「写」和「读」跨越时间、跨越进程保持一致的规则。</p>
+
+  <div class="analogy">
+    图书馆给书编索书号：如果按「书名的意思」排，两个管理员会吵起来（《三国演义》算文学还是历史？）；
+    按一串固定编号的数字逐位比，谁都不会排错。<strong>key 排序要的不是「合理」，是「无歧义」。</strong>
+  </div>
+
+  <p>顺带一提：这个设计把「想要什么样的排序」交给了上层 —— 想让时间序列按时间排？把时间戳编码进 key 的前几个字节即可。
+  引擎本身只认识字节。</p>
+</section>
+
+<!-- ============ 3 ============ -->
+<section id="s3">
+  <h2><span class="no">3</span>get 的一次旅程：meta → root → branch → leaf</h2>
+
+  <p><strong>是什么</strong>：点查询 <code>get(key)</code> 的核心是 <code>getChecked</code>
+  （<code>src/btree.zig:613</code>）。它做的事用一句话说：<strong>从根页号出发，一层层往下换页号，
+  直到落在一篇叶子上，在叶子里线性扫描找 key</strong>。</p>
+
+  <p>先补一个第 1 章的衔接：<code>get</code> 的入参不是「数据库」，而是 <code>root</code>（根页号）。
+  根页号从哪来？上层（db.zig）先读 meta 页（数据库总目录）拿到当前版本的根页号，再把它递进来 ——
+  所以本章只管「从根往下」这一段。</p>
+
+  <p><code>getChecked</code> 的骨架（去掉防御性检查后）只有三种动作：</p>
+  <ul>
+    <li><strong>读一页</strong>：<code>readNodePayloadPolicy(store, cur, crc)</code> —— 按第 2 章的 PageStore 接口读当前页号，拿到页的 payload 部分（去掉 24B 页头和 4B CRC）；</li>
+    <li><strong>是叶子？</strong> <code>payload[0] == LEAF_KIND</code>（值为 2）→ 交给 <code>findInLeaf</code>（btree.zig:629）在叶子里找；</li>
+    <li><strong>是分支？</strong> → <code>findInBranchPayload</code>（btree.zig:789）算出「该进哪个孩子」，把 <code>cur</code> 换成那个孩子的页号，回到第一步。</li>
+  </ul>
+
+  <p><strong>分支页怎么选岔口</strong>（findInBranchPayload，btree.zig:789）：
+  分支页存着若干<strong>分隔 key</strong>（separator）和一排孩子页号。
+  规则是：找到第一个<strong>大于</strong>目标 key 的分隔符，进它左边那个孩子；没有比它大的，就进最后一个孩子
+  —— 这就是普通的「二分区间」语义，只是这里用 <code>cmpKey</code> 线性扫一遍分隔符。</p>
+
+  <p><strong>叶子页怎么找</strong>（findInLeaf，btree.zig:629）：
+  从第一条记录开始逐条扫，key 小于目标就跳过、等于就命中、大于就说明不存在（数据有序，后面不可能有了）。
+  命中后还有两个分支，正好对应接下来两节：</p>
+  <ul>
+    <li>记录带着 <strong>tombstone</strong>（墓碑，1 字节的「已删除」标记）→ 返回 <code>null</code>：key 存在过，但已被删；</li>
+    <li>value 带 <strong>overflow 标志</strong> → 读 4 字节溢出页号，顺着链把大 value 拼回来（见第 5 节）。</li>
+  </ul>
+
+  <figure>
+    <svg viewBox="0 0 760 320" width="760" height="320" role="img" aria-label="get 下降流程图">
+      <defs><marker id="arrg" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#6b7280"/></marker></defs>
+      <g font-size="12.5">
+        <rect x="270" y="15" width="220" height="52" rx="9" fill="#eef2ff" stroke="#4f46e5"/>
+        <text x="380" y="36" text-anchor="middle" font-weight="700" fill="#3730a3">上层：读 meta 页</text>
+        <text x="380" y="54" text-anchor="middle" fill="#374151">拿到当前版本的 root 页号</text>
+
+        <rect x="270" y="97" width="220" height="66" rx="9" fill="#dbeafe" stroke="#2563eb"/>
+        <text x="380" y="119" text-anchor="middle" font-weight="700" fill="#1e3a8a">读一页 payload</text>
+        <text x="380" y="137" text-anchor="middle" fill="#374151">readNodePayloadPolicy</text>
+        <text x="380" y="153" text-anchor="middle" fill="#374151" font-size="11.5">（CRC 按第 7 节的分档决定验不验）</text>
+
+        <rect x="70" y="197" width="250" height="70" rx="9" fill="#ede9fe" stroke="#7c3aed"/>
+        <text x="195" y="219" text-anchor="middle" font-weight="700" fill="#5b21b6">分支页 → findInBranchPayload</text>
+        <text x="195" y="237" text-anchor="middle" fill="#374151">用 cmpKey 比分隔符，</text>
+        <text x="195" y="254" text-anchor="middle" fill="#374151">选中孩子 → cur = 孩子页号</text>
+
+        <rect x="440" y="197" width="280" height="70" rx="9" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="580" y="219" text-anchor="middle" font-weight="700" fill="#166534">叶子页 → findInLeaf</text>
+        <text x="580" y="237" text-anchor="middle" fill="#374151">逐条 cmpKey：小于跳过 / 等于命中 / 大于返回 null</text>
+        <text x="580" y="254" text-anchor="middle" fill="#374151">命中 → 处理 tombstone / overflow / 直接返回 value</text>
+
+        <line x1="380" y1="67" x2="380" y2="97" stroke="#6b7280" stroke-width="1.6" marker-end="url(#arrg)"/>
+        <line x1="330" y1="163" x2="210" y2="197" stroke="#6b7280" stroke-width="1.6" marker-end="url(#arrg)"/>
+        <line x1="430" y1="163" x2="560" y2="197" stroke="#6b7280" stroke-width="1.6" marker-end="url(#arrg)"/>
+        <path d="M195,267 C195,290 300,290 330,270 C355,254 365,163 380,163" fill="none" stroke="#9ca3af" stroke-width="1.4" stroke-dasharray="5 3" marker-end="url(#arrg)"/>
+        <text x="240" y="297" fill="#6b7280" font-size="11.5">循环：换页号，再读一页（代码里 depth&lt;1000 兜底防环，btree.zig:617）</text>
+        <text x="700" y="297" text-anchor="end" fill="#6b7280" font-size="11.5">getChecked · btree.zig:613</text>
+      </g>
+    </svg>
+    <figcaption>get 的下降循环：每圈只做「读一页 → 换页号」，直到撞见叶子页。整个查找没有任何内存里的树结构 —— 树就摊在磁盘页里。</figcaption>
+  </figure>
+
+  <div class="keypoint">
+    三个值得咀嚼的细节：① 树的「指针」就是 u32 页号，没有任何额外内存结构；
+    ② 每层下降 = 一次 <code>store.readPage()</code>，第 2 章的接口抽象在这里兑现：同一份 btree 代码，内存实现和 mmap 文件实现都能跑；
+    ③ <code>depth &lt; 1000</code> 的护栏（btree.zig:617）：页数据万一损坏出现「环」，报错而不是死循环。
+  </div>
+</section>
+
+<!-- ============ 4 ============ -->
+<section id="s4">
+  <h2><span class="no">4</span>叶子页 payload 编码：4KB 里怎么塞记录</h2>
+
+  <p><strong>是什么</strong>：一页 4096 字节，去掉页头（24B）和页尾 CRC（4B），剩约 4068 字节的 payload。
+  <code>encodeLeafPayload</code>（<code>src/btree.zig:279</code>）负责把一组记录按固定格式塞进去；
+  <code>decodeLeafPayload</code>（btree.zig:322）负责原样解出来。</p>
+
+  <p>格式没有魔法，就是「头 + 一串变长记录」紧挨着排：</p>
+
+  <table>
+    <tr><th>部位</th><th>字节数</th><th>内容</th></tr>
+    <tr><td>叶子头</td><td>3</td><td>类型标记 LEAF_KIND（1B）+ 记录条数 nkeys（2B，小端 u16）</td></tr>
+    <tr><td rowspan="5">每条记录</td><td>1</td><td><code>tombstone</code>：1 = 这条 key 已被删除（墓碑标记）</td></tr>
+    <tr><td>4</td><td><code>klen</code>：key 长度（u32 小端）</td></tr>
+    <tr><td>klen</td><td>key 本体（变长）</td></tr>
+    <tr><td>4</td><td><code>vlen</code>：value 长度（u32 小端）</td></tr>
+    <tr><td>1 + ?</td><td>flags（1B）：普通值 = 后面直接跟 value 本体；overflow 位（btree.zig:178 的 <code>LEAF_FLAG_OVERFLOW</code>）= 后面只跟 4 字节溢出页号</td></tr>
+  </table>
+
+  <div class="analogy">
+    像快递面单：<strong>[1B 是否易碎(墓碑)] [4B 收件人名字多长] [名字] [4B 货物多长] [1B 是否超大件] [货物 或 超大件提货单号]</strong>，
+    一张张面单首尾相接贴成一页。字段全是「长度 + 本体」，所以变长 key/value 不需要分隔符，扫到哪算哪。
+  </div>
+
+  <p><strong>为什么这么设计</strong>，三个点：</p>
+  <ul>
+    <li><strong>解码零分配</strong>：<code>decodeLeafPayload</code> 解出的 key/value 是<strong>直接指向页 payload 内部的切片</strong>（btree.zig:345-360 附近），不复制数据。数据本来就在 mmap 的页里，复制纯属浪费 —— 这是整个读路径「零拷贝」哲学的第一块拼图；</li>
+    <li><strong>墓碑不删数据只打标记</strong>：删除一个 key 时，写入路径把那条记录的 tombstone 位翻成 1（第 4 章详讲），读路径见到标记当作「不存在」。物理删除要整理页面，打标记只改 1 字节 —— 崩溃安全和 MVCC 都依赖「旧页永不被改动」；</li>
+    <li><strong>截断防御</strong>：decode 每读一个字段前都检查 <code>pos + len &gt; payload.len</code> 返回 <code>error.Truncated</code>（如 btree.zig:331）。磁盘上的字节不可信，解析器永远假定「页可能是坏的」。</li>
+  </ul>
+
+  <div class="keypoint">
+    记住这个布局，第 4 章写路径会反复用到：插入 = 在排好序的位置重新编码整个 payload 写新页；
+    分裂预算的推导（<code>MAX_KEY_SIZE</code>，btree.zig:173）也完全建立在这套「3B 头 + 每条 10B 固定 + 变长」的账上。
+  </div>
+</section>
+
+<!-- ============ 5 ============ -->
+<section id="s5">
+  <h2><span class="no">5</span>大 value 的去处：overflow 页链</h2>
+
+  <p><strong>是什么</strong>：叶子页只有约 4KB，而 value 可能几 MB。装不下怎么办？
+  —— value 留在叶子里的资格有上限：<code>MAX_INLINE_VALUE = 3800</code> 字节（<code>src/btree.zig:134</code>）。
+  超过预算的 value 不进叶子，而是被 <code>writeOverflowPages</code>（btree.zig:181）切成若干块，
+  每块塞一页 <strong>OVERFLOW 页</strong>，页与页之间用页头里的 <code>free_next</code> 字段串成<strong>单向链表</strong>；
+  叶子里只留一个 4 字节的「链头页号」。</p>
+
+  <figure>
+    <svg viewBox="0 0 760 260" width="760" height="260" role="img" aria-label="overflow 页链布局图">
+      <defs><marker id="arro" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#d97706"/></marker></defs>
+      <g font-size="12.5">
+        <!-- leaf -->
+        <rect x="20" y="60" width="230" height="110" rx="10" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="135" y="40" text-anchor="middle" font-weight="700" fill="#166534">叶子页</text>
+        <rect x="35" y="78" width="200" height="26" rx="6" fill="#fff" stroke="#86efac"/>
+        <text x="135" y="95" text-anchor="middle" fill="#374151" font-size="11.5">key = "bigphoto.jpg"</text>
+        <rect x="35" y="112" width="200" height="26" rx="6" fill="#fff" stroke="#86efac"/>
+        <text x="135" y="129" text-anchor="middle" fill="#374151" font-size="11.5">flags = OVERFLOW</text>
+        <rect x="35" y="146" width="200" height="16" rx="6" fill="#fef3c7" stroke="#d97706"/>
+        <text x="135" y="158" text-anchor="middle" fill="#92400e" class="mono" font-size="11">overflow 页号 = 4711</text>
+
+        <!-- chain pages -->
+        <rect x="330" y="60" width="150" height="110" rx="10" fill="#fef3c7" stroke="#d97706"/>
+        <text x="405" y="40" text-anchor="middle" font-weight="700" fill="#92400e">OVERFLOW 页 4711</text>
+        <text x="405" y="85" text-anchor="middle" fill="#374151" font-size="11.5">value 的前 ~4068 字节</text>
+        <rect x="345" y="130" width="120" height="22" rx="6" fill="#fff" stroke="#d97706"/>
+        <text x="405" y="145" text-anchor="middle" fill="#92400e" class="mono" font-size="11">free_next → 4712</text>
+
+        <rect x="560" y="60" width="150" height="110" rx="10" fill="#fef3c7" stroke="#d97706"/>
+        <text x="635" y="40" text-anchor="middle" font-weight="700" fill="#92400e">OVERFLOW 页 4712</text>
+        <text x="635" y="85" text-anchor="middle" fill="#374151" font-size="11.5">value 的后续字节</text>
+        <rect x="575" y="130" width="120" height="22" rx="6" fill="#fff" stroke="#d97706"/>
+        <text x="635" y="145" text-anchor="middle" fill="#92400e" class="mono" font-size="11">free_next → 0（链尾）</text>
+
+        <line x1="250" y1="154" x2="330" y2="120" stroke="#d97706" stroke-width="2" marker-end="url(#arro)"/>
+        <line x1="480" y1="141" x2="560" y2="115" stroke="#d97706" stroke-width="2" marker-end="url(#arro)"/>
+
+        <text x="20" y="215" fill="#374151">读回时 <tspan class="mono">readOverflowValue</tspan>（btree.zig:234）：从头页开始，每页搬 payload、看页头 free_next，直到拼够 vlen 字节。</text>
+        <text x="20" y="240" fill="#6b7280" font-size="12">一个几 MB 的 value = 一条几十页的链；链上每页都是独立的 4KB 页，同样过写路径的 CRC 校验。</text>
+      </g>
+    </svg>
+    <figcaption>overflow 链：叶子里只留 4B 链头页号，大 value 的字节摊在一串 OVERFLOW 页上，靠页头 free_next 串起来。</figcaption>
+  </figure>
+
+  <p><strong>为什么阈值是 3800 而且有两个条件</strong>：这就要看 <code>inlineValueBudget(key_len)</code>
+  （btree.zig:148）—— 一条记录能不能留在叶子里，不是只看 value 自己，而是看 <strong>key + value 的组合</strong>：</p>
+  <ul>
+    <li>条件一：value ≤ <code>MAX_INLINE_VALUE</code>（3800）—— 给同页其他记录留余量，别让一个大 value 独占一页；</li>
+    <li>条件二：<code>3（叶子头）+ 10（每条固定开销）+ key 长度 + value 长度 ≤ 页 payload 上限</code> —— 组合起来不能撑爆一页。</li>
+  </ul>
+  <p>两个条件取更严的那个。所以一个 3000 字节的 value 配一个 1200 字节的 key 也会被送去 overflow ——
+  组合超预算了。这就是源码注释里反复强调的 <strong>composite-aware（组合感知）</strong>判定（btree.zig:137-150）。</p>
+
+  <div class="analogy">
+    行李托运：随身包（叶子页）塞得下小件，但每人限重 3800「克」，且<strong>你和你的行李加起来</strong>不能超载 ——
+    超了不是因为行李大，而是因为「你 + 行李」这个组合超了。超载的行李贴个签（4B 页号）送去货舱（overflow 链）。
+  </div>
+
+  <div class="keypoint">
+    读路径的三个入口（get / getInto / Iterator）读溢出链都走同一套逻辑：顺着 free_next 逐页搬字节
+    （readOverflowValue / readOverflowValueInto）。get 版本先整块分配再填；
+    getInto / Iterator 版本直接往调用方的缓冲区里逐页拷 —— 又是零拷贝思想：不多搬一趟。
+  </div>
+</section>
+
+<!-- ============ 6 ============ -->
+<section id="s6">
+  <h2><span class="no">6</span>select 与 Iterator：范围扫描、getInto 零拷贝</h2>
+
+  <h3>select：只定位起点，不搬数据</h3>
+  <p><strong>是什么</strong>：<code>select(min, max)</code>（<code>src/btree.zig:2420</code>，带 CRC 分档的版本是
+  <code>selectChecked</code>，btree.zig:2426）做范围查询。它返回的<strong>不是一个装满结果的数组，而是一个
+  Iterator（迭代器）</strong> —— 一个记录着「我现在走到哪了」的光标对象。</p>
+
+  <p><strong>为什么</strong>：一次范围查询可能命中上百万条，一次性装进内存既慢又爆。
+  「给我一个光标，我调一次 <code>next()</code> 你给我一条」—— 想要几条走几条，不要了直接丢。
+  定位起点的过程和 get 一样：从根下降，按 <code>min</code> 选岔口，落到第一片目标叶子。</p>
+
+  <h3>Iterator 怎么「横向走」</h3>
+  <p>迭代器本体在 btree.zig:2203。它维护一个<strong>下沉栈</strong>：
+  定长数组 <code>frames: [MAX_DEPTH]Frame</code>（MAX_DEPTH = 64，btree.zig:2243），每帧记
+  <code>{ page_no, child_idx }</code> —— 「我在这一层的这个分支页，正看着第几个孩子」。
+  当前叶子扫完后，<code>stepToNextLeaf</code>（btree.zig:2348）：</p>
+  <ul>
+    <li>把栈顶帧的 <code>child_idx + 1</code>：右边还有孩子 → 进去一路「最左边」扎到底（<code>descendLeftmost</code>），落到下一片叶子；</li>
+    <li>右边没了 → 弹栈，回到上一层的分支页继续找 —— 和二叉树的中序遍历是同一个思想。</li>
+  </ul>
+  <p>因为叶子页本身就是按 key 顺序串着的逻辑序列（树把 key 有序地摊在各片叶子上），<strong>「中序遍历」就是全库有序扫描</strong>。
+  <code>next()</code>（btree.zig:2298）每吐一条前做四道过滤：跳过 tombstone、跳过 &lt; min 的、碰到 ≥ max 直接结束、
+  可选的注入式过滤钩子（<code>skip_fn</code>，给上层做区间删除阴影用，第 4/6 章见）。</p>
+
+  <figure>
+    <svg viewBox="0 0 760 280" width="760" height="280" role="img" aria-label="迭代器横向走叶子示意图">
+      <defs><marker id="arri" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#16a34a"/></marker></defs>
+      <g font-size="12.5">
+        <rect x="300" y="15" width="160" height="40" rx="8" fill="#ede9fe" stroke="#7c3aed"/>
+        <text x="380" y="40" text-anchor="middle" font-weight="700" fill="#5b21b6" font-size="12.5">分支页</text>
+        <!-- leaves -->
+        <rect x="40"  y="130" width="150" height="56" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="115" y="152" text-anchor="middle" font-weight="700" fill="#166534" font-size="12">叶子 A</text>
+        <text x="115" y="172" text-anchor="middle" fill="#374151" font-size="11.5">…已扫完</text>
+        <rect x="305" y="130" width="150" height="56" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="380" y="152" text-anchor="middle" font-weight="700" fill="#166534" font-size="12">叶子 B（当前）</text>
+        <text x="380" y="172" text-anchor="middle" fill="#374151" font-size="11.5">光标在中间某条</text>
+        <rect x="570" y="130" width="150" height="56" rx="8" fill="#f3f4f6" stroke="#9ca3af" stroke-dasharray="5 3"/>
+        <text x="645" y="152" text-anchor="middle" font-weight="700" fill="#374151" font-size="12">叶子 C（下一步）</text>
+        <text x="645" y="172" text-anchor="middle" fill="#6b7280" font-size="11.5">stepToNextLeaf 去处</text>
+        <line x1="380" y1="55" x2="380" y2="125" stroke="#6b7280" stroke-width="1.6" marker-end="url(#arri)"/>
+        <path d="M115,158 C230,158 240,158 300,158" fill="none" stroke="#16a34a" stroke-width="1.8" marker-end="url(#arri)"/>
+        <path d="M455,158 C520,158 520,158 565,158" fill="none" stroke="#16a34a" stroke-width="1.8" stroke-dasharray="5 3" marker-end="url(#arri)"/>
+        <text x="380" y="225" text-anchor="middle" fill="#374151">当前叶子扫完 → 栈顶 child_idx+1 → 还有人就 descendLeftmost 扎进下一片叶子</text>
+        <text x="380" y="250" text-anchor="middle" fill="#6b7280" font-size="12">栈里每一帧就是「我在这层分支页的第几个孩子」—— 深度只有几层，一帧才 8 字节</text>
+      </g>
+    </svg>
+    <figcaption>范围扫描 = 一次下降定位 + 反复「右移一层、扎到底」。这正是 B-tree 中序遍历：结果天然按 key 有序。</figcaption>
+  </figure>
+
+  <h3>getInto：把「零拷贝」拧到最后一滴</h3>
+  <p><code>get</code>（btree.zig:607）命中后要 <code>allocator.dupe</code> 复制一份 value 给调用方。
+  <code>getInto</code>（btree.zig:691，策略版 <code>getIntoChecked</code> btree.zig:696）换了个契约：
+  <strong>调用方自带缓冲区，引擎直接往里拷，返回写入字节数</strong>。
+  缓冲区太小 → 返回 <code>error.BufferTooSmall</code>，且<strong>一个字节都不写</strong>（拦截在任何写入之前，btree.zig:749 附近），
+  调用方换个更大的缓冲区重试即可。省掉的是中间那次临时分配 + 复制 —— 对高频小 value 的点查，
+  这就是热路径上最贵的那一刀。</p>
+
+  <div class="analogy">
+    打水：<code>get</code> 是「你伸手，我倒进一次性纸杯递给你」；<code>getInto</code> 是「你把自家水壶递过来，我直接灌」——
+    壶太小我不动你的壶，先告诉你需要多大的壶。纸杯（临时分配）用完就扔，是纯浪费。
+  </div>
+
+  <div class="keypoint">
+    迭代器吐出的 key/value 也是<strong>借用</strong>：指向 mmap 页里的字节，不复制（Iterator 注释 btree.zig:2200 前后的借用契约）。
+    上层 db.zig 会在迭代器存活期间「钉住」相关页不被回收（MVCC pin，第 6 章的主角）；
+    引擎层只保证一条：迭代器还活着，页就还在。分层各管各的承诺。
+  </div>
+</section>
+
+<!-- ============ 7 ============ -->
+<section id="s7">
+  <h2><span class="no">7</span>读时的 CRC 分档：off / sample / full</h2>
+
+  <p><strong>是什么</strong>：第 1 章讲过每页尾部有 4 字节 CRC32 校验和。但<strong>读的时候要不要每次都验</strong>？
+  cube_db 把这个选择做成了一个三档枚举 <code>CrcCheck</code>（<code>src/btree.zig:64</code>），
+  由数据库启动选项决定，贯穿所有读路径：</p>
+
+  <table>
+    <tr><th>档位</th><th>行为</th><th>代价 / 收益</th></tr>
+    <tr><td><code>.off</code></td><td>完全不验，直接返回页数据</td><td>最快。依据：COW 保证已发布的页从不被原地改写，页内容坏多来自介质损坏（低概率，交给离线体检工具兜底）</td></tr>
+    <tr><td><code>.sample</code></td><td>抽查：页号 <code>% 64 == 0</code> 的页才验（<code>SAMPLE_INTERVAL = 64</code>，btree.zig:69；判定函数 <code>sampleHit</code> btree.zig:73）</td><td>平均每 64 页验 1 页。介质刚开始坏时，迟早有抽查页命中，给出早期警报</td></tr>
+    <tr><td><code>.full</code></td><td>每一页都验，坏了返回 <code>error.CorruptCrc</code></td><td>最安全。适合「宁可慢也要立刻发现数据损坏」的场景</td></tr>
+  </table>
+
+  <p>三档汇合在唯一的咽喉 <code>readNodePayloadPolicy</code>（btree.zig:82）：
+  get / getInto / Iterator / 溢出链的<strong>每一次页读取</strong>都必须经过它，
+  所以换档 = 改一个启动选项，读路径一行代码不用动。</p>
+
+  <p><strong>为什么 .sample 是确定性抽查</strong>：<code>sampleHit</code> 只做 <code>page_no % 64 == 0</code>，
+  没有任何随机数。同一个页号永远得到同样的判定 —— 测试可复现、离线工具可以精确预言「哪些页会被抽到」。
+  随机抽查看起来更「均匀」，但不可复现的检查在存储系统里是灾难：你永远没法回答「上次那次报警到底是哪个页触发的」。</p>
+
+  <div class="analogy">
+    食品安全抽检的两种做法：每批次全检（full，成本最高）、按批次号尾号抽检（sample，规则公开可复核）、
+    完全信任冷链不检（off，赌供应链不出事）。<strong>尾号抽检的妙处是供应商事先知道规则</strong> —— 可复核的抽查才叫监控，不可复核的抽查叫抽奖。
+  </div>
+
+  <div class="why">
+    为什么读路径敢默认少验甚至不验？因为这套系统把校验放在了它最便宜的位置：
+    <strong>写路径每次落盘都算 CRC</strong>（writeNodePage，btree.zig:111 附近），页一旦发布就永不改写；
+    剩下的风险只有「磁盘介质自己慢慢坏」（bit rot），那是以月年计的慢过程 —— 交给 .sample 抽查给早期预警、
+    离线体检工具 <span class="file">cube_check</span> 全量扫（第 8 章）兜底。<strong>在正确的地方花正确的钱</strong>，
+    这是性能与可靠性的经典权衡，也是第 8 章可靠性工程的开胃菜。
+  </div>
+</section>
+
+<!-- ============ 8 ============ -->
+<section id="s8">
+  <h2><span class="no">8</span>本章自测</h2>
+
+  <p>回答得出，才算真懂了「从根走到一片叶子」这条路。答案都在本章正文里。</p>
+
+  <div class="quiz">
+    <strong>①</strong> 一个分支页 64 岔、一片叶子 32 条。从根到叶子读 4 页，最多能定位多少条记录？
+    如果叶子只能装 2 条，同样的 4 页能定位多少？（体会：树高每多 1 层 = 一次页读取，fanout 是指数级的力量）
+  </div>
+
+  <div class="quiz">
+    <strong>②</strong> 一个 3500 字节的 value，配一个 900 字节的 key，它能留在叶子里吗？
+    （提示：别只看 3500 &lt; MAX_INLINE_VALUE=3800 —— 想想 <code>inlineValueBudget</code> 为什么叫「组合感知」。）
+    它如果进 overflow，叶子里留下的是什么？
+  </div>
+
+  <div class="quiz">
+    <strong>③</strong> get、getInto、Iterator 都从根下降到叶子，它们读页的「姿势」有什么共同点？
+    <code>.off</code> 档下读路径敢跳过 CRC 校验，靠的是哪条不变量？这条不变量是谁保证的（提示：第 0 章 COW）？
+  </div>
+
+  <div class="keypoint">
+    下一章（第 4 章）我们把树「翻个面」看写路径：插入时沿路径复制新页（COW）、页满时分裂（32 变 16+16）、
+    删除时只打墓碑不搬数据 —— 你在本章认识的每一个字节布局，都会在那里被重新编码一遍。
+  </div>
+</section>
+
+<footer>
+  cube_db 讲义 · 第 3 章 · 行号以当前 HEAD 为准（btree.zig 2512 行）—— 读完请回到源码，把 getChecked 自己走一遍。
+</footer>
+
+</div>
+</body>
+</html>
