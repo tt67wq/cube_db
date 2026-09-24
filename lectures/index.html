@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>cube_db 源码讲义 · 课程目录</title>
+<style>
+  :root {
+    --bg: #f7f8fa; --card: #fff; --ink: #24292f; --muted: #6b7280;
+    --accent: #2563eb; --accent-soft: #dbeafe; --border: #e5e7eb;
+    --green: #16a34a; --green-soft: #dcfce7; --orange: #d97706; --orange-soft: #fef3c7;
+    --mono: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 0 16px 80px; background: var(--bg); color: var(--ink);
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+    line-height: 1.7; font-size: 16px; }
+  .wrap { max-width: 880px; margin: 0 auto; }
+  header.hero { background: linear-gradient(135deg, #1e3a8a, #2563eb); color: #fff;
+    border-radius: 0 0 18px 18px; padding: 44px 32px 34px; margin: 0 -16px 30px; }
+  header.hero h1 { margin: 0 0 8px; font-size: 30px; }
+  header.hero p { margin: 4px 0; opacity: .92; }
+  header.hero .tag { display: inline-block; background: rgba(255,255,255,.18);
+    border-radius: 999px; padding: 2px 12px; font-size: 13px; margin-right: 6px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 20px 0 30px; }
+  a.card { display: block; background: var(--card); border: 1px solid var(--border);
+    border-radius: 12px; padding: 18px 20px; text-decoration: none; color: var(--ink);
+    transition: border-color .15s; }
+  a.card:hover { border-color: var(--accent); }
+  a.card .no { display: inline-block; background: var(--accent); color: #fff; width: 30px;
+    height: 30px; line-height: 30px; text-align: center; border-radius: 8px;
+    font-size: 15px; font-weight: 700; margin-right: 8px; }
+  a.card.zero .no { background: var(--orange); }
+  a.card h3 { display: inline; font-size: 16.5px; margin: 0; }
+  a.card p { color: var(--muted); font-size: 13.5px; margin: 8px 0 6px; }
+  a.card .meta { font-size: 12.5px; color: var(--muted); }
+  a.card .meta .min { color: var(--green); font-weight: 600; }
+  figure { background: #fbfcfe; border: 1px dashed #c7d2e3; border-radius: 12px;
+    padding: 18px; margin: 18px 0; text-align: center; overflow-x: auto; }
+  figcaption { color: var(--muted); font-size: 13.5px; margin-top: 8px; }
+  svg text { font-family: -apple-system, "PingFang SC", sans-serif; }
+  footer { color: var(--muted); font-size: 13.5px; text-align: center; margin-top: 40px; }
+</style>
+</head>
+<body>
+<header class="hero">
+  <div class="wrap">
+    <h1>cube_db 源码讲义</h1>
+    <p>一个用 Zig 写的嵌入式 KV 存储引擎，9 章读透约 7000 行核心代码</p>
+    <p>
+      <span class="tag">读者：会编程，但没接触过 KV 存储</span>
+      <span class="tag">每章配类比 + SVG 图解</span>
+      <span class="tag">按 0 → 8 顺序读</span>
+    </p>
+  </div>
+</header>
+
+<div class="wrap">
+
+<div class="grid">
+  <a class="card zero" href="code-overview.html">
+    <span class="no">0</span><h3>代码纲要 —— 全书地图</h3>
+    <p>读完你会：看懂这个项目是什么、分几层、一次读写各自走哪里。</p>
+    <div class="meta"><span class="min">≈20 分钟</span> · code-overview.html</div>
+  </a>
+  <a class="card" href="ch01-page-format.html">
+    <span class="no">1</span><h3>页与文件格式 —— 一切的宪法</h3>
+    <p>读完你会：拆开任何一个 4KB 页，说出它的头、正文、校验和各在哪。</p>
+    <div class="meta"><span class="min">≈20 分钟</span> · ch01-page-format.html</div>
+  </a>
+  <a class="card" href="ch02-pagestore.html">
+    <span class="no">2</span><h3>PageStore 抽象 —— 可替换的插头</h3>
+    <p>读完你会：用两个指针手工做出 Zig 版 interface，理解为什么测试能跑内存、生产跑文件。</p>
+    <div class="meta"><span class="min">≈15 分钟</span> · ch02-pagestore.html</div>
+  </a>
+  <a class="card" href="ch03-btree-read.html">
+    <span class="no">3</span><h3>B-tree 读路径 —— 从根走到一片叶子</h3>
+    <p>读完你会：口算「百万数据走几页」，亲手跟踪一次 get 的每一跳。</p>
+    <div class="meta"><span class="min">≈25 分钟</span> · ch03-btree-read.html</div>
+  </a>
+  <a class="card" href="ch04-cow-write.html">
+    <span class="no">4</span><h3>COW 写路径 —— 树怎么「改」而不「涂」</h3>
+    <p>读完你会：说清一次插入复制了哪几页、页满怎么分裂、为什么写放大约 1×。</p>
+    <div class="meta"><span class="min">≈25 分钟</span> · ch04-cow-write.html</div>
+  </a>
+  <a class="card" href="ch05-transaction.html">
+    <span class="no">5</span><h3>事务与提交 —— 六步仪式逐步走</h3>
+    <p>读完你会：跟着一次 commit 走完全程，指出「原子」到底原子在哪一毫秒。</p>
+    <div class="meta"><span class="min">≈25 分钟</span> · ch05-transaction.html</div>
+  </a>
+  <a class="card" href="ch06-mvcc-reclaim.html">
+    <span class="no">6</span><h3>MVCC 与页回收 —— 旧页什么时候才能死</h3>
+    <p>读完你会：画出旧页从被替换到复用的一生，算出慢读者让文件多长多少。</p>
+    <div class="meta"><span class="min">≈20 分钟</span> · ch06-mvcc-reclaim.html</div>
+  </a>
+  <a class="card" href="ch07-filepagestore-mmap.html">
+    <span class="no">7</span><h3>落地到操作系统 —— mmap、freelist 链与文件锁</h3>
+    <p>读完你会：解释 1TB 预留为什么不占磁盘、fsync 挡在哪一步、两个进程抢一个库会怎样。</p>
+    <div class="meta"><span class="min">≈20 分钟</span> · ch07-filepagestore-mmap.html</div>
+  </a>
+  <a class="card" href="ch08-reliability.html">
+    <span class="no">8</span><h3>可靠性工程 —— 让「断电不坏」可被证明</h3>
+    <p>读完你会：看懂 CRC 加速、体检工具、fuzz 与崩溃注入如何把安全变成演习记录。</p>
+    <div class="meta"><span class="min">≈20 分钟</span> · ch08-reliability.html</div>
+  </a>
+</div>
+
+<figure>
+  <svg viewBox="0 0 760 170" width="760" height="170" role="img" aria-label="章节依赖顺序图">
+    <defs><marker id="arr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#6b7280"/></marker></defs>
+    <g font-size="12">
+      <g text-anchor="middle" font-weight="700">
+        <rect x="15"  y="40" width="66" height="40" rx="8" fill="#fef3c7" stroke="#d97706"/><text x="48"  y="65" fill="#92400e">0 纲要</text>
+        <rect x="103" y="40" width="66" height="40" rx="8" fill="#dbeafe" stroke="#2563eb"/><text x="136" y="65" fill="#1e3a8a">1 页格式</text>
+        <rect x="191" y="40" width="66" height="40" rx="8" fill="#dbeafe" stroke="#2563eb"/><text x="224" y="65" fill="#1e3a8a">2 插头</text>
+        <rect x="279" y="40" width="66" height="40" rx="8" fill="#dcfce7" stroke="#16a34a"/><text x="312" y="59" fill="#166534">3 读路径</text><text x="312" y="73" fill="#6b7280" font-size="10" font-weight="400">可并行</text>
+        <rect x="367" y="40" width="66" height="40" rx="8" fill="#dcfce7" stroke="#16a34a"/><text x="400" y="59" fill="#166534">4 写路径</text><text x="400" y="73" fill="#6b7280" font-size="10" font-weight="400">可并行</text>
+        <rect x="455" y="40" width="66" height="40" rx="8" fill="#dbeafe" stroke="#2563eb"/><text x="488" y="65" fill="#1e3a8a">5 提交</text>
+        <rect x="543" y="40" width="66" height="40" rx="8" fill="#dbeafe" stroke="#2563eb"/><text x="576" y="65" fill="#1e3a8a">6 MVCC</text>
+        <rect x="631" y="40" width="66" height="40" rx="8" fill="#dbeafe" stroke="#2563eb"/><text x="664" y="65" fill="#1e3a8a">7 mmap</text>
+      </g>
+      <g stroke="#6b7280" stroke-width="1.6" fill="none" marker-end="url(#arr)">
+        <line x1="81" y1="60" x2="103" y2="60"/><line x1="169" y1="60" x2="191" y2="60"/>
+        <line x1="257" y1="60" x2="279" y2="60"/><line x1="345" y1="60" x2="367" y2="60"/>
+        <line x1="433" y1="60" x2="455" y2="60"/><line x1="521" y1="60" x2="543" y2="60"/>
+        <line x1="609" y1="60" x2="631" y2="60"/><line x1="697" y1="60" x2="719" y2="60"/>
+      </g>
+      <rect x="645" y="105" width="82" height="36" rx="8" fill="#ede9fe" stroke="#7c3aed"/>
+      <text x="686" y="127" text-anchor="middle" font-weight="700" fill="#5b21b6" font-size="11.5">8 可靠性</text>
+      <line x1="719" y1="60" x2="719" y2="80" stroke="#6b7280" stroke-width="1.4"/>
+      <path d="M719,80 C719,92 700,95 686,95 L686,105" fill="none" stroke="#6b7280" stroke-width="1.4" marker-end="url(#arr)"/>
+      <text x="380" y="152" text-anchor="middle" fill="#6b7280" font-size="12">线性依赖：0 → 1 → 2 打底；3/4 互不依赖可并行选读；5~8 层层咬合，建议顺序读</text>
+    </g>
+  </svg>
+  <figcaption>依赖顺序：0~2 是地基，3/4 可任选先后，5 之后建议严格顺序。</figcaption>
+</figure>
+
+<footer>
+  cube_db · Zig 0.16.0 · 时长按 ~250 行讲义 / 10 分钟估算 —— 门厅到此为止，从第 0 章出发。
+</footer>
+
+</div>
+</body>
+</html>
