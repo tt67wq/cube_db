@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>cube_db 代码纲要讲义 — 给会编程但不懂 KV 存储的你</title>
+<style>
+  :root {
+    --bg: #f7f8fa;
+    --card: #ffffff;
+    --ink: #24292f;
+    --muted: #6b7280;
+    --accent: #2563eb;
+    --accent-soft: #dbeafe;
+    --green: #16a34a;
+    --green-soft: #dcfce7;
+    --orange: #d97706;
+    --orange-soft: #fef3c7;
+    --purple: #7c3aed;
+    --purple-soft: #ede9fe;
+    --red: #dc2626;
+    --red-soft: #fee2e2;
+    --border: #e5e7eb;
+    --mono: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0 16px 80px;
+    background: var(--bg); color: var(--ink);
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+    line-height: 1.75; font-size: 16px;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; }
+  header.hero {
+    background: linear-gradient(135deg, #1e3a8a, #2563eb);
+    color: #fff; border-radius: 0 0 18px 18px;
+    padding: 40px 32px 32px; margin: 0 -16px 32px;
+  }
+  header.hero h1 { margin: 0 0 8px; font-size: 30px; }
+  header.hero p { margin: 4px 0; opacity: .92; }
+  header.hero .tag {
+    display: inline-block; background: rgba(255,255,255,.18);
+    border-radius: 999px; padding: 2px 12px; font-size: 13px; margin-right: 6px;
+  }
+  nav.toc {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 12px; padding: 18px 24px; margin-bottom: 28px;
+  }
+  nav.toc h2 { margin: 0 0 8px; font-size: 16px; color: var(--muted); }
+  nav.toc ol { margin: 0; padding-left: 22px; columns: 2; column-gap: 40px; }
+  nav.toc li { margin: 3px 0; break-inside: avoid; }
+  nav.toc a { color: var(--accent); text-decoration: none; }
+  nav.toc a:hover { text-decoration: underline; }
+  section {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 14px; padding: 26px 30px; margin-bottom: 26px;
+  }
+  h2 {
+    font-size: 22px; margin: 0 0 14px;
+    padding-bottom: 10px; border-bottom: 2px solid var(--accent-soft);
+  }
+  h2 .no {
+    display: inline-block; background: var(--accent); color: #fff;
+    width: 30px; height: 30px; line-height: 30px; text-align: center;
+    border-radius: 8px; font-size: 15px; margin-right: 10px;
+  }
+  h3 { font-size: 17px; margin: 22px 0 8px; }
+  p { margin: 10px 0; }
+  code {
+    font-family: var(--mono); font-size: 87%;
+    background: #eef1f5; border-radius: 5px; padding: 1px 6px;
+  }
+  .analogy {
+    background: var(--orange-soft); border-left: 4px solid var(--orange);
+    border-radius: 0 10px 10px 0; padding: 12px 18px; margin: 14px 0;
+  }
+  .analogy::before { content: "🍊 类比"; display: block; font-weight: 700; color: var(--orange); margin-bottom: 4px; }
+  .keypoint {
+    background: var(--green-soft); border-left: 4px solid var(--green);
+    border-radius: 0 10px 10px 0; padding: 12px 18px; margin: 14px 0;
+  }
+  .keypoint::before { content: "💡 划重点"; display: block; font-weight: 700; color: var(--green); margin-bottom: 4px; }
+  .why {
+    background: var(--purple-soft); border-left: 4px solid var(--purple);
+    border-radius: 0 10px 10px 0; padding: 12px 18px; margin: 14px 0;
+  }
+  .why::before { content: "❓ 为什么这么设计"; display: block; font-weight: 700; color: var(--purple); margin-bottom: 4px; }
+  table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 15px; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: #f0f3f8; }
+  td code { white-space: nowrap; }
+  .file { font-family: var(--mono); font-size: 13.5px; color: var(--accent); font-weight: 600; }
+  figure {
+    background: #fbfcfe; border: 1px dashed #c7d2e3; border-radius: 12px;
+    padding: 18px; margin: 18px 0; text-align: center; overflow-x: auto;
+  }
+  figcaption { color: var(--muted); font-size: 13.5px; margin-top: 8px; }
+  .diagram-label { font-size: 13px; font-family: var(--mono); }
+  svg text { font-family: -apple-system, "PingFang SC", sans-serif; }
+  svg .mono { font-family: var(--mono); }
+  ul.checklist { list-style: none; padding-left: 4px; }
+  ul.checklist li { margin: 6px 0; }
+  ul.checklist li::before { content: "☑ "; color: var(--green); font-weight: 700; }
+  footer { color: var(--muted); font-size: 13.5px; text-align: center; margin-top: 40px; }
+  .pill { display:inline-block; border-radius:999px; padding:1px 10px; font-size:12.5px; font-weight:600; margin-right:4px; }
+  .pill.blue { background: var(--accent-soft); color: var(--accent); }
+  .pill.green { background: var(--green-soft); color: var(--green); }
+  .pill.purple { background: var(--purple-soft); color: var(--purple); }
+</style>
+</head>
+<body>
+<header class="hero">
+  <div class="wrap">
+    <h1>cube_db 代码纲要讲义</h1>
+    <p>一个用 Zig 写的嵌入式键值存储引擎 —— 只讲「大致骨架」，不讲代码细节</p>
+    <p>
+      <span class="tag">读者：会编程，但没接触过 KV 存储</span>
+      <span class="tag">配类比 + 图解</span>
+      <span class="tag">约 7000 行核心代码，10 个模块</span>
+    </p>
+  </div>
+</header>
+
+<div class="wrap">
+
+<nav class="toc">
+  <h2>目录</h2>
+  <ol>
+    <li><a href="#s1">先搞懂：这个项目到底是什么</a></li>
+    <li><a href="#s2">四个必须先懂的领域词</a></li>
+    <li><a href="#s3">全景：一座五层的楼（模块分层）</a></li>
+    <li><a href="#s4">磁盘上一个 DB 文件长什么样</a></li>
+    <li><a href="#s5">一次写入的旅程（核心流程）</a></li>
+    <li><a href="#s6">一次读取的旅程</a></li>
+    <li><a href="#s7">崩溃了怎么办：不用 WAL 的安全术</a></li>
+    <li><a href="#s8">周边设施：测试、工具、基准</a></li>
+    <li><a href="#s9">推荐阅读顺序</a></li>
+  </ol>
+</nav>
+
+<!-- ============ 1 ============ -->
+<section id="s1">
+  <h2><span class="no">1</span>先搞懂：这个项目到底是什么</h2>
+  <p><strong>嵌入式（embedded）键值存储引擎</strong>：它不是一个像 MySQL、Redis 那样单独跑着的「数据库服务器」，
+  而是一个<strong>编译进你程序里的库</strong>。你的应用调用 <code>db.put(key, value)</code> / <code>db.get(key)</code>，
+  数据就存到本地一个文件里。SQLite 也是这类东西（嵌入式），但 SQLite 存的是表；cube_db 更底层，只存「键 → 值」。</p>
+
+  <div class="analogy">
+    把它想象成一个<strong>超大的、带目录的档案柜</strong>：你递给管理员一张纸条「把这个文件放到 3 号抽屉 X 格」，
+    管理员直接放好；下次你说「给我 X 格的文件」，他直奔目标，不用翻箱倒柜。
+    cube_db 的全部代码，就是在设计「抽屉怎么分格、目录怎么记、柜子着火（断电崩溃）后怎么保证档案不烂」。
+  </div>
+
+  <p>README 里一句话定位：<em>LMDB 风格架构 —— 纯 COW B-tree，freelist 页面复用，没有 WAL，靠原子切换 meta 页保证崩溃安全</em>。
+  这句话里每个词你都会在第 2、5、7 节学明白。先记一个大局观：</p>
+  <ul>
+    <li><strong>目标</strong>：又快又安全地存/取字节对，任何时刻断电，已提交的数据都不丢不坏。</li>
+    <li><strong>手段</strong>：数据按固定大小的「页」管理，用一棵 B-tree 做索引，写的时候从不覆盖旧数据。</li>
+  </ul>
+</section>
+
+<!-- ============ 2 ============ -->
+<section id="s2">
+  <h2><span class="no">2</span>四个必须先懂的领域词</h2>
+  <p>后面所有图解都围绕这四个概念。每个都按「它是什么 → 为什么需要它」讲。</p>
+
+  <h3>① 页（Page）—— 磁盘读写的最小单位</h3>
+  <p>操作系统读写磁盘时，不是一个字节一个字节来的，而是以块为单位。cube_db 把文件切成固定
+  <strong>4096 字节一页</strong>的方格，每页开头有 24 字节的「页头」说明这是什么页，结尾 4 字节放校验和（CRC，一种能发现数据被写坏的指纹）。</p>
+  <div class="analogy">像一本书的「页码 + 页眉 + 正文」：装订好之后每页就是那么大，写不满也占一页。好处是引擎永远只需跟「第几页」打交道，寻址简单。</div>
+
+  <h3>② B-tree —— 磁盘上的「多叉搜索树」</h3>
+  <p>你肯定知道内存里的二叉搜索树。B-tree 是它的磁盘版：<strong>每个节点是一整页</strong>，
+  可以有很多个叉（本项目：叶子页最多 32 条记录，分支页最多 64 个孩子）。
+  按 key 排序存放，从根往下走几层就定位到目标 —— 百万级数据通常只要 2~3 层，也就是 2~3 次磁盘页读取。</p>
+  <div class="analogy">查字典：先看「偏旁目录」（分支页），翻到对应区间（还是分支页），最后落到具体那一页（叶子页，真正存 key+value 的地方）。层数少，是因为每层的「岔口」多。</div>
+
+  <h3>③ COW（Copy-On-Write，写时复制）—— 从不原地涂改</h3>
+  <p>要修改一页时，<strong>不覆盖旧页，而是写一份新页放到别处</strong>，再把「指向它的指针」换过来。旧页随后回收进 freelist 等下次复用。</p>
+  <div class="analogy">像在草稿纸上改论文：不是在原文上涂改（涂到一半笔断了，论文就毁了），而是<strong>誊一份新的，改新那份，改完才宣布「新版生效」</strong>。宣布生效之前，旧版始终完好。</div>
+
+  <h3>④ 事务（Transaction）与 MVCC —— 多人同时用，各看各的版本</h3>
+  <p><strong>事务</strong>：一串操作要么全生效、要么全不算（比如转账扣钱和加钱）。
+  <strong>MVCC</strong>（多版本并发控制）：读操作看到的是「我开始读那一刻的数据快照」，
+  就算后来写的人提交了新数据，也不影响我正在读的旧快照 —— 因为 COW 保证了旧页一直没被覆盖。</p>
+  <div class="analogy">图书馆的旧版百科全书不销毁，复印新版上架。正在查旧版的人继续查他的，不会因为「出了新版」手里的书突然变内容。谁在读旧版，旧版的那几页就<strong>不许回收</strong>（这就是代码里的 reader 水位线 / pending_free 机制要解决的问题）。</div>
+
+  <div class="keypoint">
+    这四个词是互相咬合的：<strong>页</strong>是存储粒度，<strong>B-tree</strong> 是组织方式，
+    <strong>COW</strong> 是修改方式（顺带送来了崩溃安全和 MVCC），<strong>事务/MVCC</strong> 是使用契约。
+    理解了这条链，整个项目的设计动机就通了 80%。
+  </div>
+</section>
+
+<!-- ============ 3 ============ -->
+<section id="s3">
+  <h2><span class="no">3</span>全景：一座五层的楼（模块分层）</h2>
+  <p><code>src/</code> 下 10 个文件，但从下往上是清晰的五层。上层只跟紧邻的下层说话：</p>
+
+  <figure>
+    <svg viewBox="0 0 760 430" width="760" height="430" role="img" aria-label="cube_db 模块分层图">
+      <!-- layer boxes -->
+      <g font-size="14.5">
+        <rect x="120" y="10"  width="520" height="62" rx="10" fill="#dbeafe" stroke="#2563eb"/>
+        <text x="135" y="34" font-weight="700" fill="#1e3a8a">API 层 — db.zig</text>
+        <text x="135" y="55" fill="#374151" font-size="13">用户看到的一切：open / put / get / delete / select / 事务对象 WriteTxn·ReadTxn</text>
+
+        <rect x="120" y="88"  width="520" height="62" rx="10" fill="#ede9fe" stroke="#7c3aed"/>
+        <text x="135" y="112" font-weight="700" fill="#5b21b6">算法层 — btree.zig（树） + writer.zig（事务提交）</text>
+        <text x="135" y="133" fill="#374151" font-size="13">B-tree 的增删查、页编码解码；批量应用、freelist 回收、meta 页提交</text>
+
+        <rect x="120" y="166" width="520" height="62" rx="10" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="135" y="190" font-weight="700" fill="#166534">接口层 — page_store.zig</text>
+        <text x="135" y="211" fill="#374151" font-size="13">PageStore 接口（vtable）：allocPage / freePage / readPage / writePage —— 上面不知道磁盘存在</text>
+
+        <rect x="120" y="244" width="250" height="62" rx="10" fill="#fef3c7" stroke="#d97706"/>
+        <text x="135" y="268" font-weight="700" fill="#92400e">生产实现</text>
+        <text x="135" y="289" fill="#374151" font-size="12.5 mono">file_page_store.zig</text>
+
+        <rect x="390" y="244" width="250" height="62" rx="10" fill="#fef3c7" stroke="#d97706"/>
+        <text x="405" y="268" font-weight="700" fill="#92400e">测试实现</text>
+        <text x="405" y="289" fill="#374151" font-size="12.5 mono">page_store.zig: MemPageStore</text>
+
+        <rect x="120" y="322" width="520" height="56" rx="10" fill="#f3f4f6" stroke="#9ca3af"/>
+        <text x="135" y="345" font-weight="700" fill="#374151">格式 + 工具（横向贯穿，不依赖别人）</text>
+        <text x="135" y="366" fill="#374151" font-size="13" class="mono">format.zig（页/元页格式） · crc32_hw.zig（校验加速） · cube_check.zig（离线体检）</text>
+      </g>
+      <!-- arrows -->
+      <g stroke="#6b7280" stroke-width="1.6" fill="none" marker-end="url(#arr)">
+        <line x1="380" y1="72" x2="380" y2="88"/>
+        <line x1="380" y1="150" x2="380" y2="166"/>
+        <line x1="300" y1="228" x2="245" y2="244"/>
+        <line x1="460" y1="228" x2="515" y2="244"/>
+      </g>
+      <defs><marker id="arr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#6b7280"/></marker></defs>
+    </svg>
+    <figcaption>cube_db 分层：越往下越「物理」，越往上越「逻辑」。中间那道 PageStore 接口是整个项目最值得学的一刀切分。</figcaption>
+  </figure>
+
+  <p>各文件一览（按建议阅读顺序）：</p>
+  <table>
+    <tr><th>文件</th><th>行数</th><th>一句话职责</th></tr>
+    <tr><td class="file">src/format.zig</td><td>652</td><td>「文件格式宪法」：页多大、页头长什么样、meta 页字段、CRC 怎么算。纯函数，不碰 IO。</td></tr>
+    <tr><td class="file">src/page_store.zig</td><td>260</td><td>定义 PageStore 接口（用函数表 vtable 手工做的「多态」），外加一个纯内存实现 MemPageStore 给测试用。</td></tr>
+    <tr><td class="file">src/file_page_store.zig</td><td>1040</td><td>生产实现：开机 mmap 预留 1TB 地址空间（LMDB 风格），读页零拷贝；写路径维护 freelist 页链、文件按需 ftruncate 长大、flock 排他锁防多开。</td></tr>
+    <tr><td class="file">src/btree.zig</td><td>2512</td><td>项目最大文件：COW B-tree 本体。按 key 查找、插入、删除、范围扫描；把每条记录编解码进页 payload；大 value 挂 overflow 页链。</td></tr>
+    <tr><td class="file">src/writer.zig</td><td>1047</td><td>「提交仪式」的操刀人：一个事务的批量修改怎么应用进树、旧页何时才能安全回收（MVCC 水位线）、meta 页怎么交替写完成原子提交。reader 句柄（beginRead/endRead）也在这。</td></tr>
+    <tr><td class="file">src/db.zig</td><td>1185</td><td>门面：把上面所有东西包成 Db / WriteTxn / ReadTxn 三个用户对象，管 key 大小闸门、单写者互斥锁、sync 策略。</td></tr>
+    <tr><td class="file">src/crc32_hw.zig</td><td>129</td><td>页校验和小加速：ARM64 用 CPU 指令算 CRC32，其他平台退回软件查表。结果逐位一致。</td></tr>
+    <tr><td class="file">src/cube_check.zig</td><td>159</td><td>离线体检工具（独立可执行）：逐页验 CRC，报告坏页，用退出码说话（0 好 / 1 用法错 / 2 有损坏）。</td></tr>
+    <tr><td class="file">src/root.zig / main.zig</td><td>40</td><td>root 是库的统一出口（re-export）；main 只打一行字证明能编译。</td></tr>
+  </table>
+
+  <div class="why">
+    为什么要抽出 PageStore 这个接口？因为「B-tree 算法」和「数据真放哪」是两件事。
+    测试时把整棵树放进内存（MemPageStore，快、可注入崩溃、随便检查），生产时换成 mmap 文件，
+    树的一行代码都不用改。这是存储引擎最常见的可测试性设计。
+  </div>
+</section>
+
+<!-- ============ 4 ============ -->
+<section id="s4">
+  <h2><span class="no">4</span>磁盘上一个 DB 文件长什么样</h2>
+  <p>整个数据库就是<strong>一个文件</strong>，被切成 4096 字节的页，每页有编号。前几页是「特殊席位」：</p>
+
+  <figure>
+    <svg viewBox="0 0 760 250" width="760" height="250" role="img" aria-label="DB 文件页布局图">
+      <g font-size="13">
+        <!-- page 0 -->
+        <rect x="20" y="40" width="86" height="90" rx="8" fill="#f3f4f6" stroke="#9ca3af"/>
+        <text x="63" y="25" text-anchor="middle" class="mono" fill="#6b7280">页 0</text>
+        <text x="63" y="78" text-anchor="middle" font-weight="700" fill="#374151">NULL</text>
+        <text x="63" y="98" text-anchor="middle" fill="#6b7280" font-size="11.5">占位/空值</text>
+        <!-- meta 0/1 -->
+        <rect x="112" y="40" width="86" height="90" rx="8" fill="#dbeafe" stroke="#2563eb"/>
+        <text x="155" y="25" text-anchor="middle" class="mono" fill="#6b7280">页 1</text>
+        <text x="155" y="72" text-anchor="middle" font-weight="700" fill="#1e3a8a">Meta 0</text>
+        <text x="155" y="92" text-anchor="middle" fill="#374151" font-size="11.5">数据库的</text>
+        <text x="155" y="106" text-anchor="middle" fill="#374151" font-size="11.5">「总目录」</text>
+        <rect x="204" y="40" width="86" height="90" rx="8" fill="#dbeafe" stroke="#2563eb"/>
+        <text x="247" y="25" text-anchor="middle" class="mono" fill="#6b7280">页 2</text>
+        <text x="247" y="72" text-anchor="middle" font-weight="700" fill="#1e3a8a">Meta 1</text>
+        <text x="247" y="92" text-anchor="middle" fill="#374151" font-size="11.5">总目录的</text>
+        <text x="247" y="106" text-anchor="middle" fill="#374151" font-size="11.5">备用副本</text>
+        <!-- tree pages -->
+        <rect x="310" y="40" width="66" height="90" rx="8" fill="#ede9fe" stroke="#7c3aed"/>
+        <text x="343" y="25" text-anchor="middle" class="mono" fill="#6b7280">页 3</text>
+        <text x="343" y="82" text-anchor="middle" font-weight="700" fill="#5b21b6" font-size="12.5">BRANCH</text>
+        <text x="343" y="102" text-anchor="middle" fill="#374151" font-size="11.5">树的岔口</text>
+        <rect x="382" y="40" width="66" height="90" rx="8" fill="#ede9fe" stroke="#7c3aed"/>
+        <text x="415" y="25" text-anchor="middle" class="mono" fill="#6b7280">页 4</text>
+        <text x="415" y="82" text-anchor="middle" font-weight="700" fill="#5b21b6" font-size="12.5">LEAF</text>
+        <text x="415" y="102" text-anchor="middle" fill="#374151" font-size="11.5">存 key+value</text>
+        <rect x="454" y="40" width="66" height="90" rx="8" fill="#ede9fe" stroke="#7c3aed" stroke-dasharray="5 3"/>
+        <text x="487" y="25" text-anchor="middle" class="mono" fill="#6b7280">页 5</text>
+        <text x="487" y="78" text-anchor="middle" font-weight="700" fill="#5b21b6" font-size="12">OVERFLOW</text>
+        <text x="487" y="98" text-anchor="middle" fill="#374151" font-size="11">装不下的</text>
+        <text x="487" y="112" text-anchor="middle" fill="#374151" font-size="11">大 value 链</text>
+        <!-- freelist -->
+        <rect x="560" y="40" width="80" height="90" rx="8" fill="#fef3c7" stroke="#d97706"/>
+        <text x="600" y="25" text-anchor="middle" class="mono" fill="#6b7280">…</text>
+        <text x="600" y="82" text-anchor="middle" font-weight="700" fill="#92400e" font-size="12.5">FREE</text>
+        <text x="600" y="102" text-anchor="middle" fill="#374151" font-size="11.5">可复用的空页</text>
+        <rect x="646" y="40" width="80" height="90" rx="8" fill="#fef3c7" stroke="#d97706"/>
+        <text x="686" y="25" text-anchor="middle" class="mono" fill="#6b7280">…</text>
+        <text x="686" y="82" text-anchor="middle" font-weight="700" fill="#92400e" font-size="12.5">FREE</text>
+        <text x="686" y="102" text-anchor="middle" fill="#374151" font-size="11.5">（串成链）</text>
+        <!-- annotations -->
+        <text x="20" y="175" fill="#374151" font-size="13">每页结构：<tspan class="mono">[24B 页头 | payload 正文 | 4B CRC 校验]</tspan>；页头里写着页类型、key 数等</text>
+        <text x="20" y="200" fill="#374151" font-size="13">页类型（format.zig 定义）：FREE(0) · META(1) · BRANCH(2) · LEAF(3) · OVERFLOW(4) · RANGE_TOMBSTONE(5)</text>
+        <text x="20" y="225" fill="#6b7280" font-size="12.5">RANGE_TOMBSTONE：删一大段 key 区间时，不逐条写「已删」标记，而是记一条「此区间作废」的链页</text>
+      </g>
+    </svg>
+    <figcaption>一个 DB 文件的页布局。meta 页里记着：根页号、freelist 头部、事务序号等 —— 它是理解整个文件从何读起的唯一入口。</figcaption>
+  </figure>
+
+  <div class="analogy">
+    盖楼与仓库货架：文件是地皮，页是货架位。<strong>freelist 是一张「空闲货架位登记链」</strong>——
+    写事务需要新页时先看这张单子有没有空位（复用），没有就去末端开新货架（文件长大）。
+    这就是 README 说的「写放大约 1×、永不整体重写（compact 是 O(1)）」的由来。
+  </div>
+</section>
+
+<!-- ============ 5 ============ -->
+<section id="s5">
+  <h2><span class="no">5</span>一次写入的旅程（核心流程）</h2>
+  <p>用户侧写法：<code>beginWriteTxn</code> → 若干 <code>put/delete</code> → <code>commit</code>。
+  commit 内部发生的事，就是整个项目的灵魂：</p>
+
+  <figure>
+    <svg viewBox="0 0 760 330" width="760" height="330" role="img" aria-label="写事务提交流程图">
+      <defs>
+        <marker id="arr2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#6b7280"/></marker>
+        <marker id="arr3" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#16a34a"/></marker>
+      </defs>
+      <g font-size="12.5">
+        <!-- step boxes: 2 rows -->
+        <rect x="18" y="20" width="160" height="66" rx="9" fill="#eef2ff" stroke="#4f46e5"/>
+        <text x="98" y="42" text-anchor="middle" font-weight="700" fill="#3730a3">① 攒改动</text>
+        <text x="98" y="60" text-anchor="middle" fill="#374151">put/delete 先进内存</text>
+        <text x="98" y="75" text-anchor="middle" fill="#374151">staging，不碰树</text>
+
+        <rect x="215" y="20" width="170" height="66" rx="9" fill="#eef2ff" stroke="#4f46e5"/>
+        <text x="300" y="42" text-anchor="middle" font-weight="700" fill="#3730a3">② 批量应用进 B-tree</text>
+        <text x="300" y="60" text-anchor="middle" fill="#374151">沿路径 COW：被改的节点</text>
+        <text x="300" y="75" text-anchor="middle" fill="#374151">复制成新页，收集 dirty 页</text>
+
+        <rect x="420" y="20" width="160" height="66" rx="9" fill="#eef2ff" stroke="#4f46e5"/>
+        <text x="500" y="42" text-anchor="middle" font-weight="700" fill="#3730a3">③ 旧页入回收站</text>
+        <text x="500" y="60" text-anchor="middle" fill="#374151">被替换的旧页标记</text>
+        <text x="500" y="75" text-anchor="middle" fill="#374151">pending_free（先不回收）</text>
+
+        <rect x="605" y="20" width="140" height="66" rx="9" fill="#eef2ff" stroke="#4f46e5"/>
+        <text x="675" y="42" text-anchor="middle" font-weight="700" fill="#3730a3">④ 写新页到磁盘</text>
+        <text x="675" y="60" text-anchor="middle" fill="#374151">dirty 页 + freelist 页</text>
+        <text x="675" y="75" text-anchor="middle" fill="#374151">按页号落盘</text>
+
+        <rect x="605" y="150" width="140" height="80" rx="9" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="675" y="175" text-anchor="middle" font-weight="700" fill="#166534">⑤ 原子切换 meta</text>
+        <text x="675" y="194" text-anchor="middle" fill="#374151">往「另一个」meta 页</text>
+        <text x="675" y="210" text-anchor="middle" fill="#374151">写新目录 + fsync</text>
+        <text x="675" y="225" text-anchor="middle" fill="#16a34a" font-weight="700">← 提交就发生在这一下</text>
+
+        <rect x="18" y="150" width="220" height="80" rx="9" fill="#f0fdf4" stroke="#86efac"/>
+        <text x="128" y="175" text-anchor="middle" font-weight="700" fill="#166534">⑥ 读者退场后才真正回收</text>
+        <text x="128" y="194" text-anchor="middle" fill="#374151">对比最老活跃 reader 的水位线，</text>
+        <text x="128" y="210" text-anchor="middle" fill="#374151">没人在读的旧页才放回 freelist，</text>
+        <text x="128" y="225" text-anchor="middle" fill="#374151">供后续事务复用</text>
+
+        <g stroke="#6b7280" stroke-width="1.8" fill="none" marker-end="url(#arr2)">
+          <line x1="178" y1="53" x2="215" y2="53"/>
+          <line x1="385" y1="53" x2="420" y2="53"/>
+          <line x1="580" y1="53" x2="605" y2="53"/>
+          <path d="M675,86 L675,150"/>
+          <path d="M605,200 L238,190"/>
+        </g>
+        <!-- before/after snapshot annotation -->
+        <text x="300" y="125" text-anchor="middle" fill="#6b7280" font-size="12">①~④ 期间，旧版本树在磁盘上始终完整 —— 崩溃则新页作废，目录没换，等于无事发生</text>
+        <g font-size="12.5">
+          <text x="30" y="275" fill="#374151" font-weight="700">并发契约：</text>
+          <text x="118" y="275" fill="#374151">同一时刻只允许一个写事务（Mutex 串行）；读事务随便开，用 beginRead 登记句柄、</text>
+          <text x="30" y="295" fill="#374151">endRead 注销。③⑥ 的存在就是为了：只要还有 reader 指着旧页，那页就不许被复用改写。</text>
+          <text x="30" y="320" fill="#6b7280" font-size="12">对应代码：db.zig 管锁和事务对象 · writer.zig 管 ②③④⑤⑥ 的编排 · btree.zig 管 ② 的树算法 · file_page_store.zig 管 ④ 的落盘</text>
+        </g>
+      </g>
+    </svg>
+    <figcaption>写提交六步。⑤「原子切换 meta 页」是全项目最关键的一步，理解了它就理解了「没有 WAL 为什么也崩溃安全」。</figcaption>
+  </figure>
+
+  <div class="analogy">
+    <strong>版本化的维基条目</strong>：改词条不是直接编辑线上版（①~④ 全在草稿/影子页里进行），
+    改完点「发布」的那一瞬间才切换（⑤ 写 meta）。点发布前服务器爆炸，线上版一个标点都没变过。
+    而「旧版本页面何时能从服务器删除」，要看还有没有人挂着旧版本在读（③⑥ 的 MVCC 回收）。
+  </div>
+
+  <div class="why">
+    为什么改动要先「攒」（staging）再批量应用？因为事务可能有一万条 put。逐条改树 = 逐条重写路径上的页，
+    既慢又会产生大量中间垃圾页；攒到最后一次性排进树，同一条路径一页只复制一次，写放大最小。
+  </div>
+</section>
+
+<!-- ============ 6 ============ -->
+<section id="s6">
+  <h2><span class="no">6</span>一次读取的旅程</h2>
+  <p>读路径的设计目标是：<strong>连 read() 系统调用都不要有</strong>。</p>
+  <ol>
+    <li><strong>开机预留 1TB 虚拟地址空间</strong>（mmap）。不是真占 1TB 磁盘/内存 —— 只是「先把门牌号全包下来」，文件长到多大都能直接透过这块地址看到，永远不用重新映射。</li>
+    <li><strong>读 meta 页 → 拿到根页号 → 顺着 B-tree 逐页往下走</strong>，每层就是一次数组下标访问（页号 × 4096 = mmap 里的偏移），零拷贝。</li>
+    <li><strong>读事务开始时记下当前版本（快照）</strong>：此后写者再怎么提交，我走的还是我那棵旧树 —— 因为 COW，旧页还在原地没被动过。</li>
+    <li><strong>范围查询（select）</strong>：定位到起始 key 的叶子页后顺着叶子页横向走就是有序的；区间删除的 RANGE_TOMBSTONE 页负责让扫描时跳过「已整段作废」的 key。</li>
+    <li><strong>校验策略是分档的</strong>（<code>CrcCheck = off / sample / full</code>）：性能模式下每 64 页抽查 1 页，安全模式下全量验 CRC —— 读放大和安全性自己选。</li>
+  </ol>
+
+  <div class="analogy">
+    1TB mmap 像<strong>整栋楼一开始就把所有房钥匙都配好了</strong>，后面每盖一层（文件 grow）直接用对应钥匙进，
+    不用重新配锁（remmap）。快照读则是你手里那本<strong>出发时复印的书</strong>：别人在后面修订新版，不影响你读手里这本。
+  </div>
+</section>
+
+<!-- ============ 7 ============ -->
+<section id="s7">
+  <h2><span class="no">7</span>崩溃了怎么办：不用 WAL 的安全术</h2>
+  <p>很多数据库（MySQL、Postgres）用 <strong>WAL（Write-Ahead Log，预写日志）</strong>：先把「我打算改什么」追加到日志，崩溃后重放日志恢复。
+  cube_db 反着来 —— <strong>根本没有日志可重放</strong>，靠三样东西：</p>
+
+  <table>
+    <tr><th>机制</th><th>解决什么</th></tr>
+    <tr>
+      <td><strong>双 meta 页交替写</strong><br><code>Meta 0 ↔ Meta 1</code></td>
+      <td>「目录」本身只有一页，写一半断电怎么办？准备两份，轮流更新：这次写 Meta 1，下次写 Meta 0。重启时两份都读，<strong>哪份 CRC 合法且序号新就用哪份</strong>。永远有一份是上一提交的完整版本。</td>
+    </tr>
+    <tr>
+      <td><strong>COW：未提交的页不可达</strong></td>
+      <td>崩溃时就算新数据页写了一半，meta 还指向旧树 —— 那些散落的脏页从目录上根本走不到，等价于不存在，不污染任何已提交数据。</td>
+    </tr>
+    <tr>
+      <td><strong>页级 CRC + 离线体检</strong></td>
+      <td>恢复只是「读两页 meta」（O(1)，不用扫全文件）。至于磁盘介质慢慢坏掉的页（bit rot），由 <span class="file">cube_check</span> 工具离线逐页验 CRC 抓出来，退出码汇报。</td>
+    </tr>
+  </table>
+
+  <figure>
+    <svg viewBox="0 0 760 170" width="760" height="170" role="img" aria-label="双 meta 页切换图">
+      <defs><marker id="arr4" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#16a34a"/></marker></defs>
+      <g font-size="13">
+        <rect x="30" y="35" width="150" height="60" rx="9" fill="#e0e7ff" stroke="#4f46e5"/>
+        <text x="105" y="60" text-anchor="middle" font-weight="700" fill="#3730a3">Meta 0 = v41</text>
+        <text x="105" y="80" text-anchor="middle" fill="#6b7280" font-size="12">（上一次的好版本）</text>
+        <rect x="300" y="35" width="150" height="60" rx="9" fill="#dcfce7" stroke="#16a34a"/>
+        <text x="375" y="60" text-anchor="middle" font-weight="700" fill="#166534">Meta 1 = v42 ✓</text>
+        <text x="375" y="80" text-anchor="middle" fill="#6b7280" font-size="12">本次提交写这里</text>
+        <rect x="570" y="35" width="160" height="60" rx="9" fill="#fee2e2" stroke="#dc2626"/>
+        <text x="650" y="55" text-anchor="middle" font-weight="700" fill="#991b1b">写 Meta 1 时断电？</text>
+        <text x="650" y="75" text-anchor="middle" fill="#374151" font-size="12">Meta 1 CRC 坏 → 用 Meta 0</text>
+        <text x="650" y="90" text-anchor="middle" fill="#374151" font-size="12">= 提交回滚，数据无损</text>
+        <line x1="180" y1="65" x2="300" y2="65" stroke="#16a34a" stroke-width="2" marker-end="url(#arr4)"/>
+        <text x="240" y="52" text-anchor="middle" font-size="12" fill="#374151">正常提交</text>
+        <text x="30" y="140" fill="#6b7280" font-size="12.5">恢复 = 读两页 meta，选「CRC 合法 + 序号最大」的那份当真相。这就是 README 里 O(1) recovery、crash-safe without WAL 的完整含义。</text>
+      </g>
+    </svg>
+    <figcaption>meta 页乒乓切换：任何时刻至少有一份完整目录。</figcaption>
+  </figure>
+
+  <div class="keypoint">
+    持久性还分两档：<code>Options{fsync}</code> 默认 commit 时同步刷盘（最稳）；设成异步模式则系统帮你攒着刷，
+    想要稳时手动 <code>db.sync()</code>。这是「安全 vs 快」的旋钮，也是 README 里 async/sync durability 那条。
+  </div>
+</section>
+
+<!-- ============ 8 ============ -->
+<section id="s8">
+  <h2><span class="no">8</span>周边设施：测试、工具、基准</h2>
+  <p>src 之外，仓库里还有这些地方值得知道（读代码时不用细看，但知道它们撑起信心）：</p>
+  <table>
+    <tr><th>目录</th><th>是什么</th></tr>
+    <tr><td class="file">tests/</td><td>单元 + 集成 + <strong>确定性 fuzz</strong>（随机生成操作序列跑 DB，比对内存字典模型）。崩溃安全这种「任何时刻断电都不能坏」的性质，就是靠往写路径里插 crash hook、在每步后模拟断电来验证的。</td></tr>
+    <tr><td class="file">bench/</td><td>基准矩阵：吞吐、get 延迟画像、mmap vs pwrite 对比等。README 声称的性能都有数据在这。</td></tr>
+    <tr><td class="file">spike/ · spike_mmap.zig</td><td>「探路」代码：正式实现前先写最小实验验证可行性（比如：macOS 上真能预留 1TB mmap 吗？先 spikes 一下）。</td></tr>
+    <tr><td class="file">docs/</td><td><code>usage.md</code>（中文使用手册，API 全解）、<code>cube-check.md</code>（体检工具）、<code>fuzz-testing.md</code>。</td></tr>
+    <tr><td class="file">issues/</td><td>开发过程中的问题记录。想知道「当年踩过什么坑」，这里比 README 诚实。</td></tr>
+    <tr><td class="file">build.zig / build.zig.zon</td><td>Zig 的构建配方 + 依赖声明（依赖本地 ../zio 提供 Mutex 等系统封装）。</td></tr>
+  </table>
+</section>
+
+<!-- ============ 9 ============ -->
+<section id="s9">
+  <h2><span class="no">9</span>推荐阅读顺序</h2>
+  <p>按「先契约、后实现；先格式、后算法」的顺序，每步都带着第 2~7 节的一个概念去验证：</p>
+  <ul class="checklist">
+    <li><strong>第 0 步</strong>：<code>docs/usage.md</code> 前 3 节 —— 先当用户，知道 API 承诺了什么。</li>
+    <li><strong>第 1 步</strong>：<span class="file">format.zig</span> —— 60 分钟读完页/头/meta/CRC 常量，第 4 节的图就在你脑子里了。</li>
+    <li><strong>第 2 步</strong>：<span class="file">page_store.zig</span> —— 只有 260 行的 vtable 接口 + 内存实现，看懂「楼上的三层」。</li>
+    <li><strong>第 3 步</strong>：<span class="file">btree.zig</span> —— 挑一条线走：<code>get</code> 查找路径（最短）→ 叶子 payload 编解码 → 插入的 COW 路径。对应第 5 节的步骤②。</li>
+    <li><strong>第 4 步</strong>：<span class="file">writer.zig</span> 的 commit 编排 + <span class="file">db.zig</span> 的 WriteTxn —— 把第 5 节六步逐一在代码里对号入座；重点看 pending_free 与 reader 水位线（第 2 节概念④）。</li>
+    <li><strong>第 5 步</strong>：<span class="file">file_page_store.zig</span> —— 最后看 mmap/freelist 链/flock 这些「跟 OS 贴身肉搏」的部分（第 6 节），因为它最冗长也最不需要提前懂。</li>
+    <li><strong>选修</strong>：<span class="file">cube_check.zig</span>（159 行，读完有成就感）+ <span class="file">crc32_hw.zig</span>；再翻 <code>tests/</code> 里任意一个 fuzz 测试，看「崩溃安全」是怎么被机器证明的。</li>
+  </ul>
+
+  <div class="keypoint">
+    检验你是否真读懂了这个项目的三个问题：① 为什么 commit 只需要「换 meta 页」这一动作就原子？
+    ② 为什么一个旧页「进了 freelist」还不代表「可以被覆写」？
+    ③ 为什么读方完全不需要锁？
+    三个答案分别是：乒乓双 meta、reader 水位线、COW 快照 + mmap 只读指针。能用自己的话展开这三句，纲要就读完了。
+  </div>
+</section>
+
+<footer>
+  cube_db · Zig 0.16.0 · 约 7000 行核心代码 —— 本讲义只画地图，不替你走路；出发顺序见第 9 节。
+</footer>
+
+</div>
+</body>
+</html>
