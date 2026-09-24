@@ -1,6 +1,6 @@
 # Issue T-45 — T-43 sweep 回归测试 overwrite 步骤使用 stale root（测试瑕疵）
 
-- **状态**: proposed（T-43 评审 F3 转立项）
+- **状态**: closed（T-65 刀2：第三步改指当前 root + R2 调数据形状实证恢复 split found=true inline 变体覆盖（PROBE ×45，评审双轮独立插桩复证））
 - **优先级**: low（测试语义瑕疵：sweep 有效性不受影响，但「写入 dirty 表内旧页」语义可疑）
 - **来源**: T-43 独立评审（pi-1，`review.md` Finding F3）
 - **关联**: `tests/btree_storage/insert_split_budget_test.zig` `leafOverflowScenario` 第三步

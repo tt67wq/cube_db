@@ -1,6 +1,6 @@
 # Issue T-39-C-followup — append-only freelist 增量持久化在现有崩溃模型下不可闭合（impossibility 记录）
 
-- **状态**: proposed（T-39-C 降级交付记录，待 conductor 立项处理）
+- **状态**: closed（conductor 裁决：不立项。impossibility 论证即本卡交付物，已归档；卡内 4 个设计 checkbox 属「重审崩溃模型」架构议题的前置工作——process-crash 模型维持现状，真要 power-fail 分级另立新 issue，不挂本卡。T-39 母卡 partial 记录不变）
 - **优先级**: medium（性能梯队；正确性不受影响，现有整链重写是安全的）
 - **归属**: T-39-C（增量/append-only FREE 链持久化）未闭合部分
 - **基线**: T-39-impl 分支 `a384334`（T-39-B 已落地：O(1) 去重 + 静默吞错可观测化；

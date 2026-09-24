@@ -1,6 +1,6 @@
 # Issue T-55 — T-54-G 遗留 nit：`is_shard` 前缀匹配把 partition 守卫测试也排除出 `test-one`
 
-- **状态**: `open`
+- **状态**: closed（T-65 刀1：is_shard 精确匹配，守卫回归 test-one 闭包、真分片仍响亮排除；双平台门绿）
 - **发现于**: T-54-G 独立评审（`ws1-pi3`，被评审 SHA `06ed888`）§七.1
 - **发现时间**: 2026-09-20
 - **来源**: T-54-G 把测试接线改成递归发现时，用前缀 `insertbatch_sweep_` 判定「分片」

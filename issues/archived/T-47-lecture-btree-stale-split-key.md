@@ -1,6 +1,6 @@
 # Issue T-47 — `docs/lecture_btree.html` 教学文档与 T-43/T-46 后的实现脱节
 
-- **状态**: proposed（**已交付但搁置**：交付物 `4632fcb` 未合入；评审 REQUEST_CHANGES）
+- **状态**: closed（T-65 刀3「救」：cherry 4632fcb + B1 重写 + 行号 8 处复验修正 + N-1 阈值同步；评审逐条自验 PASS）
 - **优先级**: low（教学/文档正确性，无代码正确性影响）
 - **来源**: T-46 独立评审（cube_db-pi-1，`review.md` §5 非阻塞问题 1）
 - **关联**: `docs/lecture_btree.html`；T-43（splice 统一）、T-46（删除 split_key 死机制）
