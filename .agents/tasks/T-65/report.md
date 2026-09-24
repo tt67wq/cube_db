@@ -6,6 +6,7 @@
   - `7ddee0b` fix(T-45): leafOverflowScenario 第三步 insert 改指向当前 root
   - `9d74588` docs(T-47): cherry 4632fcb（教学文档 splice 化，95+/81−）
   - `abee35e` docs(T-47): B1 重写 + 行号复验更新 + N-1 复合内联阈值同步
+  - `87d8075` fix(T-45): R2 回炉——z 键互异，实证恢复 split found=true inline 变体覆盖
 
 ## 刀 1 — T-55（精确匹配）
 
@@ -25,12 +26,31 @@
 
 - 新增 `var root = wr.new_root;`，每步 insert 后用返回的 `WriteResult.new_root` 更新；
   第三步 overwrite 目标由 `wr.new_root`（batch 后的旧根，已在 dirty 表内排队）改为当前 root。
-- **改后该步仍命中 found=true overwrite 路径**：overwrite 的 key `z3`
-  在第一步（`m` 键 insert，排序落在 a 段与 z 段之间）中未被触碰，仍在叶内；
-  3000 字节大 value 使 `entry_start + new_entry_sz + tail > cap` 的 precheck
-  照旧重定向进 `insertIntoLeafSplit` 的 overwrite 分支——覆盖意图不变。
-- 断言只强不弱：sweep 故障注入范围（countAllocs 动态标定）不变，
-  链路改为真实每步 root 推进。`insert_split_budget` filter 两连跑均绿。
+- **R2 勘误（评审 01b6879 FAIL 回炉）**：R1 版 report 称「m 不切块、z3 仍在原叶、
+  precheck 照旧重定向」——**失实**，评审插桩实证：m 必切块（93+707+3445=4245 > 4068，
+  found=false），且五个 z 种子键全同（`bigKey` 皆填 'z'+'k'×677），切块后 branch 分隔键
+  与 overwrite 键相等，路由 `≥` 落到只含 z4 的尾块页（entry_start=3，预检 3+3688 ≤ 4068）
+  → overwrite 走**快路径**，`insertIntoLeafSplit found=true` 命中 ×0（修前 ×38），
+  inline 旧值 split-found overwrite 变体覆盖归零。
+- **R2 修法（路线 (a)，评审建议量纲采纳）**：
+  1. 五个 z 键互异：`z_bufs[i][1] = 'a'+i`（za/zb/zc/zd/ze，长度不变 678B）；
+  2. 第三步 overwrite 键改用种子保存的 `z3_key = seed[6+3].key`
+     （不能再用 `bigKey(&z_bufs[3], "z")` 重填——会把 'd' 抹回 'zkk…' 变成
+     未命中键，R2 首版探针即抓到此错：SPLIT found=false vlen=3000 ×26）。
+- **改后命中机制（已实证）**：z3='zd…' < 分隔键 'ze…' → 路由到尾块前页
+  （payload 3556，z3 为最后一条，entry_start=2867、tail=0），新 entry 3688B
+  使预检 2867+3688+0=6555 > 4068 → 必进 `insertIntoLeafSplit` **found=true**，
+  且 value 3000 ≤ inlineValueBudget(678)=3377 → **inline 旧值变体**（非 overflow，
+  overflow 变体已有 btree_leaf_budget_test:142 兜底）。insert 返回 3 页 splice →
+  root 再次 buildBranchLevels，场景原有的 m 切块/splice 练习不受影响。
+- **PROBE 证据（临时插桩 `insertIntoLeafSplit` 入口 + 快路径出口，探针未入 commit，
+  src/ 零 diff）**：`zig build test-one -Dfilter=insert_split_budget` 全套件 45 次场景运行：
+  - `PROBE SPLIT found=true vlen=3000` → **×45**（每场景恰 1 次，z3 overwrite）
+  - `PROBE SPLIT found=false vlen=1` ×127（m 切块，每场景 1 次 × 运行数 + 场景外）
+  - `PROBE FAST *` → ×0；`PROBE SPLIT found=false vlen=3000` → ×0（R2 首版路由错误形态已消除）
+- 断言只强不弱：sweep 故障注入范围（countAllocs 动态标定）不变；本变体覆盖
+  由 ×0 恢复至每场景 ×1。
+- `insert_split_budget` filter 两连跑均绿；全量 `zig build test` rc=0 fc=0。
 
 ## 刀 3 — T-47（评估 → 救）
 
