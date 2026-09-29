@@ -93,10 +93,13 @@ fn execOneOp(input: []const u8, ctx: *FuzzCtx) !usize {
             };
 
             // Update reference model
+            // T-66: fetchPut keeps the OLD key pointer in the table (only the
+            // value slot is overwritten) — the model still owns prev.key. Free
+            // the newly duped key (dropped by the table) and the old value.
             for (0..actual_n) |i| {
                 const prev = ctx.model.fetchPut(owned_keys[i], owned_vals[i]) catch null;
                 if (prev) |p| {
-                    ctx.allocator.free(p.key);
+                    ctx.allocator.free(owned_keys[i]);
                     ctx.allocator.free(p.value);
                 }
             }

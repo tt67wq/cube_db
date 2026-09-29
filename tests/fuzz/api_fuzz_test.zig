@@ -45,9 +45,12 @@ fn execOneOp(input: []const u8, ctx: *FuzzCtx) !usize {
             ctx.db.put(key, value) catch return consumed;
             const owned_key = try ctx.allocator.dupe(u8, key);
             const owned_val = try ctx.allocator.dupe(u8, value);
+            // T-66: fetchPut keeps the OLD key pointer in the table (only the
+            // value slot is overwritten) — the model still owns prev.key. Free
+            // the newly duped key (dropped by the table) and the old value.
             const prev = try ctx.model.fetchPut(owned_key, owned_val);
             if (prev) |p| {
-                ctx.allocator.free(p.key);
+                ctx.allocator.free(owned_key);
                 ctx.allocator.free(p.value);
             }
         },

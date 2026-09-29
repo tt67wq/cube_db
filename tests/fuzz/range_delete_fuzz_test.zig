@@ -49,6 +49,13 @@ fn execOneOp(input: []const u8, ctx: *FuzzCtx) !usize {
                 ctx.db.putDirect(key, "v") catch continue;
 
                 // Update model (last-write-wins) — must dupe value since it's freed later
+                // T-66 (single key ownership): on collision, std.HashMap.fetchPut keeps the
+                // OLD key pointer in the table (only the value slot is overwritten) and
+                // returns prev = old {key, value}. So the model still owns prev.key — the
+                // harness must free the NEWLY DUPED key (dropped by the table) and the OLD
+                // value, and must NOT free prev.key. The old code freed prev.key here and
+                // cleanupModel freed it again (deterministic double-free on key collision,
+                // e.g. CUBE_FUZZ_SEED=0xdef73b21), and leaked owned_key on every collision.
                 const owned_key = ctx.allocator.dupe(u8, key) catch continue;
                 const owned_val = ctx.allocator.dupe(u8, "v") catch {
                     ctx.allocator.free(owned_key);
@@ -56,7 +63,8 @@ fn execOneOp(input: []const u8, ctx: *FuzzCtx) !usize {
                 };
                 const prev = ctx.model.fetchPut(owned_key, owned_val) catch null;
                 if (prev) |p| {
-                    ctx.allocator.free(p.key);
+                    // collision: table kept p.key; owned_key is now unowned → free it
+                    ctx.allocator.free(owned_key);
                     ctx.allocator.free(p.value);
                 }
             }
