@@ -341,6 +341,44 @@ try db.compact(); // immediately reclaims all dirty pages (requires no active re
 - With active readers, dirty pages stay in `pending_free` until the readers finish.
 - `compact` automatically flushes all flushable `pending_free`.
 
+### 3.6b Full-rewrite compact: compactFull
+
+`compactFull()` is the explicit **O(n)** convergence exit: it streams the visible set into a
+brand-new tree, then swaps the root in **one atomic commit** (packed `(new_root, tomb_head=0)`
++ absolute counters + one-shot retirement of the old tree/chain pages into `pending_free`).
+The write path holds the write mutex for the whole run (writers block during the copy);
+readers are unaffected (MVCC snapshots + page watermarking).
+
+```zig
+const stats = try db.compactFull(.{
+    // Optional progress callback: invoked once per flushed batch; return false
+    // to abort (error return). (copied, batches) = entries copied / batches written.
+    .progress = struct {
+        fn cb(copied: u64, batches: u64) bool {
+            std.debug.print("copied={d} batches={d}\n", .{ copied, batches });
+            return true;
+        }
+    }.cb,
+});
+// stats.entries_copied     visible entries copied (== entryCount after publish)
+// stats.live_bytes         Σ(key.len + value.len + 10) (== byte_size after publish)
+// stats.old_pages_retired  old tree + old tomb-chain pages retired (deduped)
+// stats.batches            kernel write batches
+// stats.chain_dropped      this publish dropped a non-empty tomb chain (true ⇒ new tree tomb_head=0)
+```
+
+- Semantics: counters are published as **absolute values** (`entry_count=V`, `byte_size=B`),
+  which also resets any historical drift; staged micro-batch entries are flushed BEFORE the
+  copy (staged data participates in the copy).
+- **Division of labor with O(1) `compact()`**: `compact()` only reclaims dirty pages + swaps
+  meta (the everyday fast path); **use `compactFull` when you need space convergence**
+  (purge dead entries, drop the tomb chain, re-pack live pages) — it is a rewrite, not a
+  routine operation.
+- **The online path never shrinks the file (§3.3)**: pages retired by compactFull go to
+  `pending_free`/freelist for reuse; the file high-water mark is unchanged. To give disk
+  space back to the OS, use offline `cube_check vacuum <src> <dst>` (see
+  [cube-check.md](cube-check.md); vacuum + rename to promote, optionally after a compactFull).
+
 ### 3.7 Options
 
 ```zig
@@ -353,7 +391,7 @@ var db = try Db.open(allocator, store, .{
 |---|---|---|---|
 | `fsync` | `bool` | `true` | Whether write operations fsync to disk. `false` = faster but data is lost on crash |
 
-`compact` is O(1) (meta page switch, no data rewrite).
+`compact` is O(1) (meta page switch, no data rewrite); the full-rewrite convergence exit is §3.6b `compactFull`.
 
 ---
 
@@ -393,7 +431,13 @@ db.endRead(reader);            // end read (pass the handle to unregister), rele
 - **With no active readers**: dirty pages are reclaimed automatically after each commit.
 - **Do not share a single iterator across threads**; each thread opens its own `select`.
 
+### Offline vacuum (`cube_check vacuum <src> <dst>`)
+
+Offline space reclamation: rewrites all live entries into a fresh dst; src is left untouched (promote via rename only after `EXIT_OK`). Completion semantics: on success the tool atomically writes a sidecar completion marker `<dst>.done` (content: `vacuum-complete entries=<N>`) after the final sync — **a dst without its marker is not a finished vacuum** (a killed process leaves a scrub-clean, openable prefix snapshot). The success output line always declares the marker path. A src with no committed meta (0-commit db) is refused with `EXIT_USAGE` — vacuuming it could only produce a meta-less dst that scrub rejects.
+
 ### Multi-process semantics (T-34)
+
+> Offline tooling: **`cube_check`** (`scrub` / `vacuum`) is documented in [`docs/cube-check.md`](cube-check.md). A vacuum dst from a killed process (no `EXIT_OK`) is a seemingly-valid but possibly-truncated prefix snapshot — always `scrub` before promoting it via rename.
 
 - **One opener per database file at a time**: `FilePageStore.init` takes an advisory exclusive
   lock (`flock(fd, LOCK_EX | LOCK_NB)`) right after open. A second process (or another fd in the

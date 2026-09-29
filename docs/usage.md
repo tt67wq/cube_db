@@ -12,6 +12,9 @@ cube_db 是一个用 Zig 0.16.0 编写的嵌入式键值存储引擎。固定页
 
 > 相关工具：离线完整性校验 **`cube_check`** 使用见 [cube-check.md](cube-check.md)。
 
+> 离线空间回收：**`cube_check vacuum <src> <dst>`** 把存活条目重写进全新 dst，src 不动（`EXIT_OK` 后方可 rename 顶替）。完成语义：成功后工具在最终 sync 之后写入旁路完成标记 `<dst>.done`（内容 `vacuum-complete entries=<N>`）——**没有标记的 dst 不是已完成的 vacuum**（中途被 kill 的进程会留下 scrub 全绿、可打开的前缀快照）；成功输出行总是声明标记路径。零提交（无 meta）的 src 会被拒绝（`EXIT_USAGE`），因为其 dst 无法通过 scrub。
+
+
 ---
 
 ## 目录
@@ -369,6 +372,38 @@ try db.gcTombstones(); // 收割空区间；链上没有可收割的区间时是
   gcTombstones 是独立的收敛出口，两者互不替代。
 - 没有链、或没有任何可收割区间时：不写 meta、不递增 sequence，零副作用返回。
 
+### 3.6c 全量重写压缩：compactFull
+
+`compactFull()` 是显式的 **O(n)** 收敛出口：把可见集流式拷贝进一棵全新树，然后**单次原子提交**换根
+（packed `(new_root, tomb_head=0)` + 绝对计数器 + 旧树/旧链页一次性退休进 pending_free）。
+写路径全程持写锁（拷贝期间写阻塞），读者不受影响（MVCC 快照 + 水位保页）。
+
+```zig
+const stats = try db.compactFull(.{
+    // progress 可选：每写完一批回调一次；返回 false 可中止（错误返回）。
+    // (copied, batches) = 已拷贝条目数 / 已落盘批次数。
+    .progress = struct {
+        fn cb(copied: u64, batches: u64) bool {
+            std.debug.print("copied={d} batches={d}\n", .{ copied, batches });
+            return true;
+        }
+    }.cb,
+});
+// stats.entries_copied     拷贝的可见条目数（== 发布后的 entryCount）
+// stats.live_bytes         Σ(key.len + value.len + 10)（发布后的 byte_size）
+// stats.old_pages_retired  旧树 + 旧墓碑链退休页数（去重后）
+// stats.batches            内核写入批次数
+// stats.chain_dropped      本次发布丢弃了非空墓碑链（true ⇒ 新树 tomb_head=0）
+```
+
+- 语义要点：计数器**绝对值**发布（`entry_count=V`、`byte_size=B`），顺带重置任何历史漂移；
+  staged 微批数据先 flush 再拷贝（staged 数据参与拷贝）。
+- **与 O(1) `compact()` 的分工**：`compact()` 只做脏页回收 + meta 切换（常驻快路径）；
+  **要空间收敛（清死条目、丢墓碑链、重聚活页）用 `compactFull`**——它是重写，不是日常操作。
+- **在线不收缩文件（§3.3）**：compactFull 退休的旧页进 pending_free/freelist 供复用，文件高水位不变。
+  要把空间还给 OS 磁盘，用离线 `cube_check vacuum <src> <dst>`（见 [cube-check.md](cube-check.md)；
+  也可 vacuum 后 rename 顶替，或对 src 跑一次 compactFull 再 vacuum）。
+
 
 ### 3.7 选项：Options
 
@@ -382,7 +417,7 @@ var db = try Db.open(allocator, store, .{
 |---|---|---|---|
 | `fsync` | `bool` | `true` | 写操作是否 fsync 落盘。`false` = 更快但 crash 丢数据 |
 
-compact 是 O(1) 的（meta 页切换，不重写数据）。
+compact 是 O(1) 的（meta 页切换，不重写数据）；全量重写收敛出口见 §3.6c `compactFull`。
 
 ---
 
@@ -448,6 +483,8 @@ db.endRead(reader);            // 结束读（带句柄注销），释放脏页
 - **不要跨线程共享一个迭代器**；每个线程各开各的 `select`。
 
 ### 多进程语义（T-34）
+
+> 离线工具：**`cube_check`**（`scrub` / `vacuum`）见 [`docs/cube-check.md`](cube-check.md)。被 kill 的 vacuum 留下的 dst（无 `EXIT_OK`）是"看似有效但可能缺尾部数据"的前缀快照——rename 启用前必须先 `scrub`。
 
 - **同一数据库文件同时只允许一个打开者**：`FilePageStore.init` 在 open 后立即取 advisory
   排他锁（`flock(fd, LOCK_EX | LOCK_NB)`）。第二个进程（或同进程的另一个 fd）对同一路径

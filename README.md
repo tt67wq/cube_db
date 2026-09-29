@@ -12,7 +12,7 @@ with freelist page reuse, no WAL, crash-safe via atomic meta-page switch.
 - **LMDB-style 1TB reserved mmap** read path — readers are zero-copy page pointers, no remmap on growth
 - **Explicit transactions** — `beginWriteTxn` / `beginReadTxn` (`commit` / `abort` / `end`),
   single-writer mutex, MVCC snapshot readers that don't block the writer
-- **O(1) compact** — just meta page switch, no full rewrite
+- **O(1) compact** — just meta page switch, no full rewrite; plus **`compactFull`** — explicit O(n) full-rewrite convergence exit (purges dead entries, drops the tomb chain) and offline `cube_check vacuum` for file shrinkage
 - **O(1) recovery** — reads two meta pages, no full-file scan, no WAL replay
 - **Crash-safe without WAL** — COW + atomic meta-page switch: uncommitted writes never corrupt committed data
 - **MVCC reader safety** — dirty pages held until readers drain

@@ -6,6 +6,7 @@ const f2 = @import("format.zig");
 const ps = @import("page_store.zig");
 const btree = @import("btree.zig");
 const wrt = @import("writer.zig");
+const compact_mod = @import("compact.zig");
 const PageStore = ps.PageStore;
 const State = wrt.State;
 const Mutex = zio.Mutex;
@@ -549,6 +550,128 @@ pub const Db = struct {
     /// Explicit sync (manually flush committed data to disk in async mode).
     pub fn sync(self: *Db) !void {
         try self.store.sync();
+    }
+
+    // ---- U5-6: compactFull publish path (design `bb4d489` §7 steps 4+5) ----
+
+    pub const CompactFullOptions = struct {
+        /// Per-batch progress (kernel callback shape, transparently passed
+        /// through): return false to abort (error.CompactAborted — the kernel
+        /// returns every touched page, the old db is untouched).
+        progress: ?*const fn (copied: u64, batches: u64) bool = null,
+    };
+
+    pub const CompactFullStats = struct {
+        /// Visible entries copied (== the new tree's count, absolute V).
+        entries_copied: u64,
+        /// Σ(key.len + value.len + 10) over the copied set (B formula).
+        live_bytes: u64,
+        /// Old tree + old tomb-chain pages retired (queued to pending_free
+        /// with release_seq = the publish sequence).
+        old_pages_retired: u64,
+        /// Batches the kernel wrote.
+        batches: u64,
+        /// True when a non-empty tomb chain existed and was dropped (§2.4:
+        /// the new tree holds no shadowed entries → tomb_head=0 published).
+        chain_dropped: bool,
+    };
+
+    /// Full-rewrite compact (design §1.1/§2/§3): stream the visible set into
+    /// a brand-new tree (kernel), then publish atomically in ONE commit —
+    /// packed (new_root, tomb_head=0) swap + absolute counters + retirement
+    /// of the old tree/chain via the standard pending_free watermark path.
+    ///
+    /// Contract notes:
+    ///   - O(1) `compact()` is untouched (§1.2): this is the explicit O(n)
+    ///     exit; write-mutex held for the whole run (write path blocked,
+    ///     readers unaffected — MVCC pins + watermark keep old pages alive).
+    ///   - staged micro-batch entries are flushed FIRST (§2.1 ③, deleteRange
+    ///     precedent): staged data must participate in the copy.
+    ///   - retirement = one-shot `queuePendingFree(retired_pages, new_seq)`
+    ///     (§3.1; double-enqueue with existing pending entries is allowed —
+    ///     the pool side is idempotent / watermark drains exactly once).
+    ///   - counters are set ABSOLUTELY (§5): entry_count = V, byte_size = B
+    ///     — delta-free by construction, drift-resetting (T-59/T-60 class).
+    ///   - compact.zig semantics are untouched (review U5-5-R2 approve);
+    ///     this is pure orchestration.
+    ///   - crash-matrix seams (step 6 = U5-7): the kernel's copy loop and
+    ///     this function's publish window are the taggable points — the
+    ///     publish goes through writeCommitMeta (the SAME dual-slot protocol
+    ///     + syncDataPages ordering as every commit), so the existing 7 tags
+    ///     cover the publish window verbatim; no new protocol is introduced.
+    pub fn compactFull(self: *Db, opts: CompactFullOptions) !CompactFullStats {
+        // §2.1 ③: staged puts must be visible before the copy (deleteRange
+        // does the same via its own flush).
+        try self.flush();
+
+        // Single-writer for the whole run (same seat as compact()): no
+        // interleaved commit may change root/chain/counters mid-copy.
+        self.write_mutex.lock() catch return error.LockFailed;
+        defer self.write_mutex.unlock();
+
+        // Progress adapter: kernel shape (copied, batches, user) → design
+        // §1.1 shape (copied, batches).
+        const Adapter = struct {
+            fn progress(copied: u64, batches: u64, user: ?*anyopaque) bool {
+                const o: *const CompactFullOptions = @ptrCast(@alignCast(user.?));
+                if (o.progress) |cb| return cb(copied, batches);
+                return true;
+            }
+        };
+        var kernel_opts = compact_mod.Options{ .progress = Adapter.progress, .progress_user = @constCast(@ptrCast(&opts)) };
+        if (opts.progress == null) kernel_opts.progress = null;
+
+        // Capture chain presence under the write mutex BEFORE the kernel runs
+        // (required-nit, review 3fafcf5 §6: chain_dropped means "a non-empty
+        // tomb chain existed and is dropped by this publish" — NOT "pages
+        // were retired").
+        const had_chain = self.state.getTombHead() != 0;
+
+        // Kernel: stream visible set → new tree. Publish-free (§3.1): the
+        // old tree stays reader-reachable; the kernel touches no state.
+        const result = try compact_mod.run(self, self.allocator, kernel_opts);
+        defer self.allocator.free(result.retired_pages);
+        defer self.allocator.free(result.new_pages);
+
+        // ---- Publish (§2.1 ⑧-⑩), one atomic commit ----
+        const cur_sequence = self.state.sequence.load(.acquire);
+        const new_sequence = cur_sequence + 1;
+
+        // ⑧ retirement: one-shot enqueue of the deduped retired list with
+        // release_seq = new_sequence. Double-enqueue with entries already
+        // pending is ALLOWED (design §2.1 ⑧ + U5-2-R2: pool side is
+        // idempotent / watermark drains each page exactly once); chunked
+        // enqueue only bounds lock-hold time (§3.1).
+        var i: usize = 0;
+        while (i < result.retired_pages.len) {
+            const end = @min(i + 64 * 1024, result.retired_pages.len);
+            self.state.queuePendingFree(result.retired_pages[i..end], new_sequence);
+            i = end;
+        }
+
+        // ⑨-⑩ publish: packed (new_root, 0) + absolute counters (§5). The
+        // sticky version passthrough keeps the v3→v3 rule (§2.4 point 3:
+        // gcTombstones publishes head 0 on v3 dbs; never downgrade).
+        try self.state.writeCommitMeta(result.new_root, 0, self.state.meta_version.load(.acquire), new_sequence, result.entries_copied, result.live_bytes);
+        self.state.publishSnapshot(result.new_root, 0);
+        self.state.sequence.store(new_sequence, .release);
+        self.state.entry_count.store(result.entries_copied, .release);
+        self.state.byte_size.store(result.live_bytes, .release);
+
+        // ⑪ immediate reclamation when nothing is pinned (applyBatch step 9
+        // pattern): the just-retired old tree/chain drains right away in the
+        // maintenance-window common case.
+        if (self.state.reader_count.load(.acquire) == 0) {
+            self.state.reclaimPendingFree();
+        }
+
+        return .{
+            .entries_copied = result.entries_copied,
+            .live_bytes = result.live_bytes,
+            .old_pages_retired = result.retired_pages.len,
+            .batches = result.batches,
+            .chain_dropped = had_chain,
+        };
     }
 
     pub fn dirtCount(self: *Db) u64 {

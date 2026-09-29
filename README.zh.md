@@ -8,7 +8,7 @@
 - **LMDB 式 1TB 预留 mmap 读路径** — reader 零拷贝直接指针读，文件增长无需重 mmap
 - **显式事务** — `beginWriteTxn` / `beginReadTxn`（`commit` / `abort` / `end`），
   单写者互斥，MVCC 快照 reader 不阻塞写者
-- **O(1) compact** — 只写 meta page，不重写数据
+- **O(1) compact** — 只写 meta page，不重写数据；另有 **`compactFull`** 全量重写收敛出口（显式 O(n)：清死条目、丢墓碑链）与离线 `cube_check vacuum` 收缩文件
 - **O(1) 恢复** — 读两个 meta page，不扫全文件，无 WAL 回放
 - **无 WAL 崩溃安全** — COW + 原子 meta 页切换：未提交写入永不污染已提交数据
 - **MVCC reader 安全** — 脏页持有到读者释放

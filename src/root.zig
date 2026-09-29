@@ -8,6 +8,7 @@ pub const btree = @import("btree.zig");
 pub const writer = @import("writer.zig");
 pub const db = @import("db.zig");
 pub const file_page_store = @import("file_page_store.zig");
+pub const compact = @import("compact.zig");
 pub const crc32_hw = @import("crc32_hw.zig");
 
 pub const Db = db.Db;

@@ -276,7 +276,9 @@ pub const State = struct {
     /// version and tomb_head are always passed through, never hardcoded.
     /// Preserves the T-27 power_fail ordering: data pages (incl. tomb chain
     /// pages) sync before meta; meta sync after.
-    fn writeCommitMeta(self: *State, root: u32, tomb_head: u32, version: u16, sequence: u64, entry_count: u64, byte_size: u64) !void {
+    /// U5-6: made pub for compactFull's publish (same dual-slot protocol +
+    /// power_fail ordering as every commit; version/tomb_head passthrough).
+    pub fn writeCommitMeta(self: *State, root: u32, tomb_head: u32, version: u16, sequence: u64, entry_count: u64, byte_size: u64) !void {
         const meta = f2.MetaPage{
             .magic = f2.MAGIC_V2,
             .version = version,
@@ -364,7 +366,9 @@ pub const State = struct {
     /// T-38-3: retire old tomb-chain pages through the standard MVCC
     /// pending_free path (release_seq = the sequence of the commit that made
     /// them unreachable — readers with older snapshots keep walking them).
-    fn queuePendingFree(self: *State, page_nos: []const u32, release_seq: u64) void {
+    /// U5-6: made pub for the compactFull publish path (db.zig) — same
+    /// retire-via-pending_free discipline the kernel-side callers use.
+    pub fn queuePendingFree(self: *State, page_nos: []const u32, release_seq: u64) void {
         self.pending_free_mu.lockUncancelable();
         defer self.pending_free_mu.unlock();
         for (page_nos) |pn| {
@@ -530,7 +534,9 @@ pub const State = struct {
     /// count==0 seen under the lock triggers the full reclaim — any reader
     /// registering afterwards has a snapshot >= every pending release_seq
     /// and cannot reference the reclaimed pages.
-    fn reclaimPendingFree(self: *State) void {
+    /// U5-6: made pub for compactFull's step-⑪ immediate reclamation
+    /// (applyBatch step-0/9 pattern — dispatched by watermark internally).
+    pub fn reclaimPendingFree(self: *State) void {
         self.pending_free_mu.lockUncancelable();
         defer self.pending_free_mu.unlock();
         const prof = ProfileStats.enable;
