@@ -383,6 +383,22 @@ pub const FilePageStore = struct {
         };
     }
 
+    /// Offline-vacuum-only file ceiling (U5-4, cube_check.vacuumCopy):
+    /// shrink the backing file to exactly cover `last_page`. Call ONLY after
+    /// all writes are done and synced (vacuum does this once per batch and
+    /// finally before returning): meta0/meta1 live below FIRST_DATA_PAGE, so
+    /// no page >= FIRST_DATA_PAGE is special and the writer is single-threaded
+    /// here by construction. next_free is clamped so a post-truncate write
+    /// cannot straddle the new EOF (would SIGBUS the mmap).
+    pub fn compactFileTo(self: *FilePageStore, last_page: u32) !void {
+        self.freelist_mu.lockUncancelable();
+        defer self.freelist_mu.unlock();
+        if (last_page + 1 >= self.next_free) return; // never grown past this anyway
+        const new_size: c.off_t = @intCast((@as(u64, last_page) + 1) * PAGE_SIZE);
+        if (c.ftruncate(self.fd, new_size) != 0) return error.TruncateFailed;
+        self.next_free = last_page + 1;
+    }
+
     /// Extend the high-water mark by one page (never touches the pool).
     fn bumpPageLocked(self: *FilePageStore) !u32 {
         const pn = self.next_free;

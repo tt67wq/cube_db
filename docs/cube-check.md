@@ -49,11 +49,13 @@ zig build cube-check -- scrub <db-path>
 
 ```
 Usage: cube_check scrub <db-path>
+       cube_check vacuum <src-db-path> <dst-db-path>
 ```
 
 | 参数 | 说明 |
 |---|---|
-| `scrub` | 子命令，执行离线完整性校验（当前唯一子命令） |
+| `scrub` | 子命令，执行离线完整性校验 |
+| `vacuum` | 子命令，离线空间回收：把 `src` 的存活条目重写进全新 `dst`（U5-4 引入，见 §6） |
 | `<db-path>` | 数据库文件路径（`FilePageStore` 使用的文件） |
 
 示例：
@@ -138,6 +140,7 @@ fi
 
 ## 6. 限制与注意事项
 
+- **vacuum 的 dst 可信性（F4）**：`vacuumCopy` 对**错误返回**路径会删除半成品 dst；但 vacuum 进程被 kill 或掉电时，dst 会停在最后一次成功 commit 的状态——**内部一致、可打开、但缺后面的批次**（“看似有效的前缀快照”）。因此 **rename 启用（`mv dst src`）前必须先 `cube_check scrub dst`**——scrub 只验 CRC 完整性，验不出“缺数据”；操作流程必须以 vacuum 的 `EXIT_OK` 为唯一可信信号，exit 非 0 或来路不明的 dst 一律删除重跑。
 - **要求排他访问**：`FilePageStore` 打开时持有排他文件锁（flock）。**DB 不能被任何写进程
   占用**——在线写的库需先停止写入（或对该库的副本执行），否则无法打开。
 - **只读、不修复**：scrub 只报告 CRC 失败页，不做页级修复或恢复；损坏页需从备份恢复。
