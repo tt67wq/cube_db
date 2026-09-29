@@ -16,3 +16,6 @@ zig-pkg/
 root.o
 .scratch-t36/
 .soak-t36/
+
+# 任务级报告/评审产物（机器本地；正文结论已进 issues/ 与 git 历史）
+.agents/reports/

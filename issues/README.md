@@ -19,7 +19,7 @@
 | `open` | 已确认成立，尚未指派修复 | conductor 立项 |
 | `proposed` | 已记录但**未决定要做**（待立项/待评估/已论证不可闭合） | 等决策 |
 | `fixing` | 已指派，修复进行中 | worker 干活中 |
-| `partial` | **部分闭合**：一部分痛点已验收关闭，另一部分仍开着 | 剩余部分另立或继续 |
+| `partial` | T-39 |
 | `closed` | 验收通过，已合入 main | 无 |
 
 **写状态的纪律**：状态词后必须补一句白话的「**还剩什么**」。
@@ -37,13 +37,11 @@
 
 | 状态 | 编号 |
 |---|---|
-| `fixing` | T-38 |
+| `fixing` | U-65 |
 | `partial` | T-39 |
-| `proposed` | T-39-C、T-45、T-47 |
-| `open` | T-53、T-55、T-58 |
+| `open` | T-68 |
 
-**活跃 issue 共 8 条**（根目录下除本 README 外的全部 `.md`）。
-已 closed 的 15 条见下文「三、归档」。
+**活跃 issue 共 2 条**（ISSUE-1/2/3 早已 closed，本次移入 archived/）（根目录下除本 README 外的全部 `.md`）。已 closed 条目见下文「三、归档」。
 
 ### 明细
 
@@ -51,12 +49,18 @@
 |---|---|---|---|---|
 | **T-38** | deleteRange 高效化：全量物化 + 每 key tombstone 的 O(range) 内存与写放大 | `fixing` | **阶段 1/2/3 + 4a 已合入验收**（4a = `50af0d1`：`Db.gcTombstones` 收割空区间、`deleteRange` 冗余区间短路、链恒为规范最小形式；**未动 compact 的 O(1) 承诺**）。**只剩阶段 4b（crash 矩阵扩展 → T-38-5）**；物化清除挂 U-5 真·compact | `baa44bd`、`88124bc`、`fe2f575`、`50af0d1` |
 | **T-39** | freelist 持久化写放大：每次 commit 整链重写 + O(pool) 去重扫描 | `partial` | 去重收敛 / 静默吞错可观测化 / FreelistStats 观测 API 已验收关闭；**写放大痛点未闭**，已拆出 T-39-C | — |
-| **T-39-C** | append-only freelist 增量持久化在现有崩溃模型下不可闭合（impossibility 记录） | `proposed` | 已论证「不改 T-33 崩溃安全模型则无法安全落地」，等 conductor 决定是否投入新的磁盘格式不变量（freshness proof） | — |
+| ~~T-39-C~~ | append-only freelist 不可闭合（impossibility 记录） | `closed` | 裁决不立项 `34e6a01` | — |
 | **T-45** | T-43 sweep 回归测试 overwrite 步骤使用 stale root（测试瑕疵） | `proposed` | 测试语义瑕疵，sweep 有效性不受影响；待决定是否修 | — |
 | **T-47** | `docs/lecture_btree.html` 与 T-43/T-46 后实现脱节 | `proposed` | **已交付但搁置**：交付物 `4632fcb` 未合入，评审 REQUEST_CHANGES；待返工或弃用 | — |
-| **T-53** | 「torn meta」方向仍可被当 fresh DB 打开：双槽 torn 时可能覆盖既有数据页 | `open` | medium，数据破坏面（与 T-49 同族，需双重损坏或单提交库 torn 触发）。T-53 任务只闭合了 invalid-meta 方向；torn 方向留待评估 heuristic 拒绝 | `1c6ce1d`（T-53 主任务已合入） |
-| **T-55** | T-54-G 遗留 nit：`is_shard` 前缀匹配把 `insertbatch_sweep_partition_test.zig`（毫秒级纯算术守卫）也排除出 `test-one` | `open` | 低（无正确性影响：它仍在默认门；`-Dfilter` 命中 0 时是**响亮 addFail** 而非静默通过）。修法：`is_shard` 改精确匹配 4 个分片文件名，或加 `!endsWith("_partition_test.zig")` | — |
-| **T-58** | key 长度上限不一致：`checkKeySize` 放行 4051，但 `put(key >= 4045)` 在 commit 阶段报 `error.PayloadTooLarge` | `open` | 低-中（不破坏数据，但 API 契约不一致且失败点晚）。**预存**，由 T-57 的独立测试发现。修法：把入口校验的界收紧到 btree 实际可写上限，或把 entry 固定开销算进校验 | — |
+| ~~T-53~~ | torn meta 可被当 fresh DB 打开 | `closed` | 已归档（T-53-1 合入 `0209448`） | — |
+| ~~T-55~~ | is_shard 前缀误排除 partition 测试 | `closed` | 已归档 | — |
+| ~~T-65~~ | ~~逐条 put klen≥62B split 时 OOB panic~~（根因改判：chunker 每 separator 欠 4B） | `closed` | 修复 9a36ad2 一行；评审+独立测试双复算 4137 对数；批量同治 | `4e856a0` |
+| **T-66** | fuzz harness 自身 double-free（deleteRange op key 所有权双释放）致全量套件偶发红 | `open` | CI 噪声；同 seed base 确定性复现，非产品缺陷 | — |
+| ~~T-67~~ | ~~kill -9 中途 vacuum 留部分 dst~~ | `closed` | U5-4-C：`<dst>.done` 标记 + 空库拒绝；合入 main | `8855891` |
+| ~~U-65~~ | ~~真·compact / vacuum：空间回收与墓碑物化无收敛出口~~ | `closed` | 全链合入：离线 vacuum + 在线 `Db.compactFull`（内核/发布/退休/崩溃矩阵 10 格）+ 文档/bench/设计稿；终审 `0a945d8` 判 closed | `a598dc6` |
+| ~~T-58~~ | key 上限不一致（4051 vs PayloadTooLarge） | `closed` | 已归档 `6787884` | — |
+| **T-70** | 返工报告/commit 声称 PASS 的池-正向格在测试文件中不存在（证据链诚信，非产品缺陷） | `closed` | 轮 3 整改验收：stdout-per-PASS + 10 行/10 用例自对账，R3 逐格核过无再现（`500beab`）；随 U5-7 合入关闭。长期项（PASS↔用例存在性脚本门）挂 U5-8/后续 | `b81a21d` |
+| **T-68** | `Leaf.fromPayload` 双重分配：`dec`（LEAF_MAX_ENTRIES）先分配后即弃，实际解码用 `dec_slice`（count） | `open` | low（无正确性影响；每次 leaf 解码多一轮无引用 alloc/free，OOM 面浪费）。T-65-F 报告 §5 顺带发现、未落卡，T-65-T 补立。修法：先读 header count 再按需分配一次 | — |
 
 ### 值得先看的
 
@@ -137,7 +141,7 @@ T-38 与 T-51 中都出现过 451/452 vs 452/452 的表述，它们并不矛盾�
 
 ### 4.3 编号规则
 
-编号单调递增，扫描本目录取最大值 +1。当前最大值 = **T-58**；另有独立编号 **N-1**（另一来源系列）。
+编号单调递增，扫描本目录取最大值 +1。当前最大值 = **T-68**；另有独立编号 **N-1**（另一来源系列）。
 归档不移除编号，避免历史引用失效。
 
 **注**：任务号与 issue 号可共用（如 T-52、T-53 都是「任务 `T-53` / issue `T-53`」同号），
