@@ -397,12 +397,24 @@ pub fn leafChunkLen(entries: []const LeafEntry, max: usize) usize {
 /// slice starting at the chunk's first child; a chunk of L children carries
 /// keys[0..L-1]. Returns >= 2 when at least 2 children remain: a 2-child
 /// chunk costs 3 + 8 + 4 + klen <= 3 + 8 + 4 + MAX_KEY_SIZE <= cap.
+///
+/// T-65: the old accounting charged each admitted separator `4 + k.len`
+/// (klen field + key bytes) but every separator ALSO introduces one more
+/// child whose 4B page-number slot was never counted (the `3 + 4` baseline
+/// paid only the FIRST child). A chunk with m separators is really
+/// `3 + m*(4+klen) + 4*(m+1)` — 4m bytes larger than believed: klen 57..61
+/// landed in (NODE_PAYLOAD_CAP, PAGE_SIZE) (late graceful PayloadTooLarge
+/// from writeNodePage's defense) and klen >= 62 overran the raw PAGE_SIZE
+/// stack buffer (OOB panic, index 4137 == the first chunk's true size).
+/// `need` now charges the next child's 4B slot explicitly: for any legal
+/// klen <= MAX_KEY_SIZE the admitted set always fits, and clen >= 2 holds
+/// (3+4 + 8+MAX_KEY_SIZE = 4066 <= cap).
 pub fn branchChunkLen(keys: []const []const u8, children_rem: usize, max: usize) usize {
     var n: usize = 3 + 4; // header + first child's 4B slot
     var len: usize = 1;
     while (len < @min(max, children_rem)) {
         const k = keys[len - 1]; // separator between child len-1 and len
-        const need = 4 + k.len; // separator + next child's 4B slot
+        const need = 4 + k.len + 4; // klen field + key bytes + next child's 4B slot (T-65)
         if (n + need > NODE_PAYLOAD_CAP) break;
         n += need;
         len += 1;
@@ -2511,3 +2523,119 @@ pub const Error = error{
     MapFull,
     PageNotFound,
 } || std.mem.Allocator.Error;
+
+// ===== U5-3: collectTreePages (full reachable-page collection) =====
+
+/// Collect every page reachable from `root` (U5-3 step 2, design `bb4d489`
+/// §7 step 2): the root page itself, all branch pages, all leaf pages, and —
+/// following every leaf's overflow references — each referenced overflow
+/// chain in its entirety (chain links live in the page header `free_next`,
+/// same as writeOverflowPages builds them).
+///
+/// Cycle safety: a visited set dedups by page number; the FIRST revisit of
+/// any page (branch child, overflow link, or overflow reference) aborts with
+/// error.Truncated instead of looping — the T-52 lesson (a CRC-valid ring
+/// must never hang the walker) applied to tree walks. No CRC verification is
+/// performed: the collector is a structural walk and must terminate on
+/// byte-mangled pages too (the cycle test rewrites a child pointer without
+/// fixing the checksum).
+///
+/// Output: `pages` receives distinct page numbers (caller owns the list;
+/// typically arena/ArrayList-backed by the caller). Errors: store read
+/// errors, error.Truncated on a corrupt/cyclic structure.
+pub fn collectTreePages(allocator: std.mem.Allocator, store: PageStore, root: u32, pages: *std.ArrayList(u32)) !void {
+    if (root == 0) return; // NULL_ROOT: empty tree, nothing reachable
+    var visited = std.AutoHashMap(u32, void).init(allocator);
+    defer visited.deinit();
+
+    // (U5-8, U5-3-R 3c3e2a0 N-1: dead `kind: u8` field removed — written as 0,
+    // never read; page type is resolved from the header on visit.)
+    const QueueItem = struct { page_no: u32 };
+    var stack: std.ArrayList(QueueItem) = .empty;
+    defer stack.deinit(allocator);
+
+    // mark + push root; kind resolved by header on visit
+    try visited.put(root, {});
+    try stack.append(allocator, .{ .page_no = root });
+
+    while (stack.items.len > 0) {
+        const item = stack.pop().?;
+        const page = try store.readPage(item.page_no);
+        const hdr = f2.decodePageHeader(page[0..f2.PAGE_HEADER_SIZE]);
+        try pages.append(allocator, item.page_no);
+
+        switch (hdr.page_type) {
+            f2.PAGE_TYPE_BRANCH => {
+                const payload = page[f2.PAGE_HEADER_SIZE .. f2.PAGE_SIZE - 4];
+                if (payload.len < 3) return error.Truncated;
+                const count: usize = std.mem.readInt(u16, payload[1..3], .little);
+                if (count < 1) return error.Truncated;
+                // separators: (count-1) × (4 + klen), then count children
+                var pos: usize = 3;
+                var i: usize = 0;
+                while (i + 1 < count) : (i += 1) {
+                    if (pos + 4 > payload.len) return error.Truncated;
+                    const klen = std.mem.readInt(u32, payload[pos..][0..4], .little);
+                    pos += 4;
+                    if (pos + klen > payload.len) return error.Truncated;
+                    pos += klen;
+                }
+                if (pos + 4 * count > payload.len) return error.Truncated;
+                for (0..count) |j| {
+                    const child = std.mem.readInt(u32, payload[pos + 4 * j ..][0..4], .little);
+                    if (child == 0) continue;
+                    const gop = try visited.getOrPut(child);
+                    if (gop.found_existing) return error.Truncated; // cycle (T-52 rule)
+                    try stack.append(allocator, .{ .page_no = child });
+                }
+            },
+            f2.PAGE_TYPE_LEAF => {
+                const payload = page[f2.PAGE_HEADER_SIZE .. f2.PAGE_SIZE - 4];
+                if (payload.len < 3) return error.Truncated;
+                const count: usize = std.mem.readInt(u16, payload[1..3], .little);
+                var pos: usize = 3;
+                var i: usize = 0;
+                while (i < count) : (i += 1) {
+                    if (pos + 1 + 4 > payload.len) return error.Truncated;
+                    pos += 1; // tombstone flag
+                    const klen = std.mem.readInt(u32, payload[pos..][0..4], .little);
+                    pos += 4;
+                    if (pos + klen > payload.len) return error.Truncated;
+                    pos += klen;
+                    if (pos + 4 + 1 > payload.len) return error.Truncated;
+                    const vlen = std.mem.readInt(u32, payload[pos..][0..4], .little);
+                    pos += 4; // vlen
+                    const flags = payload[pos];
+                    pos += 1;
+                    if (flags & LEAF_FLAG_OVERFLOW != 0) {
+                        if (pos + 4 > payload.len) return error.Truncated;
+                        const ovf_head = std.mem.readInt(u32, payload[pos..][0..4], .little);
+                        pos += 4;
+                        // follow the WHOLE overflow chain (free_next links)
+                        var cur = ovf_head;
+                        while (cur != 0) {
+                            const gop = try visited.getOrPut(cur);
+                            if (gop.found_existing) return error.Truncated; // cycle
+                            try pages.append(allocator, cur);
+                            const opage = try store.readPage(cur);
+                            const ohdr = f2.decodePageHeader(opage[0..f2.PAGE_HEADER_SIZE]);
+                            cur = ohdr.free_next;
+                        }
+                    } else {
+                        // inline value: vlen bytes (bounded check keeps the
+                        // walk safe on garbage)
+                        if (pos + vlen > payload.len) return error.Truncated;
+                        pos += vlen;
+                    }
+                }
+            },
+            else => {
+                // overflow pages reached via the leaf path above are appended
+                // by the chain walker (their free_next is followed there), so
+                // a bare stack visit of an overflow page means a corrupt
+                // structure — treat as truncated rather than silently passing.
+                return error.Truncated;
+            },
+        }
+    }
+}
