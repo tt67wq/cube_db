@@ -24,10 +24,7 @@
 //!             a7/a8/a9 通过（正常路径未受影响）。GREEN 时九条全过。
 
 const std = @import("std");
-const c = @cImport({
-    @cInclude("fcntl.h");
-    @cInclude("unistd.h");
-});
+const c = @import("cube_db").libc; // 0.17: @cImport removed
 const cube = @import("cube_db");
 const ps = cube.page_store;
 const dbi = cube.db;

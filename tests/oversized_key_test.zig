@@ -462,9 +462,7 @@ test "supp A8+C3: WriteTxn boundary key commits; txn usable after reject" {
 }
 
 /// 删除测试残留文件（repo 惯用法：libc unlink，见 crash_putbatch_test.zig）
-const c = @cImport({
-    @cInclude("unistd.h");
-});
+const c = @import("cube_db").libc; // 0.17: @cImport removed
 
 fn unlinkPath(path: []const u8) void {
     var buf: [256]u8 = undefined;

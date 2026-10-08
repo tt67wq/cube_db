@@ -8,9 +8,7 @@ const cube = @import("cube_db");
 const ps = cube.page_store;
 const FilePageStore = cube.file_page_store.FilePageStore;
 const f2 = cube.format;
-const c = @cImport({
-    @cInclude("unistd.h");
-});
+const c = @import("cube_db").libc; // 0.17: @cImport removed
 
 fn unlinkPath(path: []const u8) void {
     var buf: [256]u8 = undefined;

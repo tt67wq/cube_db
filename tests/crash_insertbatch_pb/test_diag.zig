@@ -53,9 +53,7 @@ pub fn print(comptime fmt: []const u8, args: anytype) void {
 //
 // 见 issues/T-62-macos-flock-reopen-ci-red.md。
 
-const td_c = @cImport({
-    @cInclude("unistd.h");
-});
+const td_c = @import("cube_db").libc; // 0.17: @cImport removed
 
 /// 带界重试的 FilePageStore 初始化：仅对 error.FileLocked 重试（最多
 /// `attempts` 次 × 50ms），其他错误立即返回；重试耗尽时由调用方自行处理。

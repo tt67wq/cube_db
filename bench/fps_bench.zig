@@ -13,10 +13,7 @@ const Db = cube.Db;
 const Entry = cube.Entry;
 const FilePageStore = cube.file_page_store.FilePageStore;
 
-const c = @cImport({
-    @cInclude("unistd.h");
-    @cInclude("fcntl.h");
-});
+const c = cube.libc; // 0.17: @cImport removed
 
 fn monoNs() i64 {
     var ts: std.c.timespec = undefined;
@@ -211,16 +208,14 @@ fn runGet(path: []const u8, cfg: Config, w: *Io.Writer) !void {
 }
 
 fn fileSize(path: []const u8) u64 {
-    const f2c = @cImport({
-        @cInclude("sys/stat.h");
-    });
+    const f2c = cube.libc; // 0.17: @cImport removed
     var buf: [256]u8 = undefined;
     if (path.len >= buf.len) return 0;
     @memcpy(buf[0..path.len], path);
     buf[path.len] = 0;
     var st: f2c.struct_stat = undefined;
     _ = f2c.stat(@ptrCast(&buf), &st);
-    return @intCast(st.st_size);
+    return @intCast(st.size);
 }
 
 fn runLargeScale(path: []const u8, n: usize, fsync: bool, label: []const u8, w: *Io.Writer) !void {

@@ -10,6 +10,7 @@ pub const db = @import("db.zig");
 pub const file_page_store = @import("file_page_store.zig");
 pub const compact = @import("compact.zig");
 pub const crc32_hw = @import("crc32_hw.zig");
+pub const libc = @import("libc.zig"); // raw libc bindings (0.17 removed @cImport)
 
 pub const Db = db.Db;
 pub const Entry = db.Entry;

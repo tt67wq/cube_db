@@ -4,20 +4,33 @@
 //! Other platforms: falls back to software table-driven CRC32
 //!
 //! The ARMv8 CRC32 instruction uses the same IEEE 802.3 polynomial as
-//! std.hash.crc.Crc32 (0x04C11DB7, reflected 0xEDB88320), so results
+//! std.hash.crc."CRC-32/ISO-HDLC" (0x04C11DB7, reflected 0xEDB88320), so results
 //! are bit-identical.
 const std = @import("std");
 const builtin = @import("builtin");
 
-const Crc32 = std.hash.crc.Crc32;
+/// Reflected CRC-32 (IEEE 802.3 poly 0x04C11DB7 → reflected 0xEDB88320), table-driven.
+/// Same algorithm as `std.hash.crc."CRC-32/ISO-HDLC"`, but kept here because `crc32Sw`
+/// takes a raw pre-inverted initial state and 0.17's crc namespace no longer exposes the
+/// internal accumulator (we used to poke `crc.crc`).
+const CRC32_POLY_REVERSED: u32 = 0xEDB8_8320;
+const crc32_table: [256]u32 = blk: {
+    @setEvalBranchQuota(10_000);
+    var t: [256]u32 = undefined;
+    for (&t, 0..) |*e, i| {
+        var c: u32 = @intCast(i);
+        for (0..8) |_| c = if (c & 1 != 0) (c >> 1) ^ CRC32_POLY_REVERSED else c >> 1;
+        e.* = c;
+    }
+    break :blk t;
+};
 
 /// Software CRC32 (table-driven, same as format.computePageChecksum)
 /// init=0 means standard CRC32 (init 0xFFFFFFFF, final XOR 0xFFFFFFFF)
 pub fn crc32Sw(init: u32, data: []const u8) u32 {
-    var crc = Crc32.init();
-    crc.crc = init ^ 0xFFFFFFFF;
-    crc.update(data);
-    return crc.final();
+    var crc = init ^ 0xFFFF_FFFF;
+    for (data) |b| crc = crc32_table[@as(u8, @truncate(crc ^ b))] ^ (crc >> 8);
+    return crc ^ 0xFFFF_FFFF;
 }
 
 /// Hardware CRC32 (ARM64 inline asm, or software fallback).

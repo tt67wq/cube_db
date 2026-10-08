@@ -63,7 +63,7 @@ pub const MetaPage = struct {
     tomb_head: u32 = 0,
 };
 
-const Crc32 = std.hash.crc.Crc32;
+const Crc32 = @field(std.hash.crc, "CRC-32/ISO-HDLC"); // 0.17: crc namespace audit renamed Crc32
 
 // ===== Page header encode/decode =====
 

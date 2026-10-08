@@ -33,9 +33,7 @@ const Db = cube.Db;
 const FilePageStore = cube.file_page_store.FilePageStore;
 const part = @import("page_partition.zig");
 
-const c = @cImport({
-    @cInclude("unistd.h");
-});
+const c = @import("cube_db").libc; // 0.17: @cImport removed
 
 const alloc = std.testing.allocator;
 

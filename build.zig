@@ -25,12 +25,12 @@ fn addTool(b: *std.Build, t: std.Build.ResolvedTarget, o: std.builtin.OptimizeMo
     const run = b.addRunArtifact(exe);
     if (tool.install_dep) run.step.dependOn(b.getInstallStep());
     b.step(tool.step, tool.desc).dependOn(&run.step);
-    if (tool.args) if (b.args) |a| run.addArgs(a);
+    if (tool.args) run.addPassthruArgs();
     return exe;
 }
 
 fn walk(b: *std.Build, io: std.Io, dir: []const u8, out: *std.ArrayList([]const u8)) void {
-    var d = b.build_root.handle.openDir(io, b.fmt("tests/{s}", .{dir}), .{ .iterate = true }) catch return;
+    var d = b.root.openDir(io, b.fmt("tests/{s}", .{dir}), .{ .iterate = true }) catch return;
     defer d.close(io);
     var it = d.iterate();
     while (it.next(io) catch null) |e| {
@@ -96,7 +96,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(check_exe);
     const check_cmd = b.addRunArtifact(check_exe);
     b.step("cube-check", "Run cube_check (args after -- : scrub <db-path>)").dependOn(&check_cmd.step);
-    if (b.args) |a| check_cmd.addArgs(a);
+    check_cmd.addPassthruArgs();
 
     const exe = addTool(b, target, optimize, mod, zio_mod, .{ .step = "run", .name = "cube_db", .root = "src/main.zig", .desc = "Run the app", .args = true, .install_dep = true });
     const bench_opts = b.addOptions();
@@ -106,7 +106,7 @@ pub fn build(b: *std.Build) void {
     _ = addTool(b, target, optimize, mod, zio_mod, .{ .step = "bench-get-profile", .name = "get_profile", .root = "bench/get_profile.zig", .desc = "Run get phase-by-phase timing breakdown" });
     _ = addTool(b, target, optimize, mod, zio_mod, .{ .step = "perf-batch", .name = "perf_batch", .root = "bench/perf_batch.zig", .desc = "Run putBatch performance measurement" });
     _ = addTool(b, target, optimize, mod, zio_mod, .{ .step = "profile-commit", .name = "profile_commit", .root = "bench/profile_commit.zig", .desc = "Run commit path phase profiling (#35)" });
-    _ = addTool(b, target, optimize, mod, zio_mod, .{ .step = "mmap-vs-pwrite", .name = "mmap_vs_pwrite", .root = "bench/mmap_vs_pwrite.zig", .desc = "Discriminating experiment: mmap vs pwrite 100MB (#41)", .db = false, .libc = true });
+    _ = addTool(b, target, optimize, mod, zio_mod, .{ .step = "mmap-vs-pwrite", .name = "mmap_vs_pwrite", .root = "bench/mmap_vs_pwrite.zig", .desc = "Discriminating experiment: mmap vs pwrite 100MB (#41)", .libc = true });
     _ = addTool(b, target, optimize, mod, zio_mod, .{ .step = "profile-fps", .name = "profile_fps", .root = "bench/profile_fps.zig", .desc = "FPS write path counters (#41)", .libc = true });
     _ = addTool(b, target, optimize, mod, zio_mod, .{ .step = "crc32-bench", .name = "crc32_bench", .root = "bench/crc32_bench.zig", .desc = "CRC32 hardware vs software single-page timing" });
     _ = addTool(b, target, optimize, mod, zio_mod, .{ .step = "bench-baseline", .name = "bench_baseline", .root = "bench/bench_baseline.zig", .desc = "Check benchmark regression baseline", .libc = true });
@@ -130,7 +130,7 @@ pub fn build(b: *std.Build) void {
     var one_hits: usize = 0;
     for (rels.items) |rel| {
         const path = b.fmt("tests/{s}", .{rel});
-        const src = b.build_root.handle.readFileAlloc(io, path, b.allocator, .limited(8 << 20)) catch continue;
+        const src = b.root.root_dir.handle.readFileAlloc(io, path, b.allocator, .limited(8 << 20)) catch continue;
         const verdict = scan(src, rel, filter);
         if (verdict == .helper) continue; // 纯 helper（test_diag/common/…）不建二进制
         const is_long_run = std.mem.eql(u8, rel, "fuzz/long_run_2min.zig"); // 裁决 1

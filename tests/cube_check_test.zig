@@ -13,9 +13,7 @@ const Db = cube.Db;
 const FilePageStore = cube.file_page_store.FilePageStore;
 const ps = cube.page_store;
 
-const c = @cImport({
-    @cInclude("unistd.h");
-});
+const c = @import("cube_db").libc; // 0.17: @cImport removed
 
 fn unlinkPath(path: []const u8) void {
     var buf: [256]u8 = undefined;

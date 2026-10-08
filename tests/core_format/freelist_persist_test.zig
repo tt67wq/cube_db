@@ -31,10 +31,7 @@ const FilePageStore = cube.file_page_store.FilePageStore;
 const part = @import("page_partition.zig");
 const tdiag = @import("test_diag.zig");
 
-const c = @cImport({
-    @cInclude("unistd.h");
-    @cInclude("fcntl.h");
-});
+const c = @import("cube_db").libc; // 0.17: @cImport removed
 
 const alloc = std.testing.allocator;
 
@@ -250,7 +247,7 @@ const Base = struct {
 /// matters: GREEN may add the P2 close-time checkpoint (one more meta write), and a fixture meta
 /// must outrank whatever is on disk.
 fn buildBase(path: []const u8, n_keys: usize) !Base {
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     errdefer alloc.free(path_z);
     {
         var fps = try FilePageStore.init(alloc, path);

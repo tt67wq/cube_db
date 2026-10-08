@@ -119,8 +119,8 @@ pub const MemPageStore = struct {
             .freelist_mu = .{},
             .next_free = FIRST_DATA_PAGE,
             .max_pages = mapsize_pages,
-            .meta0 = [_]u8{0} ** f2.PAGE_SIZE,
-            .meta1 = [_]u8{0} ** f2.PAGE_SIZE,
+            .meta0 = @as([f2.PAGE_SIZE]u8, @splat(0)),
+            .meta1 = @as([f2.PAGE_SIZE]u8, @splat(0)),
             .meta_index = 0,
         };
         // Pages are independently heap-allocated on demand in ensurePage;
@@ -157,7 +157,7 @@ pub const MemPageStore = struct {
                 self.pages.shrinkRetainingCapacity(old_len);
                 return error.OutOfMemory;
             };
-            self.pages.items[i].* = [_]u8{0} ** f2.PAGE_SIZE;
+            self.pages.items[i].* = @as([f2.PAGE_SIZE]u8, @splat(0));
         }
     }
 

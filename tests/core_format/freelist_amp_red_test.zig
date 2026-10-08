@@ -50,9 +50,7 @@ const cube = @import("cube_db");
 const f2 = cube.format;
 const FilePageStore = cube.file_page_store.FilePageStore;
 
-const c = @cImport({
-    @cInclude("unistd.h");
-});
+const c = @import("cube_db").libc; // 0.17: @cImport removed
 
 const alloc = std.testing.allocator;
 

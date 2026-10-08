@@ -19,9 +19,7 @@
 //! 用**软阈值 + 显式失败**而非依赖 harness 超时，这样 RED 输出是一条清晰的断言失败。
 
 const std = @import("std");
-const c = @cImport({
-    @cInclude("unistd.h");
-});
+const c = @import("cube_db").libc; // 0.17: @cImport removed
 const cube = @import("cube_db");
 const ps = cube.page_store;
 const dbi = cube.db;

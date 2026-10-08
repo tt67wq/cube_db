@@ -36,10 +36,7 @@ fn currentBaseline() MetricList {
     };
 }
 
-const c = @cImport({
-    @cInclude("unistd.h");
-    @cInclude("fcntl.h");
-});
+const c = cube.libc; // 0.17: @cImport removed
 
 fn unlinkPath(path: []const u8) void {
     var buf: [256]u8 = undefined;

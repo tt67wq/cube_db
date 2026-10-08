@@ -12,10 +12,7 @@ const Db = cube.Db;
 
 const alloc = std.testing.allocator;
 
-const c = @cImport({
-    @cInclude("unistd.h");
-    @cInclude("fcntl.h");
-});
+const c = @import("cube_db").libc; // 0.17: @cImport removed
 
 fn unlinkPath(path: []const u8) void {
     var buf: [256]u8 = undefined;
@@ -129,7 +126,7 @@ test "recovery: one meta page corrupted, other meta recovers" {
 }
 
 fn toZ(allocator: std.mem.Allocator, path: []const u8) ![:0]u8 {
-    return try allocator.dupeZ(u8, path);
+    return try allocator.dupeSentinel(u8, path, 0);
 }
 
 test "durability: async mode (fsync=false) + explicit sync() persists" {

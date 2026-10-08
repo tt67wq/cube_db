@@ -17,10 +17,7 @@
 //! 判定用「必须返回错误」而非具体错误码（与 open_meta_guard_test 同约定）。
 
 const std = @import("std");
-const c = @cImport({
-    @cInclude("fcntl.h");
-    @cInclude("unistd.h");
-});
+const c = @import("cube_db").libc; // 0.17: @cImport removed
 const cube = @import("cube_db");
 const f2 = cube.format;
 const ps = cube.page_store;
@@ -38,7 +35,7 @@ fn unlinkPath(path: []const u8) void {
 }
 
 fn pathZ(path: []const u8) ![:0]u8 {
-    return try alloc.dupeZ(u8, path);
+    return try alloc.dupeSentinel(u8, path, 0);
 }
 
 /// 把槽页 page_no 整页清零（T-64 t5：「一撕 + 一零」形态的零侧构造）。
@@ -52,7 +49,7 @@ fn zeroSlotPage(path: []const u8, page_no: u32) !void {
     if (fd < 0) return error.OpenFailed;
     defer _ = c.close(fd);
 
-    const zeros = [_]u8{0} ** f2.PAGE_SIZE;
+    const zeros = @as([f2.PAGE_SIZE]u8, @splat(0));
     const abs_off: c.off_t = @intCast(@as(u64, page_no) * f2.PAGE_SIZE);
     const wn = c.pwrite(fd, &zeros, f2.PAGE_SIZE, abs_off);
     if (wn != @as(isize, f2.PAGE_SIZE)) return error.WriteFailed;

@@ -10,9 +10,7 @@ fn monoNs() i64 {
     return @as(i64, @intCast(ts.sec)) * 1_000_000_000 + @as(i64, @intCast(ts.nsec));
 }
 
-const c = @cImport({
-    @cInclude("unistd.h");
-});
+const c = @import("cube_db").libc; // 0.17: @cImport removed
 
 fn unlinkPath(path: []const u8) void {
     var buf: [256]u8 = undefined;
@@ -25,7 +23,7 @@ fn unlinkPath(path: []const u8) void {
 test "FPS ordered scaling" {
     // T-54-B: smp_allocator 替换 page_allocator（微分配 mmap 取整放大 RSS，见 pb_fps_ordered_test 注释）
     const allocator = std.heap.smp_allocator;
-    const v100: [100]u8 = [_]u8{'x'} ** 100;
+    const v100: [100]u8 = @as([100]u8, @splat('x'));
 
     for ([_]usize{ 10000, 100000, 500000, 1000000 }) |n| {
         const path = ".test_fps_scale.db";

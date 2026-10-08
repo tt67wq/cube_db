@@ -43,12 +43,7 @@ const FilePageStore = cube.file_page_store.FilePageStore;
 const Db = cube.Db;
 const tdiag = @import("test_diag.zig");
 
-const c = @cImport({
-    @cInclude("unistd.h");
-    @cInclude("fcntl.h");
-    @cInclude("sys/wait.h");
-    @cInclude("signal.h");
-});
+const c = @import("cube_db").libc; // 0.17: @cImport removed
 
 const alloc = std.testing.allocator;
 
@@ -61,7 +56,7 @@ fn unlinkPath(path: []const u8) void {
 }
 
 fn pathZ(allocator: std.mem.Allocator, path: []const u8) ![:0]u8 {
-    return try allocator.dupeZ(u8, path);
+    return try allocator.dupeSentinel(u8, path, 0);
 }
 
 fn armCrashHook(comptime tag_name: []const u8) void {

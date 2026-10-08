@@ -16,11 +16,7 @@ const tdiag = @import("test_diag.zig");
 
 const alloc = std.testing.allocator;
 
-const c = @cImport({
-    @cInclude("unistd.h");
-    @cInclude("fcntl.h");
-    @cInclude("sys/wait.h");
-});
+const c = @import("cube_db").libc; // 0.17: @cImport removed
 
 fn unlinkPath(path: []const u8) void {
     var buf: [256]u8 = undefined;
@@ -31,7 +27,7 @@ fn unlinkPath(path: []const u8) void {
 }
 
 fn pathZ(allocator: std.mem.Allocator, path: []const u8) ![:0]u8 {
-    return try allocator.dupeZ(u8, path);
+    return try allocator.dupeSentinel(u8, path, 0);
 }
 
 // ===== basic reopen tests =====

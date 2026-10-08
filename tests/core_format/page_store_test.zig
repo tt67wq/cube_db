@@ -35,8 +35,8 @@ const MemPageStore = struct {
             .freelist = .empty,
             .next_free = cube.page_store.FIRST_DATA_PAGE,
             .max_pages = mapsize_pages,
-            .meta0 = [_]u8{0} ** f2.PAGE_SIZE,
-            .meta1 = [_]u8{0} ** f2.PAGE_SIZE,
+            .meta0 = @as([f2.PAGE_SIZE]u8, @splat(0)),
+            .meta1 = @as([f2.PAGE_SIZE]u8, @splat(0)),
             .meta_index = 0,
         };
     }
@@ -64,7 +64,7 @@ const MemPageStore = struct {
         if (pn >= self.max_pages) return error.MapFull;
         self.next_free = pn + 1;
         // initialize zeroed page
-        try self.pages.put(pn, [_]u8{0} ** f2.PAGE_SIZE);
+        try self.pages.put(pn, @as([f2.PAGE_SIZE]u8, @splat(0)));
         return pn;
     }
 
@@ -88,7 +88,7 @@ const MemPageStore = struct {
         if (page_no == f2.META_PAGE_1) return &self.meta1;
         const gop = try self.pages.getOrPut(page_no);
         if (!gop.found_existing) {
-            gop.value_ptr.* = [_]u8{0} ** f2.PAGE_SIZE;
+            gop.value_ptr.* = @as([f2.PAGE_SIZE]u8, @splat(0));
         }
         return gop.value_ptr;
     }

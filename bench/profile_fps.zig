@@ -14,9 +14,7 @@ fn monoNs() i64 {
     return @as(i64, @intCast(ts.sec)) * 1_000_000_000 + @as(i64, @intCast(ts.nsec));
 }
 
-const c = @cImport({
-    @cInclude("unistd.h");
-});
+const c = cube.libc; // 0.17: @cImport removed
 
 fn unlinkPath(path: []const u8) void {
     var buf: [256]u8 = undefined;

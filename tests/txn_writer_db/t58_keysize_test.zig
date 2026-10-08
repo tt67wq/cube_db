@@ -19,9 +19,7 @@
 //! PayloadTooLarge（4044 恰好 4068 可写）——正是 issue 的数字。
 
 const std = @import("std");
-const c = @cImport({
-    @cInclude("unistd.h");
-});
+const c = cube.libc; // 0.17: @cImport removed
 const cube = @import("cube_db");
 const btree = cube.btree;
 const ps = cube.page_store;

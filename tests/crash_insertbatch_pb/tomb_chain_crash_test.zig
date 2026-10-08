@@ -53,12 +53,7 @@ const FilePageStore = cube.file_page_store.FilePageStore;
 const part = @import("page_partition");
 const tdiag = @import("test_diag.zig");
 
-const c = @cImport({
-    @cInclude("unistd.h");
-    @cInclude("fcntl.h");
-    @cInclude("sys/wait.h");
-    @cInclude("signal.h");
-});
+const c = @import("cube_db").libc; // 0.17: @cImport removed
 
 const alloc = std.testing.allocator;
 
@@ -335,7 +330,7 @@ fn runCrashCase(comptime tag_name: []const u8, comptime armed: bool, path: []con
         try std.testing.expectEqual(@as(usize, 0), try countVisible(db));
     }
 
-    const pz = try alloc.dupeZ(u8, path);
+    const pz = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(pz);
 
     const pid = c.fork();

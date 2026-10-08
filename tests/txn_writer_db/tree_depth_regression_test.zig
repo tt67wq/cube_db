@@ -91,7 +91,7 @@ test "tree_depth regression: bulk put + deleteRange churn must not hit error.Tru
     var it = try db.select(null, null);
     defer it.deinit();
     var n: usize = 0;
-    var last: [10]u8 = .{'0'} ** 10;
+    var last: [10]u8 = @splat('0');
     while (try it.next()) |e| {
         try std.testing.expect(e.key.len == 10);
         // strictly ascending — no duplicates, no resurrected tombstones

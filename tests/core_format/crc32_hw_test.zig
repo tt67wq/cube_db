@@ -10,14 +10,14 @@ const crc32_hw = cube.crc32_hw;
 // ---- Consistency: hardware CRC32 == software CRC32 ----
 
 test "crc32_hw: all-zero page checksum matches software" {
-    var page: [fmt.PAGE_SIZE]u8 = [_]u8{0} ** fmt.PAGE_SIZE;
+    var page: [fmt.PAGE_SIZE]u8 = @as([fmt.PAGE_SIZE]u8, @splat(0));
     const sw = fmt.computePageChecksum(&page);
     const hw = crc32_hw.computePageChecksumHw(&page);
     try std.testing.expectEqual(sw, hw);
 }
 
 test "crc32_hw: all-0xFF page checksum matches software" {
-    var page: [fmt.PAGE_SIZE]u8 = [_]u8{0xFF} ** fmt.PAGE_SIZE;
+    var page: [fmt.PAGE_SIZE]u8 = @as([fmt.PAGE_SIZE]u8, @splat(0xFF));
     const sw = fmt.computePageChecksum(&page);
     const hw = crc32_hw.computePageChecksumHw(&page);
     try std.testing.expectEqual(sw, hw);
@@ -45,7 +45,7 @@ test "crc32_hw: random-ish page checksum matches software" {
 }
 
 test "crc32_hw: page with real header + payload matches software" {
-    var page: [fmt.PAGE_SIZE]u8 = [_]u8{0} ** fmt.PAGE_SIZE;
+    var page: [fmt.PAGE_SIZE]u8 = @as([fmt.PAGE_SIZE]u8, @splat(0));
     // Write a header
     std.mem.writeInt(u32, page[0..4], 42, .little); // page_no
     page[4] = 3; // LEAF

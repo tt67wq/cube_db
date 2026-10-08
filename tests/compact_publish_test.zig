@@ -26,9 +26,7 @@ const Entry = cube.Entry;
 const FilePageStore = cube.file_page_store.FilePageStore;
 const MemPageStore = cube.page_store.MemPageStore;
 
-const c = @cImport({
-    @cInclude("unistd.h");
-});
+const c = @import("cube_db").libc; // 0.17: @cImport removed
 
 fn unlinkPath(path: []const u8) void {
     var buf: [256]u8 = undefined;

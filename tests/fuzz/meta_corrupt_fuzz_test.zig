@@ -24,7 +24,7 @@ fn metaCorruptTarget(ctx: *usize, smith: *std.testing.Smith) !void {
         .free_count = 0,
         .last_page = 10,
     };
-    var page0: [f2.PAGE_SIZE]u8 = [_]u8{0} ** f2.PAGE_SIZE;
+    var page0: [f2.PAGE_SIZE]u8 = @as([f2.PAGE_SIZE]u8, @splat(0));
     f2.writeMetaPage(&page0, &meta, 0);
 
     // Use smith input to randomly flip some bytes

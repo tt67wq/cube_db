@@ -20,11 +20,7 @@ const FilePageStore = cube.file_page_store.FilePageStore;
 const part = @import("page_partition");
 const tdiag = @import("test_diag.zig");
 
-const c = @cImport({
-    @cInclude("unistd.h");
-    @cInclude("sys/wait.h");
-    @cInclude("signal.h");
-});
+const c = @import("cube_db").libc; // 0.17: @cImport removed
 
 const alloc = std.testing.allocator;
 
@@ -231,7 +227,7 @@ fn runCrashCase(comptime tag_name: []const u8, path: []const u8) !void {
         try std.testing.expectEqual(@as(usize, N), try countVisible(db));
     }
 
-    const pz = try alloc.dupeZ(u8, path);
+    const pz = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(pz);
 
     const pid = c.fork();
@@ -286,7 +282,7 @@ test "T-38-5-C6 mid_tomb_chain on the deleteRange path needs a MULTI-page chain"
     // armed：再来一条 deleteRange（count==0 全遮蔽会被 C1 短路！）→
     // 用未遮蔽的 key 造一条新链：先 put 回 2 个 key（打洞），再 deleteRange 覆盖它们？
     // 打洞会把链切得更碎（仍多页），再走 deleteRange 触发 mid。
-    const pz = try alloc.dupeZ(u8, path);
+    const pz = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(pz);
     const pid = c.fork();
     if (pid < 0) return error.ForkFailed;

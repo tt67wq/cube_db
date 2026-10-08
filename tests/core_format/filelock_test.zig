@@ -38,23 +38,18 @@ const std = @import("std");
 const cube = @import("cube_db");
 const FilePageStore = cube.file_page_store.FilePageStore;
 
-const c = @cImport({
-    @cInclude("unistd.h");
-    @cInclude("fcntl.h");
-    @cInclude("sys/wait.h");
-    @cInclude("signal.h");
-});
+const c = @import("cube_db").libc; // 0.17: @cImport removed
 
 const alloc = std.testing.allocator;
 
 fn unlinkPath(path: []const u8) void {
-    const pz = alloc.dupeZ(u8, path) catch return;
+    const pz = alloc.dupeSentinel(u8, path, 0) catch return;
     defer alloc.free(pz);
     _ = c.unlink(pz);
 }
 
 fn pathZ(path: []const u8) ![:0]u8 {
-    return alloc.dupeZ(u8, path);
+    return alloc.dupeSentinel(u8, path, 0);
 }
 
 /// Exit codes of the forked children (distinct from crash-test conventions on
@@ -73,9 +68,7 @@ const exit_other = 3; // any other error / unexpected path
 // 时会 error.FileLocked。A3 的子进程入口先关闭继承 fd（保留管道写端），kill+waitpid
 // 后的 reopen 用有界重试（仅对 FileLocked）。详见 issues/T-62-macos-flock-reopen-ci-red.md。
 
-const f62_c = @cImport({
-    @cInclude("unistd.h");
-});
+const f62_c = @import("cube_db").libc; // 0.17: @cImport removed
 
 fn closeInheritedFds(except: []const c_int) void {
     var fd: c_int = 3;

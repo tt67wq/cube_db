@@ -10,14 +10,7 @@ const f2 = @import("format.zig");
 const ps = @import("page_store.zig");
 const zio = @import("zio");
 const builtin = @import("builtin");
-const c = @cImport({
-    @cInclude("sys/mman.h");
-    @cInclude("sys/stat.h");
-    @cInclude("fcntl.h");
-    @cInclude("unistd.h");
-    @cInclude("errno.h"); // T-34: EWOULDBLOCK/EAGAIN for the flock error path
-    @cInclude("sys/file.h"); // T-34: flock()/LOCK_* — Linux defines these here, not in fcntl.h
-});
+const c = @import("libc.zig"); // 0.17: @cImport removed — see src/libc.zig
 
 const PAGE_SIZE = f2.PAGE_SIZE;
 
@@ -151,7 +144,7 @@ pub const FilePageStore = struct {
 
     /// Open (or create) path and mmap the 1TB reserved region. The file grows on demand.
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !FilePageStore {
-        const path_z = try allocator.dupeZ(u8, path);
+        const path_z = try allocator.dupeSentinel(u8, path, 0);
         defer allocator.free(path_z);
         const fd = c.open(path_z, @as(c_int, c.O_RDWR | c.O_CREAT), @as(c.mode_t, 0o644));
         if (fd < 0) return error.OpenFailed;
@@ -181,7 +174,7 @@ pub const FilePageStore = struct {
             return error.FstatFailed;
         }
         const min_size: u64 = @as(u64, ps.FIRST_DATA_PAGE) * PAGE_SIZE;
-        if (@as(u64, @intCast(st.st_size)) < min_size) {
+        if (@as(u64, @intCast(st.size)) < min_size) {
             if (c.ftruncate(fd, @as(c.off_t, @intCast(min_size))) != 0) {
                 _ = c.close(fd);
                 return error.TruncateFailed;
@@ -203,8 +196,8 @@ pub const FilePageStore = struct {
             .freelist = .empty,
             .next_free = ps.FIRST_DATA_PAGE,
             .meta_index = 0,
-            .meta0 = [_]u8{0} ** PAGE_SIZE,
-            .meta1 = [_]u8{0} ** PAGE_SIZE,
+            .meta0 = @splat(@as(u8, 0)),
+            .meta1 = @splat(@as(u8, 0)),
         };
 
         // Load the meta buffers from the mmap region, then try to recover
@@ -255,7 +248,7 @@ pub const FilePageStore = struct {
         else if (m0 != null) m0 else m1;
         if (active) |m| {
             const needed: u64 = @max(min_size, (@as(u64, m.last_page) + 1) * PAGE_SIZE);
-            if (@as(u64, @intCast(st.st_size)) < needed) {
+            if (@as(u64, @intCast(st.size)) < needed) {
                 if (c.ftruncate(fd, @as(c.off_t, @intCast(needed))) != 0) {
                     fps.free_list_discarded = (m.free_head != 0 or m.free_count != 0);
                     return fps;
@@ -322,7 +315,7 @@ pub const FilePageStore = struct {
         var st: c.struct_stat = undefined;
         if (c.fstat(self.fd, &st) != 0) return error.FstatFailed;
         if (FpsCounters.enable) FpsCounters.fstat_calls += 1;
-        if (@as(u64, @intCast(st.st_size)) < needed) {
+        if (@as(u64, @intCast(st.size)) < needed) {
             if (c.ftruncate(self.fd, @as(c.off_t, @intCast(needed))) != 0) return error.TruncateFailed;
             if (FpsCounters.enable) FpsCounters.ftruncate_calls += 1;
         }
@@ -419,7 +412,7 @@ pub const FilePageStore = struct {
     // the guard would have caught, without crashing on the accepted poison.
 
     fn assertNotChainPageLocked(self: *FilePageStore, page_no: u32) void {
-        if (comptime builtin.mode == .Debug) {
+        if (comptime builtin.mode == .debug) {
             for (self.chain_cur.items) |p| std.debug.assert(p != page_no);
             for (self.chain_prev.items) |p| std.debug.assert(p != page_no);
         }

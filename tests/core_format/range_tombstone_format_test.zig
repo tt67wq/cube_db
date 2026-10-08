@@ -338,7 +338,7 @@ test "T-38-1: bound representability envelope — 4051 single-side / succ exact-
     var page: [f2.PAGE_SIZE]u8 = undefined;
 
     // (a) 单侧 4051B（= MAX_KEY_SIZE）用户边界 + null：16 + 4051 = 4067 ≤ 4068 → 可表示
-    const kmax = [_]u8{'m'} ** cube.btree.MAX_KEY_SIZE;
+    const kmax = @as([cube.btree.MAX_KEY_SIZE]u8, @splat('m'));
     try std.testing.expectEqual(@as(usize, 4051), cube.btree.MAX_KEY_SIZE); // envelope 算术前提
     const single = [_]f2.RangeTombstone{
         .{ .min = plain(&kmax), .max = null },
@@ -359,7 +359,7 @@ test "T-38-1: bound representability envelope — 4051 single-side / succ exact-
 
     // (b) 打洞右段形状 [succ('q'×4051), "z")：succ 紧凑存储 = 原键长 4051，
     //     16 + 4051 + 1 = 4068 恰好装满 → 可表示（F1/F2 核心：右段恒可建）
-    const big = [_]u8{'q'} ** cube.btree.MAX_KEY_SIZE;
+    const big = @as([cube.btree.MAX_KEY_SIZE]u8, @splat('q'));
     const right = [_]f2.RangeTombstone{
         .{ .min = succ(&big), .max = plain("z") },
     };
@@ -375,16 +375,16 @@ test "T-38-1: bound representability envelope — 4051 single-side / succ exact-
     // (c) 双长边界 ['a'×3000, 'z'×3000]：16 + 6000 > 4068 →
     //     typed error.TombBoundTooLarge（不得是笼统 TombPageOverflow；
     //     生产方向 = 边界 spill 到 overflow 页，阶段 1 决策按 typed 拒绝）
-    const lo = [_]u8{'a'} ** 3000;
-    const hi = [_]u8{'z'} ** 3000;
+    const lo = @as([3000]u8, @splat('a'));
+    const hi = @as([3000]u8, @splat('z'));
     const both_long = [_]f2.RangeTombstone{
         .{ .min = plain(&lo), .max = plain(&hi) },
     };
     try std.testing.expectError(error.TombBoundTooLarge, f2.encodeTombPage(&page, 7, &both_long, 9, 0));
 
     // (d) 边界恰好装满：16 + 2026 + 2026 = 4068 → 可表示（不 off-by-one）
-    const lo2 = [_]u8{'a'} ** 2026;
-    const hi2 = [_]u8{'z'} ** 2026;
+    const lo2 = @as([2026]u8, @splat('a'));
+    const hi2 = @as([2026]u8, @splat('z'));
     const exact = [_]f2.RangeTombstone{
         .{ .min = plain(&lo2), .max = plain(&hi2) },
     };
@@ -397,8 +397,8 @@ test "T-38-1: bound representability envelope — 4051 single-side / succ exact-
     }
 
     // (e) 恰好装满 +1B：16 + 2026 + 2027 = 4069 > 4068 → TombBoundTooLarge
-    const lo3 = [_]u8{'a'} ** 2026;
-    const hi3 = [_]u8{'z'} ** 2027;
+    const lo3 = @as([2026]u8, @splat('a'));
+    const hi3 = @as([2027]u8, @splat('z'));
     const one_over = [_]f2.RangeTombstone{
         .{ .min = plain(&lo3), .max = plain(&hi3) },
     };
@@ -444,7 +444,7 @@ test "T-38-1: meta v2 round-trip — tomb_head=0, byte-identical v2 encoding" {
     // v2=58B：encodeMetaPayload 不动 tomb 区（payload[58..62] 恒 0）
     // —— 新代码写的 v2 页与旧二进制逐字节一致
     const payload = page[f2.PAGE_HEADER_SIZE .. f2.PAGE_SIZE - 4];
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 4), payload[58..62]);
+    try std.testing.expectEqualSlices(u8, &(@as([4]u8, @splat(0))), payload[58..62]);
 }
 
 test "T-38-1: meta v3 round-trip — tomb_head persists, old code rejects cleanly" {

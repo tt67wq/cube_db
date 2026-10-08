@@ -45,12 +45,7 @@ const FilePageStore = cube.file_page_store.FilePageStore;
 const part = @import("page_partition"); // T-54-G: 改走 build.zig 模块（子目录二进制的模块路径不能 ../ 越界）
 const tdiag = @import("test_diag.zig");
 
-const c = @cImport({
-    @cInclude("unistd.h");
-    @cInclude("fcntl.h");
-    @cInclude("sys/wait.h");
-    @cInclude("signal.h");
-});
+const c = @import("cube_db").libc; // 0.17: @cImport removed
 
 const alloc = std.testing.allocator;
 
@@ -305,7 +300,7 @@ fn runCrashCase(comptime tag_name: []const u8, comptime armed: bool, comptime do
     defer unlinkPath(path);
     try buildPreState(path);
 
-    const pz = try alloc.dupeZ(u8, path);
+    const pz = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(pz);
 
     const pid = c.fork();
@@ -377,7 +372,7 @@ test "T5-r: reopen is idempotent — restoreFreeList is read-only" {
     // CrashTag has no restore-phase tag, so this is the observable equivalent: a crash during a
     // read-only phase leaves the file byte-identical.
     {
-        const pz = try alloc.dupeZ(u8, path);
+        const pz = try alloc.dupeSentinel(u8, path, 0);
         defer alloc.free(pz);
         const pid = c.fork();
         if (pid < 0) return error.ForkFailed;

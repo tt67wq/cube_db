@@ -45,7 +45,7 @@ test "stress: 1000 sequential keys all readable, heap-allocated" {
 }
 
 test "stress: 1000 keys reopen persists (FilePageStore 1TB region)" {
-    const c = @cImport({ @cInclude("unistd.h"); });
+    const c = @import("cube_db").libc; // 0.17: @cImport removed
     const path = ".test_stress_reopen.db";
     defer {
         var buf: [64]u8 = undefined;

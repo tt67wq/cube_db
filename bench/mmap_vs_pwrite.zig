@@ -5,12 +5,7 @@
 //! Usage: zig build run-mmap-vs-pwrite -Doptimize=ReleaseFast
 //!   or: zig build-exe bench/mmap_vs_pwrite.zig -O ReleaseFast && ./mmap_vs_pwrite
 const std = @import("std");
-const c = @cImport({
-    @cInclude("sys/mman.h");
-    @cInclude("sys/stat.h");
-    @cInclude("fcntl.h");
-    @cInclude("unistd.h");
-});
+const c = @import("cube_db").libc; // 0.17: @cImport removed
 
 const PAGE_SIZE: usize = 4096;
 const TOTAL_MB: usize = 100;
@@ -32,7 +27,7 @@ fn unlinkPath(path: []const u8) void {
 }
 
 fn openFile(path: []const u8) !c_int {
-    const path_z = try std.heap.page_allocator.dupeZ(u8, path);
+    const path_z = try std.heap.page_allocator.dupeSentinel(u8, path, 0);
     defer std.heap.page_allocator.free(path_z);
     const fd = c.open(path_z, @as(c_int, c.O_RDWR | c.O_CREAT), @as(c.mode_t, 0o644));
     if (fd < 0) return error.OpenFailed;
@@ -153,7 +148,7 @@ fn runCubeDbPattern(fd: c_int, label: []const u8) !i64 {
         if (c.fstat(fd, &st) != 0) return error.FstatFailed;
         fstat_count += 1;
         const needed: u64 = (@as(u64, p) + 1) * PAGE_SIZE;
-        if (@as(u64, @intCast(st.st_size)) < needed) {
+        if (@as(u64, @intCast(st.size)) < needed) {
             if (c.ftruncate(fd, @as(c.off_t, @intCast(needed))) != 0) return error.TruncateFailed;
             ftruncate_count += 1;
         }
