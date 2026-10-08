@@ -85,7 +85,7 @@ pub fn build(b: *std.Build) void {
     const zio_mod = b.dependency("zio", .{ .target = target, .optimize = optimize }).module("zio");
     const mod = b.addModule("cube_db", .{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize });
     mod.addImport("zio", zio_mod);
-    mod.link_libc = true; // T1: mmap wrapper uses @cImport libc
+    mod.link_libc = true; // T1: src/libc.zig externs link against system libc
     const cube_check_mod = b.addModule("cube_check", .{ .root_source_file = b.path("src/cube_check.zig"), .target = target, .optimize = optimize });
     cube_check_mod.addImport("cube_db", mod);
     cube_check_mod.addImport("zio", zio_mod);

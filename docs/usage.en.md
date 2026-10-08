@@ -1,6 +1,6 @@
 # cube_db Usage Manual
 
-cube_db is an embedded key-value store written in Zig 0.16.0. Fixed pages (4KB) + freelist page
+cube_db is an embedded key-value store written in Zig 0.17.0. Fixed pages (4KB) + freelist page
 reuse + COW B-tree:
 
 - **O(1) compact**: only writes the meta page, no data rewrite
@@ -28,8 +28,8 @@ Pure synchronous API; no runtime setup required.
 ## 1. Installation & build
 
 Dependencies:
-- Zig 0.16.0
-- A local `../zio` repo (`build.zig.zon` path dependency)
+- Zig 0.17.0
+- `zio` (a `build.zig.zon` URL dependency: a GitHub tarball at a pinned commit, fetched and hash-verified by `zig build`)
 
 ```bash
 zig build test          # run all tests

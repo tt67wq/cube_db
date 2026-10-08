@@ -4,7 +4,7 @@
   <img src="docs/assets/cube_db_logo.png" alt="cube_db logo" width="100%" max-width="800">
 </p>
 
-An embedded key-value store written in Zig 0.16.0, LMDB-style architecture: pure COW B-tree
+An embedded key-value store written in Zig 0.17.0, LMDB-style architecture: pure COW B-tree
 with freelist page reuse, no WAL, crash-safe via atomic meta-page switch.
 
 - Embedded KV engine: `get` / `put` / `delete` / `select`
@@ -24,8 +24,9 @@ with freelist page reuse, no WAL, crash-safe via atomic meta-page switch.
 
 ## Dependencies
 
-- Zig 0.16.0
-- Local `../zio` repo (`build.zig.zon` path dependency)
+- Zig 0.17.0
+- `zio` (`build.zig.zon` URL dependency: GitHub tarball at a pinned commit; fetched and
+  hash-verified by `zig build`)
 
 ## Build & Test
 

@@ -209,11 +209,12 @@ test "crc Db: sample skips healthy-path reads — non-hit corruption stays silen
 // ===== wf-pi-3 (test worker) strengthening — plan M1/M2/M3/M9/M10 =====
 
 test "crc: CrcCheck enum is exactly { off, sample, full } (M1)" {
-    const fields = @typeInfo(wrt.CrcCheck).@"enum".fields;
-    try std.testing.expectEqual(@as(usize, 3), fields.len);
-    try std.testing.expectEqualStrings("off", fields[0].name);
-    try std.testing.expectEqualStrings("sample", fields[1].name);
-    try std.testing.expectEqualStrings("full", fields[2].name);
+    // 0.17: @typeInfo(enum) is struct-of-arrays — `.fields` -> `.field_names`
+    const names = @typeInfo(wrt.CrcCheck).@"enum".field_names;
+    try std.testing.expectEqual(@as(usize, 3), names.len);
+    try std.testing.expectEqualStrings("off", names[0]);
+    try std.testing.expectEqualStrings("sample", names[1]);
+    try std.testing.expectEqualStrings("full", names[2]);
 }
 
 test "crc Db: off full-range scan over corrupted page completes silently (M2)" {

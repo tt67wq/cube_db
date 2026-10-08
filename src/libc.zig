@@ -37,13 +37,15 @@ pub const LOCK_NB: c_int = 4;
 pub const EAGAIN: c_int = @intFromEnum(std.c.E.AGAIN);
 pub const EWOULDBLOCK: c_int = EAGAIN;
 
-pub extern "c" fn open(path: [*:0]const u8, flags: c_int, mode: mode_t) c_int;
+// C's `open` is variadic: `open(path, flags, ...)` with the mode promoted to int when
+// O_CREAT is set. A fixed third param of `mode_t` would pass 16 bits on Darwin (where
+// mode_t is u16) into a slot libc reads as a 32-bit int -> garbage permissions (EACCES).
+pub extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
 pub extern "c" fn close(fd: c_int) c_int;
 pub extern "c" fn unlink(path: [*:0]const u8) c_int;
 pub extern "c" fn flock(fd: c_int, operation: c_int) c_int;
 pub extern "c" fn fstat(fd: c_int, buf: *struct_stat) c_int;
-pub extern "c" fn stat(path: [*:0]const u8, buf: *struct_stat) c_int;
-pub extern "c" fn ftruncate(fd: c_int, length: off_t) c_int;
+pub extern "c" fn stat(path: [*:0]const u8, buf: *struct_stat) c_int;pub extern "c" fn ftruncate(fd: c_int, length: off_t) c_int;
 pub extern "c" fn fsync(fd: c_int) c_int;
 pub extern "c" fn mmap(addr: ?*anyopaque, len: usize, prot: c_int, flags: c_int, fd: c_int, offset: off_t) *anyopaque;
 pub extern "c" fn munmap(addr: *anyopaque, len: usize) c_int;
@@ -55,6 +57,9 @@ pub extern "c" fn pipe(fds: *[2]c_int) c_int;
 pub const O_RDONLY: c_int = 0;
 
 // ===== process control (crash-injection test harness: fork + kill -9 + waitpid) =====
+/// ponytail: `fstat`/`stat` link the plain libc symbol. Fine on Linux (glibc >= 2.33) and
+/// Darwin arm64; Darwin x86_64 needs the `$INODE64` variants (std.c does that dispatch, but
+/// its fstat is unavailable on Linux). Link error there, not silent breakage.
 pub const pid_t = std.c.pid_t;
 pub extern "c" fn fork() pid_t;
 pub extern "c" fn waitpid(pid: pid_t, status: *c_int, options: c_int) pid_t;

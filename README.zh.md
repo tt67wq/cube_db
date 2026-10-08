@@ -1,6 +1,6 @@
 # cube_db
 
-嵌入式键值存储，用 Zig 0.16.0 编写，LMDB 式架构：纯 COW B-tree + freelist 页面复用，无 WAL，
+嵌入式键值存储，用 Zig 0.17.0 编写，LMDB 式架构：纯 COW B-tree + freelist 页面复用，无 WAL，
 通过原子 meta 页切换实现崩溃安全。
 
 - 嵌入式 KV 引擎：`get` / `put` / `delete` / `select`
@@ -22,8 +22,8 @@
 
 ## 依赖
 
-- Zig 0.16.0
-- 本地 `../zio` 仓库（`build.zig.zon` 的 path 依赖）
+- Zig 0.17.0
+- `zio`（`build.zig.zon` 的 URL 依赖：固定 commit 的 GitHub tarball，`zig build` 自动下载并按 hash 校验）
 
 ## 构建与测试
 

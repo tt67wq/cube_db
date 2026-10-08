@@ -2,7 +2,7 @@
 //! De-risks the load-bearing assumption of scheme I. Standalone program, not built via cube_db.
 //! zig build-exe spike_mmap.zig -lc && ./spike_mmap
 const std = @import("std");
-const c = @import("cube_db").libc; // 0.17: @cImport removed
+const c = @import("src/libc.zig"); // 0.17: @cImport removed (standalone: no cube_db module)
 
 const REGION: usize = 1 << 40; // 1 TB reserved virtual region
 

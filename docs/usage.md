@@ -1,6 +1,6 @@
 # cube_db 使用手册
 
-cube_db 是一个用 Zig 0.16.0 编写的嵌入式键值存储引擎。固定页（4KB） + freelist 页面复用 + COW B-tree：
+cube_db 是一个用 Zig 0.17.0 编写的嵌入式键值存储引擎。固定页（4KB） + freelist 页面复用 + COW B-tree：
 
 - **O(1) compact**：只写 meta page，不重写数据
 - **~1× 写放大**：旧页进 freelist 原地复用
@@ -32,8 +32,8 @@ cube_db 是一个用 Zig 0.16.0 编写的嵌入式键值存储引擎。固定页
 ## 1. 安装与构建
 
 依赖：
-- Zig 0.16.0
-- 本地 `../zio` 仓库（`build.zig.zon` 的 path 依赖）
+- Zig 0.17.0
+- `zio`（`build.zig.zon` 的 URL 依赖：固定 commit 的 GitHub tarball，`zig build` 自动下载并按 hash 校验）
 
 ```bash
 zig build test          # 跑全部测试

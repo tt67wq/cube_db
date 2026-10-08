@@ -2,7 +2,7 @@
     .name = .cube_db,
     .version = "0.0.0",
     .fingerprint = 0x561af1326a981d69,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .zio = .{
             .url = "https://github.com/lalinsky/zio/archive/3bbd74d68a889e5d4da7274afdc7c7617ec614d6.tar.gz",

@@ -24,7 +24,7 @@
 
 ## 1. 安装与构建
 
-依赖与主库一致：Zig 0.16.0 + 本地 `../zio` 仓库。
+依赖与主库一致：Zig 0.17.0 + `zio`（build.zig.zon URL 依赖）。
 
 ```bash
 # 编译并安装可执行文件到 zig-out/bin/cube_check

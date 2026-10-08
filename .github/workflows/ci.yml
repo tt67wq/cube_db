@@ -1,4 +1,4 @@
-# cube_db CI — 推代码 / 开 PR 时自动: 装 zig → 准备 zio → 编译 → 全量测试
+# cube_db CI — 推代码 / 开 PR 时自动: 装 zig → 编译 → 全量测试
 name: CI
 
 on:
@@ -13,44 +13,36 @@ jobs:
       # 1. 把你的仓库代码下载到 CI 机器
       - uses: actions/checkout@v4
 
-      # 2. 安装 Zig 0.16.0(与本地 asdf 一致)。
-      #    不用 mlugg/setup-zig: v1 用旧命名 zig-linux-x86_64, Zig 0.16 已改名
-      #    zig-x86_64-linux, 导致全镜像 404/503。直接 curl 下载已验证 URL。
-      - name: Install Zig 0.16.0
+      # 2. 安装 Zig 0.17.0(与本地 asdf 一致)。
+      #    不用 mlugg/setup-zig: v1 用旧命名 zig-linux-x86_64, 导致全镜像 404/503。
+      #    直接 curl 下载已验证 URL。
+      - name: Install Zig 0.17.0
         run: |
-          curl -fsSL -o /tmp/zig.tar.xz https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
+          curl -fsSL -o /tmp/zig.tar.xz https://ziglang.org/download/0.17.0/zig-x86_64-linux-0.17.0.tar.xz
           sudo tar -xJf /tmp/zig.tar.xz -C /opt
-          sudo mv /opt/zig-x86_64-linux-0.16.0 /opt/zig
+          sudo mv /opt/zig-x86_64-linux-0.17.0 /opt/zig
           echo "/opt/zig" >> "$GITHUB_PATH"
           # GITHUB_PATH 只对后续步骤生效, 当前 shell 用全路径验证
           /opt/zig/zig version
 
-      # 2b. libc 头文件: build.zig 全库 link_libc=true (mmap wrapper @cImport),
+      # 2b. libc 头文件: build.zig 全库 link_libc=true (src/libc.zig 的 extern 声明需链接系统 libc),
       #     ubuntu-latest 只有运行时 libc 无 /usr/include 系统头, 需装 libc6-dev
       - name: Install libc headers (libc6-dev)
         run: sudo apt-get update && sudo apt-get install -y libc6-dev linux-libc-dev
 
-      # 3. zio 依赖: build.zig.zon 用 .path = "../zio"(兄弟目录),CI 上不存在。
-      #    完整 clone 再 checkout SHA(不用 --depth 1 + fetch SHA: 远端不暴露
-      #    任意 commit 引用, 浅 clone 按名字 fetch SHA 会 404)。固定 3aa3423
-      #    (本地验证过的版本; 升级 zio 时改这里)。
-      - name: Clone zio dependency to ../zio
-        run: |
-          git clone https://github.com/lalinsky/zio.git ../zio
-          cd ../zio && git checkout 3aa3423
-
-      # 4. 编译检查(快,~1min)— 任何模块编译失败这里就红
+      # 3. 编译检查(快,~1min)— 任何模块编译失败这里就红
+      #    zio 依赖走 build.zig.zon 的 URL tarball, zig 自行下载并按 hash 校验, 无需预置
       - name: Compile (zig build)
         run: zig build -j2 --maxrss 4GB
 
-      # 5. 全量测试 = 项目验收命令(编译 + 全部 unit/integration tests)
+      # 4. 全量测试 = 项目验收命令(编译 + 全部 unit/integration tests)
       #    历史 flaky 的 txn_test.concurrency 竞态已于 2026-08-13 修复 (e26931c)
       #    -j2 --maxrss 4GB: 单次 zig build test 本地实测峰值 3.2GB(37 个测试二进制并行编译),
       #    GitHub runner 约 7GB RAM, 压并发+限内存防 OOM
       - name: Run full test suite
         run: zig build test -j2 --maxrss 4GB
 
-      # 6. 基准回归检查(先注释掉: 阈值按本机 M1 Pro 校准,CI 的 CPU 不同会误报)
+      # 5. 基准回归检查(先注释掉: 阈值按本机 M1 Pro 校准,CI 的 CPU 不同会误报)
       #    待 bench_baseline 支持 mem-only 模式后再启用。
       # - name: Benchmark regression baseline
       #   run: zig build bench-baseline -Doptimize=ReleaseFast
